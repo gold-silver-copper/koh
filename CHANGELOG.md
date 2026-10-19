@@ -194,6 +194,19 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- **A session's reports no longer say a program waits for input it has yet to get, or before the
+  output it wrote first.** Input still queued for the terminal, keys still on their way into it
+  (Linux hands them over on a worker), output the server had read but not yet taken, and output
+  held for the terminal's modes all count as the program being at work; keys are looked at before
+  the program and output after it, so neither slips between the looks.
+- **A password prompt printed just before echo goes off is never told with echo on**: a report
+  due in the moment between no longer sends the prompt before the modes are read again.
+- **`koh connect -- PROG` leaves no ended session behind.** The client's close saying it had the
+  end counts as the end delivered whichever way the server noticed the connection go; before, the
+  session could stay listed, its program exited, until its TTL ran out.
+- **A resize goes before the keys typed after it**, so a command typed at once sees the new size.
+- **A cut `koh cp` keeps what reached it**: the receiver lands the bytes already sent although the
+  sender is gone, so the next copy resumes from them.
 - The shell's marks koh writes count in a fux shell pane too: with `FUX_MARK_NONCE` in its
   environment (fux 0.27 gives it to the programs a shell pane runs), every mark carries it, so
   `koh connect` typed into a shell pane answers fux's `line` with `· done STATUS`.

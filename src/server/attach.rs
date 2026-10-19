@@ -224,6 +224,8 @@ pub(super) async fn serve(
     let mut resized = 0;
     let mut window: Option<Window> = None;
     let mut exited = false;
+    // The session was told the client has its end.
+    let mut told = false;
     // The client is owed a new epoch, redrawn: it fell behind, or asked.
     let mut redraw = false;
     let how = loop {
@@ -281,6 +283,7 @@ pub(super) async fn serve(
                 if delivered.unwrap_or(false) {
                     // The client has the program's end: the session need keep it no longer.
                     client.ended().await;
+                    told = true;
                     let _ = tokio::time::timeout(FINAL_WAIT, conn.closed()).await;
                     close(conn, Close::SessionEnded);
                     break "shell exited";
@@ -359,6 +362,11 @@ pub(super) async fn serve(
             break "client detached (session retained)";
         }
     };
+    // A client that has the end closes saying so, at once: whichever arm saw the connection go,
+    // the end was delivered.
+    if exited && !told && crate::transport_iroh::closed_because(conn) == Some(Close::SessionEnded) {
+        client.ended().await;
+    }
     info!(peer = %conn.remote_id(), "{how}");
 }
 

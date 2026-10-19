@@ -589,22 +589,29 @@ pub async fn run_client<B: KohBackend>(
             }
             Net::Down(dial) => (None, Some(dial), None),
         };
+        let others = async {
+            tokio::select! {
+                typed = input_rx.recv() => Step::Typed(typed),
+                () = when(keys.deadline().map(|at| tokio::time::sleep_until(at.into()))) => Step::Timeout,
+                () = shutdown.cancelled() => Step::Quit,
+                msg = when(from_server.map(mpsc::Receiver::recv)) => Step::Server(msg),
+                dialed = when(dialing) => Step::Dialed(dialed),
+                _ = tick.tick() => Step::Tick,
+                permit = when(room.as_ref().map(mpsc::Sender::reserve)) => match permit {
+                    Ok(permit) => {
+                        // Taken at once: the permit is the room, and it goes with the held input.
+                        drop(permit);
+                        Step::Room
+                    }
+                    Err(_) => Step::Server(None),
+                },
+            }
+        };
+        // A resize first: keys typed after it must not reach the program before it does.
         let step = tokio::select! {
-            typed = input_rx.recv() => Step::Typed(typed),
-            () = when(keys.deadline().map(|at| tokio::time::sleep_until(at.into()))) => Step::Timeout,
-            () = shutdown.cancelled() => Step::Quit,
+            biased;
             () = resizes.next() => Step::Resize,
-            msg = when(from_server.map(mpsc::Receiver::recv)) => Step::Server(msg),
-            dialed = when(dialing) => Step::Dialed(dialed),
-            _ = tick.tick() => Step::Tick,
-            permit = when(room.as_ref().map(mpsc::Sender::reserve)) => match permit {
-                Ok(permit) => {
-                    // Taken at once: the permit is the room, and it goes with the held input.
-                    drop(permit);
-                    Step::Room
-                }
-                Err(_) => Step::Server(None),
-            },
+            step = others => step,
         };
         let read = match step {
             Step::Typed(None) | Step::Quit => {

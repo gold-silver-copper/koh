@@ -281,12 +281,12 @@ fn past_its_room_a_command_waits_and_past_the_waiting_it_is_told_the_server_is_b
             })
             .await
             .expect("the server");
-            // One runs, holding the one connection; one waits for it.
+            // One runs, holding the one connection until its input ends.
             let mut running = remote
                 .koh("exec")
                 .expect("koh")
-                .args([&remote.id, "--sh", "echo running; sleep 2"])
-                .stdin(Stdio::null())
+                .args([&remote.id, "--sh", "echo running; read x"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .spawn()
                 .expect("exec");
@@ -294,17 +294,35 @@ fn past_its_room_a_command_waits_and_past_the_waiting_it_is_told_the_server_is_b
             let mut first = std::io::BufReader::new(running.stdout.take().expect("stdout"));
             first.read_line(&mut said).expect("its first line");
             assert_eq!(said, "running\n");
-            let waiting = remote
-                .koh("exec")
-                .expect("koh")
-                .args([&remote.id, "--", "echo", "waited"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("exec");
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            let busy = remote.run("exec", &["--", "true"]).expect("exec");
+            // Two more: whichever the server takes first waits for room, and the other, past as
+            // many waiting, is turned away.
+            let mut next = [(); 2].map(|()| {
+                remote
+                    .koh("exec")
+                    .expect("koh")
+                    .args([&remote.id, "--", "echo", "waited"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("exec")
+            });
+            let mut refused = None;
+            for _ in 0..200 {
+                refused = next
+                    .iter_mut()
+                    .position(|child| child.try_wait().expect("try_wait").is_some());
+                if refused.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let [a, b] = next;
+            let (busy, waiting) = match refused.expect("one is turned away") {
+                0 => (a, b),
+                _ => (b, a),
+            };
+            let busy = busy.wait_with_output().expect("exec");
             assert_eq!(busy.status.code(), Some(75), "{busy:?}");
             let said = String::from_utf8_lossy(&busy.stderr);
             assert!(
@@ -316,6 +334,7 @@ fn past_its_room_a_command_waits_and_past_the_waiting_it_is_told_the_server_is_b
             let said: serde_json::Value = serde_json::from_slice(&busy.stdout).expect("json");
             assert_eq!(said["error"]["kind"], "busy");
             // The first ends; the one waiting is served.
+            drop(running.stdin.take());
             let _ = running.wait();
             drop(first);
             let out = waiting.wait_with_output().expect("exec");

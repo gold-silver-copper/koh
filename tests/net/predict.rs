@@ -45,13 +45,22 @@ fn echoed_keystrokes_are_predicted_then_confirmed() -> anyhow::Result<()> {
             .await
             .is_some());
         // The first keystroke is only ever tentative; once the shell has echoed it, later ones show.
-        type_slowly(&client, b"e").await?;
-        anyhow::ensure!(client.wait_until(WAIT, |t| t.contains('e')).await.is_some());
-        type_slowly(&client, b"cho hello").await?;
-        anyhow::ensure!(client
-            .wait_until(WAIT, |t| t.contains("echo hello"))
-            .await
-            .is_some());
+        // A key typed just after the prompt came is held until echoed (the modes may not be known
+        // yet): each one goes once the last is echoed, so those after the hold are predicted
+        // however slow the link and the machine are.
+        let mut typed = String::new();
+        for c in "echo hello".chars() {
+            typed.push(c);
+            client.send(c.to_string().as_bytes()).await?;
+            anyhow::ensure!(
+                client
+                    .wait_until(WAIT, |t| t.contains(typed.trim_end()))
+                    .await
+                    .is_some(),
+                "{typed:?} never echoed: {}",
+                client.screen()
+            );
+        }
         anyhow::ensure!(
             client
                 .wait_for(WAIT, |p| p.text.contains("echo hello")

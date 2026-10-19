@@ -446,6 +446,8 @@ pub struct Pty {
     /// Keystrokes and query replies share this queue, so they stay in order.
     writer_tx: Sender<InputChunk>,
     write_budget: Arc<AtomicUsize>,
+    /// Set while the reader holds output it read from the master and has yet to send on.
+    reading: Arc<AtomicBool>,
     /// The program, until reaped.
     running: Option<Running>,
     reaper: Reaper,
@@ -478,6 +480,8 @@ impl Pty {
         let stopping = Arc::clone(&pumps.stopping);
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(OUTPUT_CHANNEL_DEPTH);
+        let reading = Arc::new(AtomicBool::new(false));
+        let in_hand = Arc::clone(&reading);
         pumps.reader = Some(
             std::thread::Builder::new()
                 .name("koh-pty-reader".into())
@@ -494,7 +498,17 @@ impl Pty {
                                 break;
                             }
                         }
-                        match fuxix::io::read(&reader, &mut buf) {
+                        if waiting.iter().all(|fd| fd.revents().is_empty()) {
+                            continue; // the timeout passed: look at `stopping` again
+                        }
+                        // Set before the read takes output from the master, cleared once it is
+                        // sent on: a probe sees it in one place or the other.
+                        in_hand.store(true, Ordering::SeqCst);
+                        let read = fuxix::io::read(&reader, &mut buf);
+                        if !matches!(read, Ok(n) if n > 0) {
+                            in_hand.store(false, Ordering::SeqCst);
+                        }
+                        match read {
                             Ok(0) => break, // EOF: the slave closed (macOS)
                             Ok(n) => {
                                 let mut chunk = std::mem::replace(&mut buf, vec![0u8; READ_CHUNK]);
@@ -504,7 +518,10 @@ impl Pty {
                                         return;
                                     }
                                     match tx.try_send(chunk) {
-                                        Ok(()) => break,
+                                        Ok(()) => {
+                                            in_hand.store(false, Ordering::SeqCst);
+                                            break;
+                                        }
                                         Err(mpsc::error::TrySendError::Closed(_)) => return,
                                         Err(mpsc::error::TrySendError::Full(pending)) => {
                                             chunk = pending;
@@ -562,6 +579,7 @@ impl Pty {
                 master,
                 writer_tx,
                 write_budget,
+                reading,
                 running: Some(Running {
                     child,
                     pid,
@@ -627,13 +645,28 @@ impl Pty {
         let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
             return crate::terminal::Activity::Unknown;
         };
-        // Keys it has yet to read (on a busy machine, a program blocked reading is not woken at
-        // once), or output no one has read yet: what it does with its input is still to come, as
-        // fux's own check has it.
-        if self.keys_unread() || self.output_unread() {
+        // What it does with keys it has yet to read, or with output no one has read yet, is still
+        // to come, as fux's own check has it: it is busy. Keys are looked at before the program
+        // (on a busy machine, one blocked reading is not woken at once, so a program seen reading
+        // after they were taken has taken them), output after it (so what it wrote before it was
+        // seen reading is found); and each place before the next one it moves on to: input
+        // queued for the writer before the terminal's queue, output in the master before the
+        // reader's hands (and the session's queue after them).
+        if self.keys_queued() || self.keys_unread() {
             return crate::terminal::Activity::Busy;
         }
-        fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt).into()
+        let found =
+            fuxix::process::terminal_activity(&self.master, leader, since_key, answered, prompt);
+        if self.output_unread() || self.reading.load(Ordering::SeqCst) {
+            return crate::terminal::Activity::Busy;
+        }
+        found.into()
+    }
+
+    /// Whether input waits for the writer to put it in the terminal, or is being written: its
+    /// charge is given back once the write returned.
+    fn keys_queued(&self) -> bool {
+        self.write_budget.load(Ordering::SeqCst) > 0
     }
 
     /// Whether output the program wrote waits to be read from the master, as a poll that does
@@ -645,20 +678,26 @@ impl Pty {
     }
 
     /// Whether keys wait in the terminal for the program to read. On Linux the slave is opened to
-    /// ask (with no wait, and never as a controlling terminal); on macOS the master's `FIONREAD`
-    /// counts them.
+    /// ask (with no wait, and never as a controlling terminal): a poll first, which moves on what
+    /// the master's writes left on their way (Linux hands them to the slave on a worker, so the
+    /// program may not have them yet), then `FIONREAD`, which counts what a poll of a read
+    /// waiting for more keys (`VMIN`) does not. On macOS the master's `FIONREAD` counts them.
     fn keys_unread(&self) -> bool {
         #[cfg(target_os = "macos")]
-        let unread = fuxix::io::unread(&self.master).ok();
+        let unread = fuxix::io::unread(&self.master).is_ok_and(|n| n > 0);
         #[cfg(not(target_os = "macos"))]
         let unread = {
             use rustix::fs::{Mode, OFlags};
             let flags = OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-            rustix::fs::open(self.master.slave_path(), flags, Mode::empty())
-                .ok()
-                .and_then(|slave| fuxix::io::unread(slave).ok())
+            rustix::fs::open(self.master.slave_path(), flags, Mode::empty()).is_ok_and(|slave| {
+                let mut fds = [PollFd::new(&slave, Events::IN)];
+                let polled = fuxix::poll::poll(&mut fds, Some(Duration::ZERO));
+                polled.is_ok_and(|n| n > 0)
+                    && fds.iter().any(|fd| fd.revents().intersects(Events::IN))
+                    || fuxix::io::unread(&slave).is_ok_and(|n| n > 0)
+            })
         };
-        unread.is_some_and(|n| n > 0)
+        unread
     }
 
     /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.

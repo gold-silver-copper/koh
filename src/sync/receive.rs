@@ -282,8 +282,9 @@ fn malformed() -> Failure {
 
 /// Land what `input` brings at `target` under `opts`, answering on `answer`.
 ///
-/// `answer` says `false` once the sender is gone. What was done, or why it stopped: what landed
-/// before a failure stays, and a file under way keeps its part for the next copy.
+/// `answer` says `false` once the sender is gone; the input is read on to its end all the same.
+/// What was done, or why it stopped: what landed before a failure stays, and a file under way
+/// keeps its part for the next copy.
 pub fn receive(
     input: impl Read,
     target: &Target,
@@ -316,12 +317,11 @@ impl<R: Read> Receiver<'_, R> {
         crate::request::decode(&self.buf).map_err(|_bad| malformed())
     }
 
-    fn tell(&mut self, answer: Answer) -> Result<(), Failure> {
-        if (self.answer)(Reply::Answer(answer)) {
-            Ok(())
-        } else {
-            Err(cut())
-        }
+    /// Answer the sender. One gone hears nothing, but what it sent before it went is still
+    /// landed: the bytes of a file answered earlier, behind this header, may be here already, and
+    /// a cut copy keeps them for the next one. The input ends where the sender stopped.
+    fn tell(&mut self, answer: Answer) {
+        (self.answer)(Reply::Answer(answer));
     }
 
     /// Note `name` as sent into the open directory, for `--delete`.
@@ -645,7 +645,8 @@ impl<R: Read> Receiver<'_, R> {
                 existed: there.is_some(),
             },
         );
-        self.tell(answer)
+        self.tell(answer);
+        Ok(())
     }
 
     /// File `id`'s bytes from `from`: into its part, then it into place.

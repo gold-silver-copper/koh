@@ -698,27 +698,29 @@ impl Session {
     }
 
     /// Probe what the program is doing at `now`, for `why`, input last written to it at `typed`
-    /// and the screen changed since if `answered`; told if a report is due.
-    fn probe(&mut self, now: Instant, why: Probe, (typed, answered): (Option<Instant>, bool)) {
+    /// and the screen changed since if `answered`; told if a report is due. Output waiting in
+    /// `pty_rx`, looked at after the program, is still to come: it is busy.
+    fn probe(
+        &mut self,
+        now: Instant,
+        why: Probe,
+        (typed, answered): (Option<Instant>, bool),
+        pty_rx: &mpsc::Receiver<Vec<u8>>,
+    ) {
         let since_key = typed.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
         let prompt = self.host.emu.live().commands().prompt;
         let activity = self.host.pty.activity(since_key, answered, prompt);
+        let activity = if pty_rx.is_empty() {
+            activity
+        } else {
+            Activity::Busy
+        };
         if let Some(report) = self.reports.probed(now, why, activity) {
             self.show(Shown::Report {
                 activity: report.activity,
                 input: self.written,
             });
         }
-    }
-
-    /// Probe for a report as polled, after what is `held` is told (with the modes read first, as
-    /// its settling would): a report never goes before output the program wrote before it.
-    fn report(&mut self, held: &mut Vec<Shown>, typed: (Option<Instant>, bool)) {
-        if !held.is_empty() {
-            self.refresh_tty();
-            self.release(held);
-        }
-        self.probe(Instant::now(), Probe::Poll, typed);
     }
 
     /// Feed `chunk` to the emulator and the filter; what passes goes into `held`.
@@ -843,7 +845,7 @@ impl Session {
                         }
                         // The shell marked a command's start or end: a report made after it.
                         if marked {
-                            self.probe(now, Probe::Marked, (typed_at, answered));
+                            self.probe(now, Probe::Marked, (typed_at, answered), &pty_rx);
                         }
                         self.publish_status(exited);
                     } else {
@@ -861,7 +863,8 @@ impl Session {
                     self.refresh_tty();
                     self.release(&mut held);
                 }
-                () = until(self.echo.next()) => {
+                // Not while output is held for the modes: it goes first, once they are read.
+                () = until(self.echo.next()), if held.is_empty() => {
                     if let Some(seq) = self.echo.promote(Instant::now()) {
                         // What the program wrote in that time goes before.
                         self.release(&mut held);
@@ -951,15 +954,16 @@ impl Session {
                     }
                 }
                 // What the program is doing: the report owed, and a change while a client sees it.
-                // Output it wrote before goes first: none read and waiting (the report stays owed
-                // until that is taken), then what is held for the modes.
-                () = until(self.reports.due(Instant::now())), if exited.is_none() && (pty_rx.is_empty() || !reading) => {
-                    self.report(&mut held, (typed_at, answered));
+                // Output it wrote before goes first: none read and waiting, and none held for the
+                // modes (it goes once they are read, as its settling has it). Until then the
+                // report stays owed.
+                () = until(self.reports.due(Instant::now())), if exited.is_none() && held.is_empty() && (pty_rx.is_empty() || !reading) => {
+                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered), &pty_rx);
                     self.publish_status(exited);
                 }
                 _ = poll.tick(), if exited.is_none() && self.presence.receiver_count() > 0 => {
-                    if pty_rx.is_empty() || !reading {
-                        self.report(&mut held, (typed_at, answered));
+                    if held.is_empty() && (pty_rx.is_empty() || !reading) {
+                        self.probe(Instant::now(), Probe::Poll, (typed_at, answered), &pty_rx);
                         self.publish_status(exited);
                     }
                 }

@@ -66,9 +66,6 @@ const PROMPT_HOLD: Duration = crate::proto::TTY_TICK.saturating_mul(2);
 /// How long notices stay on the status line.
 const NOTICE_FOR: Duration = Duration::from_secs(3);
 
-/// How long the client waits, once it has the program's end, for the server to close.
-const END_WAIT: Duration = Duration::from_secs(2);
-
 /// Dials the server and makes the opening request ([`crate::request`]).
 ///
 /// It makes a shell's first connection and every reconnect, which reattaches to the session the
@@ -683,8 +680,9 @@ pub async fn run_client<B: KohBackend>(
                             Shown::Exit(code) => {
                                 display.leave(&mut backend)?;
                                 backend.flush()?;
-                                // The server closes once it knows the end is here.
-                                let _ = tokio::time::timeout(END_WAIT, wire.conn.closed()).await;
+                                // The end is here, which this close tells the server: it waits
+                                // for nothing more, and neither does the client.
+                                wire.conn.close(Close::SessionEnded.code().into(), b"");
                                 return Ok(Some(code));
                             }
                             Shown::Beat => {}

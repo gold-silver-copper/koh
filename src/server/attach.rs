@@ -190,7 +190,11 @@ async fn write_epoch(
             () = reset.cancelled() => None,
         }
     };
-    let _ = done.send(wrote.await.unwrap_or(false));
+    // A client closes saying the session ended only once it has its end, which may be before
+    // the stream's last bytes were acknowledged.
+    let delivered = wrote.await.unwrap_or(false)
+        || crate::transport_iroh::closed_because(&conn) == Some(Close::SessionEnded);
+    let _ = done.send(delivered);
 }
 
 /// One of the client's streams as the server reads it.

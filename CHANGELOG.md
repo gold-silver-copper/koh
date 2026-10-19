@@ -77,6 +77,10 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - **A `-C` directory in this machine's home that the server lacks** (an unquoted `-C ~/proj`,
   which the local shell expands) is said to be so, with how to name the server's: `-C '~/proj'`
   or `-C proj`.
+- **`koh connect` exits as soon as the session's end is here**, closing the link saying so
+  (which the server takes as the end delivered), not after waiting up to 2 s for the server.
+- **Leaving puts the cursor back after resetting the scroll margins** (`CSI r`, which sends it
+  home): the local prompt comes below the session's output, not over its top row.
 - **`koh cp --dry-run` (`-n`)** changes nothing and sends no file's bytes: it lists each change
   (`new`, `replaced`, `deleted`, `dir`, `link`) and the summary it would make.
 - **A burst of commands from one client is all served** (an agent's parallel reads): a full

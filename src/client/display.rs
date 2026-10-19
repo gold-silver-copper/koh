@@ -293,6 +293,7 @@ impl Display {
         }
         self.entered = false;
         let screen = self.mirror.screen();
+        let kitty = screen.kitty_keyboard_flags() != 0;
         let mut out = Vec::new();
         if screen.mode(Mode::SynchronizedOutput) {
             out.extend_from_slice(b"\x1b[?2026l");
@@ -303,20 +304,27 @@ impl Display {
         if screen.hyperlink().is_some() {
             out.extend_from_slice(b"\x1b]8;;\x1b\\");
         }
+        // Where the cursor is once the main screen is back: the margins' and origin mode's resets
+        // below send it home, and it goes back there after them.
+        if let Err(error) = self.mirror.process(&out) {
+            tracing::debug!(%error, "the mirror of the terminal refused output");
+        }
+        let screen = self.mirror.screen();
+        let (row, col) = screen.cursor_position();
+        let blank = screen.cell(row, 0).is_none_or(|c| !c.has_contents());
         out.extend_from_slice(
             b"\x1b[0m\x1b[r\x1b[?69l\x1b[?6l\x1b[?7h\x1b[4l\x1b[?25h\x1b[?1l\x1b>\x1b[?9l\
               \x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\
               \x1b[?2031l\x1b[>4;0m",
         );
+        cup(&mut out, row, col);
         // Every kitty keyboard mode the program pushed.
-        if screen.kitty_keyboard_flags() != 0 {
+        if kitty {
             out.extend_from_slice(b"\x1b[<99u");
         }
         out.extend_from_slice(b"\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\");
         backend.write_bytes(&out)?;
         // A fresh line, unless the cursor is at the start of an empty one.
-        let (row, col) = screen.cursor_position();
-        let blank = screen.cell(row, 0).is_none_or(|c| !c.has_contents());
         if col > 0 || !blank {
             backend.write_bytes(b"\r\n")?;
         }
@@ -483,5 +491,28 @@ mod tests {
         assert_eq!(screen.attributes(), Attributes::default());
         // The palette is put back too.
         assert!(backend.written.windows(7).any(|w| w == b"\x1b]104\x1b\\"));
+    }
+
+    /// Leaving puts the cursor back where the program left it, the margins reset (which sends it
+    /// home), then on a fresh line: the user's prompt comes below the output, not over its top.
+    #[test]
+    fn leaving_resets_the_margins_and_keeps_the_cursor_below_the_output() {
+        for program in [
+            &b"one\r\ntwo\r\nthree"[..],
+            b"\x1b[?1049h\x1b[2;3r\x1b[?6hfull",
+        ] {
+            let mut backend = CaptureBackend::default();
+            let mut display = Display::new(Size::new(6, 20), true, true).unwrap();
+            display.new_epoch(Size::new(6, 20)).unwrap();
+            let before = b"one\r\ntwo\r\nthree";
+            display.output(&mut backend, before).unwrap();
+            if program != before {
+                display.output(&mut backend, program).unwrap();
+            }
+            display.leave(&mut backend).unwrap();
+            let (rows, cursor) = shown(6, 20, &backend.written);
+            assert_eq!(rows[..3], ["one", "two", "three"], "{program:?}");
+            assert_eq!(cursor, (3, 0), "{program:?}: {rows:?}");
+        }
     }
 }

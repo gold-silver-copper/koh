@@ -843,11 +843,19 @@ fn connect_runs_one_program_on_a_terminal_and_exits_with_its_status() {
                 "{}",
                 seen.text_from(0)
             );
+            // It ends as soon as the end is here: it closes the link, waiting on the server for
+            // nothing (it waited 2 s for the server to close).
+            let ending = std::time::Instant::now();
             assert_eq!(
                 exit_of(&mut client).await,
                 Some(3),
                 "{}",
                 seen.text_from(at)
+            );
+            assert!(
+                ending.elapsed() < Duration::from_millis(1800),
+                "{:?}",
+                ending.elapsed()
             );
             let (mut client, seen) = on_pty(&nowhere).expect("koh connect");
             assert_eq!(

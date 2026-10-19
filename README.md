@@ -99,9 +99,11 @@ hidden `.koh-….part` name and renamed into place once whole, so a cut copy lea
 half-written that looks complete, and the next copy resumes the part. A file written gets the
 time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
 copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
-leaves entries alone, and `--atomic` lands nothing until the whole copy came. `--dry-run` (`-n`)
+leaves entries alone, and `--atomic` lands nothing until the whole copy came. `--dry-run`
 changes nothing and sends no file's bytes: it lists each change it would make (`new`,
-`replaced`, `deleted`, `dir`, `link`, and the path), then the summary. It ends with one
+`replaced`, `deleted`, `dir`, `link`, and the path, with a file's size and that of the one it
+replaces), then the summary. Without `--delete`, what the destination has that the source lacks
+is kept, and the summary counts it (`2 there not in the source, kept: --delete removes them`). It ends with one
 line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)` (`files received` for a download), or
 `--json`. A tree copied to a directory of its own name that is there already updates it, as `src/.` does
 (`koh cp -r src laptop:src` run twice, which `cp` would land as `src/src`); `laptop:src/` or
@@ -167,7 +169,8 @@ Start something that should outlive the call, and wait for it on the server:
 
 ```sh
 koh run box --name srv -- python3 -m http.server 8000
-koh wait box srv --text 'Serving HTTP' --timeout 30
+koh wait box srv --text 'Serving HTTP' --timeout 30   # past 30s: exit 124, how the job
+                                      # stands (processes, CPU time) and its last lines
 koh logs box srv                      # its last 200 lines so far, then `· running 12s`;
                                       # --follow until it ends
 koh kill box srv

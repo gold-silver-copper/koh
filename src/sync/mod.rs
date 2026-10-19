@@ -368,6 +368,9 @@ pub struct Summary {
     pub links: u64,
     /// Entries removed ([`Opts::delete`]).
     pub deleted: u64,
+    /// Entries of the destination's directories the source does not have, left there: what
+    /// [`Opts::delete`] would remove.
+    pub kept: u64,
     /// Fifos, sockets and devices the sender skipped, and the first few of them, from the
     /// destination.
     pub skipped: u64,
@@ -391,6 +394,10 @@ pub struct Change {
     /// From the destination, as [`Summary::inside`] names it.
     #[serde(deserialize_with = "change_path")]
     pub path: String,
+    /// A file's size, as it would land (new, replaced).
+    pub size: Option<u64>,
+    /// The size of the file it would replace.
+    pub was: Option<u64>,
 }
 
 /// What a change is.
@@ -456,6 +463,16 @@ impl Summary {
 
     /// Note a dry run's change of `path`.
     fn change(&mut self, kind: ChangeKind, path: &Path) {
+        self.change_sized(kind, path, (None, None));
+    }
+
+    /// As [`Self::change`], of a file `size` bytes long, over one of `was` bytes.
+    fn change_sized(
+        &mut self,
+        kind: ChangeKind,
+        path: &Path,
+        (size, was): (Option<u64>, Option<u64>),
+    ) {
         let shown = path.to_string_lossy();
         let shown = shown
             .get(..shown.floor_char_boundary(MAX_PATH))
@@ -465,6 +482,8 @@ impl Summary {
             self.changes.push(Change {
                 kind,
                 path: shown.to_owned(),
+                size,
+                was,
             });
         } else {
             self.changes_unshown = self.changes_unshown.saturating_add(1);

@@ -113,7 +113,17 @@ fn say(
         return Ok(());
     }
     for change in &summary.changes {
-        writeln!(out, "{:<8} {}", change.kind.name(), escaped(&change.path))?;
+        let sizes = match (change.size, change.was) {
+            (Some(size), Some(was)) => format!(" ({}, was {})", bytes(size), bytes(was)),
+            (Some(size), None) => format!(" ({})", bytes(size)),
+            (None, _) => String::new(),
+        };
+        writeln!(
+            out,
+            "{:<8} {}{sizes}",
+            change.kind.name(),
+            escaped(&change.path)
+        )?;
     }
     if summary.changes_unshown > 0 {
         writeln!(out, "… {} more", summary.changes_unshown)?;
@@ -135,6 +145,13 @@ fn say(
     }
     if summary.deleted > 0 {
         parts.push(format!("{} deleted", summary.deleted));
+    }
+    if summary.kept > 0 {
+        parts.push(format!(
+            "{} there not in the source, kept: --delete removes {}",
+            summary.kept,
+            if summary.kept == 1 { "it" } else { "them" }
+        ));
     }
     if summary.dirs > 0 {
         parts.push(format!("{} dirs made", summary.dirs));

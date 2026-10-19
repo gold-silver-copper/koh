@@ -237,7 +237,8 @@ struct Open {
     rel: PathBuf,
     /// Its names from the target's directory, for `--atomic`'s renames at the end.
     names: Vec<Name>,
-    /// The names the sender sent into it (and the parts of files under way), for `--delete`.
+    /// The names the sender sent into it (and the parts of files under way): what is not among
+    /// them is removed (`--delete`) or counted as kept. None past [`MAX_SEEN`] without `--delete`.
     seen: Option<HashSet<Vec<u8>>>,
     /// The mode and time it gets at its end.
     mode: Option<Mode>,
@@ -255,6 +256,8 @@ struct Pending {
     size: u64,
     /// A file was there, which this replaces.
     existed: bool,
+    /// Its size, if it was a file.
+    was: Option<u64>,
 }
 
 struct Receiver<'a, R: Read> {
@@ -327,11 +330,20 @@ impl<R: Read> Receiver<'_, R> {
 
     /// Note `name` as sent into the open directory, for `--delete`.
     fn saw(&mut self, name: &[u8]) -> Result<(), Failure> {
-        if let Some(seen) = self.open.last_mut().and_then(|open| open.seen.as_mut()) {
+        let delete = self.opts.delete;
+        let Some(open) = self.open.last_mut() else {
+            return Ok(());
+        };
+        if let Some(seen) = open.seen.as_mut() {
             if seen.insert(name.to_vec()) {
                 self.seen = self.seen.saturating_add(1);
                 if self.seen > MAX_SEEN {
-                    return Err(Failure::new(FailKind::TooMany, Path::new("")));
+                    if delete {
+                        return Err(Failure::new(FailKind::TooMany, Path::new("")));
+                    }
+                    // Only counted: what is kept goes uncounted here.
+                    self.seen = self.seen.saturating_sub(seen.len());
+                    open.seen = None;
                 }
             }
         }
@@ -389,7 +401,7 @@ impl<R: Read> Receiver<'_, R> {
                                 fd,
                                 rel: PathBuf::new(),
                                 names: Vec::new(),
-                                seen: self.opts.delete.then(HashSet::new),
+                                seen: Some(HashSet::new()),
                                 mode: None,
                                 mtime: mtime.filter(|_| self.opts.keep_times),
                             });
@@ -517,7 +529,7 @@ impl<R: Read> Receiver<'_, R> {
             fd,
             rel,
             names,
-            seen: self.opts.delete.then(HashSet::new),
+            seen: Some(HashSet::new()),
             mode: (made || self.opts.keep_times).then_some(mode),
             mtime: mtime.filter(|_| self.opts.keep_times),
         });
@@ -548,6 +560,10 @@ impl<R: Read> Receiver<'_, R> {
                     .excludes
                     .excludes(&entry, path.as_os_str().as_bytes());
                 if seen.contains(&entry) || excluded {
+                    continue;
+                }
+                if !self.opts.delete {
+                    self.summary.kept = self.summary.kept.saturating_add(1);
                     continue;
                 }
                 let Ok(name) = Name::new(entry) else { continue };
@@ -642,6 +658,7 @@ impl<R: Read> Receiver<'_, R> {
                 mtime,
                 size,
                 existed: there.is_some(),
+                was: there.filter(|e| e.kind == Kind::File).map(|e| e.size),
             },
         );
         self.tell(answer);
@@ -720,7 +737,8 @@ impl<R: Read> Receiver<'_, R> {
             self.summary.resumed = self.summary.resumed.saturating_add(1);
         }
         if self.opts.dry_run {
-            self.summary.change(kind, &p.rel);
+            self.summary
+                .change_sized(kind, &p.rel, (Some(p.size), p.was));
         }
     }
 

@@ -67,9 +67,20 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
-- **Protocol `koh/11`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
+- **Protocol `koh/12`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
   the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
-  --dry-run`, the problem `NoSuchProgram`, and the close codes `Busy` and `NoSuchDir`.
+  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, and a running
+  job's processes and CPU time in `koh jobs`.
+- **`koh jobs` shows a running job at work**: `build running 41s processes=3 cpu=12.4s
+  output=0 B ./build.sh` (`--json`: `processes`, `cpu_ms`), counting the processes in the
+  session the job leads and the CPU time they and their ended children used, so a job that
+  writes its own log file no longer looks dead. Where the server has no `/proc` (macOS) it is
+  left out.
+- **A cut-off `koh exec` says what cut it off** and what became of the command: stopped by a
+  signal after so long (the command hung up; a time limit calls for `koh run`), the link gone
+  quiet (the server hangs it up once it sees that), or the server shut down or restarted. It
+  said only `interrupted: the command was hung up` or `the server did not answer: timed out`.
+- **A download says its files were received**: `4 files received, 41 KB → ./src`, not `sent`.
 - **`koh connect SERVER -C DIR [-- PROG ARG...]`** starts the new session, its program or a
   shell, in DIR; one not there exits 126, as `exec` does.
 - **A command that did not start exits the same from `exec` and `run`**: 127 no such program,
@@ -194,6 +205,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- **A program `koh serve` hosts starts with every signal at its default** though koh was started
+  ignoring some (a script's `&` ignores SIGINT and SIGQUIT): a session's `Ctrl-\` quit nothing.
+  Linux and Android, where koh can read what it was started ignoring.
 - **A session's reports no longer say a program waits for input it has yet to get, or before the
   output it wrote first.** Input still queued for the terminal, keys still on their way into it
   (Linux hands them over on a worker), output the server had read but not yet taken, and output

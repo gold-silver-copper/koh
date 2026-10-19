@@ -45,14 +45,9 @@ pub(crate) fn cancel_on_signals(
     token: &tokio_util::sync::CancellationToken,
 ) -> std::io::Result<tokio_util::sync::CancellationToken> {
     use tokio::signal::unix::{signal, SignalKind};
-    // Read before the handler replaces it: the lowest bit of the `SigIgn` mask Linux and Android show
-    // (elsewhere, never). The handler is installed even so: a program started later gets SIGHUP's
-    // default at its `exec`, as a hosted shell must to hang up with its session.
-    let nohup = std::fs::read_to_string("/proc/self/status").is_ok_and(|status| {
-        let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"));
-        mask.and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-            .is_some_and(|mask| mask & 1 == 1)
-    });
+    // Read before the handler replaces it. The handler is installed even so: a program started
+    // later gets SIGHUP's default at its `exec`, as a hosted shell must to hang up with its session.
+    let nohup = ignored_at_start() & 1 == 1;
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
     let mut hup = signal(SignalKind::hangup())?;
@@ -74,6 +69,7 @@ pub(crate) fn cancel_on_signals(
                 else => return,
             };
             tracing::info!(signal = name, "shutting down");
+            let _ = STOPPED_BY.set(name);
             match shutdown.signal(std::time::Instant::now()) {
                 Shutdown::Draining(_) => draining.cancel(),
                 Shutdown::Forced => force.cancel(),
@@ -82,6 +78,45 @@ pub(crate) fn cancel_on_signals(
         }
     });
     Ok(forced)
+}
+
+/// The first signal [`cancel_on_signals`] took, by name.
+static STOPPED_BY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The signal that stopped this process, by name, if one did ([`cancel_on_signals`]).
+pub(crate) fn stopped_by() -> Option<&'static str> {
+    STOPPED_BY.get().copied()
+}
+
+/// The signals this process was started ignoring, a bit each (signal `n` is bit `n - 1`): the
+/// `SigIgn` mask Linux and Android show; elsewhere none is known.
+fn ignored_at_start() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"));
+    mask.and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .unwrap_or(0)
+}
+
+/// Have the programs this process starts begin with every signal at its default, as from a login,
+/// though it was started ignoring some: a script's `&` ignores SIGINT and SIGQUIT, and an ignored
+/// signal stays ignored across `exec`, so a hosted shell's `Ctrl-\` would do nothing. Each is
+/// caught instead, by a handler that does nothing: this process goes on as if it ignored it, and
+/// `exec` gives a caught signal its default. Not SIGPIPE, which Rust ignores itself and gives its
+/// default back to what it starts, nor those [`cancel_on_signals`] catches, SIGHUP among them.
+/// Only where the mask is known ([`ignored_at_start`]).
+pub(crate) fn default_signals_for_children() {
+    use tokio::signal::unix::{signal, SignalKind};
+    const CAUGHT: [i32; 4] = [1, 2, 13, 15];
+    let ignored = ignored_at_start();
+    for (number, bit) in (1..=31_i32).zip(0..31_u32) {
+        if ignored.checked_shr(bit).unwrap_or(0) & 1 == 0 || CAUGHT.contains(&number) {
+            continue;
+        }
+        // Once installed, the handler stays when its stream is dropped.
+        if let Err(error) = signal(SignalKind::from_raw(number)) {
+            tracing::debug!(number, %error, "an ignored signal is left ignored");
+        }
+    }
 }
 
 /// Where a process is in shutting down, by the signals it got. Counted apart from what they

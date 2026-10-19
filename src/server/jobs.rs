@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use super::cli::Host;
 use super::place::Place;
 use crate::request::{
-    JobInfo, JobList, JobName, JobState, LogMsg, Problem, ProblemKind, Run, Signal, Started,
+    JobInfo, JobList, JobName, JobState, LogMsg, Problem, ProblemKind, Run, Signal, Started, Usage,
     MAX_COMMAND, MAX_LOG_CHUNK, MAX_TITLE,
 };
 
@@ -117,6 +117,8 @@ pub struct Status {
 pub struct Job {
     pub name: JobName,
     command: String,
+    /// The session it leads, by its pid.
+    session: Option<fuxix::process::Pid>,
     started: Instant,
     ended: Mutex<Option<Instant>>,
     log: Mutex<Log>,
@@ -137,8 +139,9 @@ impl Job {
             .is_ok_and(|log| log.find(text.as_bytes(), from))
     }
 
-    /// How it stands at `now`, its command whole if `whole`, else cut for a listing.
-    fn info(&self, now: Instant, whole: bool) -> JobInfo {
+    /// How it stands at `now`, its command whole if `whole`, else cut for a listing; `usage` says
+    /// what each session's processes use.
+    fn info(&self, now: Instant, whole: bool, usage: Option<&Sessions>) -> JobInfo {
         let status = *self.status.borrow();
         let ended = self.ended.lock().ok().and_then(|e| *e);
         let dropped = self.log.lock().map_or(0, |log| log.dropped());
@@ -155,6 +158,10 @@ impl Job {
             state: status.exit.map_or(JobState::Running, JobState::Exited),
             output_bytes: status.written,
             dropped_bytes: dropped,
+            usage: (status.exit.is_none())
+                .then(|| usage.zip(self.session))
+                .flatten()
+                .map(|(usage, session)| usage.get(&session.as_raw()).copied().unwrap_or_default()),
         }
     }
 
@@ -178,6 +185,41 @@ impl Job {
             .and_then(|e| *e)
             .is_some_and(|at| at < cutoff)
     }
+}
+
+/// What each session's processes use, by its leader's pid.
+type Sessions = BTreeMap<i32, Usage>;
+
+/// What every session's processes use, as `/proc` says: `None` where there is no `/proc` (macOS).
+/// A process's own CPU time and that of its children it waited for count, so a build's compilers
+/// that came and went are in it.
+fn sessions() -> Option<Sessions> {
+    let ticks = rustix::param::clock_ticks_per_second().max(1);
+    let mut sessions = Sessions::new();
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // After the program's name, which may hold anything but ends at the last `)`: the state,
+        // ppid, pgrp, session, …; utime, stime, cutime and cstime are the 12th to the 15th.
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = fields.split_whitespace().collect();
+        let field = |at: usize| fields.get(at).and_then(|f| f.parse::<i64>().ok());
+        let Some(session) = field(3).and_then(|s| i32::try_from(s).ok()) else {
+            continue;
+        };
+        let used = (11..=14).filter_map(field).fold(0_u64, |sum, t| {
+            sum.saturating_add(u64::try_from(t).unwrap_or(0))
+        });
+        let usage = sessions.entry(session).or_default();
+        usage.processes = usage.processes.saturating_add(1);
+        usage.cpu_ms = usage
+            .cpu_ms
+            .saturating_add(used.saturating_mul(1000).checked_div(ticks).unwrap_or(0));
+    }
+    Some(sessions)
 }
 
 /// Every peer's jobs, by peer and name.
@@ -215,7 +257,7 @@ impl Jobs {
             let job = self
                 .get(peer, name)
                 .ok_or_else(|| Problem::new(ProblemKind::NoSuchJob, name))?;
-            return Ok(JobList(vec![job.info(now, true)]));
+            return Ok(JobList(vec![job.info(now, true, sessions().as_ref())]));
         }
         let mut jobs: Vec<Arc<Job>> = self.table.lock().map_or_else(
             |_| Vec::new(),
@@ -228,8 +270,11 @@ impl Jobs {
             },
         );
         jobs.sort_by_key(|job| job.started);
+        let usage = sessions();
         Ok(JobList(
-            jobs.iter().map(|job| job.info(now, false)).collect(),
+            jobs.iter()
+                .map(|job| job.info(now, false, usage.as_ref()))
+                .collect(),
         ))
     }
 
@@ -282,6 +327,7 @@ impl Jobs {
         let job = Arc::new(Job {
             name: name.clone(),
             command: run.command.display(),
+            session: process.session(),
             started: now,
             ended: Mutex::new(None),
             log: Mutex::new(Log {

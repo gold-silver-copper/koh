@@ -64,6 +64,11 @@ impl Process {
         }
     }
 
+    /// The session it leads, unless it was reaped.
+    pub(super) fn session(&self) -> Option<fuxix::process::Pid> {
+        self.running.as_ref().map(Running::pid)
+    }
+
     /// Send its process group `signal`, unless it was reaped.
     pub(super) fn signal(&self, signal: fuxix::process::Signal) {
         if let Some(running) = &self.running {

@@ -137,6 +137,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     crate::log::init_stderr(tracing::Level::INFO);
     // Before the banner, so a signal once it shows is handled.
     let shutdown = CancellationToken::new();
+    crate::default_signals_for_children();
     let forced = crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
     let hosting = Hosting::from_config(&args)?;
 

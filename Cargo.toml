@@ -63,7 +63,7 @@ qrcode = { version = "=0.14.1", default-features = false }
 # Files beneath a directory, by its descriptor (`openat` and its kin): `koh cp` lands what a peer
 # names without following a symlink out of the tree it writes, and a scoped key's paths stay in its
 # directory.
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs", "param"] }
 # Whole-file hashes: `koh cp` sends only the files that changed. Already in the tree through iroh.
 blake3 = "1.8.7"
 # `--json` output.

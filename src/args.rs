@@ -294,7 +294,8 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
   koh logs SERVER build [--follow]      its last 200 lines (--tail N, --all), then on stderr
                                         `· running 34s` or `· exited 101 after 34s`; with
                                         --follow on until it ends, then exits with its status
-  koh jobs SERVER [build]               one line a job; with a name, its command whole
+  koh jobs SERVER [build]               one line a job; with a name, its command whole; a
+                                        running one's processes and CPU time (Linux servers)
   koh kill SERVER build [--signal KILL]
 
 Copy (a sync: merges, makes parents, sends only files that changed, by hash):
@@ -306,8 +307,8 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run (-n)
   changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
   `link` and its path) before the summary. Prints one line,
-  where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`. A cut copy
-  resumes when rerun.
+  where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
+  (`received` for a download). A cut copy resumes when rerun.
 
 Shell sessions (`koh connect SERVER` in a terminal, or fux):
   koh sessions SERVER                   number, attached, state (reading/busy/...), last status

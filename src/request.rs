@@ -689,6 +689,18 @@ pub struct JobInfo {
     pub output_bytes: u64,
     /// Of those, how many are no longer kept: the oldest go once the log is full.
     pub dropped_bytes: u64,
+    /// While it runs, what its session's processes use, where the server's system says: a job
+    /// that writes to a file of its own shows no output, but this shows it at work.
+    pub usage: Option<Usage>,
+}
+
+/// What a running job's processes (those in the session it leads) use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// How many there are.
+    pub processes: u32,
+    /// The CPU time they used, and their children that ended used, in milliseconds.
+    pub cpu_ms: u64,
 }
 
 /// The peer's jobs, oldest first.

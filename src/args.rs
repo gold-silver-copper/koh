@@ -274,13 +274,17 @@ pub const HELP_AGENTS: &str = "\
 koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID --direct IP:PORT`
 or an endpoint id. Nothing here needs a terminal but `connect`.
 
+Two chains, each one line:
+  koh cp -r src/. SERVER:x/src && koh exec SERVER -C x -- cargo test   edit here, build there
+  koh run SERVER --name b -- cargo build && koh wait SERVER b --timeout 600   a long build that
+                                       outlives a dropped link (rerun the wait if it timed out)
+
 Run something:
   koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
   koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
   koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
   koh exec SERVER -C proj -- PROG ...  start in DIR (relative: in the home). Not an unquoted
                                        -C ~/proj: your shell makes that this machine's home
-  koh cp -r src/. SERVER:x/src && koh exec SERVER -C x -- cargo test  edit here, build there
   stdin goes to the command; stdout and stderr come back apart (sent to one file here, as
   2>&1 or a terminal does, in the order it wrote them); exits with its status (127 no such
   program, 126 could not start: no -C DIR there, 255 koh's own error). A killed koh hangs it up

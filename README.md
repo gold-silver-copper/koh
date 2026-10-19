@@ -35,6 +35,7 @@ koh wait laptop build                 # until it ends: its last lines, then its 
 koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
 koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
 koh cp -r src/. laptop:x/src && koh exec laptop -C x -- cargo test  # edit here, build there
+koh run laptop --name b -- cargo build && koh wait laptop b --timeout 600  # a long build that outlives a drop
 ```
 
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to

@@ -390,6 +390,55 @@ fn scrolled_off_output_is_in_the_terminals_scrollback_and_a_fresh_attachs() {
         });
 }
 
+/// A client that fell behind is sent a new epoch, its screen redrawn: what scrolled off while it
+/// lagged comes above the redraw, into its terminal's scrollback, not lost. A slow link and a
+/// burst of output far past what the session keeps events for make it lag.
+#[test]
+fn what_scrolled_off_while_a_client_lagged_reaches_its_scrollback() {
+    koh_testkit::multi_thread(4)
+        .expect("runtime")
+        .block_on(async {
+            let profile = Profile {
+                delay: Duration::from_millis(20),
+                rate: Some(256_000),
+                queue: Duration::from_secs(1),
+                ..Profile::default()
+            };
+            let net = FaultNet::new(profile, 11);
+            let (server, endpoint) = hosting(&net, &["sh"]).await.expect("server");
+            let mut client = Client::connect_on(endpoint, server.id, Options::default())
+                .await
+                .expect("client");
+            // Some 6 MB at once: far more events than the session keeps, and than the link takes.
+            let burst =
+                b"awk 'BEGIN { for (i = 0; i < 80000; i++) printf \"lag row %05d %s\\n\", i, \
+                \"..........................................................\" }'\r";
+            let ended = client.send(burst).await.is_ok()
+                && client
+                    .wait_until(Duration::from_secs(60), |t| t.contains("lag row 79999"))
+                    .await
+                    .is_some();
+            assert!(ended, "the burst never ended: {}", client.screen());
+            let scrollback = client.scrollback();
+            let missing: Vec<usize> = (79_500..79_970)
+                .filter(|n| {
+                    let row = format!("lag row {n:05} ");
+                    scrollback
+                        .iter()
+                        .filter(|line| line.starts_with(&row))
+                        .count()
+                        != 1
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "scrolled off, not in the scrollback once: {missing:?}"
+            );
+            let _ = client.finish().await;
+            server.stop().await.expect("the server stops cleanly");
+        });
+}
+
 /// What the scrollback tests type: 200 lines, most of which scroll off.
 const OLD_LINES: &[u8] = b"i=0; while [ $i -lt 200 ]; do echo old line $i; i=$((i+1)); done\r";
 

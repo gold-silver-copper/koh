@@ -6,7 +6,8 @@
 //! written than the link carries in about a round trip past that, so what is written is never
 //! more than that behind the program. A client that falls behind further than the session keeps
 //! events for is sent a new epoch: the old stream is reset, so QUIC stops sending what it
-//! missed, and the new one begins with the screen as it is now.
+//! missed, and the new one begins with the screen as it is now, and above it what scrolled off
+//! since the top row of what the client read ([`Event::Top`]), into its terminal's scrollback.
 
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use super::session::{Event, Input, SessionClient, Start, ToSession, Window};
+use crate::bounded::Bounded;
 use crate::log::Peer;
 use crate::proto::{encode_shown, ClientDecoder, ClientMsg, Close, ProtoError, Shown, HEARTBEAT};
 use crate::transport_iroh::close;
@@ -27,6 +29,9 @@ const WRITER_QUEUE: usize = 4096;
 
 /// The bytes in flight past what the client read, before its rate is known.
 const FIRST_BUDGET: u64 = 256 * 1024;
+
+/// Most tops of the primary screen kept ahead of what the client read ([`Event::Top`]).
+const MAX_TOPS: usize = 1024;
 
 /// The least and the most bytes in flight past what the client read.
 const LEAST_BUDGET: u64 = 64 * 1024;
@@ -214,8 +219,19 @@ pub(super) async fn serve(
     start: Start,
     control: RecvStream,
 ) {
-    let Start { shown, mut events } = start;
+    let Start {
+        shown,
+        top,
+        mut events,
+    } = start;
     let mut epoch = Epoch::open(conn, 1, shown);
+    // Where the client's terminal stands: the top row it has read up to, and the tops further on
+    // in what was written, by the bytes of the epoch they follow.
+    let mut seen = None;
+    let mut tops: Bounded<(u64, fux_vt::RowId), MAX_TOPS> = Bounded::default();
+    if let Some(top) = top {
+        tops.push_evicting((epoch.pace.written, top));
+    }
     let input = client.input.clone();
     let mut streams: [Option<RecvStream>; 2] = [Some(control), None];
     let mut from: [FromClient; 2] = Default::default();
@@ -229,13 +245,21 @@ pub(super) async fn serve(
     // The client is owed a new epoch, redrawn: it fell behind, or asked.
     let mut redraw = false;
     let how = loop {
+        while let Some(&(_, top)) = tops.front().filter(|(at, _)| *at <= epoch.pace.read) {
+            seen = Some(top);
+            tops.pop_front();
+        }
         if std::mem::take(&mut redraw) && !exited {
-            let Some(start) = client.redraw().await else {
+            let Some(start) = client.redraw(seen).await else {
                 break "the session was ended (revoked, or the server is stopping)";
             };
             events = start.events;
             let n = epoch.n.wrapping_add(1);
             epoch = Epoch::open(conn, n, start.shown);
+            tops.clear();
+            if let Some(top) = start.top {
+                tops.push_evicting((epoch.pace.written, top));
+            }
         }
         if let Some(w) = window.take() {
             // Taken at the next pass if the session's asks are full.
@@ -261,6 +285,12 @@ pub(super) async fn serve(
                         let (queue, _) = mpsc::channel(1);
                         drop(std::mem::replace(&mut epoch.queue, queue));
                     }
+                    Ok(())
+                }
+                Ok(Event::Top(top)) => {
+                    // Kept within a bound: past it the oldest goes, and the client is taken to
+                    // stand no further on than it did, which repeats history rather than lose it.
+                    tops.push_evicting((epoch.pace.written, top));
                     Ok(())
                 }
                 Ok(Event::Echo { attach, seq }) => {

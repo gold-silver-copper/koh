@@ -101,13 +101,14 @@ impl Watched {
     async fn next(&mut self) -> anyhow::Result<bool> {
         match self.events.recv().await {
             Ok(Event::Show(shown)) => self.shown.take(&shown)?,
+            Ok(Event::Top(_)) => {}
             Ok(Event::Echo { attach, seq }) => {
                 if attach == self.client.attachment() {
                     self.shown.echo = self.shown.echo.max(seq);
                 }
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let start = self.client.redraw().await.context("a redraw")?;
+                let start = self.client.redraw(None).await.context("a redraw")?;
                 self.shown = Shownness::new()?;
                 for s in &start.shown {
                     self.shown.take(s)?;

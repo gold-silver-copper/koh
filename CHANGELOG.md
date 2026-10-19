@@ -205,6 +205,10 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- **A client that fell behind keeps what scrolled off meanwhile**: its new epoch's redraw has
+  above it the history that scrolled off since the top row of what it read, into its terminal's
+  scrollback, where it had the screen alone and lost the rest (a slow link under a burst of
+  output; it made a scrollback test flaky on CI).
 - **A program `koh serve` hosts starts with every signal at its default** though koh was started
   ignoring some (a script's `&` ignores SIGINT and SIGQUIT): a session's `Ctrl-\` quit nothing.
   Linux and Android, where koh can read what it was started ignoring.

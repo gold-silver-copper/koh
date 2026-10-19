@@ -365,19 +365,25 @@ pub enum Event {
     Show(Arc<Shown>),
     /// The input up to `seq` of attachment `attach` had its time to show.
     Echo { attach: u64, seq: InputSeq },
+    /// After the output before it, the primary screen's top row is this one: a client that read
+    /// that far has the rows above it in its terminal's scrollback.
+    Top(fux_vt::RowId),
 }
 
 /// What a client is sent from where it begins: the screen as it is, then the events after it.
 pub struct Start {
     /// The redraw, the modes and the last report.
     pub shown: Vec<Shown>,
+    /// The primary screen's top row as the redraw shows it.
+    pub top: Option<fux_vt::RowId>,
     pub events: broadcast::Receiver<Event>,
 }
 
 /// What a connection asks its session beside input: served whatever the program is doing.
 enum Ask {
-    /// A redraw, and the events after it: for a client that fell behind.
-    Redraw(oneshot::Sender<Start>),
+    /// A redraw, and the events after it: for a client that fell behind, whose terminal holds
+    /// the rows above this one, if known (the history after it comes above the redraw).
+    Redraw(Option<fux_vt::RowId>, oneshot::Sender<Start>),
     /// A client was told the program's end: once it exited, the session ends.
     Ended,
     /// The window of attachment `attach` is now `size` (clamped): asked beside input, so a
@@ -448,11 +454,12 @@ impl SessionClient {
         self.attach
     }
 
-    /// A redraw and the events after it, for a client that fell behind; `None` if the session
-    /// ended.
-    pub async fn redraw(&self) -> Option<Start> {
+    /// A redraw and the events after it, for a client that fell behind, whose terminal holds the
+    /// rows above `seen` (if known): what scrolled off after them comes above it, into the
+    /// terminal's scrollback. `None` if the session ended.
+    pub async fn redraw(&self, seen: Option<fux_vt::RowId>) -> Option<Start> {
         let (reply, answer) = oneshot::channel();
-        self.asks.send(Ask::Redraw(reply)).await.ok()?;
+        self.asks.send(Ask::Redraw(seen, reply)).await.ok()?;
         answer.await.ok()
     }
 
@@ -551,6 +558,7 @@ fn start(
             tty: None,
             title: String::new(),
             bells: 0,
+            top: None,
             echo: EchoAck::default(),
             written: InputSeq::default(),
             screen_changes: 0,
@@ -602,6 +610,8 @@ struct Session {
     title: String,
     /// The bells as last told.
     bells: u64,
+    /// The primary screen's top row as last told.
+    top: Option<fux_vt::RowId>,
     /// The newest attachment's inputs awaiting their echo.
     echo: EchoAck,
     /// The newest attachment's newest input written to the program: what a report follows.
@@ -661,8 +671,26 @@ impl Session {
         }
         Start {
             shown,
+            top: top_row(emu.live()),
             events: self.events.subscribe(),
         }
+    }
+
+    /// Rows of history a client whose terminal holds the rows above `seen` lacks: those after it
+    /// that scrolled off since. All that is kept, at most [`ATTACH_HISTORY`], if `seen` is no
+    /// longer kept; none if it is not known.
+    fn history_since(&self, seen: Option<fux_vt::RowId>) -> usize {
+        let Some(seen) = seen else {
+            return 0;
+        };
+        let screen = self.host.emu.live();
+        let kept = screen
+            .main_rows()
+            .len()
+            .saturating_sub(usize::from(screen.size().rows()));
+        let at = screen.main_rows().position(|row| row.id() == seen);
+        at.map_or(kept, |at| kept.saturating_sub(at))
+            .min(ATTACH_HISTORY)
     }
 
     /// Tell every client `shown`.
@@ -744,6 +772,13 @@ impl Session {
         }
         for shown in held.drain(..) {
             self.show(shown);
+        }
+        let top = top_row(self.host.emu.live());
+        if top != self.top {
+            self.top = top;
+            if let Some(top) = top {
+                let _ = self.events.send(Event::Top(top));
+            }
         }
         let bells = self.host.emu.bell_count();
         if bells != self.bells {
@@ -881,11 +916,11 @@ impl Session {
                     }
                 },
                 Some(ask) = asks_rx.recv() => match ask {
-                    Ask::Redraw(reply) => {
+                    Ask::Redraw(seen, reply) => {
                         // What is held goes first: the redraw shows it, and the events after it
                         // must not.
                         self.release(&mut held);
-                        let _ = reply.send(self.start(0));
+                        let _ = reply.send(self.start(self.history_since(seen)));
                     }
                     Ask::Ended if exited.is_some() => break,
                     Ask::Ended => {}
@@ -1018,6 +1053,15 @@ fn redrawn(piece: Piece) -> Vec<Shown> {
 }
 
 /// A filter's piece as the wire carries it; a mark no terminal reads is dropped.
+/// The primary screen's top row: below the history, whichever screen is in use.
+fn top_row(screen: &fux_vt::Screen) -> Option<fux_vt::RowId> {
+    let kept = screen
+        .main_rows()
+        .len()
+        .saturating_sub(usize::from(screen.size().rows()));
+    screen.main_rows().nth(kept).map(|row| row.id())
+}
+
 fn shown_of(piece: Piece) -> Option<Shown> {
     match piece {
         Piece::Out(bytes) => Some(Shown::Out(bytes)),

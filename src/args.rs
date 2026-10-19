@@ -316,7 +316,8 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   `link` and its path; a file's size, and the size of the one it replaces) before the summary.
   --diff is that dry run, each replaced text file (to 1 MiB) followed by its unified diff
   (a/ the destination's, b/ the source's): which files differ by content, and how.
-  Without --delete, what the source lacks is kept and counted. Prints one line,
+  Without --delete, what the source lacks is kept and counted, but for directories (most
+  often made there, as a build's target/). Prints one line,
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
   (`received` for a download). A cut copy resumes when rerun.
   To build there what you edit here, sync in the same call as the build, so it never sees stale

@@ -563,7 +563,14 @@ impl<R: Read> Receiver<'_, R> {
                     continue;
                 }
                 if !self.opts.delete {
-                    self.summary.kept = self.summary.kept.saturating_add(1);
+                    // A directory only there is most often what was made there (a build's
+                    // `target/`), so only what else is there is counted.
+                    let dir = fsat::stat(fd, OsStr::from_bytes(&entry))
+                        .map_err(io)?
+                        .is_some_and(|e| e.kind == Kind::Dir);
+                    if !dir {
+                        self.summary.kept = self.summary.kept.saturating_add(1);
+                    }
                     continue;
                 }
                 let Ok(name) = Name::new(entry) else { continue };

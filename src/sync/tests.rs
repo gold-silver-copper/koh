@@ -186,9 +186,12 @@ fn a_tree_merges_into_one_there_and_delete_and_exclude_say_what_goes() {
     fs::create_dir_all(dest.join("a")).unwrap();
     fs::write(dest.join("a/theirs"), b"t").unwrap();
     fs::write(dest.join("cache.o"), b"c").unwrap();
-    // Merged: what was there stays, without --delete.
+    fs::create_dir_all(dest.join("target/debug")).unwrap();
+    fs::write(dest.join("target/debug/x"), b"x").unwrap();
+    // Merged: what was there stays, without --delete, counted but for a directory made there.
     let merged = copy(&[&src], &scratch.join("dest"), &Opts::default()).unwrap();
-    assert_eq!(merged.new, 2);
+    assert_eq!((merged.new, merged.kept), (2, 2), "{merged:?}");
+    fs::remove_dir_all(dest.join("target")).unwrap();
     assert!(dest.join("a/theirs").exists() && dest.join("a/one").exists());
     // With --delete, what the source lacks goes, but what is excluded stays and is not sent.
     let opts = Opts {

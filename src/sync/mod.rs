@@ -379,8 +379,9 @@ pub struct Summary {
     pub links: u64,
     /// Entries removed ([`Opts::delete`]).
     pub deleted: u64,
-    /// Entries of the destination's directories the source does not have, left there: what
-    /// [`Opts::delete`] would remove.
+    /// Entries of the destination's directories the source does not have, left there, but for
+    /// directories (most often made there, as a build's output): what [`Opts::delete`] would
+    /// remove.
     pub kept: u64,
     /// Fifos, sockets and devices the sender skipped, and the first few of them, from the
     /// destination.

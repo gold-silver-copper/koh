@@ -13,6 +13,7 @@ use fux_vt::keys::encode::{key_bytes, KeyMode};
 use fux_vt::keys::Keystroke;
 
 use crate::events::{InputEvent, WireColours, WireScheme, MAX_PASTE, PALETTE};
+use crate::stream::incomplete_utf8;
 
 use super::probe::{self, COLOUR_QUERIES};
 
@@ -59,6 +60,9 @@ pub struct Keys {
     reports: bool,
     /// Questions for the terminal, for the caller to write.
     ask: Vec<u8>,
+    /// The start of a character whose rest has not come: it waits for it however long that takes,
+    /// as a terminal's own output does, rather than ending at an Escape's deadline as broken.
+    partial: Vec<u8>,
     scratch: Vec<u8>,
 }
 
@@ -77,6 +81,7 @@ impl Keys {
             asked: colours,
             reports: false,
             ask: probe::queries(colours),
+            partial: Vec::new(),
             scratch: Vec::with_capacity(16),
         }
     }
@@ -91,11 +96,25 @@ impl Keys {
         self.colours.as_ref().filter(|c| c.known())
     }
 
-    /// Take `bytes`, as the terminal sent them at `now`.
+    /// Take `bytes`, as the terminal sent them at `now`. A character they end in the middle of
+    /// waits for its rest, unless a sequence is begun that it may belong to (a mouse report's
+    /// coordinates), which the decoder waits on as usual.
     pub fn bytes(&mut self, now: Instant, bytes: &[u8]) -> Read {
+        let mut bytes = std::borrow::Cow::Borrowed(bytes);
+        if !self.partial.is_empty() {
+            let mut joined = std::mem::take(&mut self.partial);
+            joined.extend_from_slice(&bytes);
+            bytes = joined.into();
+        }
+        let (whole, rest) = bytes.split_at(bytes.len().saturating_sub(incomplete_utf8(&bytes)));
         let mut decoded = Vec::new();
-        self.decoder.bytes(bytes, &mut decoded);
+        self.decoder.bytes(whole, &mut decoded);
         self.decoder.mark(now);
+        if self.decoder.deadline().is_none() {
+            self.partial.extend_from_slice(rest);
+        } else {
+            self.decoder.bytes(rest, &mut decoded);
+        }
         self.take(now, decoded)
     }
 
@@ -237,6 +256,23 @@ mod tests {
         assert_eq!(twice.events.len(), 1);
         assert!(!twice.quit);
         assert_eq!(keys.bytes(now, b"\x1ex").events.len(), 2);
+    }
+
+    #[test]
+    fn a_character_split_across_reads_arrives_whole_however_long_the_pause() {
+        let mut now = Instant::now();
+        let mut keys = Keys::new(now, false);
+        let mut got = Vec::new();
+        for byte in "é世😀".bytes() {
+            got.extend(keys.bytes(now, &[byte]).events);
+            // The pause outlasts any deadline the read left.
+            now += std::time::Duration::from_secs(2);
+            got.extend(keys.timeout(now).events);
+        }
+        assert_eq!(got, [key('é'), key('世'), key('😀')]);
+        // A byte that cannot go on with the character ends it as it is.
+        assert_eq!(keys.bytes(now, &[0xc3]), Read::default());
+        assert_eq!(keys.bytes(now, b"a").events, [key('\u{fffd}'), key('a')]);
     }
 
     #[test]

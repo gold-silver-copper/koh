@@ -28,13 +28,14 @@ const MAX_DEFERRED: usize = 1_000_000;
 /// Where what is copied lands.
 #[derive(Debug)]
 pub enum Target {
-    /// Each item inside this directory, under its own name. `nest` is its name when it was there
-    /// and nothing else said to copy into it (a `/` at its end, several sources): `cp`'s rule
-    /// puts a tree of that name inside it, which is refused, as one copied there again would be.
+    /// Each item inside this directory, under its own name. `named` is its name when it was there
+    /// and nothing else said to copy into it (a `/` at its end, several sources): a tree of that
+    /// name is brought into line with it, as the tree's contents (`X/.`) would be, rather than
+    /// nested in it as `cp`'s rule would (`koh cp -r X S:X` run again).
     Into {
         dir: Option<OwnedFd>,
         shown: PathBuf,
-        nest: Option<Name>,
+        named: Option<Name>,
     },
     /// The one item, as `name` in this directory.
     As {
@@ -71,7 +72,7 @@ impl Target {
                     Ok(meta) if meta.is_dir() => Self::Into {
                         dir: Some(fsat::open_dir_path(path).map_err(io)?),
                         shown: path.clone(),
-                        nest: path
+                        named: path
                             .file_name()
                             .and_then(|name| Name::new(name.as_bytes().to_vec()).ok())
                             .filter(|_| !names_dir),
@@ -84,7 +85,7 @@ impl Target {
                         Self::Into {
                             dir: made_path(path, dry).map_err(io)?,
                             shown: path.clone(),
-                            nest: None,
+                            named: None,
                         }
                     }
                     _ => {
@@ -114,7 +115,7 @@ impl Target {
                     None => Self::Into {
                         dir: Some(root_fd),
                         shown,
-                        nest: None,
+                        named: None,
                     },
                     Some((last, parents)) => {
                         let parent = if dry {
@@ -132,7 +133,7 @@ impl Target {
                                     .transpose()
                                     .map_err(io)?,
                                 shown,
-                                nest: (!names_dir).then(|| last.clone()),
+                                named: (!names_dir).then(|| last.clone()),
                             },
                             Some(Kind::Link) => {
                                 return Err(Failure::new(FailKind::IsASymlink, &shown))
@@ -162,7 +163,7 @@ impl Target {
                                 Self::Into {
                                     dir,
                                     shown,
-                                    nest: None,
+                                    named: None,
                                 }
                             }
                             Some(_) | None => Self::As {
@@ -345,7 +346,18 @@ impl<R: Read> Receiver<'_, R> {
         };
         let mut placed: usize = 0;
         loop {
-            let item = self.next()?;
+            let mut item = self.next()?;
+            // A tree named as the directory it is copied to is that directory: its contents.
+            if let Item::Dir { name, mode, mtime } = &item {
+                if self.open.is_empty()
+                    && matches!(target, Target::Into { named: Some(named), .. } if named == name)
+                {
+                    item = Item::Contents {
+                        mode: *mode,
+                        mtime: *mtime,
+                    };
+                }
+            }
             // Where an entry goes: in the open directory, or at the top, where the target says.
             let at_top = self.open.is_empty();
             match item {
@@ -389,19 +401,6 @@ impl<R: Read> Receiver<'_, R> {
                     }
                 }
                 Item::Dir { name, mode, mtime } => {
-                    if let (
-                        true,
-                        Target::Into {
-                            nest: Some(nest),
-                            shown,
-                            ..
-                        },
-                    ) = (at_top, target)
-                    {
-                        if *nest == name {
-                            return Err(Failure::new(FailKind::Nests, shown));
-                        }
-                    }
                     let (dir, name) = self.place(target, name, &mut placed)?;
                     self.enter(dir.as_ref(), &name, mode, mtime)?;
                 }

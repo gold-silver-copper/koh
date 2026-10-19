@@ -557,8 +557,6 @@ pub enum FailKind {
     Malformed,
     /// Any other error.
     Other,
-    /// A tree whose name the destination, a directory already, has: it would land nested.
-    Nests,
 }
 
 impl FailKind {
@@ -601,7 +599,6 @@ impl FailKind {
             Self::Truncated => "truncated",
             Self::Malformed => "malformed",
             Self::Other => "failed",
-            Self::Nests => "nests",
         }
     }
 
@@ -630,11 +627,6 @@ impl FailKind {
             }
             Self::Malformed => "the other end sent a malformed copy stream",
             Self::Other => "failed",
-            Self::Nests => {
-                "is a directory of the tree's name already, so the tree would land nested inside \
-                 it: to bring it into line, copy what is in the tree (`DIR/.`) to it; to nest it, \
-                 name the destination DIR/NAME"
-            }
         }
     }
 }

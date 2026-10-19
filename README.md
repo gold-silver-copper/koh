@@ -103,8 +103,9 @@ leaves entries alone, and `--atomic` lands nothing until the whole copy came. `-
 changes nothing and sends no file's bytes: it lists each change it would make (`new`,
 `replaced`, `deleted`, `dir`, `link`, and the path), then the summary. It ends with one
 line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)` (`files received` for a download), or
-`--json`. A tree is not nested in a directory of its own name that is there already (`koh cp -r
-src laptop:src` run twice, which `cp` would land as `src/src`): `src/.` brings it into line. A
+`--json`. A tree copied to a directory of its own name that is there already updates it, as `src/.` does
+(`koh cp -r src laptop:src` run twice, which `cp` would land as `src/src`); `laptop:src/` or
+`laptop:src/src` nests it. A
 source given on the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
 as symlinks, never followed on either side, and fifos, sockets and devices are skipped and said
 so. Remote paths are taken as the server user's shell would take them, but not globbed: no

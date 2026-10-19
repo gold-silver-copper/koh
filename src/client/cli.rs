@@ -33,6 +33,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct Remote {
     /// Server endpoint id to connect to.
     pub server: EndpointId,
+    /// The server as the user named it (a saved name, or the id), for the commands koh suggests.
+    pub named: String,
     /// The secret-key file; `None` for the default client key path.
     pub key_file: Option<PathBuf>,
     /// Dial this socket address directly, with no relay or discovery; wins over `relay_url`.
@@ -43,9 +45,10 @@ pub struct Remote {
 
 impl Remote {
     /// `server`, dialed through n0's relays and discovery, as the default client key.
-    pub const fn new(server: EndpointId) -> Self {
+    pub fn new(server: EndpointId) -> Self {
         Self {
             server,
+            named: server.to_string(),
             key_file: None,
             direct: None,
             relay_url: None,
@@ -76,7 +79,7 @@ pub struct ConnectConfig {
 
 impl ConnectConfig {
     /// A config for dialing `server` with every other option at the CLI default.
-    pub const fn new(server: EndpointId) -> Self {
+    pub fn new(server: EndpointId) -> Self {
         Self {
             remote: Remote::new(server),
             pick: Pick::Latest,
@@ -742,7 +745,7 @@ pub async fn logs(
 ) -> anyhow::Result<Option<u32>> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
-    let shown = job.clone();
+    let hint = format!("koh wait {} {job}", remote.named);
     let mut opened = Opened::dial(remote, &Request::Logs { job, follow, tail }).await?;
     opened.control.finish()?;
     let read = async {
@@ -774,7 +777,7 @@ pub async fn logs(
                     crate::log::stderr(match exit {
                         Some(status) => format!("· exited {status} after {secs}s"),
                         None => format!(
-                            "· running {secs}s: `koh wait SERVER {shown}` waits for its end"
+                            "· running {secs}s: `{hint}` waits for its end"
                         ),
                     });
                     return anyhow::Ok(exit);

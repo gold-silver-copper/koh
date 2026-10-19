@@ -67,10 +67,15 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
 
 ### Changed
-- **Protocol `koh/12`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
+- **Protocol `koh/13`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
   the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
-  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, and a running
-  job's processes and CPU time in `koh jobs`.
+  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, a running
+  job's processes and CPU time in `koh jobs`, and a tree copied to a directory of its own name
+  updating it (the copy failure `nests` is gone).
+- **`koh cp -r X SERVER:X` run again updates `X`**, as `X/.` does, where it was refused (`cp`'s
+  rule would land it as `X/X`): the copy is a sync, and every agent that ran it meant that, then
+  had to learn `X/.` from the refusal. A destination ending in `/` (`SERVER:X/`) or naming
+  `SERVER:X/X` still nests it.
 - **`koh jobs` shows a running job at work**: `build running 41s processes=3 cpu=12.4s
   output=0 B ./build.sh` (`--json`: `processes`, `cpu_ms`), counting the processes in the
   session the job leads and the CPU time they and their ended children used, so a job that
@@ -205,6 +210,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
   only through `koh-testkit`; the comparison oracle is gone.
 
 ### Fixed
+- **A character split across reads of `koh connect`'s input arrives whole**: its first bytes wait
+  for the rest however long that takes, where 35 ms later (the decoder's wait for a lone Escape)
+  each byte went on as `�` (`é世😀` typed a byte at a time arrived as nine of them).
+- **`koh logs` on a running job names the server as it was given**: `` `koh wait laptop build`
+  waits for its end ``, no longer `koh wait SERVER build`.
 - **A client that fell behind keeps what scrolled off meanwhile**: its new epoch's redraw has
   above it the history that scrolled off since the top row of what it read, into its terminal's
   scrollback, where it had the screen alone and lost the rest (a slow link under a burst of

@@ -594,10 +594,8 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             ok(&running);
             let said = String::from_utf8_lossy(&running.stderr);
             assert!(said.starts_with("· running "), "{said}");
-            assert!(
-                said.contains("`koh wait SERVER 1` waits for its end"),
-                "{said}"
-            );
+            let hint = format!("`koh wait {} 1` waits for its end", remote.id);
+            assert!(said.contains(&hint), "{said}");
             ok(&remote.run("kill", &["1"]).expect("kill"));
             let killed = remote.run("wait", &["1", "--timeout", "10"]).expect("wait");
             assert_eq!(killed.status.code(), Some(128 + 15), "{killed:?}");
@@ -711,15 +709,12 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             );
             let want = tree(&from).expect("the tree");
             assert_eq!(tree(&there.join("a tree")).expect("there"), want);
-            // Named as the tree, which is there now, it would nest inside it (cp's rule): refused,
-            // saying how to bring it into line, which `a tree/.` does.
+            // Named as the tree, which is there now: it is brought into line, as `a tree/.` would
+            // be, not nested inside it as cp's rule would.
             let same = remote.at(&there.join("a tree"));
             let out = cp(&["-r".into(), from.clone().into(), same.clone()]);
-            assert_eq!(out.status.code(), Some(1), "{out:?}");
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert!(said.contains("nested") && said.contains("DIR/."), "{said}");
+            assert!(out.status.success(), "{out:?}");
             assert!(!there.join("a tree/a tree").exists());
-            let out = cp(&[from.join(".").into(), same.clone()]);
             let said = String::from_utf8_lossy(&out.stdout);
             assert!(
                 said.starts_with(&format!(

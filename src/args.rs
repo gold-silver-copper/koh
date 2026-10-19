@@ -229,6 +229,10 @@ impl RemoteArgs {
         };
         Remote {
             server,
+            named: match self.server {
+                ServerRef::Id(id) => id.to_string(),
+                ServerRef::Name(name) => name,
+            },
             key_file: self.key_file,
             direct,
             relay_url,
@@ -300,8 +304,8 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
 
 Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
-  koh cp -r ./src/. SERVER:proj/src     updates proj/src (`./src SERVER:proj/src` would nest it
-                                        in itself, as cp does: koh refuses that)
+  koh cp -r ./src SERVER:proj/src       updates proj/src, there already (as `./src/.` does; cp
+                                        would nest it as proj/src/src: name that, or end in /)
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
   arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run (-n)
@@ -623,7 +627,7 @@ fn wait() -> Command {
 }
 
 fn cp() -> Command {
-    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree is not nested in a directory of its own name that is there (`koh cp -r X S:X` again): `X/.` updates it. Prints what it did and where it landed"))
+    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree copied to a directory of its own name that is there updates it, as `X/.` does (`koh cp -r X S:X` again), where cp would nest it: `S:X/` or `S:X/X` nests it. Prints what it did and where it landed"))
         .arg(
             Arg::new("paths")
                 .value_name("PATH")

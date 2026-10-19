@@ -34,6 +34,8 @@ koh run laptop --name build -- cargo build   # a job: it outlives koh and the li
 koh wait laptop build                 # until it ends: its last lines, then its status
 koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
 koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
+koh cp -r src/. laptop:x/src && koh exec laptop -C x -- cargo test  # edit here, build there
+koh run laptop --name b -- cargo build && koh wait laptop b --timeout 600  # a long build that outlives a drop
 ```
 
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to
@@ -105,7 +107,7 @@ changes nothing and sends no file's bytes: it lists each change it would make (`
 replaces), then the summary; `--diff` is that dry run, each replaced text file (up to 1 MiB)
 followed by a unified diff of it (`a/` the destination's, `b/` the source's), for which the
 source's file goes to the destination's end, nothing else coming back but the diff. Without `--delete`, what the destination has that the source lacks
-is kept, and the summary counts it (`2 there not in the source, kept: --delete removes them`). It ends with one
+is kept, and the summary counts it (`2 there not in the source, kept: --delete removes them`), but for directories, most often made there (a build's `target/`). It ends with one
 line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)` (`files received` for a download), or
 `--json`. A tree copied to a directory of its own name that is there already updates it, as `src/.` does
 (`koh cp -r src laptop:src` run twice, which `cp` would land as `src/src`); `laptop:src/` or

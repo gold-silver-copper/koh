@@ -84,7 +84,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - **`koh cp` has no `-n`**: coreutils `cp -n` means "no clobber", so a dry run is spelled
   `--dry-run`.
 - **`koh cp` counts what the destination has that the source lacks**, kept without `--delete`:
-  `(...; 2 there not in the source, kept: --delete removes them)` (`kept` in `--json`).
+  `(...; 2 there not in the source, kept: --delete removes them)` (`kept` in `--json`). A
+  directory only there goes uncounted: it is most often made there, as a build's `target/`.
 - **A dry run gives each file's size**, and the size of the one it would replace:
   `replaced src/lib.rs (4.1 KB, was 3.9 KB)` (`size`, `was` in `--json`).
 - **`koh cp -r X SERVER:X` run again updates `X`**, as `X/.` does, where it was refused (`cp`'s

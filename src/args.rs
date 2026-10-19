@@ -274,6 +274,11 @@ pub const HELP_AGENTS: &str = "\
 koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID --direct IP:PORT`
 or an endpoint id. Nothing here needs a terminal but `connect`.
 
+Two chains, each one line:
+  koh cp -r src/. SERVER:x/src && koh exec SERVER -C x -- cargo test   edit here, build there
+  koh run SERVER --name b -- cargo build && koh wait SERVER b --timeout 600   a long build that
+                                       outlives a dropped link (rerun the wait if it timed out)
+
 Run something:
   koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
   koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
@@ -316,7 +321,8 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   `link` and its path; a file's size, and the size of the one it replaces) before the summary.
   --diff is that dry run, each replaced text file (to 1 MiB) followed by its unified diff
   (a/ the destination's, b/ the source's): which files differ by content, and how.
-  Without --delete, what the source lacks is kept and counted. Prints one line,
+  Without --delete, what the source lacks is kept and counted, but for directories (most
+  often made there, as a build's target/). Prints one line,
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
   (`received` for a download). A cut copy resumes when rerun.
   To build there what you edit here, sync in the same call as the build, so it never sees stale

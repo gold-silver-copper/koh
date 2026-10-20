@@ -27,6 +27,7 @@ pub const SUSPEND_KEY: u8 = 0x1a;
 /// The keys the client reads its own commands in: xterm's legacy bytes, in normal cursor mode.
 const LEGACY: KeyMode = KeyMode::Legacy {
     application: false,
+    keypad: false,
     other_keys: None,
     backarrow: false,
 };

@@ -11,9 +11,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0 and 0.13.0 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0 and 0.14.0 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.14.0] — 2026-10-20
 
 ### Added
 - **`koh exec SERVER -- PROG ARG...`** runs a command on the server with no terminal: its words
@@ -213,7 +215,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
   program writing to the client's terminal) are sent but not predicted one by one, which cost a
   screenful of work each.
-- Updated `fux-vt` 0.3.4 → 0.10.0 and `fuxix` 0.1.7 → 0.6.1, including the test harnesses. The
+- Updated `fux-vt` 0.3.4 → 0.11.0 and `fuxix` 0.1.7 → 0.6.2, including the test harnesses. The
   minimum Rust version is unchanged.
   - **`--scrollback` is now `--scrollback-bytes`**, the history each session keeps in bytes, 8 MiB
     by default (about 20,000 lines of 50 characters), at most 1 GiB, as fux-vt bounds it.
@@ -223,6 +225,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
     others, primary device attributes now name selective erase, horizontal scrolling and
     rectangular editing, which it carries out, and `CSI 3 J` clears the scrollback.
   - Kitty's F13 to F35 reach the program; a mouse press on the wire always names its button.
+  - fux-vt 0.11 (its best-in-class pass): an unbracketed paste reaches the program with each LF
+    as CR, as xterm sends a paste; a mouse position past column 223 in the default encoding is
+    sent as a 0 byte, as xterm sends it, not dropped; the keypad follows DECKPAM; and an attaching
+    client gets back highlight tracking (1001), urxvt (1015) and SGR-pixel (1016) mouse modes and
+    a modifyOtherKeys mask (`CSI > 4 ; level : mask m`) a program set.
 - PTY input is bounded by bytes, including in-flight writes; backpressure retains pending
   buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
 - Terminal dimensions are normalized once for the hosted emulator and PTY.

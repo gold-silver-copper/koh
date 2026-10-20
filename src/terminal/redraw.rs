@@ -21,8 +21,8 @@ use crate::stream::Piece;
 /// What leaves a terminal as a fresh one shows a program: the primary screen, no margins, the
 /// cursor shown and wrapping, no input mode a program set, the pen and the palette reset.
 pub const RESET: &[u8] = b"\x1b[?2026l\x1b[?1049l\x1b[?47l\x1b[?1047l\x1b[r\x1b[?69l\x1b[?6l\
-\x1b[?7h\x1b[4l\x1b[20l\x1b[?5l\x1b[?25h\x1b[?1l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\
-\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[=0;1u\x1b[>4;0m\x1b]8;;\x1b\\\x1b[0m\
+\x1b[?7h\x1b[4l\x1b[20l\x1b[?5l\x1b[?25h\x1b[?1l\x1b>\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
+\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?1004l\x1b[?2004l\x1b[?2031l\x1b[=0;1u\x1b[>4;0m\x1b]8;;\x1b\\\x1b[0m\
 \x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\";
 
 /// Whether every terminal takes `glyph` as as wide as fux-vt does: one character, not of
@@ -236,6 +236,7 @@ pub fn redraw(screen: &fux_vt::Screen, title: &str, history: usize) -> Vec<Piece
         MouseProtocolMode::None => None,
         MouseProtocolMode::Press => Some("9"),
         MouseProtocolMode::PressRelease => Some("1000"),
+        MouseProtocolMode::Highlight => Some("1001"),
         MouseProtocolMode::ButtonMotion => Some("1002"),
         MouseProtocolMode::AnyMotion => Some("1003"),
     };
@@ -246,19 +247,28 @@ pub fn redraw(screen: &fux_vt::Screen, title: &str, history: usize) -> Vec<Piece
         MouseProtocolEncoding::Default => {}
         MouseProtocolEncoding::Utf8 => out.extend_from_slice(b"\x1b[?1005h"),
         MouseProtocolEncoding::Sgr => out.extend_from_slice(b"\x1b[?1006h"),
+        MouseProtocolEncoding::Urxvt => out.extend_from_slice(b"\x1b[?1015h"),
+        MouseProtocolEncoding::SgrPixels => out.extend_from_slice(b"\x1b[?1016h"),
     }
     let kitty = screen.kitty_keyboard_flags();
     if kitty != 0 {
         let _ = write!(out, "\x1b[>{kitty}u");
     }
-    if let Some(level) = screen.modify_other_keys() {
-        use fux_vt::keys::encode::OtherKeys;
-        let level = match level {
-            OtherKeys::Usual => 1,
-            OtherKeys::All => 2,
-            OtherKeys::Unmodified => 3,
+    if let Some(keys) = screen.modify_other_keys() {
+        use fux_vt::keys::encode::OtherKeysLevel;
+        let level = match keys.level() {
+            OtherKeysLevel::Usual => 1,
+            OtherKeysLevel::All => 2,
+            OtherKeysLevel::Unmodified => 3,
         };
-        let _ = write!(out, "\x1b[>4;{level}m");
+        let factored = keys.factored();
+        let mask =
+            u8::from(factored.shift) | u8::from(factored.ctrl) << 2 | u8::from(factored.alt) << 3;
+        if mask == 0 {
+            let _ = write!(out, "\x1b[>4;{level}m");
+        } else {
+            let _ = write!(out, "\x1b[>4;{level}:{mask}m");
+        }
     }
     let shape = screen.cursor_shape();
     if shape != fux_vt::CursorShape::Initial {

@@ -421,8 +421,8 @@ mod tests {
             (b"\x1b[?1003h\x1b[?1006h", hover, hover),
             // The wheel.
             (sgr_1000, b"\x1b[<65;3;4M", b"\x1b[<65;3;4M"),
-            // Past 223 the default encoding carries nothing, so nothing is sent.
-            (b"\x1b[?1000h", b"\x1b[<0;224;1M", b""),
+            // Past 223 the default encoding carries a 0 byte, as xterm 411 sends it.
+            (b"\x1b[?1000h", b"\x1b[<0;224;1M", b"\x1b[M \0!"),
             (b"\x1b[?1000h", b"\x1b[<0;223;1M", b"\x1b[M \xff!"),
         ] {
             assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
@@ -440,11 +440,11 @@ mod tests {
             &mut out,
         );
         assert_eq!(out, b"\x1b[200~abcd\x1b[201~");
-        // Unbracketed: the text as pasted.
+        // Unbracketed: the text as pasted, each LF as CR, as xterm 411 sends a paste.
         t.process(b"\x1b[?2004l");
         out.clear();
         t.encode_input(&[paste("a\nb")], &mut out);
-        assert_eq!(out, b"a\nb");
+        assert_eq!(out, b"a\rb");
         // A paste is whole: what follows it is never inside its bracket.
         t.process(b"\x1b[?2004h");
         out.clear();

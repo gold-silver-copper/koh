@@ -513,7 +513,9 @@ fn a_report_follows_the_input_and_output_before_it() -> anyhow::Result<()> {
 
 /// An exit says whether its program read every key written to it: one that read them all and
 /// ended, the input up to the last; one that ended with keys left in its terminal, none. A
-/// terminal driving the client knows so whether its last keys reached the program.
+/// terminal driving the client knows so whether its last keys reached the program. Only where the
+/// keys a program left in a terminal it closed can be counted (macOS empties the queue).
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn an_exit_says_whether_its_program_read_every_key() -> anyhow::Result<()> {
     runtime()?.block_on(async {

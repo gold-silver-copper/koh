@@ -245,8 +245,9 @@ its terminal while it prints is told `polling`: it may draw on its own.
 
 The program's end says whether it read every key written to it: `Shown::Exit { code, read }`,
 `read` the newest of this attachment's inputs written to it if none was left in its terminal or
-on its way there as it ended (`Pty::keys_left`, which still counts what a program left unread in
-a terminal it closed). A client whose every input that covers writes `activity=ended` before it
+on its way there as it ended (`Pty::keys_left`, which on Linux still counts what a program left
+unread in a terminal it closed; macOS empties that queue at the last close, so there `read` is
+`None` once the program closed its terminal). A client whose every input that covers writes `activity=ended` before it
 leaves, once: a terminal that saw no report after its last keys (an editor that read its save and
 quit at once, and ended without reading again) knows they reached it, and that any it sent after
 went nowhere.

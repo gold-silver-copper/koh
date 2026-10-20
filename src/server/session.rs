@@ -828,8 +828,8 @@ impl Session {
                 self.release(&mut held);
                 let code = exit.code();
                 // Every key written to it read: none waits to be written, nor in its terminal.
-                let read =
-                    (pending.is_empty() && !self.host.pty.keys_left()).then_some(self.written);
+                let left = self.host.pty.keys_left(ending.output_ended.is_some());
+                let read = (pending.is_empty() && left == Some(false)).then_some(self.written);
                 self.show(Shown::Exit { code, read });
                 exited = Some(code);
                 self.exited = exited;

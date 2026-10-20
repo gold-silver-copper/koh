@@ -669,9 +669,14 @@ impl Pty {
     }
 
     /// Whether input written to it has yet to be read by its program: waiting for the writer, or
-    /// in the terminal. Once the program ended, what it left unread there.
-    pub fn keys_left(&self) -> bool {
-        self.keys_queued() || self.keys_unread()
+    /// in the terminal; once the program ended, what it left unread there. `None` where that is
+    /// not known: macOS empties a terminal's queue at its last close, so once its program
+    /// `closed` it, what it left is gone uncounted.
+    pub fn keys_left(&self, closed: bool) -> Option<bool> {
+        if closed && cfg!(target_os = "macos") {
+            return None;
+        }
+        Some(self.keys_queued() || self.keys_unread())
     }
 
     /// Whether input waits for the writer to put it in the terminal, or is being written: its

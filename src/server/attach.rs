@@ -275,7 +275,7 @@ pub(super) async fn serve(
         let broke: Result<(), ProtoError> = tokio::select! {
             event = events.recv(), if !exited && epoch.room() => match event {
                 Ok(Event::Show(shown)) => {
-                    exited = matches!(*shown, Shown::Exit(_));
+                    exited = matches!(*shown, Shown::Exit { .. });
                     if !epoch.send(&shown) {
                         break "client detached (session retained)";
                     }

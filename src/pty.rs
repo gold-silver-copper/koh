@@ -668,6 +668,12 @@ impl Pty {
         found.into()
     }
 
+    /// Whether input written to it has yet to be read by its program: waiting for the writer, or
+    /// in the terminal. Once the program ended, what it left unread there.
+    pub fn keys_left(&self) -> bool {
+        self.keys_queued() || self.keys_unread()
+    }
+
     /// Whether input waits for the writer to put it in the terminal, or is being written: its
     /// charge is given back once the write returned.
     fn keys_queued(&self) -> bool {

@@ -169,7 +169,7 @@ fn show(display: &mut Display, term: &mut Term, pieces: &[Shown]) -> Result<(), 
             | Shown::Echo(_)
             | Shown::Bell(_)
             | Shown::Title(_)
-            | Shown::Exit(_)
+            | Shown::Exit { .. }
             | Shown::Beat => Ok(()),
         }
         .map_err(|e| e.to_string())?;

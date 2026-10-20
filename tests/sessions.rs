@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/14 client.
+//! loopback iroh with a minimal koh/15 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -23,6 +23,8 @@ const WINDOW: Size = Size::new(24, 80);
 struct Shownness {
     term: fux_vt::Parser,
     exit: Option<u32>,
+    /// The input its program read all of as it exited, as the exit says.
+    read: Option<InputSeq>,
     tty: Option<TtyModes>,
     /// The PTY's modes when each text first showed: `(text, modes)`.
     reports: Vec<Activity>,
@@ -39,6 +41,7 @@ impl Shownness {
         Ok(Self {
             term: fux_vt::Parser::new(size, 0)?,
             exit: None,
+            read: None,
             tty: None,
             reports: Vec::new(),
             marks: Vec::new(),
@@ -59,7 +62,7 @@ impl Shownness {
             }
             Shown::Tty(tty) => self.tty = Some(*tty),
             Shown::Echo(seq) => self.echo = self.echo.max(*seq),
-            Shown::Exit(code) => self.exit = Some(*code),
+            Shown::Exit { code, read } => (self.exit, self.read) = (Some(*code), *read),
             Shown::Bell(_) | Shown::Title(_) | Shown::Beat => {}
         }
         Ok(())
@@ -306,7 +309,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/14 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/15 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -504,6 +507,35 @@ fn a_report_follows_the_input_and_output_before_it() -> anyhow::Result<()> {
         tokio::time::timeout(Duration::from_secs(5), serve)
             .await
             .context("the server ends its session and returns")???;
+        Ok(())
+    })
+}
+
+/// An exit says whether its program read every key written to it: one that read them all and
+/// ended, the input up to the last; one that ended with keys left in its terminal, none. A
+/// terminal driving the client knows so whether its last keys reached the program.
+#[test]
+fn an_exit_says_whether_its_program_read_every_key() -> anyhow::Result<()> {
+    runtime()?.block_on(async {
+        for (program, all) in [
+            ("sleep 0.5; head -c 4 >/dev/null", true),
+            ("sleep 0.5", false),
+        ] {
+            let secret = generate_secret_key()?;
+            let (addr, shutdown, serve) =
+                loopback_serve(secret.public(), &["sh", "-c", program]).await?;
+            let mut client = RawClient::connect(addr, secret).await?;
+            client.type_bytes(b"abc\r").await?;
+            let seq = client.last_seq;
+            client.until(|s| s.exit.is_some()).await?;
+            let read = client.shown.read;
+            anyhow::ensure!(read == all.then_some(seq), "{program}: {read:?}");
+            client.conn.close(0u32.into(), b"done");
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(5), serve)
+                .await
+                .context("the server ends its session and returns")???;
+        }
         Ok(())
     })
 }

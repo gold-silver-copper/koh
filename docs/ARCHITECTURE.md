@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/14 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/15 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -81,9 +81,9 @@ testing/agentbench/  coding agents driving koh on task sets, scored
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/14)
+## The protocol (koh/15)
 
-The ALPN `koh/14` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/15` is the version check: a peer on another version fails the TLS handshake with a
 clear error. After the handshake the server checks the allowlist and takes a connection permit;
 then the client says what the connection is for, as the first message on its first uni stream
 (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
@@ -242,6 +242,14 @@ before it was probed; the client writes it only if that covers all the input it 
 connection (one made before the server had its last keys is dropped: the one owed after them
 follows), and writes the last one again after any mark (fux forgets a report at a mark). A program that polls
 its terminal while it prints is told `polling`: it may draw on its own.
+
+The program's end says whether it read every key written to it: `Shown::Exit { code, read }`,
+`read` the newest of this attachment's inputs written to it if none was left in its terminal or
+on its way there as it ended (`Pty::keys_left`, which still counts what a program left unread in
+a terminal it closed). A client whose every input that covers writes `activity=ended` before it
+leaves, once: a terminal that saw no report after its last keys (an editor that read its save and
+quit at once, and ended without reading again) knows they reached it, and that any it sent after
+went nowhere.
 
 What a terminal can rely on: a report written after its own last input to `koh connect` was probed
 after that input was written to the remote program's terminal; a report follows every mark koh

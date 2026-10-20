@@ -17,7 +17,7 @@ use clap::error::ErrorKind;
 use clap::{value_parser, Arg, ArgAction, ArgMatches, Command};
 use iroh::{EndpointId, RelayUrl};
 
-use koh::client::{ConnectConfig, CopyJob, Remote};
+use koh::client::{ConnectConfig, CopyJob, Remote, SyncTree};
 use koh::keycmd::{KeyConfig, KeyOp};
 use koh::names::{List, Op, Route, Scope};
 use koh::request::{
@@ -153,6 +153,8 @@ pub enum Cmd {
     Exec {
         remote: RemoteArgs,
         run: Run,
+        /// A tree to bring into line there first (`--sync`).
+        sync: Option<SyncTree>,
         json: bool,
     },
     /// `koh run`.
@@ -160,6 +162,7 @@ pub enum Cmd {
         remote: RemoteArgs,
         name: Option<JobName>,
         run: Run,
+        sync: Option<SyncTree>,
         json: bool,
     },
     /// `koh jobs`.
@@ -274,10 +277,15 @@ pub const HELP_AGENTS: &str = "\
 koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID --direct IP:PORT`
 or an endpoint id. Nothing here needs a terminal but `connect`.
 
-Two chains, each one line:
-  koh cp -r src/. SERVER:x/src && koh exec SERVER -C x -- cargo test   edit here, build there
-  koh run SERVER --name b -- cargo build && koh wait SERVER b --timeout 600   a long build that
-                                       outlives a dropped link (rerun the wait if it timed out)
+Edit here, build there, in one call:
+  koh exec SERVER --sync proj -- cargo test   proj here synced to SERVER:proj (only the files that
+                                       changed, said in a line on stderr), then run in it
+  koh exec SERVER --sync . -C proj -- cargo test   from within the tree: -C names it there
+  koh run SERVER --sync proj --name b -- cargo build && koh wait SERVER b --timeout 600   a long
+                                       build that outlives a dropped link (rerun the wait if it
+                                       timed out: the job runs on)
+  koh cp -r --exclude target SERVER:proj/. proj   back here: what a command changed there
+                                       (rustfmt), only the files that differ
 
 Run something:
   koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
@@ -326,8 +334,9 @@ Copy (a sync: merges, makes parents, sends only files that changed, by hash):
   where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
   (`received` for a download). A cut copy resumes when rerun.
   To build there what you edit here, sync in the same call as the build, so it never sees stale
-  code (an unchanged tree costs only hashes): `koh cp -r ./src/. SERVER:proj/src && koh exec
-  SERVER -C proj -- make`. There is no watch mode, whose sync a build can still overtake.
+  code (an unchanged tree costs only hashes): `koh exec SERVER --sync proj -- make` (`--exclude
+  target` keeps a local build's output here). There is no watch mode, whose sync a build can
+  still overtake.
 
 Shell sessions (`koh connect SERVER` in a terminal, or fux):
   koh sessions SERVER                   number, attached, state (reading/busy/...), last status
@@ -555,6 +564,22 @@ fn command_args(cmd: Command) -> Command {
             .help("Run LINE with the server user's shell ($SHELL -c)"),
     )
     .arg(cwd().help("Start in DIR (relative: in the server user's home)"))
+    .arg(
+        Arg::new("sync")
+            .long("sync")
+            .value_name("LOCAL")
+            .value_parser(value_parser!(PathBuf))
+            .help("First bring the directory there into line with LOCAL here, sending only the files that changed (as `koh cp -r LOCAL/. SERVER:DIR`), and say so in a line on stderr: DIR is -C's, else LOCAL's own path (relative: in the home), where the command then starts"),
+    )
+    .arg(
+        Arg::new("exclude")
+            .long("exclude")
+            .value_name("PATTERN")
+            .action(ArgAction::Append)
+            .value_parser(value_parser!(OsString))
+            .requires("sync")
+            .help("With --sync: neither send nor remove entries matching it: `target`, `*.o` (repeatable)"),
+    )
     .arg(
         Arg::new("command")
             .value_name("PROG")
@@ -815,6 +840,65 @@ fn run_of(m: &ArgMatches) -> Result<Run, clap::Error> {
     })
 }
 
+/// The command `m` names, and the tree `--sync` brings into line first, if asked: to `-C`'s
+/// directory, else to the local one's own path there, which the command then starts in.
+fn synced_run(m: &ArgMatches) -> Result<(Run, Option<SyncTree>), clap::Error> {
+    let mut run = run_of(m)?;
+    let Some(local) = m.get_one::<PathBuf>("sync") else {
+        return Ok((run, None));
+    };
+    let excludes = excludes(m)?;
+    let dest = if let Some(dir) = &run.cwd {
+        dir.clone()
+    } else {
+        let dest = same_path(local).ok_or_else(|| {
+            invalid(&format!(
+                "--sync {}: it has no name of its own there; say where it goes with -C DIR \
+                 (koh exec SERVER --sync {} -C proj -- ...)",
+                local.display(),
+                local.display()
+            ))
+        })?;
+        let dest = RemotePath::new(dest).map_err(|why| invalid(&format!("--sync: {why}")))?;
+        run.cwd = Some(dest.clone());
+        dest
+    };
+    let sync = SyncTree {
+        local: local.clone(),
+        dest,
+        excludes,
+    };
+    Ok((run, Some(sync)))
+}
+
+/// `local`'s path as the server takes it: the same, made of its names alone (`./src/` is `src`);
+/// `None` for one that names no directory of its own (`.`, `..`, `../x`).
+fn same_path(local: &std::path::Path) -> Option<Vec<u8>> {
+    use std::path::Component;
+    let mut names: Vec<&[u8]> = Vec::new();
+    for part in local.components() {
+        match part {
+            Component::Normal(name) => names.push(name.as_bytes()),
+            Component::CurDir => {}
+            Component::RootDir => names.push(b""),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    let path = names.join(&b'/');
+    (names.iter().any(|name| !name.is_empty())).then_some(path)
+}
+
+/// The `--exclude` patterns `m` gives.
+fn excludes(m: &ArgMatches) -> Result<Excludes, clap::Error> {
+    m.get_many::<OsString>("exclude")
+        .into_iter()
+        .flatten()
+        .map(|p| Pattern::new(p.as_bytes().to_vec()))
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(Excludes::new)
+        .map_err(|why| invalid(&format!("--exclude: {why}")))
+}
+
 /// The directory `-C` names, if given.
 fn cwd_of(m: &ArgMatches) -> Result<Option<RemotePath>, clap::Error> {
     m.get_one::<OsString>("cwd")
@@ -879,17 +963,25 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             last: m.get_flag("last"),
             json: json(m),
         }),
-        Some(("exec", m)) => Ok(Cmd::Exec {
-            remote: remote_args(m)?,
-            run: run_of(m)?,
-            json: json(m),
-        }),
-        Some(("run", m)) => Ok(Cmd::Start {
-            remote: remote_args(m)?,
-            name: m.get_one::<JobName>("name").cloned(),
-            run: run_of(m)?,
-            json: json(m),
-        }),
+        Some(("exec", m)) => {
+            let (run, sync) = synced_run(m)?;
+            Ok(Cmd::Exec {
+                remote: remote_args(m)?,
+                run,
+                sync,
+                json: json(m),
+            })
+        }
+        Some(("run", m)) => {
+            let (run, sync) = synced_run(m)?;
+            Ok(Cmd::Start {
+                remote: remote_args(m)?,
+                name: m.get_one::<JobName>("name").cloned(),
+                run,
+                sync,
+                json: json(m),
+            })
+        }
         Some(("jobs", m)) => Ok(Cmd::Jobs(
             remote_args(m)?,
             m.get_one::<JobName>("job").cloned(),
@@ -953,14 +1045,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
                 .flatten()
                 .collect();
             let (server, job) = copy_job(&paths)?;
-            let excludes = m
-                .get_many::<OsString>("exclude")
-                .into_iter()
-                .flatten()
-                .map(|p| Pattern::new(p.as_bytes().to_vec()))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(Excludes::new)
-                .map_err(|why| invalid(&format!("--exclude: {why}")))?;
+            let excludes = excludes(m)?;
             let opts = Opts {
                 keep_times: m.get_flag("preserve"),
                 delete: m.get_flag("delete"),
@@ -1480,6 +1565,57 @@ mod tests {
         );
     }
 
+    /// `--sync DIR` sends DIR's contents to the same path there, made of its names alone, and
+    /// starts the command in it; with -C, to -C's directory. A path with no name of its own
+    /// there needs -C, and `--exclude` needs `--sync`.
+    #[test]
+    fn sync_names_where_the_tree_goes_and_the_command_starts() {
+        let synced = |argv: &[&str]| {
+            let (Cmd::Exec { run, sync, .. } | Cmd::Start { run, sync, .. }) =
+                parsed(&[&["koh"][..], argv].concat())
+            else {
+                panic!("exec or run");
+            };
+            let sync = sync.expect("a sync");
+            let cwd = run.cwd.map(|dir| dir.as_bytes().to_vec());
+            (sync.dest.as_bytes().to_vec(), cwd)
+        };
+        let proj = (b"proj".to_vec(), Some(b"proj".to_vec()));
+        assert_eq!(
+            synced(&["exec", ID, "--sync", "./proj/", "--", "make"]),
+            proj
+        );
+        let deep = synced(&[
+            "run",
+            ID,
+            "--sync",
+            "a/./b",
+            "--exclude",
+            "target",
+            "--",
+            "make",
+        ]);
+        assert_eq!(deep.0, b"a/b");
+        assert_eq!(
+            synced(&["exec", ID, "--sync", "/w/p", "--", "make"]).0,
+            b"/w/p"
+        );
+        let there = (b"~/p".to_vec(), Some(b"~/p".to_vec()));
+        assert_eq!(
+            synced(&["exec", ID, "--sync", ".", "-C", "~/p", "--", "make"]),
+            there
+        );
+        for dir in [".", "..", "../x"] {
+            let matches = command()
+                .try_get_matches_from(["koh", "exec", ID, "--sync", dir, "--", "make"])
+                .expect("valid command line");
+            let said = parse(&matches).expect_err("no name there").to_string();
+            assert!(said.contains("with -C DIR"), "{said}");
+        }
+        let alone = ["koh", "exec", ID, "--exclude", "target", "--", "make"];
+        assert!(command().try_get_matches_from(alone).is_err());
+    }
+
     /// `koh exec` takes its program and arguments after `--`, each word as it is (a line for the
     /// shell only with `--sh`); `koh cp` reads `SERVER:PATH` as scp does, one side the server's.
     #[test]
@@ -1487,7 +1623,9 @@ mod tests {
         use koh::client::CopyJob;
         use koh::request::Command as Remote;
         use std::path::PathBuf;
-        let Cmd::Exec { remote, run, json } = parsed(&[
+        let Cmd::Exec {
+            remote, run, json, ..
+        } = parsed(&[
             "koh",
             "exec",
             "laptop",
@@ -1499,7 +1637,8 @@ mod tests {
             "ls",
             "-la",
             "a b",
-        ]) else {
+        ])
+        else {
             panic!("exec");
         };
         let Remote::Argv(argv) = &run.command else {

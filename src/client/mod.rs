@@ -15,7 +15,7 @@ mod probe;
 
 pub use backend::{DefaultBackend, KohBackend};
 pub use cli::{connect, sessions, BellHook, ConnectConfig, Remote};
-pub use copy::{copy, CopyJob};
+pub use copy::{copy, sync, CopyJob, SyncTree, Synced};
 pub use exec::exec;
 pub(crate) use io::spawn_client_io;
 
@@ -684,7 +684,12 @@ pub async fn run_client<B: KohBackend>(
                                 }
                             }
                             Shown::Title(now_title) => title = now_title,
-                            Shown::Exit(code) => {
+                            Shown::Exit { code, read } => {
+                                // Its program read every key this connection sent: said to a
+                                // terminal that reads reports, which then knows they reached it.
+                                if read.is_some_and(|read| read >= wire.sent) {
+                                    display.ended(&mut backend)?;
+                                }
                                 display.leave(&mut backend)?;
                                 backend.flush()?;
                                 // The end is here, which this close tells the server: it waits

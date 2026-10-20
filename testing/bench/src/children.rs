@@ -234,7 +234,7 @@ fn paint(workload: &Workload, messages: &[Vec<u8>]) -> anyhow::Result<usize> {
                 | Shown::Echo(_)
                 | Shown::Bell(_)
                 | Shown::Title(_)
-                | Shown::Exit(_)
+                | Shown::Exit { .. }
                 | Shown::Beat => {}
             }
         }

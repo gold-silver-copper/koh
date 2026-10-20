@@ -142,6 +142,14 @@ impl Display {
         backend.mark(format_args!("S;activity={}", activity.name()))
     }
 
+    /// Report that the remote program ended having read every key sent it (`OSC 133 ; S ;
+    /// activity=ended`): a terminal driving koh knows the last keys reached it, though no report
+    /// of it reading again came.
+    pub fn ended(&mut self, backend: &mut impl KohBackend) -> io::Result<()> {
+        self.unpaint(backend)?;
+        backend.mark(format_args!("S;activity=ended"))
+    }
+
     /// Grade the predictions against the terminal as it is.
     pub fn reconcile(&mut self) {
         self.predictor.cull(self.mirror.screen());

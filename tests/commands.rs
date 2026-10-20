@@ -887,6 +887,106 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
         });
 }
 
+/// `--sync DIR` brings the same path there into line with DIR here, says so in a line on stderr,
+/// and runs the command in it: an edit-and-build loop is one call. Only what changed is sent;
+/// `-C` names another place there; `.` alone, with no name of its own there, needs `-C`.
+#[test]
+fn exec_and_run_sync_a_tree_first_and_run_in_it() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::start("sync").await.expect("the server");
+            let here = koh_testkit::scratch!("sync-here").expect("a scratch directory");
+            let name = format!("koh-sync-{}", std::process::id());
+            std::fs::create_dir_all(here.join(&name).join("src")).expect("the tree");
+            std::fs::write(here.join(&name).join("src/a.txt"), b"one\n").expect("a file");
+            let koh = |sub: &str, args: &[&str]| {
+                remote
+                    .koh(sub)
+                    .expect("koh")
+                    .arg(&remote.id)
+                    .args(args)
+                    .current_dir(&here)
+                    .output()
+                    .expect("koh")
+            };
+            let at = format!("{}:{name}", remote.id);
+            let cat = ["--", "sh", "-c", "cat src/a.txt; basename \"$PWD\""];
+            let out = koh("exec", &[&["--sync", &name][..], &cat[..]].concat());
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("one\n{name}\n")
+            );
+            assert!(
+                said.starts_with(&format!("koh: synced 1 file sent, 4 B → {at} (1 new;")),
+                "{said}"
+            );
+            // Edited here: that file alone goes, before the command reads it.
+            std::fs::write(here.join(&name).join("src/a.txt"), b"two\n").expect("an edit");
+            let out = koh(
+                "exec",
+                &[&["--sync", &format!("./{name}/")][..], &cat[..]].concat(),
+            );
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                String::from_utf8_lossy(&out.stdout).starts_with("two\n"),
+                "{out:?}"
+            );
+            assert!(
+                said.starts_with(&format!("koh: synced 1 file sent, 4 B → {at} (1 replaced")),
+                "{said}"
+            );
+            // What a command made there is kept, and said so, with nothing to act on.
+            koh("exec", &["--sync", &name, "--", "touch", "made"]);
+            let out = koh("exec", &["--sync", &name, "--", "true"]);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(said.contains("1 there not in the source, kept)"), "{said}");
+            // A job, the same way; and its JSON says the sync.
+            let out = koh(
+                "run",
+                &[
+                    "--json",
+                    "--name",
+                    "synced",
+                    "--sync",
+                    &name,
+                    "--",
+                    "cat",
+                    "src/a.txt",
+                ],
+            );
+            let said: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+            assert_eq!(said["job"], "synced", "{said}");
+            assert_eq!(said["synced"]["unchanged"], 1, "{said}");
+            let out = koh("wait", &["synced"]);
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "two\n", "{out:?}");
+            // Into -C's directory, from within the tree.
+            let out = remote
+                .koh("exec")
+                .expect("koh")
+                .args([
+                    &remote.id,
+                    "--sync",
+                    ".",
+                    "-C",
+                    &format!("{name}-too"),
+                    "--",
+                    "ls",
+                ])
+                .current_dir(here.join(&name))
+                .output()
+                .expect("koh");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "src\n", "{out:?}");
+            // `.` alone goes nowhere it names: refused, saying how, and nothing ran.
+            let out = koh("exec", &["--sync", ".", "--", "touch", "ran"]);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{out:?}");
+            assert!(said.contains("with -C DIR"), "{said}");
+        });
+}
+
 /// An in-process loopback server for the client `client`, saved with the scope `scope`
 /// (`cp=DIR`, `exec=DIR`), as `koh clients add` saves one.
 async fn scoped_server(

@@ -1,4 +1,4 @@
-//! The koh/14 shell protocol: what a session's connection carries after its opening request
+//! The koh/15 shell protocol: what a session's connection carries after its opening request
 //! ([`crate::request`]).
 //!
 //! The client writes [`ClientMsg`]s on two uni streams, its first (the request's) for control
@@ -213,8 +213,11 @@ pub enum Shown {
     Bell(u64),
     /// The window title is now this, at most 256 characters.
     Title(#[serde(deserialize_with = "title")] String),
-    /// The program exited, with this status; the session ends.
-    Exit(u32),
+    /// The program exited with status `code`; the session ends. `read`: the input up to which
+    /// (this connection's) was written to its terminal, if it read every key written there before
+    /// it ended (none left in its terminal or on its way to it), so a terminal driving the client
+    /// knows its last keys reached it; `None` if some were left, or it is not known.
+    Exit { code: u32, read: Option<InputSeq> },
     /// Nothing: the link lives.
     Beat,
 }
@@ -412,7 +415,10 @@ mod tests {
                 input: InputSeq(4),
             },
             Shown::Echo(InputSeq(9)),
-            Shown::Exit(3),
+            Shown::Exit {
+                code: 3,
+                read: Some(InputSeq(9)),
+            },
         ];
         let bytes: Vec<u8> = msgs.iter().flat_map(|m| encode_shown(m).unwrap()).collect();
         let mut decoder = ShownDecoder::default();

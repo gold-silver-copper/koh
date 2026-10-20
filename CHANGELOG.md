@@ -15,6 +15,19 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Added
+
+- `koh exec` and `koh run` take `--sync LOCAL` (and `--exclude PATTERN`): the directory there,
+  `-C`'s or else LOCAL's own path, is first brought into line with LOCAL as `koh cp -r LOCAL/.`
+  does, said in a line on stderr (`koh: synced 2 files sent, …`, or `synced` in `--json`), and
+  the command runs in it. An edit-here, build-there loop is one call.
+
+### Changed
+
+- The protocol is koh/15: a session's end says whether its program read every key written to it,
+  and `koh connect` then writes `OSC 133 ; S ; activity=ended`, so a terminal driving it (fux)
+  knows the last keys reached a program that ended without reading again.
+
 ## [0.14.0] — 2026-10-20
 
 ### Added

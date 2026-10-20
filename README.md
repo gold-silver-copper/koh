@@ -28,14 +28,14 @@ koh connect laptop
 The same server runs commands and jobs, and copies files, with no shell session at all:
 
 ```sh
+koh exec laptop --sync x -- cargo test  # edit here, build there: x synced to laptop:x, then run in it
 koh exec laptop -- make test          # its stdout and stderr apart; koh exits with its status
 git diff | koh exec laptop -C src/app -- git apply
 koh run laptop --name build -- cargo build   # a job: it outlives koh and the link
 koh wait laptop build                 # until it ends: its last lines, then its status
 koh cp -r ./site laptop:              # a tree into the server user's home, as a sync
 koh cp laptop:notes.md laptop:todo .  # back here, into the current directory
-koh cp -r src/. laptop:x/src && koh exec laptop -C x -- cargo test  # edit here, build there
-koh run laptop --name b -- cargo build && koh wait laptop b --timeout 600  # a long build that outlives a drop
+koh run laptop --sync x --name b -- cargo build && koh wait laptop b --timeout 600  # a long build that outlives a drop
 ```
 
 Or run `koh` alone on a terminal for a menu of this machine's keys, the servers it connects to
@@ -188,12 +188,16 @@ koh cp box:app/target/report.json .   # there to here
 koh cp --diff -r ./src box:app/       # change nothing: which files differ, and how
 ```
 
-To build there what you edit here, sync in the same call as the build: an unchanged tree costs
-only hashes, and the build never sees stale code. koh has no watch mode, since a build started
-right after an edit could still beat its sync.
+To build there what you edit here, sync in the same call as the build: `--sync DIR` on `exec`
+or `run` brings the same path there (or `-C`'s) into line with DIR, says so in a line on stderr,
+and runs the command in it. An unchanged tree costs only hashes, and the build never sees stale
+code. koh has no watch mode, since a build started right after an edit could still beat its
+sync.
 
 ```sh
-koh cp -r ./src/. box:app/src && koh exec box -C app -- cargo build
+koh exec box --sync app -- cargo build          # app here to box:app, then build there
+koh exec box --sync . -C app -- cargo test      # from within the tree
+koh cp -r --exclude target box:app/. app        # back: what a command changed there (rustfmt)
 ```
 
 Shell sessions, opened with `koh connect` (in fux, or any terminal), can be read and waited on

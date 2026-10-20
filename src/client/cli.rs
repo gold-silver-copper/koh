@@ -624,7 +624,7 @@ impl<'a> From<&'a JobInfo> for JobView<'a> {
 /// `koh run`: start `run` as job `name` on `remote`; its name, to `out`.
 pub async fn run(
     remote: &Remote,
-    (name, run): (Option<JobName>, Run),
+    (name, run, synced): (Option<JobName>, Run, Option<&super::Synced>),
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
@@ -636,8 +636,16 @@ pub async fn run(
         #[derive(Serialize)]
         struct View<'a> {
             job: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            synced: Option<&'a super::Synced>,
         }
-        return json_line(out, &View { job: name.as_str() });
+        return json_line(
+            out,
+            &View {
+                job: name.as_str(),
+                synced,
+            },
+        );
     }
     writeln!(out, "{name}")?;
     Ok(())

@@ -666,8 +666,9 @@ impl Session {
                 input: self.written,
             });
         }
+        // What this new attachment sent its program is none of it.
         if let Some(code) = self.exited {
-            shown.push(Shown::Exit(code));
+            shown.push(Shown::Exit { code, read: None });
         }
         Start {
             shown,
@@ -826,7 +827,10 @@ impl Session {
                 // Whatever is held goes first, then the end. Input goes nowhere from now on.
                 self.release(&mut held);
                 let code = exit.code();
-                self.show(Shown::Exit(code));
+                // Every key written to it read: none waits to be written, nor in its terminal.
+                let left = self.host.pty.keys_left(ending.output_ended.is_some());
+                let read = (pending.is_empty() && left == Some(false)).then_some(self.written);
+                self.show(Shown::Exit { code, read });
                 exited = Some(code);
                 self.exited = exited;
                 pending = PendingInput::default();

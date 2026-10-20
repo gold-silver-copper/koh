@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::cli::{bytes, escaped, Format, Opened, Remote};
 use crate::request::{RemotePath, Request, Sources};
+use crate::sync::glob::Excludes;
 use crate::sync::{
     self, ChannelReader, ChannelWriter, Copy, Dest, FailKind, Failure, Opts, Reply, Source,
     SourceCount, Summary, Target, PIPE_DEPTH, REPLY_DEPTH,
@@ -133,6 +134,25 @@ fn say(
     if summary.changes_unshown > 0 {
         writeln!(out, "… {} more", summary.changes_unshown)?;
     }
+    writeln!(out, "{}", line(summary, (landed, dry, verb), true))?;
+    if summary.skipped > 0 {
+        crate::log::stderr(format_args!(
+            "koh: skipped {} fifo(s), socket(s) or device(s), which cannot be copied: {}{}",
+            summary.skipped,
+            summary.skipped_shown.join(", "),
+            if summary.skipped > u64::try_from(summary.skipped_shown.len()).unwrap_or(u64::MAX) {
+                ", …"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(())
+}
+
+/// The line that says what a copy did: `3 files sent, 41 KB → SERVER:proj (1 new, 2 replaced; 120
+/// unchanged)`, as a dry run if `dry`; with how `--delete` removes what it kept if `delete` says.
+fn line(summary: &Summary, (landed, dry, verb): (&str, bool, &str), delete: bool) -> String {
     // What came across, split into new and replaced, which add up to it; then the rest.
     let mut sent = Vec::new();
     if summary.new > 0 {
@@ -152,10 +172,16 @@ fn say(
         parts.push(format!("{} deleted", summary.deleted));
     }
     if summary.kept > 0 {
+        let them = if summary.kept == 1 { "it" } else { "them" };
+        // Before a command (`--sync`), what it made there (a lockfile) is kept, as it should be.
+        let how = if delete {
+            format!(": --delete removes {them}")
+        } else {
+            String::new()
+        };
         parts.push(format!(
-            "{} there not in the source, kept: --delete removes {}",
-            summary.kept,
-            if summary.kept == 1 { "it" } else { "them" }
+            "{} there not in the source, kept{how}",
+            summary.kept
         ));
     }
     if summary.dirs > 0 {
@@ -171,8 +197,7 @@ fn say(
         (false, false) => format!(" ({}; {})", sent.join(", "), parts.join(", ")),
     };
     let written = summary.written();
-    writeln!(
-        out,
+    format!(
         "{}{written} file{} {}{}, {} → {landed}{more}{}",
         if dry { "dry run: " } else { "" },
         if written == 1 { "" } else { "s" },
@@ -180,20 +205,55 @@ fn say(
         verb,
         bytes(summary.bytes),
         if dry { "; nothing changed" } else { "" },
-    )?;
-    if summary.skipped > 0 {
-        crate::log::stderr(format_args!(
-            "koh: skipped {} fifo(s), socket(s) or device(s), which cannot be copied: {}{}",
-            summary.skipped,
-            summary.skipped_shown.join(", "),
-            if summary.skipped > u64::try_from(summary.skipped_shown.len()).unwrap_or(u64::MAX) {
-                ", …"
-            } else {
-                ""
-            }
-        ));
+    )
+}
+
+/// A tree brought into line on the server before a command runs there (`--sync`).
+///
+/// What `local` holds goes to `dest`, as `koh cp -r LOCAL/. SERVER:DEST` sends it, only the files
+/// that changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncTree {
+    pub local: PathBuf,
+    pub dest: RemotePath,
+    pub excludes: Excludes,
+}
+
+/// What a sync did: where it landed, as the user would name it, and its summary.
+#[derive(Debug, Serialize)]
+pub struct Synced {
+    pub landed: String,
+    #[serde(flatten)]
+    pub summary: Summary,
+}
+
+impl Synced {
+    /// The line that says it, on stderr before the command's output: `koh: synced 2 files sent,
+    /// 13 KB → SERVER:proj (2 replaced; 19 unchanged)`.
+    pub fn line(&self) -> String {
+        format!(
+            "synced {}",
+            line(&self.summary, (&self.landed, false, "sent"), false)
+        )
     }
-    Ok(())
+}
+
+/// Bring `sync.dest` on `remote` into line with `sync.local` here.
+pub async fn sync(remote: &Remote, sync: SyncTree) -> anyhow::Result<Synced> {
+    let interrupted = CancellationToken::new();
+    crate::cancel_on_signals(&interrupted)?;
+    let landed = format!(
+        "{}:{}",
+        remote.named,
+        escaped(&String::from_utf8_lossy(sync.dest.as_bytes()))
+    );
+    let opts = Opts {
+        excludes: sync.excludes,
+        ..Opts::default()
+    };
+    let sources = vec![sync.local.join(".")];
+    let summary = put(remote, (sources, sync.dest), opts, &interrupted).await?;
+    Ok(Synced { landed, summary })
 }
 
 /// The server's `sources` to `dest`.

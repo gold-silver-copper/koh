@@ -98,6 +98,23 @@ async fn run(cmd: Cmd) -> u8 {
     }
 }
 
+/// Bring the tree `sync` names into line on `remote`, if asked, and say so on stderr unless the
+/// answer is `json`, whose value carries it.
+async fn synced(
+    remote: &koh::client::Remote,
+    sync: Option<koh::client::SyncTree>,
+    json: bool,
+) -> anyhow::Result<Option<koh::client::Synced>> {
+    let Some(sync) = sync else {
+        return Ok(None);
+    };
+    let synced = koh::client::sync(remote, sync).await?;
+    if !json {
+        koh::log::stderr(format_args!("koh: {}", synced.line()));
+    }
+    Ok(Some(synced))
+}
+
 async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
     use koh::client::cli::{self, Format};
     let mut out = std::io::stdout();
@@ -116,17 +133,36 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => cli::output(&resolve(remote)?, (session, last), format(json), &mut out)
             .await
             .map(|()| None),
-        Cmd::Exec { remote, run, json } => koh::client::exec(&resolve(remote)?, run, format(json))
-            .await
-            .map(Some),
+        Cmd::Exec {
+            remote,
+            run,
+            sync,
+            json,
+        } => {
+            let remote = resolve(remote)?;
+            let synced = synced(&remote, sync, json).await?;
+            koh::client::exec(&remote, (run, synced.as_ref()), format(json))
+                .await
+                .map(Some)
+        }
         Cmd::Start {
             remote,
             name,
             run,
+            sync,
             json,
-        } => cli::run(&resolve(remote)?, (name, run), format(json), &mut out)
+        } => {
+            let remote = resolve(remote)?;
+            let synced = synced(&remote, sync, json).await?;
+            cli::run(
+                &remote,
+                (name, run, synced.as_ref()),
+                format(json),
+                &mut out,
+            )
             .await
-            .map(|()| None),
+            .map(|()| None)
+        }
         Cmd::Jobs(remote, job, json) => cli::jobs(&resolve(remote)?, job, format(json), &mut out)
             .await
             .map(|()| None),

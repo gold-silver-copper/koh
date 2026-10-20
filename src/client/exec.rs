@@ -19,6 +19,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::cli::{Format, Opened, Remote};
+use super::copy::Synced;
 use crate::request::{ExecStream, ExitStatus, RemotePath, Request, Run, MAX_REPLY};
 
 /// Most bytes moved at once from a stream.
@@ -31,9 +32,16 @@ pub const MAX_KEPT: usize = 16 << 20;
 /// ended.
 const BROKEN_PIPE: u32 = 128 + 13;
 
-/// `koh exec`: run `run` on `remote`; its exit status (128 plus the signal that killed it; 127 if
-/// there is no such program, 126 if it could not start).
-pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u32> {
+/// `koh exec`: run `run` on `remote`; its exit status.
+///
+/// That is 128 plus the signal that killed it; 127 if there is no such program, 126 if it could
+/// not start. `synced` is the tree brought into line there first, if one was, which `--json`'s
+/// value says.
+pub async fn exec(
+    remote: &Remote,
+    (run, synced): (Run, Option<&Synced>),
+    format: Format,
+) -> anyhow::Result<u32> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
     // Apart, its stdout and stderr could come back in another order than it wrote them: when they
@@ -47,7 +55,7 @@ pub async fn exec(remote: &Remote, run: Run, format: Format) -> anyhow::Result<u
         &opened.conn,
         &mut opened.control,
         stdin,
-        (&interrupted, cwd.as_ref()),
+        (&interrupted, cwd.as_ref(), synced),
         format,
     )
     .await;
@@ -109,7 +117,7 @@ async fn drive(
     conn: &Connection,
     control: &mut SendStream,
     stdin: mpsc::Receiver<Vec<u8>>,
-    (interrupted, cwd): (&CancellationToken, Option<&RemotePath>),
+    (interrupted, cwd, synced): (&CancellationToken, Option<&RemotePath>, Option<&Synced>),
     format: Format,
 ) -> anyhow::Result<u32> {
     let started = Instant::now();
@@ -169,6 +177,8 @@ async fn drive(
             stdout_dropped: u64,
             stderr_dropped: u64,
             error: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            synced: Option<&'a Synced>,
         }
         let problem = code.as_ref().err().map(ToString::to_string);
         let view = View {
@@ -178,6 +188,7 @@ async fn drive(
             stdout_dropped: out_dropped,
             stderr_dropped: err_dropped,
             error: problem.as_deref(),
+            synced,
         };
         let mut line = serde_json::to_vec(&view)?;
         line.push(b'\n');

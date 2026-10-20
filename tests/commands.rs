@@ -938,6 +938,11 @@ fn exec_and_run_sync_a_tree_first_and_run_in_it() {
                 said.starts_with(&format!("koh: synced 1 file sent, 4 B → {at} (1 replaced")),
                 "{said}"
             );
+            // What a command made there is kept, and said so, with nothing to act on.
+            koh("exec", &["--sync", &name, "--", "touch", "made"]);
+            let out = koh("exec", &["--sync", &name, "--", "true"]);
+            let said = String::from_utf8_lossy(&out.stderr);
+            assert!(said.contains("1 there not in the source, kept)"), "{said}");
             // A job, the same way; and its JSON says the sync.
             let out = koh(
                 "run",

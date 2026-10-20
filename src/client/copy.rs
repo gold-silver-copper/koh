@@ -173,13 +173,14 @@ fn line(summary: &Summary, (landed, dry, verb): (&str, bool, &str), delete: bool
     }
     if summary.kept > 0 {
         let them = if summary.kept == 1 { "it" } else { "them" };
+        // Before a command (`--sync`), what it made there (a lockfile) is kept, as it should be.
         let how = if delete {
-            "--delete"
+            format!(": --delete removes {them}")
         } else {
-            "`koh cp --delete`"
+            String::new()
         };
         parts.push(format!(
-            "{} there not in the source, kept: {how} removes {them}",
+            "{} there not in the source, kept{how}",
             summary.kept
         ));
     }

@@ -17,7 +17,7 @@ cargo-fuzz = true
 koh = { path = ".." }
 libfuzzer-sys = "0.4"
 # The user's terminal the client writes to, in `server_process`; koh's own version.
-fux-vt = "0.11.0"
+fux-vt = "0.12.0"
 
 [[bin]]
 name = "proto_decode"

@@ -13,7 +13,9 @@ use koh::request::{
     Problem, ProblemKind, RemotePath, Request, Resume, Run, RunId, SessionNum, Until, Wait,
     WaitText,
 };
-use koh::sync::{Answer as SyncAnswer, FileId, Item, Mode, Name, Opts, Reply, SourceCount};
+use koh::sync::{
+    Answer as SyncAnswer, FileHeader, FileId, Item, Mode, Name, Opts, Reply, SourceCount,
+};
 use koh::terminal::{Activity, Size, TtyModes};
 
 fn hex(bytes: &[u8]) -> String {
@@ -82,7 +84,6 @@ fn requests() -> Option<Vec<Request>> {
             opts: Opts {
                 delete: true,
                 dry_run: true,
-                diff: true,
                 ..Opts::default()
             },
         }),
@@ -145,13 +146,13 @@ fn shown() -> Option<Vec<Shown>> {
 fn items() -> Option<Vec<Item>> {
     let name = |n: &str| Name::new(n.as_bytes().to_vec()).ok();
     Some(vec![
-        Item::File {
+        Item::File(FileHeader {
             id: FileId(1),
             name: name("a.rs")?,
             mode: Mode::new(0o644)?,
             mtime: None,
             size: 12,
-        },
+        }),
         Item::Data {
             id: FileId(1),
             from: 0,
@@ -181,7 +182,6 @@ fn replies() -> Vec<Reply> {
                 path: "src/a.rs".into(),
                 size: Some(12),
                 was: None,
-                diff: None,
             }],
             ..koh::sync::Summary::default()
         })),
@@ -336,7 +336,7 @@ const PINNED: &[&str] = &[
     "000000170401056275696c64010c63642078202626206d616b6500",
     "0000000b06056275696c640101c801",
     "00000014080100056275696c6401096c697374656e696e67",
-    "0000000f09010570726f6a2f02000100010100",
+    "0000000d09010570726f6a2f0200010100",
     "000000110103020000016104000306706173746564",
     "0000000400011e64",
     "00000009020101020300000100",
@@ -358,8 +358,8 @@ const PINNED: &[&str] = &[
     "000000030c0300",
     "000000010b",
     "000000050000010000",
-    "0000001001000000000000000000000000000000",
-    "0000001e01000100000000000000000000000100087372632f612e7273010c000000",
+    "0000000d01000000000000000000000000",
+    "0000001a01000100000000000000000100087372632f612e7273010c0000",
     "000000020902",
     "00000003008901",
     "000000080100056275696c64",

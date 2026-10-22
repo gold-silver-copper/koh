@@ -319,20 +319,15 @@ Jobs (survive koh exiting and the link dropping; output and status kept):
   koh kill SERVER build [--signal KILL]
 
 Copy (a sync: merges, makes parents, sends only files that changed, by hash):
-  koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
-  koh cp -r ./src SERVER:proj/src       updates proj/src, there already (as `./src/.` does; cp
-                                        would nest it as proj/src/src: name that, or end in /)
+  koh cp -r ./src SERVER:proj/          src lands as proj/src, as cp's rule says
+  koh cp -r ./src/. SERVER:proj/src     proj/src brought into line with src's contents
   koh cp SERVER:proj/out.txt .          the other way
   --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
-  arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run
-  changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
-  `link` and its path; a file's size, and the size of the one it replaces) before the summary.
-  --diff is that dry run, each replaced text file (to 1 MiB) followed by its unified diff
-  (a/ the destination's, b/ the source's): which files differ by content, and how.
-  Without --delete, what the source lacks is kept and counted, but for directories (most
-  often made there, as a build's target/). Prints one line,
-  where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
-  (`received` for a download). A cut copy resumes when rerun.
+  arrival time, so builds see changes); --dry-run changes nothing and sends no file, listing
+  each change (`new`, `replaced`, `deleted`, `dir`, `link` and its path; a file's size, and the
+  size of the one it replaces) before the summary. Prints one line:
+  `3 files sent, 41 KB → SERVER:proj/ (1 new, 2 replaced; 120 unchanged)` (`received` for a
+  download). A cut copy resumes when rerun.
   To build there what you edit here, sync in the same call as the build, so it never sees stale
   code (an unchanged tree costs only hashes): `koh exec SERVER --sync proj -- make` (`--exclude
   target` keeps a local build's output here). There is no watch mode, whose sync a build can
@@ -668,7 +663,7 @@ fn wait() -> Command {
 }
 
 fn cp() -> Command {
-    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree copied to a directory of its own name that is there updates it, as `X/.` does (`koh cp -r X S:X` again), where cp would nest it: `S:X/` or `S:X/X` nests it. Prints what it did and where it landed"))
+    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. Prints what it did"))
         .arg(
             Arg::new("paths")
                 .value_name("PATH")
@@ -680,10 +675,8 @@ fn cp() -> Command {
         .arg(flag("recursive", "recursive").short('r').visible_short_alias('R').help("Accepted, as scp's: directories always copy whole"))
         .arg(flag("preserve", "preserve").short('p').help("Keep the source's modification times"))
         .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
-        .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
         .arg(flag("dry_run", "dry-run").help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
-        .arg(flag("diff", "diff").help("A dry run that also shows how each replaced text file differs (a unified diff, a/ the destination's, b/ the source's; files up to 1 MiB): the source's file goes to the destination's end to be compared, nothing changed"))
-        .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
+        .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: a name anywhere (`*.o`, `target`), or a path from the top of the tree copied (`src/gen/*`) (repeatable)"))
         .arg(json())
 }
 
@@ -1049,9 +1042,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             let opts = Opts {
                 keep_times: m.get_flag("preserve"),
                 delete: m.get_flag("delete"),
-                atomic: m.get_flag("atomic"),
-                dry_run: m.get_flag("dry_run") || m.get_flag("diff"),
-                diff: m.get_flag("diff"),
+                dry_run: m.get_flag("dry_run"),
                 excludes,
             };
             let shown = paths
@@ -1677,7 +1668,7 @@ mod tests {
             (remote.server, job, opts)
         };
         let (server, job, opts) = copy(&["-r", "-p", "--delete", "a", "./b:c", "laptop:~/x"]);
-        assert!(opts.keep_times && opts.delete && !opts.atomic);
+        assert!(opts.keep_times && opts.delete && !opts.dry_run);
         assert_eq!(server, super::ServerRef::Name("laptop".to_owned()));
         let CopyJob::Put { sources, dest } = job else {
             panic!("put");

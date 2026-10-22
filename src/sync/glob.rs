@@ -1,8 +1,9 @@
 //! `koh cp --exclude`'s patterns.
 //!
 //! `*` stands for any run of characters but `/`, `?` for one, `[abc]`, `[a-z]` and `[!x]` for one
-//! of a set. A pattern without `/` matches an entry's name, wherever it
-//! is; one with a `/` matches its path from the top of what is copied (`src/gen/*`).
+//! of a set. A pattern without `/` matches an entry's name, wherever it is; one with a `/` matches
+//! its path from the top of the tree copied (`src/gen/*` in `proj/src/gen`, `proj` copied), the
+//! same at either end whatever name the tree lands as.
 
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};

@@ -182,36 +182,30 @@ struct PtyHost {
     emu: ServerTerminal,
     pty: crate::pty::Pty,
     filter: Filter,
-    /// The attachment and number of the newest resize applied.
-    resized: (u64, u32),
 }
 
 impl PtyHost {
-    /// Start `command` (empty for `$SHELL`) in `home` at `size`, in `cwd` if given, left to `reaper` once closed, a
-    /// shell `marks` knows started so that it marks its commands, and only its marks counted; the
-    /// host and a receiver of its output. Blocks until the program starts.
+    /// Start what `launch` asks (else `spec`'s command) at `size`, left to `reaper` once closed: a
+    /// shell `spec.marks` knows is started so that it marks its commands, and only its marks are
+    /// counted. The host and a receiver of its output; blocks until the program starts.
     fn spawn(
-        command: &[String],
-        (size, scrollback_bytes): (Size, usize),
-        (home, cwd, marks): (
-            &crate::pty::Home,
-            Option<&std::path::Path>,
-            Option<&super::marks::MarksDir>,
-        ),
+        spec: &SessionSpec,
+        launch: &Launch,
+        size: Size,
         reaper: &crate::pty::Reaper,
     ) -> anyhow::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         let size = crate::terminal::clamp_dims(size);
-        let Size { rows, cols } = size;
-        let mut emu = ServerTerminal::new(rows, cols, scrollback_bytes)
+        let mut emu = ServerTerminal::new(size.rows, size.cols, spec.scrollback_bytes)
             .context("creating the terminal emulator")?;
+        let command = launch.program.as_deref().unwrap_or(&spec.command);
         let argv = crate::pty::session_argv(command);
-        let marked = marks.and_then(|marks| marks.mark(&argv));
+        let marked = spec.marks.as_ref().and_then(|marks| marks.mark(&argv));
         let (argv, env) = marked
             .as_ref()
             .map_or((&argv[..], &[][..]), |m| (&m.argv[..], &m.env[..]));
-        let (pty, pty_rx) =
-            crate::pty::Pty::spawn(rows, cols, argv, env, ("xterm-256color", home, cwd), reaper)
-                .context("spawning shell")?;
+        let cwd = launch.cwd.as_deref();
+        let (pty, pty_rx) = crate::pty::Pty::spawn(size, argv, env, &spec.home, cwd, reaper)
+            .context("spawning shell")?;
         let nonce = marked.as_ref().map(|m| m.nonce.as_bytes().to_vec());
         emu.require_mark_nonce(nonce.as_deref());
         let filter = Filter::new(Policy {
@@ -219,31 +213,17 @@ impl PtyHost {
             clipboard: true,
             links: true,
         });
-        Ok((
-            Self {
-                emu,
-                pty,
-                filter,
-                resized: (0, 0),
-            },
-            pty_rx,
-        ))
+        Ok((Self { emu, pty, filter }, pty_rx))
     }
 
-    /// The PTY's modes, read now; `None` if they cannot be read.
-    fn tty(&self) -> Option<TtyModes> {
-        self.pty.tty_modes()
-    }
-
-    /// The client's window is now `size` (clamped); whether that changed the size. A program that
-    /// asked for in-band resize reports (mode 2048) hears of it on its input, in `pending`.
+    /// The client's window is now `size`; whether that changed the size. A program that asked for
+    /// in-band resize reports (mode 2048) hears of it on its input, in `pending`.
     fn resize(&mut self, size: Size, pending: &mut PendingInput) -> bool {
         if !self.emu.resize(size) {
             return false;
         }
-        let host = crate::terminal::host_size(size);
-        if let Err(e) = self.pty.resize(host.rows(), host.cols()) {
-            tracing::warn!(error = %e, rows = host.rows(), cols = host.cols(), "pty resize failed");
+        if let Err(e) = self.pty.resize(crate::terminal::clamp_dims(size)) {
+            tracing::warn!(error = %e, "pty resize failed");
         }
         if let Some(report) = self.emu.resize_report() {
             pending.reply(&report);
@@ -260,9 +240,8 @@ impl PtyHost {
             .flatten()
     }
 
-    /// Queue what the program gets of `input` from attachment `attach` in `pending`; whether the
-    /// size changed. A resize is applied once, whichever way it came first, and never one older.
-    fn apply(&mut self, attach: u64, input: ToSession, pending: &mut PendingInput) -> bool {
+    /// Queue what the program gets of `input` in `pending`.
+    fn apply(&mut self, input: ToSession, pending: &mut PendingInput) {
         match input {
             ToSession::Events { seq, events } => {
                 self.emu.encode_input(&events, &mut pending.bytes);
@@ -273,13 +252,7 @@ impl PtyHost {
             ToSession::Colours(colours) => {
                 pending.bytes.extend(self.emu.set_colours(&colours));
             }
-            ToSession::Resize(window) if (attach, window.n) > self.resized => {
-                self.resized = (attach, window.n);
-                return self.resize(window.size, pending);
-            }
-            ToSession::Resize(_) => {}
         }
-        false
     }
 
     /// What the shell's marks and the last probe say of it.
@@ -305,15 +278,6 @@ pub(crate) enum ToSession {
     },
     /// What the user's terminal said of its colours.
     Colours(crate::events::WireColours),
-    /// The client's window, among its input so nothing typed after it overtakes it.
-    Resize(Window),
-}
-
-/// The client's window, clamped, and the number of the resize that sent it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Window {
-    pub(crate) n: u32,
-    pub(crate) size: Size,
 }
 
 /// What is known of how the program ended, and so when the session counts it ended: its exit once
@@ -386,9 +350,9 @@ enum Ask {
     Redraw(Option<fux_vt::RowId>, oneshot::Sender<Start>),
     /// A client was told the program's end: once it exited, the session ends.
     Ended,
-    /// The window of attachment `attach` is now `size` (clamped): asked beside input, so a
-    /// resize never waits behind typing the program has not taken.
-    Resize { attach: u64, window: Window },
+    /// The window of attachment `attach` is now `size`: asked beside input, so a resize never
+    /// waits behind typing the program has not taken.
+    Resize { attach: u64, size: Size },
     /// How the session stands, for a listing.
     Describe(oneshot::Sender<Description>),
     /// The screen's text, or the last command's output if `last`.
@@ -417,13 +381,11 @@ pub struct Status {
     pub screen: u64,
 }
 
-/// Whether [`Registry::attach`] created a fresh session or reattached to a running one.
+/// Whether [`Registry::attach`] started a session or reattached to a running one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachKind {
-    /// A brand-new session was spawned for this peer.
     Created,
-    /// Reattached; `detached_for` is how long it had no client, `None` if it had one.
-    Reattached { detached_for: Option<Duration> },
+    Reattached,
 }
 
 /// What an attach gets: a session and where its client begins, or why not
@@ -463,10 +425,10 @@ impl SessionClient {
         answer.await.ok()
     }
 
-    /// The client's window is now `window` (clamped); `false` if the session cannot take it yet.
-    pub(crate) fn resize(&self, window: Window) -> bool {
+    /// The client's window is now `size`; `false` if the session cannot take it yet.
+    pub(crate) fn resize(&self, size: Size) -> bool {
         let attach = self.attach;
-        self.asks.try_send(Ask::Resize { attach, window }).is_ok()
+        self.asks.try_send(Ask::Resize { attach, size }).is_ok()
     }
 
     /// The client was told the program's end: the session, its program exited, may end.
@@ -475,18 +437,20 @@ impl SessionClient {
     }
 }
 
-// --- the session task -------------------------------------------------------------------------
-
 /// A connection attaches to a session at a window size, with history above the redraw if it
 /// attaches afresh.
 struct Attach {
     size: Size,
     history: usize,
-    /// What a new session runs in place of the spec's command.
-    program: Option<Arc<[String]>>,
-    /// Where a new session starts, in place of the server user's home.
-    cwd: Option<PathBuf>,
+    launch: Launch,
     reply: oneshot::Sender<Attached>,
+}
+
+/// What a new session runs, and where: else the spec's command, in the server user's home.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    pub program: Option<Arc<[String]>>,
+    pub cwd: Option<PathBuf>,
 }
 
 /// How many attaches may wait for one session; past them, one is refused as at capacity.
@@ -514,26 +478,13 @@ fn start(
     let (asks, asks_rx) = mpsc::channel(ASK_QUEUE);
     let (status_tx, status) = watch::channel(Status::default());
     let asked = asks.clone();
-    let command = first
-        .program
-        .clone()
-        .unwrap_or_else(|| Arc::clone(&spec.command));
-    let (scrollback_bytes, ttl, home) = (spec.scrollback_bytes, spec.ttl, spec.home.clone());
-    let cwd = first.cwd.clone();
-    let marks = spec.marks.clone();
-    let reaper = reaper.clone();
+    let (spec, reaper, ttl) = (spec.clone(), reaper.clone(), spec.ttl);
+    let (launch, size) = (first.launch.clone(), first.size);
     let task = async move {
-        let size = first.size;
         // Forking and the program's exec block, and must hold up no other session.
-        let spawned = tokio::task::spawn_blocking(move || {
-            PtyHost::spawn(
-                &command,
-                (size, scrollback_bytes),
-                (&home, cwd.as_deref(), marks.as_deref()),
-                &reaper,
-            )
-        })
-        .await;
+        let spawned =
+            tokio::task::spawn_blocking(move || PtyHost::spawn(&spec, &launch, size, &reaper))
+                .await;
         let (host, pty_rx) = match spawned.map_err(anyhow::Error::from).and_then(|s| s) {
             Ok(spawned) => spawned,
             Err(e) => {
@@ -563,6 +514,8 @@ fn start(
             written: InputSeq::default(),
             screen_changes: 0,
             exited: None,
+            typed_at: None,
+            answered: false,
         };
         // A requester already gone drops its client, which the session sees as a detach.
         let (client, start) = session.client(first.size, first.history);
@@ -582,7 +535,7 @@ fn start(
 }
 
 /// Wait until `deadline`, or forever if there is none.
-async fn until(deadline: Option<Instant>) {
+pub(super) async fn until(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
@@ -620,6 +573,10 @@ struct Session {
     screen_changes: u64,
     /// The program's status, once it exited: a client attaching then is told it.
     exited: Option<u32>,
+    /// When typed input last reached the program.
+    typed_at: Option<Instant>,
+    /// Whether the program wrote after the input that reached it last, which the probe asks.
+    answered: bool,
 }
 
 impl Session {
@@ -629,11 +586,7 @@ impl Session {
         self.echo = EchoAck::default();
         self.written = InputSeq::default();
         let mut pending = PendingInput::default();
-        let window = Window { n: 0, size };
-        if self
-            .host
-            .apply(self.attaches, ToSession::Resize(window), &mut pending)
-        {
+        if self.host.resize(size, &mut pending) {
             self.reports.owe();
         }
         // A resize report owed the program.
@@ -660,9 +613,9 @@ impl Session {
         }
         shown.push(Shown::Title(emu.title().to_owned()));
         shown.push(Shown::Bell(emu.bell_count()));
-        if let Some(report) = self.reports.last() {
+        if let Some(activity) = self.reports.last() {
             shown.push(Shown::Report {
-                activity: report.activity,
+                activity,
                 input: self.written,
             });
         }
@@ -700,12 +653,10 @@ impl Session {
     }
 
     /// Publish how the session stands, if it changed.
-    fn publish_status(&self, exited: Option<u32>) {
+    fn publish_status(&self) {
         let status = Status {
-            state: self
-                .host
-                .shell_state(self.reports.last().map(|r| r.activity)),
-            exited,
+            state: self.host.shell_state(self.reports.last()),
+            exited: self.exited,
             screen: self.screen_changes,
         };
         self.status.send_if_modified(|now| {
@@ -717,7 +668,7 @@ impl Session {
 
     /// Read the PTY's modes and tell them if they changed.
     fn refresh_tty(&mut self) {
-        let tty = self.host.tty();
+        let tty = self.host.pty.tty_modes();
         if tty.is_some() && tty != self.tty {
             self.tty = tty;
             if let Some(tty) = tty {
@@ -726,40 +677,34 @@ impl Session {
         }
     }
 
-    /// Probe what the program is doing at `now`, for `why`, input last written to it at `typed`
-    /// and the screen changed since if `answered`; told if a report is due. Output waiting in
-    /// `pty_rx`, looked at after the program, is still to come: it is busy.
-    fn probe(
-        &mut self,
-        now: Instant,
-        why: Probe,
-        (typed, answered): (Option<Instant>, bool),
-        pty_rx: &mpsc::Receiver<Vec<u8>>,
-    ) {
-        let since_key = typed.map_or(Duration::MAX, |at| now.saturating_duration_since(at));
+    /// Probe what the program is doing at `now`, for `why`; told if a report is due. Output
+    /// waiting in `pty_rx`, looked at after the program, is still to come: it is busy.
+    fn probe(&mut self, now: Instant, why: Probe, pty_rx: &mpsc::Receiver<Vec<u8>>) {
+        let since_key = self
+            .typed_at
+            .map_or(Duration::MAX, |at| now.saturating_duration_since(at));
         let prompt = self.host.emu.live().commands().prompt;
-        let activity = self.host.pty.activity(since_key, answered, prompt);
+        let activity = self.host.pty.activity(since_key, self.answered, prompt);
         let activity = if pty_rx.is_empty() {
             activity
         } else {
             Activity::Busy
         };
-        if let Some(report) = self.reports.probed(now, why, activity) {
+        if let Some(activity) = self.reports.probed(now, why, activity) {
             self.show(Shown::Report {
-                activity: report.activity,
+                activity,
                 input: self.written,
             });
         }
+        self.publish_status();
     }
 
     /// Feed `chunk` to the emulator and the filter; what passes goes into `held`.
     fn output(&mut self, chunk: &[u8], held: &mut Vec<Shown>) {
         self.host.emu.process(chunk);
-        let mut pieces = Vec::new();
-        self.host
-            .filter
-            .feed(chunk, &mut |piece| pieces.push(piece));
-        held.extend(pieces.into_iter().filter_map(shown_of));
+        self.host.filter.feed(chunk, &mut |piece| {
+            held.extend(shown_of(piece));
+        });
     }
 
     /// Tell what was held, after the side channels the output changed: the output in pieces as
@@ -788,6 +733,12 @@ impl Session {
         }
     }
 
+    /// Since when no client is attached, `detached` squared with the clients: the last may have
+    /// left unseen by the `closed` arm.
+    fn detached(&self, detached: Option<Instant>) -> Option<Instant> {
+        detached.or_else(|| (self.presence.receiver_count() == 0).then(Instant::now))
+    }
+
     /// Run until the program exited and a client was told its end, the session is detached for
     /// the whole `ttl`, or the registry ends it.
     async fn run(
@@ -806,24 +757,22 @@ impl Session {
         // its terminal may run on, and a job it left in the background may hold its terminal open
         // after it exited.
         let mut ending = Ending::default();
-        let mut exited: Option<u32> = None;
         let mut tty_tick = tokio::time::interval(TTY_TICK);
         tty_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         // The next read of the PTY's modes after output, and the wait before the one after it.
         let mut settle: Option<(Instant, Duration)> = None;
-        // When typed input last reached the program.
-        let mut typed_at: Option<Instant> = None;
-        // Output waiting for the modes' read, and its bytes.
+        // Output waiting for the modes' read.
         let mut held: Vec<Shown> = Vec::new();
-        // Whether the program wrote after the input that reached it last, which the probe asks.
-        let mut answered = false;
         // While a client is attached, what the program is doing is probed for a change.
         let mut poll = tokio::time::interval(reports::POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         self.refresh_tty();
 
         loop {
-            if let Some(exit) = ending.ended(Instant::now()).filter(|_| exited.is_none()) {
+            if let Some(exit) = ending
+                .ended(Instant::now())
+                .filter(|_| self.exited.is_none())
+            {
                 // Whatever is held goes first, then the end. Input goes nowhere from now on.
                 self.release(&mut held);
                 let code = exit.code();
@@ -831,69 +780,71 @@ impl Session {
                 let left = self.host.pty.keys_left(ending.output_ended.is_some());
                 let read = (pending.is_empty() && left == Some(false)).then_some(self.written);
                 self.show(Shown::Exit { code, read });
-                exited = Some(code);
-                self.exited = exited;
+                self.exited = Some(code);
                 pending = PendingInput::default();
                 // Its output is read no more: a job left writing stops the reader, not wakes it.
                 pty_rx.close();
-                self.publish_status(exited);
+                self.publish_status();
             }
-            if exited.is_none() {
+            let running = self.exited.is_none();
+            if running {
                 if let Some(Some(seq)) = pending.flush(|bytes| self.host.pty.write(bytes)) {
-                    {
-                        let now = Instant::now();
-                        typed_at = Some(now);
-                        answered = false;
-                        self.reports.owe();
-                        self.echo.written(seq, now);
-                        self.written = seq;
-                    }
+                    let now = Instant::now();
+                    self.typed_at = Some(now);
+                    self.answered = false;
+                    self.reports.owe();
+                    self.echo.written(seq, now);
+                    self.written = seq;
                 }
             }
-            let reading = exited.is_none() && ending.output_ended.is_none();
-            let held_bytes: usize = held
-                .iter()
-                .map(|s| if let Shown::Out(b) = s { b.len() } else { 0 })
-                .sum();
+            let reading = running && ending.output_ended.is_none();
+            // Output it wrote before a report goes first: none read and waiting, and none held for
+            // the modes (it goes once they are read, as its settling has it).
+            let probing = running && held.is_empty() && (pty_rx.is_empty() || !reading);
 
             tokio::select! {
                 chunk = pty_rx.recv(), if reading => {
                     let now = Instant::now();
-                    if let Some(chunk) = chunk {
-                        ending.last_output = Some(now);
-                        let marks = self.host.emu.live().commands();
-                        self.output(&chunk, &mut held);
-                        for _ in 0..OUTPUT_CHUNKS_AT_ONCE {
-                            let Ok(more) = pty_rx.try_recv() else { break };
-                            self.output(&more, &mut held);
-                        }
-                        answered = true;
-                        self.screen_changes = self.screen_changes.wrapping_add(1);
-                        // Query answers go to the program, not the screen.
-                        pending.reply(&self.host.emu.take_host_replies());
-                        let echo = typed_at.is_some_and(|at| now.saturating_duration_since(at) < TTY_SETTLE);
-                        let marked = self.host.emu.live().commands() != marks;
-                        if echo || marked || held_bytes > HELD_MOST {
-                            // An echo, or a mark (a prompt's modes are read when it is drawn):
-                            // the modes now, then the output.
-                            self.refresh_tty();
-                            self.release(&mut held);
-                            settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
-                        } else if settle.is_none() {
-                            settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
-                        }
-                        // The shell marked a command's start or end: a report made after it.
-                        if marked {
-                            self.probe(now, Probe::Marked, (typed_at, answered), &pty_rx);
-                        }
-                        self.publish_status(exited);
-                    } else {
+                    let Some(chunk) = chunk else {
                         ending.output_ended = Some(now);
                         ending.exit = ending.exit.or_else(|| self.host.exit().map(|e| (e, now)));
+                        continue;
+                    };
+                    let held_bytes: usize = held
+                        .iter()
+                        .map(|s| if let Shown::Out(b) = s { b.len() } else { 0 })
+                        .sum();
+                    ending.last_output = Some(now);
+                    let marks = self.host.emu.live().commands();
+                    self.output(&chunk, &mut held);
+                    for _ in 0..OUTPUT_CHUNKS_AT_ONCE {
+                        let Ok(more) = pty_rx.try_recv() else { break };
+                        self.output(&more, &mut held);
+                    }
+                    self.answered = true;
+                    self.screen_changes = self.screen_changes.wrapping_add(1);
+                    // Query answers go to the program, not the screen.
+                    pending.reply(&self.host.emu.take_host_replies());
+                    let echo = self.typed_at.is_some_and(|at| now.saturating_duration_since(at) < TTY_SETTLE);
+                    let marked = self.host.emu.live().commands() != marks;
+                    if echo || marked || held_bytes > HELD_MOST {
+                        // An echo, or a mark (a prompt's modes are read when it is drawn): the
+                        // modes now, then the output.
+                        self.refresh_tty();
+                        self.release(&mut held);
+                        settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
+                    } else if settle.is_none() {
+                        settle = now.checked_add(TTY_SETTLE).map(|at| (at, TTY_SETTLE));
+                    }
+                    // The shell marked a command's start or end: a report made after it.
+                    if marked {
+                        self.probe(now, Probe::Marked, &pty_rx);
+                    } else {
+                        self.publish_status();
                     }
                 },
-                () = until(ending.deadline().map(|(at, _)| at)), if exited.is_none() => {}
-                () = until(settle.map(|(at, _)| at)), if exited.is_none() => {
+                () = until(ending.deadline().map(|(at, _)| at)), if running => {}
+                () = until(settle.map(|(at, _)| at)), if running => {
                     let wait = settle.map_or(TTY_TICK, |(_, wait)| wait.saturating_mul(2));
                     settle = Instant::now()
                         .checked_add(wait)
@@ -912,11 +863,9 @@ impl Session {
                 }
                 // The session holds a sender, so this never ends. Taken while the program cannot,
                 // too, and dropped: an old attachment's, or any once the program exited.
-                Some(Input { attach, input }) = input_rx.recv(), if pending.is_empty() || exited.is_some() => {
-                    if attach == self.attaches && exited.is_none() && self.host.apply(attach, input, &mut pending) {
-                        // Resized: a report follows.
-                        self.reports.owe();
-                        self.screen_changes = self.screen_changes.wrapping_add(1);
+                Some(Input { attach, input }) = input_rx.recv(), if pending.is_empty() || !running => {
+                    if attach == self.attaches && running {
+                        self.host.apply(input, &mut pending);
                     }
                 },
                 Some(ask) = asks_rx.recv() => match ask {
@@ -926,27 +875,23 @@ impl Session {
                         self.release(&mut held);
                         let _ = reply.send(self.start(self.history_since(seen)));
                     }
-                    Ask::Ended if exited.is_some() => break,
+                    Ask::Ended if !running => break,
                     Ask::Ended => {}
-                    Ask::Resize { attach, window } => {
-                        let input = ToSession::Resize(window);
-                        if attach == self.attaches && exited.is_none() && self.host.apply(attach, input, &mut pending) {
+                    Ask::Resize { attach, size } => {
+                        if attach == self.attaches && running && self.host.resize(size, &mut pending) {
                             self.reports.owe();
                             self.screen_changes = self.screen_changes.wrapping_add(1);
                         }
                     }
                     Ask::Describe(reply) => {
-                        // Squared with the clients as an attach squares it.
-                        if detached.is_none() && self.presence.receiver_count() == 0 {
-                            detached = Some(Instant::now());
-                        }
+                        detached = self.detached(detached);
                         let size = self.host.emu.live().size();
                         let _ = reply.send(Description {
                             detached,
                             size: Size::new(size.rows(), size.cols()),
                             title: self.host.emu.title().chars().take(MAX_TITLE).collect(),
-                            exited,
-                            state: self.host.shell_state(self.reports.last().map(|r| r.activity)),
+                            exited: self.exited,
+                            state: self.host.shell_state(self.reports.last()),
                         });
                     }
                     Ask::Text { last, reply } => {
@@ -961,20 +906,15 @@ impl Session {
                 },
                 msg = control.recv() => match msg {
                     Some(Attach { size, history, reply, .. }) => {
-                        // The one place the detach is squared with the clients: the last may have
-                        // left unseen by the arm below, and it is dated before this attach.
-                        if detached.is_none() && self.presence.receiver_count() == 0 {
-                            detached = Some(Instant::now());
-                        }
-                        let detached_for = detached.map(|since| since.elapsed());
+                        // Dated before this attach.
+                        let since = self.detached(detached);
                         self.release(&mut held);
                         let (client, start) = self.client(size, history);
                         // A connection already gone drops its client: the session stays detached
                         // since when it was, so an attach that never arrives does not renew its
                         // TTL.
-                        if reply.send(Ok((client, start, AttachKind::Reattached { detached_for }))).is_ok() {
-                            detached = None;
-                        }
+                        let taken = reply.send(Ok((client, start, AttachKind::Reattached))).is_ok();
+                        detached = if taken { None } else { since };
                     }
                     // The registry ended this session: revoked, or the server is shutting down.
                     None => break,
@@ -982,28 +922,24 @@ impl Session {
                 () = self.presence.closed(), if detached.is_none() => {
                     detached = Some(Instant::now());
                 }
-                () = tokio::time::sleep(INPUT_RETRY), if !pending.is_empty() && exited.is_none() => {}
+                () = tokio::time::sleep(INPUT_RETRY), if !pending.is_empty() && running => {}
                 // A program may turn echo off without writing anything (a password prompt printed
                 // first): the client hears of it within a tick.
-                _ = tty_tick.tick(), if exited.is_none() => {
+                _ = tty_tick.tick(), if running => {
                     let now = Instant::now();
                     ending.exit = ending.exit.or_else(|| self.host.exit().map(|e| (e, now)));
                     if detached.is_none() {
                         self.refresh_tty();
                     }
                 }
-                // What the program is doing: the report owed, and a change while a client sees it.
-                // Output it wrote before goes first: none read and waiting, and none held for the
-                // modes (it goes once they are read, as its settling has it). Until then the
-                // report stays owed.
-                () = until(self.reports.due(Instant::now())), if exited.is_none() && held.is_empty() && (pty_rx.is_empty() || !reading) => {
-                    self.probe(Instant::now(), Probe::Poll, (typed_at, answered), &pty_rx);
-                    self.publish_status(exited);
+                // The report owed; it stays owed until output written before it went.
+                () = until(self.reports.due(Instant::now())), if probing => {
+                    self.probe(Instant::now(), Probe::Poll, &pty_rx);
                 }
-                _ = poll.tick(), if exited.is_none() && self.presence.receiver_count() > 0 => {
-                    if held.is_empty() && (pty_rx.is_empty() || !reading) {
-                        self.probe(Instant::now(), Probe::Poll, (typed_at, answered), &pty_rx);
-                        self.publish_status(exited);
+                // A change, while a client sees it.
+                _ = poll.tick(), if running && self.presence.receiver_count() > 0 => {
+                    if probing {
+                        self.probe(Instant::now(), Probe::Poll, &pty_rx);
                     }
                 }
                 // Detached for the whole TTL.
@@ -1056,7 +992,6 @@ fn redrawn(piece: Piece) -> Vec<Shown> {
     out
 }
 
-/// A filter's piece as the wire carries it; a mark no terminal reads is dropped.
 /// The primary screen's top row: below the history, whichever screen is in use.
 fn top_row(screen: &fux_vt::Screen) -> Option<fux_vt::RowId> {
     let kept = screen
@@ -1066,14 +1001,13 @@ fn top_row(screen: &fux_vt::Screen) -> Option<fux_vt::RowId> {
     screen.main_rows().nth(kept).map(|row| row.id())
 }
 
+/// A filter's piece as the wire carries it; a mark no terminal reads is dropped.
 fn shown_of(piece: Piece) -> Option<Shown> {
     match piece {
         Piece::Out(bytes) => Some(Shown::Out(bytes)),
         Piece::Mark(mark) => MarkText::new(mark).map(Shown::Mark),
     }
 }
-
-// --- the registry -----------------------------------------------------------------------------
 
 /// What the registry is asked.
 enum Request {
@@ -1104,6 +1038,7 @@ pub struct Registry {
 }
 
 /// What the registry hosts, and the session TTL.
+#[derive(Clone)]
 pub struct SessionSpec {
     pub command: Arc<[String]>,
     pub scrollback_bytes: usize,
@@ -1174,9 +1109,9 @@ impl Registry {
         self.run
     }
 
-    /// What every session's program, and every command `koh exec` runs, is left to once closed.
-    pub fn reaper(&self) -> crate::pty::Reaper {
-        self.reaper.clone()
+    /// What every session's program, and every command and job, is left to once closed.
+    pub fn reaper(&self) -> &crate::pty::Reaper {
+        &self.reaper
     }
 
     /// Attach `peer` to the session `pick` names, at window `size`: its latest (or a new one if it
@@ -1188,7 +1123,7 @@ impl Registry {
         peer: EndpointId,
         pick: Pick,
         size: Size,
-        (program, cwd): (Option<Arc<[String]>>, Option<PathBuf>),
+        launch: Launch,
     ) -> Attached {
         let history = if matches!(pick, Pick::Resume(_)) {
             0
@@ -1200,8 +1135,7 @@ impl Registry {
             let attach = Attach {
                 size,
                 history,
-                program: program.clone(),
-                cwd: cwd.clone(),
+                launch: launch.clone(),
                 reply,
             };
             self.tx
@@ -1278,10 +1212,10 @@ impl Registry {
 
     /// Stop the registry and every session, and wait for them to end and their programs to be
     /// reaped, each killed once its grace is over.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(&self) {
         self.shutdown.cancel();
         self.tx.closed().await;
-        let reaper = self.reaper;
+        let reaper = self.reaper.clone();
         let _ = tokio::task::spawn_blocking(move || reaper.drain()).await;
     }
 }

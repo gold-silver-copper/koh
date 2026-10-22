@@ -17,10 +17,11 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use super::session::{Event, Input, SessionClient, Start, ToSession, Window};
+use super::session::{until, Event, Input, SessionClient, Start, ToSession};
 use crate::bounded::Bounded;
 use crate::log::Peer;
 use crate::proto::{encode_shown, ClientDecoder, ClientMsg, Close, ProtoError, Shown, HEARTBEAT};
+use crate::terminal::Size;
 use crate::transport_iroh::close;
 
 /// How many messages may wait for an epoch's stream beside its redraw: the bytes waiting are
@@ -95,13 +96,6 @@ impl Pace {
     }
 }
 
-impl Epoch {
-    /// Whether more may be queued now: within the budget, and the queue has room.
-    fn room(&self) -> bool {
-        self.pace.room() && self.queue.capacity() > 0
-    }
-}
-
 /// One epoch's stream, written by a task of its own.
 struct Epoch {
     n: u32,
@@ -139,6 +133,11 @@ impl Epoch {
             epoch.send(&shown);
         }
         epoch
+    }
+
+    /// Whether more may be queued now: within the budget, and the queue has room.
+    fn room(&self) -> bool {
+        self.pace.room() && self.queue.capacity() > 0
     }
 
     /// Queue `shown`; `false` if the stream is gone.
@@ -202,6 +201,17 @@ async fn write_epoch(
     let _ = done.send(delivered);
 }
 
+/// What the client asked beside input, for the loop to act on.
+#[derive(Default)]
+struct Asked {
+    /// The newest resize's number: one no newer is a copy (both streams carry it), or out of date.
+    resized: u32,
+    /// A window the session has yet to take.
+    window: Option<Size>,
+    /// A new epoch, redrawn: the client fell behind, or asked.
+    redraw: bool,
+}
+
 /// One of the client's streams as the server reads it.
 #[derive(Default)]
 struct FromClient {
@@ -236,20 +246,18 @@ pub(super) async fn serve(
     let mut streams: [Option<RecvStream>; 2] = [Some(control), None];
     let mut from: [FromClient; 2] = Default::default();
     let mut bufs = [vec![0u8; 16 * 1024], vec![0u8; 16 * 1024]];
-    // The newest resize taken: one no newer is a copy or out of date.
-    let mut resized = 0;
-    let mut window: Option<Window> = None;
+    let mut asked = Asked::default();
     let mut exited = false;
+    // When the client is taken not to have the program's end.
+    let mut undelivered = None;
     // The session was told the client has its end.
     let mut told = false;
-    // The client is owed a new epoch, redrawn: it fell behind, or asked.
-    let mut redraw = false;
     let how = loop {
         while let Some(&(_, top)) = tops.front().filter(|(at, _)| *at <= epoch.pace.read) {
             seen = Some(top);
             tops.pop_front();
         }
-        if std::mem::take(&mut redraw) && !exited {
+        if std::mem::take(&mut asked.redraw) && !exited {
             let Some(start) = client.redraw(seen).await else {
                 break "the session was ended (revoked, or the server is stopping)";
             };
@@ -261,9 +269,9 @@ pub(super) async fn serve(
                 tops.push_evicting((epoch.pace.written, top));
             }
         }
-        if let Some(w) = window.take() {
+        if let Some(size) = asked.window.take() {
             // Taken at the next pass if the session's asks are full.
-            window = (!client.resize(w)).then_some(w);
+            asked.window = (!client.resize(size)).then_some(size);
         }
         let waiting = from.iter().position(|f| f.waiting.is_some());
         let wants = [0, 1].map(|at| {
@@ -284,6 +292,7 @@ pub(super) async fn serve(
                         // whether the client had it.
                         let (queue, _) = mpsc::channel(1);
                         drop(std::mem::replace(&mut epoch.queue, queue));
+                        undelivered = Instant::now().checked_add(FINAL_WAIT.saturating_mul(4));
                     }
                     Ok(())
                 }
@@ -301,7 +310,7 @@ pub(super) async fn serve(
                 }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::debug!(missed, "the client fell behind: a new epoch, redrawn");
-                    redraw = true;
+                    asked.redraw = true;
                     Ok(())
                 }
                 // The session ended without an end to tell: revoked, or the server stopping.
@@ -323,16 +332,11 @@ pub(super) async fn serve(
                 conn.close(0u32.into(), b"");
                 break "the end went undelivered (session kept)";
             }
-            () = tokio::time::sleep(FINAL_WAIT.saturating_mul(4)), if exited => {
+            () = until(undelivered), if exited => {
                 conn.close(0u32.into(), b"");
                 break "the end went undelivered (session kept)";
             }
-            () = async {
-                match beat {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            }, if !exited && epoch.room() => {
+            () = until(beat), if !exited && epoch.room() => {
                 if !epoch.send(&Shown::Beat) {
                     break "client detached (session retained)";
                 }
@@ -346,7 +350,7 @@ pub(super) async fn serve(
                         }
                         // What the stream already brought behind it is taken now: no more may
                         // come to wake the read.
-                        take(f, &mut epoch, (&mut resized, &mut window, &mut redraw), rtt)
+                        take(f, &mut epoch, &mut asked, rtt)
                     }
                     None => Ok(()),
                 },
@@ -371,7 +375,7 @@ pub(super) async fn serve(
                     match from.get_mut(at) {
                         Some(f) => {
                             f.decoder.push(bytes);
-                            take(f, &mut epoch, (&mut resized, &mut window, &mut redraw), rtt)
+                            take(f, &mut epoch, &mut asked, rtt)
                         }
                         None => Ok(()),
                     }
@@ -400,12 +404,12 @@ pub(super) async fn serve(
     info!(session = %client.session(), "{how}");
 }
 
-/// Take the messages `from` decoded: progress for the epoch's pace, a window, and input for the
-/// session, which waits in `from` once one does.
+/// Take the messages `from` decoded: progress for the epoch's pace, what the client asked, and
+/// input for the session, which waits in `from` once one does.
 fn take(
     from: &mut FromClient,
     epoch: &mut Epoch,
-    (resized, window, redraw): (&mut u32, &mut Option<Window>, &mut bool),
+    asked: &mut Asked,
     rtt: Duration,
 ) -> Result<(), ProtoError> {
     while from.waiting.is_none() {
@@ -419,15 +423,12 @@ fn take(
                 }
             }
             ClientMsg::Resize { n, size } => {
-                // Both streams carry it: the first copy counts.
-                if n > *resized {
-                    *resized = n;
-                    let size = crate::terminal::clamp_dims(size);
-                    *window = Some(Window { n, size });
-                    from.waiting = Some(ToSession::Resize(Window { n, size }));
+                if n > asked.resized {
+                    asked.resized = n;
+                    asked.window = Some(crate::terminal::clamp_dims(size));
                 }
             }
-            ClientMsg::Redraw => *redraw = true,
+            ClientMsg::Redraw => asked.redraw = true,
             ClientMsg::Keys { seq, events } => {
                 from.waiting = Some(ToSession::Events { seq, events });
             }

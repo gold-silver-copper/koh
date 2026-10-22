@@ -7,9 +7,9 @@ use std::time::Duration;
 use iroh::endpoint::Connection;
 use iroh::EndpointId;
 
-use super::jobs::Jobs;
+use super::cli::Host;
 use super::place::{Place, Resolved};
-use super::session::{Registry, Status};
+use super::session::Status;
 use crate::request::{Answer, On, Problem, ProblemKind, Until, Wait, Waited};
 use crate::terminal::Activity;
 
@@ -21,22 +21,17 @@ pub(super) async fn serve(
     conn: &Connection,
     peer: EndpointId,
     wait: &Wait,
-    (registry, jobs): (&Registry, &Jobs),
+    host: &Host,
     place: &Place,
 ) {
     let waited = tokio::select! {
-        waited = waited(peer, wait, (registry, jobs), place) => waited,
+        waited = waited(peer, wait, host, place) => waited,
         _ = conn.closed() => return,
     };
     super::answer(conn, &waited).await;
 }
 
-async fn waited(
-    peer: EndpointId,
-    wait: &Wait,
-    (registry, jobs): (&Registry, &Jobs),
-    place: &Place,
-) -> Answer<Waited> {
+async fn waited(peer: EndpointId, wait: &Wait, host: &Host, place: &Place) -> Answer<Waited> {
     let file = match &wait.until {
         Until::File(path) => Some(place.resolve(path)?),
         Until::End | Until::Text(_) | Until::Reading => None,
@@ -57,14 +52,19 @@ async fn waited(
             Ok(Waited::File)
         }
         Some(On::Job(name)) => {
-            let job = jobs
+            let job = host
+                .jobs
                 .get(peer, name)
                 .ok_or_else(|| Problem::new(ProblemKind::NoSuchJob, name))?;
             let mut status = job.watch();
+            // Where the text is looked for from: past what was searched before.
+            let mut from = 0;
             loop {
                 let now = *status.borrow_and_update();
                 match &wait.until {
-                    Until::Text(text) if job.found(text.as_str(), 0) => return Ok(Waited::Text),
+                    Until::Text(text) if job.find(text.as_str(), &mut from) => {
+                        return Ok(Waited::Text)
+                    }
                     Until::File(_) if file.as_ref().is_some_and(there) => return Ok(Waited::File),
                     Until::End | Until::Text(_) | Until::File(_) | Until::Reading => {}
                 }
@@ -76,7 +76,8 @@ async fn waited(
             }
         }
         Some(On::Session(session)) => {
-            let found = registry
+            let found = host
+                .registry
                 .find(peer, *session)
                 .await
                 .ok_or_else(|| Problem::new(ProblemKind::NoSuchSession, session))?;

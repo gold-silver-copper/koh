@@ -9,7 +9,7 @@ use std::io;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
@@ -19,6 +19,8 @@ use fuxix::poll::{Events, PollFd};
 use fuxix::process::{Pid, Signal};
 use fuxix::Errno;
 use tokio::sync::mpsc;
+
+use crate::terminal::Size;
 
 /// Size of each output chunk read from the PTY master.
 const READ_CHUNK: usize = 8192;
@@ -31,6 +33,9 @@ const WRITE_BUDGET: usize = 1024 * 1024;
 
 /// How long a hung-up program has to exit, saving its history, before it is killed.
 const HANGUP_GRACE: Duration = Duration::from_secs(1);
+
+/// The terminal a PTY's program is told it is on: what the session's emulator answers as.
+const TERM: &str = "xterm-256color";
 
 /// A write the PTY did not take; its allocation stays with the caller for a retry.
 #[derive(Debug, thiserror::Error)]
@@ -90,19 +95,14 @@ impl Exit {
     }
 }
 
-/// The argv for `command`, taken verbatim (no splitting, so a path with a space works); empty means
-/// the shell `fallback` names.
-fn build_command(command: &[String], fallback: impl FnOnce() -> String) -> Vec<String> {
+/// The argv a session runs for `command`: it, verbatim (no splitting, so a path with a space
+/// works), or `$SHELL` (else the platform's shell) if empty.
+pub fn session_argv(command: &[String]) -> Vec<String> {
     if command.is_empty() {
-        vec![fallback()]
+        vec![resolve_shell(std::env::var_os("SHELL"))]
     } else {
         command.to_vec()
     }
-}
-
-/// The argv a session runs for `command`: it, or `$SHELL` (else the platform's shell) if empty.
-pub fn session_argv(command: &[String]) -> Vec<String> {
-    build_command(command, || resolve_shell(std::env::var_os("SHELL")))
 }
 
 /// Remove each `KOH_*` variable of the `inherited` from `cmd`: they configure koh, not the hosted
@@ -133,23 +133,6 @@ fn resolve_shell(shell_env: Option<std::ffi::OsString>) -> String {
         || PLATFORM_SHELL.to_owned(),
         |sh| sh.to_string_lossy().into_owned(),
     )
-}
-
-/// What failed in a PTY: allocation, the spawn, the pump threads, or a resize.
-#[derive(Debug, thiserror::Error)]
-pub enum PtyError {
-    /// Allocating the pseudo-terminal pair failed.
-    #[error("opening pty: {0}")]
-    OpenPty(#[source] io::Error),
-    /// Starting the program on the slave side failed.
-    #[error("spawning shell: {0}")]
-    Spawn(#[source] io::Error),
-    /// Cloning the master or starting a pump thread failed.
-    #[error("starting pty reader: {0}")]
-    Reader(#[from] io::Error),
-    /// Propagating a window-size change to the kernel (`TIOCSWINSZ`) failed.
-    #[error("resizing pty: {0}")]
-    Resize(#[source] io::Error),
 }
 
 /// The home a session's program gets: the user's, or for tests one of their own
@@ -261,10 +244,9 @@ fn write_while_running(fd: &OwnedFd, bytes: &[u8], stopping: &AtomicBool) -> boo
     true
 }
 
-/// A program koh started, until it is reaped: owning it is the right to signal its pid, which is
-/// no longer its own once reaped.
-pub(crate) struct Running {
-    child: std::process::Child,
+/// A program koh started, until it is reaped.
+struct Running {
+    child: Child,
     pid: Pid,
     whom: Whom,
 }
@@ -280,17 +262,6 @@ enum Whom {
 }
 
 impl Running {
-    /// `child`, which leads a session of its own (`fuxix::process::lead_session`) and has no
-    /// terminal: a hang-up reaches its whole group. `None` if it has no pid to signal.
-    pub(crate) fn group(child: std::process::Child) -> Option<Self> {
-        let pid = Pid::of(&child)?;
-        Some(Self {
-            child,
-            pid,
-            whom: Whom::Group,
-        })
-    }
-
     fn signal(&self, signal: Signal) -> io::Result<()> {
         match self.whom {
             Whom::Leader => fuxix::process::kill(self.pid, signal),
@@ -299,20 +270,8 @@ impl Running {
         .map_err(io::Error::from)
     }
 
-    /// Its pid: for a command with no terminal, its process group's and session's too.
-    pub(crate) const fn pid(&self) -> Pid {
-        self.pid
-    }
-
-    /// Send `signal` to what it reaches: its group, for a command with no terminal.
-    pub(crate) fn kill(&self, signal: Signal) {
-        if let Err(error) = self.signal(signal) {
-            tracing::debug!(%error, "signalling a command failed");
-        }
-    }
-
     /// How it ended, if it has; reaped then.
-    pub(crate) fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+    fn try_wait(&mut self) -> io::Result<Option<Exit>> {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
@@ -322,18 +281,103 @@ impl Running {
         );
         Ok(Some(Exit::Status(code)))
     }
+}
 
-    /// Hang up, as a terminal closing does, and leave it to `reaper`, which kills it if it
-    /// outlives [`HANGUP_GRACE`] (a group, whatever of it is left then).
-    pub(crate) fn hang_up(self, reaper: &Reaper) {
-        let _ = self.signal(Signal::Hup);
+/// A program koh started, hung up when dropped unless it was reaped: owning it is the right to
+/// signal its pid, which is no longer its own once reaped. A hung-up one is left to the reaper,
+/// which kills it (a group, whatever of it is left) if it outlives [`HANGUP_GRACE`].
+pub(crate) struct Program {
+    running: Option<Running>,
+    reaper: Reaper,
+}
+
+impl Program {
+    /// `child`, which leads a session of its own (`fuxix::process::lead_session`) and has no
+    /// terminal: a signal reaches its whole group. `None` if it has no pid to signal.
+    pub(crate) fn group(child: Child, reaper: &Reaper) -> Option<Self> {
+        let pid = Pid::of(&child)?;
+        Some(Self {
+            running: Some(Running {
+                child,
+                pid,
+                whom: Whom::Group,
+            }),
+            reaper: reaper.clone(),
+        })
+    }
+
+    /// Its pid, unless it was reaped: for a group, its group's and session's too.
+    pub(crate) fn pid(&self) -> Option<Pid> {
+        self.running.as_ref().map(|running| running.pid)
+    }
+
+    /// Send `signal` to what it reaches, unless it was reaped.
+    pub(crate) fn signal(&self, signal: Signal) {
+        if let Some(Err(error)) = self.running.as_ref().map(|running| running.signal(signal)) {
+            tracing::debug!(%error, "signalling a program failed");
+        }
+    }
+
+    /// How it ended, if it has; it is then reaped, and never signalled again.
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<Exit>> {
+        let Some(running) = &mut self.running else {
+            return Ok(None);
+        };
+        let exit = running.try_wait()?;
+        if exit.is_some() {
+            self.running = None;
+        }
+        Ok(exit)
+    }
+
+    /// Resolves once it has exited, leaving it to [`Self::try_wait`] to reap: until then its pid
+    /// stays its own, so a signal meanwhile cannot reach another process.
+    pub(crate) fn exited(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let pid = self.pid();
+        async move {
+            if let Some(pid) = pid {
+                let _ = tokio::task::spawn_blocking(move || wait_exited(pid)).await;
+            }
+        }
+    }
+}
+
+impl Drop for Program {
+    fn drop(&mut self) {
+        let Some(running) = self.running.take() else {
+            return;
+        };
+        let _ = running.signal(Signal::Hup);
         let kill_at = std::time::Instant::now().checked_add(HANGUP_GRACE);
-        if let Err(error) = reaper.0.send(Reap::Child(Stopping {
-            running: self,
-            kill_at,
-        })) {
+        if let Err(error) = self
+            .reaper
+            .0
+            .send(Reap::Child(Stopping { running, kill_at }))
+        {
             tracing::error!(%error, "PTY child reaper stopped unexpectedly");
         }
+    }
+}
+
+/// Block until `pid`, a child, has exited or cannot be waited for, without reaping it.
+fn wait_exited(pid: Pid) {
+    use rustix::process::{waitid, WaitId, WaitIdOptions};
+    let Some(id) = rustix::process::Pid::from_raw(pid.as_raw()) else {
+        return;
+    };
+    loop {
+        let waited = waitid(
+            WaitId::Pid(id),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        );
+        if matches!(waited, Err(rustix::io::Errno::INTR)) {
+            continue;
+        }
+        // macOS reports a stop too: only an exit, or an error, ends the wait.
+        if waited.is_err() || !matches!(fuxix::process::ended(pid), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -447,34 +491,32 @@ impl Drop for Pumps {
 /// A program running on a PTY, ended by [`Pty::close`]. Rust cannot make a value be consumed, so
 /// a `Pty` dropped unclosed (by a panic) still stops its pumps and hangs its program up.
 pub struct Pty {
+    /// First, so the program is hung up before the rest goes.
+    program: Program,
     master: fuxix::pty::Master,
     /// Keystrokes and query replies share this queue, so they stay in order.
     writer_tx: Sender<InputChunk>,
     write_budget: Arc<AtomicUsize>,
     /// Set while the reader holds output it read from the master and has yet to send on.
     reading: Arc<AtomicBool>,
-    /// The program, until reaped.
-    running: Option<Running>,
-    reaper: Reaper,
     pumps: Pumps,
 }
 
 impl Pty {
-    /// Allocate a `rows`×`cols` PTY and start `command` (argv, verbatim; empty for `$SHELL`)
-    /// on it in `home` (in `cwd`, if given), with `TERM` and `env` set. Returns it and a receiver
-    /// of its output, which ends when the program closes the PTY.
+    /// Allocate a PTY of `size` and start `argv` on it, verbatim, in `home` (in `cwd`, if given),
+    /// with `TERM` and `env` set. Returns it and a receiver of its output, which ends when the
+    /// program closes the PTY.
     pub fn spawn(
-        rows: u16,
-        cols: u16,
-        command: &[String],
+        size: Size,
+        argv: &[String],
         env: &[(String, String)],
-        (term, home, cwd): (&str, &Home, Option<&Path>),
+        home: &Home,
+        cwd: Option<&Path>,
         reaper: &Reaper,
-    ) -> Result<(Self, mpsc::Receiver<Vec<u8>>), PtyError> {
-        let size = pty_size(rows, cols).map_err(PtyError::OpenPty)?;
+    ) -> io::Result<(Self, mpsc::Receiver<Vec<u8>>)> {
         // fuxix serializes the allocation itself and works around macOS's PTY races.
-        let (master, slave) =
-            fuxix::pty::open(size).map_err(|e| PtyError::OpenPty(io::Error::other(e)))?;
+        let (master, slave) = fuxix::pty::open(pty_size(size)?)
+            .map_err(|e| io::Error::other(format!("opening a PTY: {e}")))?;
 
         // Read the master before the child exists: macOS discards what a short-lived child wrote
         // if it exits before anything reads (about 3 spawns in 1000 under load).
@@ -561,10 +603,9 @@ impl Pty {
                 })?
         });
 
-        let argv = session_argv(command);
         let (child, pid) = slave
-            .spawn(&argv, |cmd| {
-                cmd.env("TERM", term);
+            .spawn(argv, |cmd| {
+                cmd.env("TERM", TERM);
                 scrub_koh_env(cmd, std::env::vars_os().map(|(key, _)| key));
                 home.apply(cmd);
                 if let Some(cwd) = cwd {
@@ -574,23 +615,23 @@ impl Pty {
             })
             .map_err(|error| {
                 let program = argv.first().map_or("", String::as_str);
-                PtyError::Spawn(io::Error::new(
-                    error.kind(),
-                    format!("starting {program}: {error}"),
-                ))
+                io::Error::new(error.kind(), format!("starting {program}: {error}"))
             })?;
+        let program = Program {
+            running: Some(Running {
+                child,
+                pid,
+                whom: Whom::Leader,
+            }),
+            reaper: reaper.clone(),
+        };
         Ok((
             Self {
+                program,
                 master,
                 writer_tx,
                 write_budget,
                 reading,
-                running: Some(Running {
-                    child,
-                    pid,
-                    whom: Whom::Leader,
-                }),
-                reaper: reaper.clone(),
                 pumps,
             },
             rx,
@@ -647,7 +688,7 @@ impl Pty {
         answered: bool,
         prompt: bool,
     ) -> crate::terminal::Activity {
-        let Some(leader) = self.running.as_ref().map(|running| running.pid) else {
+        let Some(leader) = self.program.pid() else {
             return crate::terminal::Activity::Unknown;
         };
         // What it does with keys it has yet to read, or with output no one has read yet, is still
@@ -716,37 +757,23 @@ impl Pty {
         unread
     }
 
-    /// Propagate a window-size change to `rows`×`cols`; the kernel raises `SIGWINCH` in the child.
-    pub fn resize(&self, rows: u16, cols: u16) -> Result<(), PtyError> {
-        let size = pty_size(rows, cols).map_err(PtyError::Resize)?;
-        fuxix::terminal::set_window_size(&self.master, size).map_err(|e| PtyError::Resize(e.into()))
+    /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.
+    pub fn resize(&self, size: Size) -> io::Result<()> {
+        Ok(fuxix::terminal::set_window_size(
+            &self.master,
+            pty_size(size)?,
+        )?)
     }
 
     /// How the program ended, if it has; it is then reaped, and never signalled again.
     pub fn try_wait(&mut self) -> io::Result<Option<Exit>> {
-        let Some(running) = &mut self.running else {
-            return Ok(None);
-        };
-        let exit = running.try_wait()?;
-        if exit.is_some() {
-            self.running = None;
-        }
-        Ok(exit)
+        self.program.try_wait()
     }
 }
 
-impl Drop for Pty {
-    fn drop(&mut self) {
-        // Closed or not; the pumps stop as `pumps` drops.
-        if let Some(running) = self.running.take() {
-            running.hang_up(&self.reaper);
-        }
-    }
-}
-
-/// `rows`×`cols`, which a PTY must have nonzero.
-fn pty_size(rows: u16, cols: u16) -> io::Result<fuxix::terminal::Size> {
-    fuxix::terminal::Size::new(rows, cols)
+/// `size`, which a PTY must have nonzero.
+fn pty_size(size: Size) -> io::Result<fuxix::terminal::Size> {
+    fuxix::terminal::Size::new(size.rows, size.cols)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "PTY size must be nonzero"))
 }
 
@@ -757,11 +784,7 @@ mod tests {
     #[test]
     fn the_command_is_argv_verbatim_or_else_the_shell() {
         let argv = ["zellij", "attach", "-c", "my session"].map(String::from);
-        assert_eq!(build_command(&argv, || "unused".to_owned()), argv);
-        assert_eq!(
-            build_command(&[], || "/custom/shell".to_owned()),
-            ["/custom/shell"]
-        );
+        assert_eq!(session_argv(&argv), argv);
         // An empty `$SHELL` is as if unset: the platform's shell, which on Android is not /bin/sh.
         let fish = resolve_shell(Some(OsString::from("/usr/bin/fish")));
         assert_eq!(fish, "/usr/bin/fish");

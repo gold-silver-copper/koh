@@ -82,6 +82,11 @@ jobs:
             fi
           done
           echo "layering edges OK"
+      - name: a bash koh marks, on macOS (its own is 3.2, which koh leaves unmarked)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: test
         run: cargo test --locked
       - name: test with nvim (ignored elsewhere, as it needs nvim 0.10 or later)

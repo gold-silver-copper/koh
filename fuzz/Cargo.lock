@@ -1570,6 +1570,7 @@ dependencies = [
  "fux-vt",
  "koh",
  "libfuzzer-sys",
+ "postcard",
 ]
 
 [[package]]

@@ -6,11 +6,11 @@
 //! Each must only return errors on bad input, never panic, and never allocate past its bound.
 
 use koh::request::{
-    decode, Answer, Attached, ExitStatus, JobList, KeyProof, LogMsg, Request, SessionList, Started,
-    Waited,
+    Answer, Attached, ExitStatus, JobList, KeyProof, LogMsg, Request, SessionList, Started, Waited,
 };
 use koh::sync::{Item, Reply};
 use libfuzzer_sys::fuzz_target;
+use postcard::from_bytes as decode;
 
 fuzz_target!(|data: &[u8]| {
     let _ = decode::<KeyProof>(data);

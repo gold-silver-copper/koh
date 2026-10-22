@@ -13,6 +13,7 @@ use iroh::endpoint::{
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey};
 
 use crate::proto::Close;
+use crate::request::{KeyProof, MAX_PROOF};
 
 /// How long a connection lives with nothing heard.
 ///
@@ -58,7 +59,7 @@ fn koh_transport_config(accept: bool, idle: Idle) -> QuicTransportConfig {
 }
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/15";
+pub const PROTOCOL: &str = "koh/16";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.
@@ -75,6 +76,42 @@ pub fn closed_because(conn: &Connection) -> Option<Close> {
         return None;
     };
     Close::from_code(close.error_code.into_inner())
+}
+
+/// What a client's key signs: this, then what the connection's TLS session exports under it.
+const PROOF_LABEL: &[u8] = b"koh client key proof";
+
+/// What a key proof signs for `conn`: [`PROOF_LABEL`], then 32 bytes only this connection's TLS
+/// session yields, the same at both ends.
+fn proof_message(conn: &Connection) -> anyhow::Result<Vec<u8>> {
+    let mut exported = [0u8; 32];
+    conn.export_keying_material(&mut exported, PROOF_LABEL, &[])
+        .map_err(|e| anyhow::anyhow!("exporting the connection's keying material: {e:?}"))?;
+    Ok([PROOF_LABEL, &exported].concat())
+}
+
+/// `key`'s proof for `conn`, framed: what a client writes first on its first stream
+/// ([`crate::request::KeyProof`]).
+pub fn prove(conn: &Connection, key: &SecretKey) -> anyhow::Result<Vec<u8>> {
+    let proof = KeyProof {
+        key: key.public(),
+        signature: key.sign(&proof_message(conn)?),
+    };
+    Ok(crate::request::encode(&proof, MAX_PROOF)?)
+}
+
+/// The key `conn`'s client proves, read from `recv`: an error for a proof that is malformed,
+/// past its bound, or not this connection's.
+pub async fn proven(
+    conn: &Connection,
+    recv: &mut iroh::endpoint::RecvStream,
+) -> anyhow::Result<EndpointId> {
+    let proof: KeyProof = crate::request::decode(&read_framed(recv, MAX_PROOF).await?)?;
+    proof
+        .key
+        .verify(&proof_message(conn)?, &proof.signature)
+        .map_err(|e| anyhow::anyhow!("a key proof that is not this connection's: {e}"))?;
+    Ok(proof.key)
 }
 
 /// Read one length-prefixed message from `recv` ([`crate::request::encode`]'s framing), its

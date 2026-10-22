@@ -1,13 +1,14 @@
 //! What a connection is for: the opening request the client makes on its first stream, and the
 //! server's answers to it.
 //!
-//! After the handshake and the allowlist, the client opens a uni stream and writes one
-//! [`Request`] on it, a 4-byte big-endian length then its postcard encoding; the server attaches
-//! or starts nothing before it. What the stream carries after the request is the request's: a
-//! shell's input ([`crate::proto::ClientMsg`]), a command's stdin, or a copy's items
-//! ([`crate::sync`]). The server answers on uni streams of its own: a shell's first one carries
-//! [`Attached`] (then what the program shows follows, [`crate::proto`]), a command's a tag
-//! ([`ExecStream`]) then its output or its [`ExitStatus`], the others an [`Answer`].
+//! After the handshake the client opens a uni stream and writes on it its [`KeyProof`], then one
+//! [`Request`]: each a 4-byte big-endian length then its postcard encoding. The server reads the
+//! request only once the allowlist has the key proved, and attaches or starts nothing before it.
+//! What the stream carries after the request is the request's: a shell's input
+//! ([`crate::proto::ClientMsg`]), a command's stdin, or a copy's items ([`crate::sync`]). The
+//! server answers on uni streams of its own: a shell's first one carries [`Attached`] (then what
+//! the program shows follows, [`crate::proto`]), a command's a tag ([`ExecStream`]) then its output
+//! or its [`ExitStatus`], the others an [`Answer`].
 //!
 //! Everything here is pure: each type refuses, as it is decoded, what is past its bound or names
 //! nothing (a path holding a NUL byte, an empty command), so a value holds only what may be acted
@@ -31,6 +32,9 @@ pub const MAX_OUTPUT: usize = 8 << 20;
 
 /// Most bytes of a path named on the other end: Linux's `PATH_MAX`.
 pub const MAX_PATH: usize = 4096;
+
+/// Most bytes of a [`KeyProof`]: a key and a signature, with room to spare.
+pub const MAX_PROOF: usize = 128;
 
 /// Most bytes of a command: its words together, or its shell line.
 pub const MAX_COMMAND: usize = 256 * 1024;
@@ -105,6 +109,19 @@ pub enum Pick {
     /// That one of that run: the client's redial to the session it was on. A server run since
     /// restarted has no such session, whatever its numbers.
     Resume(Resume),
+}
+
+/// The client's key, proven: what a connection opens with, before its [`Request`].
+///
+/// A client dials from a key made for its process alone, so two of its processes at once never
+/// share an endpoint id: iroh routes by that id, and two endpoints sharing one take each other's
+/// paths (the relay keeps only the newest). The key the server allows is proven here instead, by
+/// its signature over what this one connection's TLS session exports
+/// ([`crate::transport_iroh::prove`]), which no other connection can reuse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyProof {
+    pub key: iroh::PublicKey,
+    pub signature: iroh::Signature,
 }
 
 /// What the connection is for.

@@ -1,4 +1,4 @@
-//! The koh/15 shell protocol: what a session's connection carries after its opening request
+//! The koh/16 shell protocol: what a session's connection carries after its opening request
 //! ([`crate::request`]).
 //!
 //! The client writes [`ClientMsg`]s on two uni streams, its first (the request's) for control

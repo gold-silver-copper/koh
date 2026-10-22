@@ -397,7 +397,7 @@ pub(super) async fn serve(
     if exited && !told && crate::transport_iroh::closed_because(conn) == Some(Close::SessionEnded) {
         client.ended().await;
     }
-    info!(peer = %conn.remote_id(), "{how}");
+    info!(session = %client.session(), "{how}");
 }
 
 /// Take the messages `from` decoded: progress for the epoch's pace, a window, and input for the

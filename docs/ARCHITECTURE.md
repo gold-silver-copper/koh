@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/15 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/16 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -81,16 +81,23 @@ testing/agentbench/  coding agents driving koh on task sets, scored
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/15)
+## The protocol (koh/16)
 
-The ALPN `koh/15` is the version check: a peer on another version fails the TLS handshake with a
-clear error. After the handshake the server checks the allowlist and takes a connection permit;
-then the client says what the connection is for, as the first message on its first uni stream
-(`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
+The ALPN `koh/16` is the version check: a peer on another version fails the TLS handshake with a
+clear error. A client dials from a key made for its process alone: iroh routes by endpoint id, and
+two endpoints sharing one take each other's place at a relay and each other's paths, so every `koh`
+the client runs at once would knock the others' links down. Its own key, the one the allowlist
+names, it proves instead, as the first message on its first uni stream: a `KeyProof`, the key and
+its signature over a label and 32 bytes exported from this connection's TLS session, which nothing
+but this connection can reuse (`src/transport_iroh/mod.rs`, `prove` and `proven`; at most 128
+bytes). The server reads it within the handshake's deadline, in the handshake's place, then checks
+the allowlist for the proven key and takes a connection permit; a peer that proves no allowed key is
+closed as not allowed. Then the client says what the connection is for, as the next message on that
+stream (`src/request.rs`), a 4-byte length and its postcard encoding, at most 1 MiB, and the server
 attaches or starts nothing before it. A client that makes no request within 10 s (the handshake's
-deadline) is closed as breaking the protocol, and so is one whose request does not decode: a
-path holding a NUL, a command over 256 KiB or 4096 words, no sources or more than 1024 are refused
-as they are decoded. The request is one of:
+deadline) is closed as breaking the protocol, and so is one whose request does not decode: a path
+holding a NUL, a command over 256 KiB or 4096 words, no sources or more than 1024 are refused as
+they are decoded. The request is one of:
 
 - `Shell { pick, size, program, cwd }`: a session, at the client's window size; with a `program`
   (`koh connect SERVER -- PROG ARG...`), a new one running it in place of the shell; with a

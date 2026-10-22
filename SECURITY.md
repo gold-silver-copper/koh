@@ -25,8 +25,9 @@ credit reporters who want it.
 - On-disk identity-key handling and local-attacker hardening (`src/identity.rs`,
   `src/identity/key_file.rs`): the key file is the raw 32-byte secret, protected by its
   permissions (0600) like an SSH host key.
-- The connection accept gauntlet / node-id allowlist authorization
-  (`src/server/cli.rs`), and the session registry that attaches only allowed peers
+- The connection accept gauntlet / client-key allowlist authorization (`src/server/cli.rs`),
+  and the proof of a client's key on each connection (`src/transport_iroh/mod.rs`, `prove` and
+  `proven`), and the session registry that attaches only allowed peers
   (`src/server/session/sessions.rs`).
 - The untrusted wire decoders (`src/proto.rs`, `src/request.rs`, `src/sync/`) and the connection
   cores (`src/server/attach.rs`, `src/client/mod.rs`).
@@ -163,6 +164,17 @@ rewrite changed or brought.
 | N-12 | A peer's job, session or wait reaching another peer's | Each is found by peer and name or number only: `tests/commands.rs::connect_picks_a_session_by_number_or_a_new_one_and_sessions_lists_them`, `tests/sessions.rs::attach_creates_then_reattaches_the_same_peer` |
 | N-13 | A client that never reads a session's output makes the server keep it | The session keeps 128 events for its slowest client, then sends it a redraw; the connection writes no more than its budget past what the client read: `src/server/attach.rs::the_budget_follows_what_the_client_reads_in_a_round_trip` |
 | N-14 | A sync's bookkeeping grows with the tree | At most 4 million names seen and a million renames or removals deferred (`MAX_SEEN`, `MAX_DEFERRED` in `src/sync/receive.rs`), 64 files unanswered (`WINDOW`), 128 directories deep (`MAX_DEPTH`): `src/sync/tests.rs::a_copy_cut_anywhere_leaves_whole_files_and_the_next_one_resumes` |
+
+**Audit of the client key proven on each connection (P-).** A client dials from a node-id made for
+its process alone and proves its key on the connection (#68); every check that took the
+connection's node-id for the client's key was followed to where it reads the proven key now.
+
+| ID | Finding | Guarded by |
+|----|---------|------------|
+| P-1 | A client's processes all dialed as its one node-id, so at a relay the newest took the others' place and at the server the paths found for one were used for the others: their links dropped | Each process dials from a key of its own: `tests/commands.rs::quiet_commands_of_one_key_at_once_through_a_relay_all_keep_their_links` |
+| P-2 | A peer gets in without the allowed key: no proof, a malformed one, an allowed key's proof replayed from another connection, or a key not on the list | The proof is a signature over 32 bytes only that connection's TLS session yields, checked before the request is read; each is closed as not allowed alike: `tests/net/hostile_peer.rs::a_client_proving_no_allowed_key_is_refused` |
+| P-3 | Since any node-id now completes the handshake, an unproven peer could hold the server's room | The proof is read in the handshake's place and within its 10 s, before any connection permit, at most 128 bytes: `tests/sessions.rs::an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes` |
+| P-4 | The scopes, revocation, the audit log, and whose sessions and jobs went by the connection's node-id | All go by the proven key: `tests/names_cli.rs::clients_added_and_removed_take_effect_on_a_running_server`, `tests/commands.rs::a_scoped_key_copies_only_in_its_directory_and_runs_no_shell`, `tests/commands.rs::connect_picks_a_session_by_number_or_a_new_one_and_sessions_lists_them` |
 
 ## Please do not
 

@@ -366,8 +366,8 @@ fn clients_added_and_removed_take_effect_on_a_running_server() {
     let admitted = || {
         let (at, secret) = (at.clone(), secret.clone());
         async move {
-            let endpoint = bind_endpoint_local(secret, false).await?;
-            let admitted = koh::client::IrohConnector::new(endpoint.clone(), at)
+            let endpoint = bind_endpoint_local(secret.clone(), false).await?;
+            let admitted = koh::client::IrohConnector::new(endpoint.clone(), at, secret)
                 .connect(
                     koh::request::Pick::Latest,
                     koh::terminal::Size::new(24, 80),

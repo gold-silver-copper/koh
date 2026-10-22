@@ -101,10 +101,11 @@ async fn main() -> Result<()> {
 
     // Everything else gets admitted first, then opens its input stream and writes crafted
     // messages on it.
-    let ep = bind_endpoint_local(evil_secret!(), false).await?;
+    let key = evil_secret!();
+    let ep = bind_endpoint_local(generate_secret_key()?, false).await?;
     let conn = ep.connect(direct_addr(server_id, saddr), ALPN).await?;
-    // A shell, asked for on the first stream, kept open as the control stream; the server's first
-    // stream admits us.
+    // The allowed key proved, then a shell asked for, on the first stream, kept open as the
+    // control stream; the server's first stream admits us.
     let mut control = conn.open_uni().await?;
     let shell = koh::request::Request::Shell {
         pick: koh::request::Pick::Latest,
@@ -112,9 +113,9 @@ async fn main() -> Result<()> {
         program: None,
         cwd: None,
     };
-    control
-        .write_all(&koh::request::encode(&shell, koh::request::MAX_REQUEST)?)
-        .await?;
+    let mut opening = koh::transport_iroh::prove(&conn, &key)?;
+    opening.extend(koh::request::encode(&shell, koh::request::MAX_REQUEST)?);
+    control.write_all(&opening).await?;
     conn.accept_uni().await?;
     eprintln!("evil-client: admitted; running attack '{attack}'");
 

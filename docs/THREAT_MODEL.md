@@ -6,24 +6,24 @@ look; pair it with [`SECURITY.md`](../SECURITY.md).
 
 ## What koh is
 
-A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server** spawns
-a real shell in a PTY, keeps its screen in an emulator of its own that answers the program's
+A mosh-like remote shell over [iroh](https://iroh.computer) (peer-to-peer QUIC). The **server**
+spawns a real shell in a PTY, keeps its screen in an emulator of its own that answers the program's
 questions, and relays the program's output to a **client**, which writes it to the user's terminal
 as ssh would, less those questions. The same connection and allowlist also run commands, jobs and
-copies.
-A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and only peers
-on its **allowlist** are admitted. The node-id is not enumerable, but the server's UDP port is open
-like any listener's: anyone who can reach it can start QUIC handshakes, as iroh answers a
-ClientHello whatever its server name. So handshakes under way are capped: 256 in all, and when all
-the room is taken a new one gives up the oldest of the address holding the most (an IPv6 /48
-counts as one, and a relay's as one); they hold no connection permit. A new handshake is
-never refused, but when its room would cost one under way, an address not yet validated must first
-answer a QUIC retry, which a spoofed address cannot. So stalled handshakes from spoofed addresses
-take no room; a flood from enough real addresses (or from a NAT the client shares) can still give
-up an allowed client's handshakes while it lasts. Each has 10 s, and the flood is warned of at most
-once every 10 s. It is a
-**single-operator** tool for connecting a small set of machines you control — not a multi-user network
-service.
+copies. A peer finds a server by its Ed25519 **node-id** (through relays + NAT hole-punching), and
+only clients whose key is on its **allowlist** are admitted. A client dials from a node-id made for
+its process alone and proves its own key in the connection's first message (below), so any number of
+a client's processes reach a server at once without taking each other's place at a relay or on a
+path. The node-id is not enumerable, but the server's UDP port is open like any listener's: anyone
+who can reach it can start QUIC handshakes, as iroh answers a ClientHello whatever its server name.
+So handshakes under way are capped: 256 in all, and when all the room is taken a new one gives up
+the oldest of the address holding the most (an IPv6 /48 counts as one, and a relay's as one); they
+hold no connection permit. A new handshake is never refused, but when its room would cost one under
+way, an address not yet validated must first answer a QUIC retry, which a spoofed address cannot. So
+stalled handshakes from spoofed addresses take no room; a flood from enough real addresses (or from
+a NAT the client shares) can still give up an allowed client's handshakes while it lasts. Each has
+10 s, and the flood is warned of at most once every 10 s. It is a **single-operator** tool for
+connecting a small set of machines you control — not a multi-user network service.
 
 ## Attacker models
 
@@ -35,7 +35,7 @@ service.
    request of at most 1 MiB, a command of at most 256 KiB and 4096 words with no NUL, paths of at
    most 4096 bytes with no NUL, at most 1024 sources, a job's name a short word, a wait's text at
    most 4 KiB, each refused as it is decoded, before anything is allocated for it. A shell reaches
-   the koh/15 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
+   the koh/16 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
    pace what the server sends) and redraw requests. Input comes as decoded events (`Keys`: keys,
    mouse events, focus changes, whole pastes); decoding refuses what no terminal sends (a modifier
    bit no key has, a function key past F12, a kitty code that is no Unicode scalar, a paste over
@@ -159,17 +159,29 @@ service.
    the destination: a user who does not trust the server copies from it into a directory of its
    own.
 3. **Network / MITM** — QUIC + TLS 1.3 (via iroh) give transport encryption and node-id
-   authentication by construction (no TOFU window). Considered: replay, and connection-level tamper.
+   authentication by construction (no TOFU window); the client's key is proven by a signature over
+   what that one TLS session exports, so a proof seen on one connection is worth nothing on
+   another. Considered: replay, and connection-level tamper.
 4. **Local attacker** — another uid on the same host. Targets: the identity key file, the state dir,
    signals to a recycled pid, temp files.
 
 ## Trust boundaries & key defenses
 
-- **Peer identity:** both ends are authenticated by Ed25519 node-id *by construction* (no TOFU
-  window). Authorization is an explicit **allowlist** (off-list peers refused); at least one entry is
+- **Peer identity:** the server is authenticated by its Ed25519 node-id *by construction* (no TOFU
+  window), which the client dials. The client's connection comes from a node-id made for its
+  process alone; its key, the one the allowlist names, is proven first on its first stream
+  (`KeyProof`, `src/request.rs`: at most 128 bytes, refused past that before it is read): its
+  Ed25519 signature over a label and 32 bytes exported from that connection's TLS session
+  (`src/transport_iroh/mod.rs`, `prove` and `proven`), which only the two ends of that session can
+  compute. It must come within the handshake's 10 s, while the connection still holds one of the
+  capped handshake places, not a connection permit. A peer that proves no key, a proof made on
+  another connection, or a key not on the list is closed as not allowed alike, before its request
+  is read, so nothing says which keys are. Everything after (the scopes, revocation, the audit log,
+  whose sessions and jobs) goes by the proven key. Authorization is an explicit **allowlist**
+  (off-list keys refused); at least one entry is
   required, so there is no "accept any peer" mode. This is the **single** authentication factor —
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
-  like an SSH private key, and remove a lost machine's id from every allowlist (`koh clients rm`,
+  like an SSH private key, and remove a lost machine's key from every allowlist (`koh clients rm`,
   which a running server heeds within 2 s, closing that peer's connections, which hangs up any
   command it runs, and ending all of its sessions (a scope changed closes its connections too), and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
   read well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key, is held to the key's own
@@ -213,7 +225,7 @@ The detailed finding history lives in [SECURITY.md's audit trail](../SECURITY.md
 
 - **No privilege separation / multi-user model:** the shell runs as the uid that ran `koh serve`;
   there is no per-user mapping, PAM, chroot, or `ForceCommand`-class policy. The only access control
-  is the node-id allowlist; access is uniform across allowed peers.
+  is the allowlist of client keys; access is uniform across allowed peers.
 - **No hardware-backed / certificate / agent identity, and no at-rest encryption:** the node-id key
   lives on disk, protected by file permissions only (not in an HSM / FIDO2 token / agent).
 - **No post-quantum key exchange yet:** transport crypto is inherited from iroh; koh is a policy-taker.

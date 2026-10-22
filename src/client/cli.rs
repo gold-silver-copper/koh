@@ -23,7 +23,7 @@ use crate::request::{
     ProblemKind, RemotePath, Request, Run, SessionInfo, SessionList, SessionNum, Signal, Started,
     Until, Wait, Waited, MAX_LOG_CHUNK, MAX_OUTPUT, MAX_REPLY,
 };
-use crate::transport_iroh::{bind_on, close_endpoint, Idle, Network};
+use crate::transport_iroh::{bind_on, close_endpoint, generate_secret_key, Idle, Network};
 
 /// How long the first dial may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -181,14 +181,13 @@ impl BellHook {
     }
 }
 
-/// Bind an endpoint to dial `remote` from, as `identity`, its connections idle at most as `idle`
-/// says, and the connector that dials it.
+/// Bind an endpoint to dial `remote` from, with a key of its own, its connections idle at most as
+/// `idle` says, and the connector that dials it, proving `identity` on each.
 async fn connector(
     remote: &Remote,
     identity: &crate::identity::Identity,
     idle: Idle,
 ) -> anyhow::Result<(iroh::Endpoint, IrohConnector)> {
-    let secret = identity.secret.clone();
     let server = remote.server;
     let (network, target) = match (remote.direct, remote.relay_url.clone()) {
         (Some(addr), _) => (
@@ -201,8 +200,9 @@ async fn connector(
         ),
         (None, None) => (Network::N0, server.into()),
     };
-    let endpoint = bind_on(secret, (false, idle), &network, None).await?;
-    let connector = IrohConnector::new(endpoint.clone(), target);
+    // The endpoint's key is this process's alone; the client key is proven on each connection.
+    let endpoint = bind_on(generate_secret_key()?, (false, idle), &network, None).await?;
+    let connector = IrohConnector::new(endpoint.clone(), target, identity.secret.clone());
     Ok((endpoint, connector))
 }
 

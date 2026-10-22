@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 # The effective floor is dictated by dependencies, not by koh's own 2021 edition: fux-vt and fuxix declare
 # 1.95 (edition 2024), above the `=`-pinned iroh 1.3.0's 1.91. Declaring it turns "cargo install on

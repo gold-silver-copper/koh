@@ -15,6 +15,48 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+A review of the week's rewrite: its bugs fixed, and a smaller, simpler koh.
+
+### Fixed
+
+- **`koh cp -r --delete NAME SERVER:` could delete the server's home.** A tree copied to a
+  directory of its own name was merged into it, and `SERVER:` is the home, so a local directory
+  named as the user was taken for the home's contents. That rule is gone: `X/.` copies into.
+- A read-only source directory no longer makes its own files fail to land, and `-p` keeps
+  directories' times: a directory gets its mode and time once its files have landed.
+- `--exclude` patterns with a `/` match the same path at both ends, from the top of the tree
+  copied, so `--delete` never removes what they exclude. The receiver refuses more than a window
+  of files waiting for their bytes.
+- Removing or rescoping a client hangs up its jobs, not just its sessions; a server's shutdown
+  waits for every command and job it hung up.
+- `koh wait --text` on a job searches only what came since it last looked, outside the log's lock.
+- A resize during a reconnect reaches the program; a job that exits 124 is not taken for a timed
+  out wait; a `koh wait` cut short closes its connection; exit 3 means only "not reached".
+- The menu no longer replaces a saved name, which dropped a client's scope and a server's route.
+- A right-side prompt (zsh `RPROMPT`, powerlevel10k, fish) no longer turns prediction off, and a
+  line-editing key can no longer predict away part of the prompt.
+- `koh output --last` of a command that printed nothing is empty; a redraw keeps soft wraps soft,
+  and puts back where the program saved the cursor before its full screen.
+
+### Removed
+
+- `koh cp --atomic` (it was not atomic) and `--diff`; the "kept" count and the list of skipped
+  names in the summary.
+- `koh key info` (`koh id [client|server]` says a key's id); the key file's lock, which only kept
+  `koh key reset` from running beside a koh; the menu's "last connected".
+- Marks for bash older than 4.4 (macOS's 3.2): it runs unmarked.
+- Predictions of the line editor's own keys (`Ctrl-W`, `Ctrl-U`, `Ctrl-A`, `Ctrl-E`, Home, End,
+  `Alt-B`, `Alt-F`, `Alt-Backspace`): they wait one round trip.
+
+### Changed
+
+- The protocol is koh/17 (a colours message's palette is a fixed 16, a job's log can say a
+  problem, a copy's items are leaner). Both ends need the new version.
+- Commands and jobs wait for their exit instead of polling for it, and start off the async
+  threads; the output filter passes plain text whole; a copy moves each chunk with one copy.
+- `koh help-agents` and the commands' help are shorter.
+- Updated `fux-vt` 0.12.0 → 0.12.1.
+
 ## [0.16.0] — 2026-10-21
 
 ### Fixed

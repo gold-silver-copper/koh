@@ -698,7 +698,7 @@ impl Pty {
         // seen reading is found); and each place before the next one it moves on to: input
         // queued for the writer before the terminal's queue, output in the master before the
         // reader's hands (and the session's queue after them).
-        if self.keys_queued() || self.keys_unread() {
+        if self.keys_queued() || self.master.keys_unread() {
             return crate::terminal::Activity::Busy;
         }
         let found =
@@ -717,7 +717,7 @@ impl Pty {
         if closed && cfg!(target_os = "macos") {
             return None;
         }
-        Some(self.keys_queued() || self.keys_unread())
+        Some(self.keys_queued() || self.master.keys_unread())
     }
 
     /// Whether input waits for the writer to put it in the terminal, or is being written: its
@@ -732,29 +732,6 @@ impl Pty {
         let mut fds = [PollFd::new(&self.master, Events::IN)];
         let polled = fuxix::poll::poll(&mut fds, Some(Duration::ZERO));
         polled.is_ok_and(|n| n > 0) && fds.iter().any(|fd| fd.revents().intersects(Events::IN))
-    }
-
-    /// Whether keys wait in the terminal for the program to read. On Linux the slave is opened to
-    /// ask (with no wait, and never as a controlling terminal): a poll first, which moves on what
-    /// the master's writes left on their way (Linux hands them to the slave on a worker, so the
-    /// program may not have them yet), then `FIONREAD`, which counts what a poll of a read
-    /// waiting for more keys (`VMIN`) does not. On macOS the master's `FIONREAD` counts them.
-    fn keys_unread(&self) -> bool {
-        #[cfg(target_os = "macos")]
-        let unread = fuxix::io::unread(&self.master).is_ok_and(|n| n > 0);
-        #[cfg(not(target_os = "macos"))]
-        let unread = {
-            use rustix::fs::{Mode, OFlags};
-            let flags = OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-            rustix::fs::open(self.master.slave_path(), flags, Mode::empty()).is_ok_and(|slave| {
-                let mut fds = [PollFd::new(&slave, Events::IN)];
-                let polled = fuxix::poll::poll(&mut fds, Some(Duration::ZERO));
-                polled.is_ok_and(|n| n > 0)
-                    && fds.iter().any(|fd| fd.revents().intersects(Events::IN))
-                    || fuxix::io::unread(&slave).is_ok_and(|n| n > 0)
-            })
-        };
-        unread
     }
 
     /// Propagate a window-size change; the kernel raises `SIGWINCH` in the child.

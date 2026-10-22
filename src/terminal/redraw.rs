@@ -266,21 +266,14 @@ pub fn redraw(screen: &fux_vt::Screen, title: &str, history: usize) -> Vec<Piece
     if kitty != 0 {
         let _ = write!(out, "\x1b[>{kitty}u");
     }
-    if let Some(keys) = screen.modify_other_keys() {
+    if let Some(level) = screen.modify_other_keys() {
         use fux_vt::keys::encode::OtherKeysLevel;
-        let level = match keys.level() {
+        let level = match level {
             OtherKeysLevel::Usual => 1,
             OtherKeysLevel::All => 2,
             OtherKeysLevel::Unmodified => 3,
         };
-        let factored = keys.factored();
-        let mask =
-            u8::from(factored.shift) | u8::from(factored.ctrl) << 2 | u8::from(factored.alt) << 3;
-        if mask == 0 {
-            let _ = write!(out, "\x1b[>4;{level}m");
-        } else {
-            let _ = write!(out, "\x1b[>4;{level}:{mask}m");
-        }
+        let _ = write!(out, "\x1b[>4;{level}m");
     }
     let shape = screen.cursor_shape();
     if shape != fux_vt::CursorShape::Initial {

@@ -1,1 +1,0 @@
-ssh bench 'cd ~/svc && sed -i -e "s/^listen_port = .*/listen_port = 8080/" -e "s/^log_level = .*/log_level = info/" -e "s|^data_dir = .*|data_dir = ~/svc/var|" config.ini && ~/bin/svc start && ~/bin/svc-ping'

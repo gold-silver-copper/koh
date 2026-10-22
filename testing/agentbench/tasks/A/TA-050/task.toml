@@ -1,9 +1,0 @@
-id = "TA-050"
-title = "Trigger a waiting watcher"
-cat = "sessions"
-difficulty = "easy"
-goal = '''
-On the remote machine, run `~/bin/watch-build`; it waits for a build trigger. While it is
-waiting, trigger a build by running `~/bin/trigger-build` from a second shell. It is done when
-`watch-build` has seen the trigger and finished on its own.
-'''

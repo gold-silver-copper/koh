@@ -1,9 +1,0 @@
-#!/usr/bin/env python3
-import json, os, sys
-os.makedirs(os.path.expanduser("~/.bench"), exist_ok=True)
-with open(os.path.expanduser("~/.bench/argv.json"), "a") as f:
-    f.write(json.dumps(sys.argv[1:]) + "\n")
-if len(sys.argv) != 2:
-    print(f"tag-release: expected one argument, got {len(sys.argv) - 1}", file=sys.stderr)
-    sys.exit(2)
-print(f"tagged release as {sys.argv[1]!r}")

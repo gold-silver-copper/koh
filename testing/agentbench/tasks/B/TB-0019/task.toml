@@ -1,9 +1,0 @@
-id = "TB-0019"
-title = "Which row crashed the import"
-cat = "crash"
-difficulty = "easy"
-goal = """
-On the remote machine, `~/bin/import-orders ~/data/orders.csv` crashes partway through the file.
-Find the data row that makes it crash, and write that row, exactly as the line appears in
-`~/data/orders.csv`, to `bad-row.txt` in your local directory.
-"""

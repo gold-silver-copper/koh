@@ -1,7 +1,0 @@
-Standup notes, Thursday
-
-	- deploy of ledger 2.4 slipped to Monday	(waiting on DBA)  
-~. this line starts with a tilde and a dot
-~~ and this one with two tildes
-  - café budget: € 1.200,00
-- last line has no newline

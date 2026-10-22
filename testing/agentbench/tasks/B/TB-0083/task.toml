@@ -1,9 +1,0 @@
-id = "TB-0083"
-title = "Feed the orders file to the importer"
-cat = "stdin"
-difficulty = "easy"
-goal = """
-Your local directory has `orders.csv`. On the remote machine, `~/bin/ingest-orders` reads CSV on
-its standard input and writes a summary to `~/ingest/summary.txt`. Run it with the contents of your
-local `orders.csv` as its standard input, exactly as the file is.
-"""

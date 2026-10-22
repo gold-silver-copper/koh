@@ -71,11 +71,10 @@ src/
 └── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, the binary on a PTY, commands, jobs and copies, names,
-                     key creation races, wire goldens and the corpus
+                     key creation races, the wire's round-trips and the corpus
 testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
-testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
+testing/corpus/      real programs' output (from fux), replayed by tests and bench
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
-testing/agentbench/  coding agents driving koh on task sets, scored
 ```
 
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
@@ -568,108 +567,37 @@ construction rather than by care at each call:
   waiting; past them it is closed as `Busy` ("server busy: too many connections at once; retry"),
   which the client says, exiting 75.
 
-## Testing tiers
+## Testing
 
-You never need a second *machine* to develop koh — you need a second *process* and occasionally a
-second *container*. The verification is layered cheapest-first; everything but Tier 3 is headless.
+Everything but real devices runs headless, on one machine, in `cargo test`; each test says what
+it guards in its name and comment.
 
-### Tier 0 — pure logic, no infra (`cargo test`)
+- **Unit tests** beside the code: the filter, the redraw, the wire's round-trips and caps, the
+  pacing budget, the display's overlay, the predictor, and the sync (cut anywhere and resumed,
+  nothing landed through a symlink or outside a scoped directory).
+- **`tests/net/`**: a real server and client on iroh endpoints joined only by an in-process
+  fault-injecting link (`tests/net/link.rs`): loss, delay, reordering and outages under real QUIC;
+  convergence, ordered input, reattach, resize, backpressure, the bell hook, prediction, and
+  hostile clients and servers.
+- **`tests/pty.rs`, `tests/sessions.rs`**: real programs on real PTYs, the session registry, and
+  the real accept loop over loopback iroh.
+- **`tests/e2e_pty_binary.rs`, `tests/commands.rs`**: the real `koh` binary, on a PTY or as a
+  command: connect, suspend, exec, jobs, waits, copies, scoped keys, and a relay shared by one
+  key's processes.
+- **`tests/corpus.rs`**: real programs' output (`testing/corpus/`, from fux) through the server,
+  the wire and the client's display; a terminal reading what the client wrote must show what one
+  reading the program's output does, and so must one fed the server's redraw.
+- **Fuzzing** (`fuzz/`, weekly in CI): every decoder a peer reaches, the program's output through
+  the emulator and filter, and the user's terminal's input.
 
-The protocol, diff/apply, predictor and session registry need no network or TTY, so they're tested
-deterministically:
+Test crates start with `#![forbid(clippy::disallowed_methods)]`: they start programs, spawn tasks
+and make scratch directories only through **`koh-testkit`** (`testkit/`). Terminal I/O is behind
+`client::backend::KohBackend`, so the client's loop runs against a capturing terminal in tests.
 
-- **The filter and the redraw** — questions dropped and marks relayed however the output is
-  split, bounds, titles and the clipboard; a redrawn terminal shows what the program drew, in its
-  modes, history and prompts included.
-- **Protocol cores** — `proto` and `request` round-trips and size caps; the pacing budget; the
-  display's overlay painted and taken back; a sync cut anywhere resumes, merges, deletes and
-  excludes, and lands nothing through a symlink or outside a scoped directory.
-- **Predictor** — predict→confirm→clear, predict→no-echo→suppress.
-- **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
-  Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `proto_decode` (both directions of the
-  wire), `request_decode` (the opening request, the replies sent whole and a copy's items),
-  `server_process` (the hosted program's output, through the emulator and the filter, redrawn),
-  `server_input` (the client's input, encoded for the program) and `client_input` (what the
-  user's terminal sends, start-up answers included, read by the session's decoder).
-- **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
-  fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
-  pieces with their resizes: the server's emulator and filter, the wire's encoding, the client's
-  display. A fux-vt terminal reading every byte the client wrote must show what a fux-vt parser
-  fed the program's output shows, and so must one fed the redraw of the server's screen at every
-  step.
-
-### Tier 1 — real iroh endpoints on one machine (`cargo test`)
-
-A second host is just a second endpoint, and a TTY is just an allocated PTY.
-
-- **`tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
-  endpoints whose only path is an in-process fault-injecting link (`tests/net/link.rs`, an iroh
-  custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
-  covers screen convergence, exactly-once ordered input, reattach, a forced mid-session drop,
-  scrollback in the user's terminal, exit status, resize, XON/XOFF, input backpressure, a program
-  that stops reading, the bell hook, prediction and the no-echo property, and hostile clients and
-  servers. The corpus runs
-  here too, through a real server and client under loss (eleven recordings by default, every one
-  with `KOH_NET_CORPUS=all`).
-- **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs: output
-  streaming and teardown, exit statuses, the
-  reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
-  terminal; the session registry's attach/reattach/cap/TTL/teardown; the real accept loop
-  (`serve_endpoint`, its allowlist and admission) and the per-connection echo-ack over loopback
-  iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
-  table past what its tests hold at once: an open that finds the table full while another PTY is
-  being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
-  many short-lived PTYs hit on a fresh machine.
-- **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
-  `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
-  frames read back from the master, connected with `--direct` to an in-process server; the
-  `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
-  restarted under a connected client, which finds it again and hears its session is gone.
-- **`tests/commands.rs`** — the real binary's `koh exec` (words as they are, output apart,
-  statuses, stdin, the hang-up of a client stopped or killed), jobs (outliving their client,
-  waited for, followed and killed), `koh cp` both ways as a sync (changed files only, arrival
-  times, `--delete`), a scoped key, and `koh sessions`, `output` and `wait --session` beside `koh
-  connect --new` and `--session`, against an in-process server.
-
-The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
-crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a
-task or write to the system temp dir on its own: it does those through **`koh-testkit`**
-(`testkit/`, its own workspace), whose `command` starts only `koh` and a list of harmless tools
-(never one that authenticates, as `sudo` does), whose `spawn` runs a task on the test's runtime,
-and whose `Scratch` is a private directory under `target/`, removed on drop. It also holds the
-test runtimes, PTY output capture and the seeded random sequence the tests and the scoreboard use.
-
-The scoreboard sits beside the tests, in its own Cargo workspace:
-
-- **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
-  measures koh beside mosh and ssh by bytes on the wire for each recording and synthetic workload,
-  keystroke latency beside a flood on three links, server memory per session and instructions
-  retired.
-
-Terminal I/O is behind `client::backend::KohBackend`, so the same loop runs against the real
-terminal (binary) or a capturing one (tests), which can also be told what the overlay painted.
-
-### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
-
-The layer a single in-process test can't reach: the **real `koh` binary on a real Android OS**,
-driven over `adb` by scripts run directly, never part of `cargo test`. A **smoke** suite
-proves the Android iroh/DNS path binds without the `ndk-context` panic (a runtime-only bug
-cross-compilation can't catch); a **stress** suite hammers koh under load, churn, and adverse
-conditions (connection churn, concurrent sessions, throughput + memory-longevity leak checks, signal
-handling, a short screen-off freeze and a long one, reattach continuity, `tc netem`
-loss/jitter/reorder beneath real QUIC, a total-outage roaming analogue, and a bare-id connection over
-the public relay); and a **security** suite proves the data-plane and key defenses against a
-cross-compiled malicious-peer harness. The memory checks are part of the point: an emulator has the
-RAM to survive what would get the server killed on a phone, so the suites bound the server's RSS
-under attack rather than only its survival. Every check first proves its precondition (the attack
-ran, the client was attached) from the server's log, so a result cannot pass vacuously. The netem
-tests root only `tc` (`su 0`, on a userdebug image), never the shell koh runs in.
-
-### Tier 3 — real devices (manual)
-
-A small final human acceptance pass: paste the endpoint id on an actual phone, connect to an actual
-Mac over the public relay, type on a laggy cell link, and feel the predictions. The headless tiers
-prove correctness; only a real two-device run over a real radio proves *feel* and migration.
+Beside the tests: the scoreboard (`testing/scoreboard.sh`, `testing/bench/`) measures koh beside
+mosh and ssh (bytes on the wire, keystroke latency under a flood, server memory); the Android
+scripts (`testing/android/`) run the real binary on an emulator over `adb`: the Android DNS path,
+stress, netem loss, and a malicious peer. A real phone over a real radio is the last, manual check.
 
 ## Acceptance criteria (mosh feel)
 

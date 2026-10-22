@@ -1,9 +1,0 @@
-id = "TB-0021"
-title = "The fatal error behind a failed worker"
-cat = "crash"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/queue-worker`. After a while it exits with a failure and points
-you at its log. Find the line in that log that says why it died (the one line marked `FATAL`) and
-write that whole line, exactly, to `fatal.txt` in your local directory.
-"""

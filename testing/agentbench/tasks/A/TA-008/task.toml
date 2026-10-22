@@ -1,9 +1,0 @@
-id = "TA-008"
-title = "Failing tests in a long run"
-cat = "output"
-difficulty = "moderate"
-goal = '''
-On the remote machine, run `~/bin/run-tests`. It runs thousands of tests; a few fail. Write the
-names of the failing tests to `failed.txt` in your local directory, one name per line, in the
-order the run reports them (a test name looks like `store::compaction_0417`).
-'''

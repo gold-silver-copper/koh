@@ -1,9 +1,0 @@
-id = "TA-023"
-title = "Feed a local CSV to a remote program"
-cat = "stdin"
-difficulty = "easy"
-goal = '''
-Your local directory has `orders.csv`. On the remote machine, `~/bin/totals` reads an orders
-CSV on its standard input and prints the totals per region. Run it on your local `orders.csv`
-and save what it prints as `totals.txt` in your local directory.
-'''

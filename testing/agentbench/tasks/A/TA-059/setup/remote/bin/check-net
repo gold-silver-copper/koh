@@ -1,9 +1,0 @@
-#!/usr/bin/env python3
-import os, random, sys, time
-rng = random.Random(61)
-print("check-net: probing ...", flush=True)
-time.sleep(rng.uniform(2, 6))
-os.makedirs(os.path.expanduser("~/.checks"), exist_ok=True)
-open(os.path.expanduser("~/.checks/net"), "w").write("ran\n")
-print('net: WARNING 2 of 3 uplinks up')
-sys.exit(1)

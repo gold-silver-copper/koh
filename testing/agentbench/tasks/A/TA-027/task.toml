@@ -1,9 +1,0 @@
-id = "TA-027"
-title = "Copy a large snapshot"
-cat = "files"
-difficulty = "moderate"
-goal = '''
-On the remote machine, run `~/bin/snapshot`. It writes a database snapshot of about 40 MB under
-`~/snap/`. Copy that snapshot file to `db.snapshot` in your local directory. It is done when the
-local copy is identical to the snapshot.
-'''

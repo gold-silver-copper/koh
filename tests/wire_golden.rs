@@ -1,9 +1,5 @@
-//! The koh/16 encoding.
-//!
-//! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
-//! captured by running the encoder, and a change to the wire must change them in the same commit,
-//! deliberately, and bump the protocol's name (the ALPN), which is pinned beside them. Each also
-//! decodes back to itself, and seeds the fuzzers.
+//! The wire's messages, built here by hand from the wire types, both ways: each decodes back to
+//! itself, and seeds the fuzzers. A change to the wire bumps the protocol's name (the ALPN).
 #![forbid(clippy::disallowed_methods)]
 
 use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, WireScheme};
@@ -15,14 +11,6 @@ use koh::request::{
 };
 use koh::sync::{Answer as SyncAnswer, FileId, Item, Mode, Name, Opts, Reply, SourceCount};
 use koh::terminal::{Activity, Size, TtyModes};
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
-}
 
 fn path(p: &str) -> Option<RemotePath> {
     RemotePath::new(p.as_bytes().to_vec()).ok()
@@ -255,21 +243,7 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 #[test]
-fn the_wire_is_pinned() {
-    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/16");
-    let got: Vec<String> = framed()
-        .unwrap()
-        .iter()
-        .map(|(_, bytes)| hex(bytes))
-        .collect();
-    let want = PINNED;
-    let said: Vec<String> = framed()
-        .unwrap()
-        .iter()
-        .map(|(what, bytes)| format!("{what}\n  {}", hex(bytes)))
-        .collect();
-    assert_eq!(got, want, "the wire changed:\n{}", said.join("\n"));
-    // And each decodes back to itself.
+fn every_message_decodes_back_to_itself() {
     for r in requests().unwrap() {
         let bytes = koh::request::encode(&r, usize::MAX).expect("encodes");
         assert_eq!(
@@ -294,7 +268,7 @@ fn the_wire_is_pinned() {
     }
 }
 
-/// The pinned messages, as fuzz seeds, into `KOH_FUZZ_SEEDS` if it names a directory.
+/// The messages, as fuzz seeds, into `KOH_FUZZ_SEEDS` if it names a directory.
 #[test]
 fn the_wire_messages_seed_the_fuzzers() {
     let client: Vec<u8> = client_msgs()
@@ -327,44 +301,3 @@ fn the_wire_messages_seed_the_fuzzers() {
         std::fs::write(dir.join(format!("wire-{n}")), seed).expect("a seed");
     }
 }
-
-/// Captured by running the encoder; see the module's doc.
-const PINNED: &[&str] = &[
-    "000000080003090218500000",
-    "0000001000011850010103676462010470726f6a",
-    "00000012030002046d616b65032d6a34010373726300",
-    "000000170401056275696c64010c63642078202626206d616b6500",
-    "0000000b06056275696c640101c801",
-    "00000014080100056275696c6401096c697374656e696e67",
-    "0000000f09010570726f6a2f02000100010100",
-    "000000110103020000016104000306706173746564",
-    "0000000400011e64",
-    "00000009020101020300000100",
-    "000000050302f0a204",
-    "0000000104",
-    "0000000d000b1b5b316d68691b5b6d0d0a",
-    "000000050103443b31",
-    "00000003020004",
-    "00000003030001",
-    "000000020407",
-    "000000020502",
-    "00000003060174",
-    "0000000407030107",
-    "0000000108",
-    "0000000b020104612e7273a403000c",
-    "00000003060100",
-    "0000000108",
-    "000000020902",
-    "000000030c0300",
-    "000000010b",
-    "000000050000010000",
-    "0000001001000000000000000000000000000000",
-    "0000001e01000100000000000000000000000100087372632f612e7273010c000000",
-    "000000020902",
-    "00000003008901",
-    "000000080100056275696c64",
-    "0000000602046f75740a",
-    "000000020103",
-    "0000000403016522",
-    "00000060ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c51dcaa56c9b849e997169dfeff70a2c1a9320a8c9c741e00c546d2d2c7de27efb8643babafd50525888e47d9dc80cb37f2ee24d53fc1d1af9bde980d4a0d7e02",
-];

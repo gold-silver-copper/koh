@@ -1,9 +1,0 @@
-id = "TB-0035"
-title = "Find a CVE in paged release notes"
-cat = "tui"
-difficulty = "easy"
-goal = """
-On the remote machine, `~/bin/release-notes` shows the project's release notes in a pager. Find the
-release 4.2.1 entry: its "Security" section names exactly one CVE that release fixed. Write that CVE
-id (like `CVE-2024-12345`) to `answer.txt` in your local directory.
-"""

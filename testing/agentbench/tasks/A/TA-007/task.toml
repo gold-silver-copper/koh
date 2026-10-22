@@ -1,9 +1,0 @@
-id = "TA-007"
-title = "The error early in a long build"
-cat = "output"
-difficulty = "easy"
-goal = '''
-On the remote machine, run `~/bin/build`. It prints thousands of lines and exactly one error,
-which has a code of the form `BLD-NNNN`. Write that code (only the code) to `answer.txt` in your
-local directory.
-'''

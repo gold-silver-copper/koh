@@ -1,9 +1,0 @@
-id = "TA-024"
-title = "Binary firmware over stdin"
-cat = "stdin"
-difficulty = "moderate"
-goal = '''
-Your local directory has a firmware image, `firmware.bin`. On the remote machine,
-`~/bin/flash` reads an image on its standard input and writes it to the device. Flash your
-local `firmware.bin` with it. It is done when the device holds exactly that image.
-'''

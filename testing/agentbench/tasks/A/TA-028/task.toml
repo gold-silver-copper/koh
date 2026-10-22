@@ -1,9 +1,0 @@
-id = "TA-028"
-title = "Upload a site, modes kept"
-cat = "files"
-difficulty = "easy"
-goal = '''
-Your local directory has a website in `site/`. Put a copy of it on the remote machine at
-`~/www/site/`, with the same files, contents and names (hidden files included) and the same
-file modes: the scripts in it must stay executable and nothing else may become executable.
-'''

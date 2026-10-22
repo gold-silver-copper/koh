@@ -1,9 +1,0 @@
-id = "TB-0009"
-title = "Which files failed to sync"
-cat = "output"
-difficulty = "moderate"
-goal = """
-On the remote machine, run `~/bin/sync-assets`. It draws a progress line that keeps rewriting
-itself, and among its output it reports some files it could not copy. Write the paths of the files
-that failed (exactly as it names them), one per line, to `failed.txt` in your local directory.
-"""

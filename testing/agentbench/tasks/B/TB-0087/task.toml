@@ -1,9 +1,0 @@
-id = "TB-0087"
-title = "Fetch the packaged build"
-cat = "files"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/package-build`. It packs the game into one large file (about
-48 MB) under `~/dist/`. Copy that package to your local directory, under the same file name. It
-must arrive byte for byte identical.
-"""

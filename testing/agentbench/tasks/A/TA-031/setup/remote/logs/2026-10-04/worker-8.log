@@ -1,9 +1,0 @@
-2026-10-04T00:52 worker-8 flushed cache
-2026-10-04T01:27 worker-8 GC pause 12ms
-2026-10-04T02:30 worker-8 GC pause 12ms
-2026-10-04T03:07 worker-8 heartbeat
-2026-10-04T04:15 worker-8 processed batch
-2026-10-04T05:14 worker-8 heartbeat
-2026-10-04T06:41 worker-8 GC pause 12ms
-2026-10-04T07:59 worker-8 flushed cache
-2026-10-04T12:00 worker-8 java.lang.OutOfMemoryError: Java heap space

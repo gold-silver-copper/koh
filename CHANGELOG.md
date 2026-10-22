@@ -51,315 +51,42 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [0.14.0] — 2026-10-20
 
-### Added
-- **`koh exec SERVER -- PROG ARG...`** runs a command on the server with no terminal: its words
-  passed as they are (no shell; `--sh 'LINE'` runs a shell line, `-C DIR` starts it elsewhere),
-  local stdin streamed to it, its stdout and stderr back apart, and koh exiting with its status
-  (128+N when signal N killed it; 127 for no such program, 126 when it could not start; 255 on
-  koh's own errors). A koh stopped by a signal hangs the command up at once, and one killed
-  outright or cut off within 10 s (SIGHUP to its process group, SIGKILL after a second).
-- **Jobs**: `koh run SERVER [--name NAME] -- PROG ARG...` starts a command that outlives koh and
-  the link, its output kept (the newest `--job-log-bytes`, 4 MiB by default) and its status;
-  `koh jobs`, `koh logs [--follow]`, `koh kill [--signal]` and `koh wait SERVER JOB [--text
-  TEXT]` find it by name.
-- **`koh wait`** waits on the server: for a job's end or text, a file (`--file`), a session's
-  running command to end (`--session N`, with its status) or its program to wait for input
-  (`--reading`), or a text on its screen; `--timeout SECS` exits 124.
-- **`koh output SERVER --session N [--last]`** prints a session's screen as text, or its last
-  finished command's output; `koh sessions` says each session's program state, whether a command
-  runs and the last one's status.
-- **`koh cp` is a sync**, both ways, done in process by the server: into the destination if it is
-  a directory (or ends in `/`, or there are several sources), else as it, its parents made;
-  directories merge; only files that changed are sent (same size and blake3 hash: left alone); a
-  file is written beside its target and renamed into place whole, and a cut copy's part resumes;
-  a file written gets its arrival time (so builds see it changed) unless `-p`; `dir/.` copies its
-  contents; `--delete`, `--exclude PAT` and `--atomic`; one summary line, or `--json`. Symlinks
-  are copied as symlinks and never followed, setuid and setgid never land.
-- **`--json`** on `sessions`, `output`, `exec`, `run`, `jobs`, `kill`, `wait` and `cp`, failures
-  as `{"error":{"kind","message"}}`, and one table of exit codes for every command (0, 1, 2 usage,
-  3 not reached, 4 refused, 75 server busy, 124 timed out). `koh help-agents`, and the end of `koh --help`, is the
-  page scripts and agents need.
-- **Scoped client keys**: `koh clients add NAME ID --cp DIR` allows only copies beneath `DIR`;
-  `--exec DIR` only commands and jobs, started in `DIR`. Saved as `cp=DIR` and `exec=DIR` in
-  `clients`.
-- **Several sessions per client.** `koh connect SERVER --new` starts another; `koh connect SERVER
-  --session N` attaches to one by number; `koh connect SERVER` attaches to the one attached last.
-  `koh sessions SERVER` lists them, one a line: number, attached or detached (and for how long),
-  age, size, whether the program runs or exited, and title. `--max-sessions` bounds them all
-  together, and the TTL applies to each.
-- **A saved server remembers how to dial it.** `koh servers add NAME ID --direct IP:PORT` (or
-  `--relay-url URL`) saves it in `servers` as `name id direct=IP:PORT` (or `relay=URL`), and
-  every command and the menu dial that name so unless given `--direct` or `--relay-url`
-  themselves. `koh servers` and the menu show it.
+koh for scripts and agents, beside the shell: a rewrite (#56) and its follow-ups.
 
-- **The remote program's state reaches your terminal** (`OSC 133 ; S ; activity=STATE`, with
-  `FUX_MARK_NONCE`'s nonce as the marks have it): the server reports what the session's program
-  is doing (`reading` its terminal, `polling` it, `waiting` on something else, `busy`, `idle` or
-  `unknown`) after each input written to it, on each change (probed every 20 ms while a client is
-  attached), after each command's start and end and after a resize, an unchanged state at most
-  every 10 ms; the client writes each in its place in the output, and the last again after any
-  mark. fux driving `koh connect` then sees a remote `less`, REPL or prompt wait for input, and
-  while `koh exec` or `koh wait` runs it is told `busy`. The probe is fuxix 0.6's
-  (`terminal_activity`, fux's own); on macOS it says only `busy`, `idle` or `unknown`.
+### Added
+
+- **`koh exec SERVER -- PROG ARG...`**: a command with no terminal, its words passed as they are
+  (`--sh LINE` for a shell line), stdin through, stdout and stderr apart, its exit status koh's.
+  A command whose client goes is hung up.
+- **Jobs**: `koh run` starts a command that outlives koh and the link; `koh jobs`, `koh logs
+  [--follow]`, `koh kill`, and `koh wait SERVER JOB` (its end, `--text`, or `--file`).
+- **`koh wait` on sessions** (`--session N`, its command's end or its program reading) and
+  **`koh output SERVER --session N [--last]`**, a session's screen or last command's output.
+- **`koh cp` is a sync**, both ways: whole-file hashes, merge into what's there, resume,
+  `--delete`, `--exclude`, `--dry-run`, arrival times unless `-p`, and a one-line summary.
+- **`--json`** on every command for scripts; **scoped client keys** (`--cp DIR`, `--exec DIR`);
+  **several sessions per client** (`koh connect --new`, `--session N`, `koh sessions`);
+  **saved servers remember their route** (`--direct`, `--relay-url`); `koh connect SERVER --
+  PROG` and `-C DIR`.
+- **The remote program's state reaches the terminal** (`OSC 133 ; S`), and `koh serve` marks its
+  shells' commands (OSC 133), signed with a per-session nonce.
 
 ### Changed
-- **Protocol `koh/14`**: `koh connect SERVER -- PROG ARG...` and `-C DIR`, `koh logs --tail`,
-  the end of a log saying how the job stands, a command's stdout and stderr on one pipe, `koh cp
-  --dry-run`, the problem `NoSuchProgram`, the close codes `Busy` and `NoSuchDir`, a running
-  job's processes and CPU time in `koh jobs`, what a copy kept and a dry run's sizes, and a tree copied to a directory of its own name
-  updating it (the copy failure `nests` is gone), and `koh cp --diff` (koh/14).
-- **`koh logs` on a running job points at following it**: it ends `` · running 34s: `koh logs
-  laptop build --follow` follows it to its end ``, where it named `koh wait`, which prints
-  nothing more until the end.
-- **`koh output` leaves out the blank rows below what the screen shows** (a row painted in a
-  colour shows something), text and `--json` alike: a 3-line screen on a 50-row terminal came
-  back as 3 lines and 47 empty ones.
-- **A `koh wait` on a job that times out says how the job stands**: `koh: timed out after 30s:
-  build running 41s processes=3 cpu=12.4s output=2 KB`, then its last lines (`--tail`), then
-  `· running 41s: ...`, where it said only `timed out` and agents took a job at work for a hung one.
-- **`koh cp` has no `-n`**: coreutils `cp -n` means "no clobber", so a dry run is spelled
-  `--dry-run`.
-- **`koh cp` counts what the destination has that the source lacks**, kept without `--delete`:
-  `(...; 2 there not in the source, kept: --delete removes them)` (`kept` in `--json`). A
-  directory only there goes uncounted: it is most often made there, as a build's `target/`.
-- **A dry run gives each file's size**, and the size of the one it would replace:
-  `replaced src/lib.rs (4.1 KB, was 3.9 KB)` (`size`, `was` in `--json`).
-- **`koh cp -r X SERVER:X` run again updates `X`**, as `X/.` does, where it was refused (`cp`'s
-  rule would land it as `X/X`): the copy is a sync, and every agent that ran it meant that, then
-  had to learn `X/.` from the refusal. A destination ending in `/` (`SERVER:X/`) or naming
-  `SERVER:X/X` still nests it.
-- **`koh jobs` shows a running job at work**: `build running 41s processes=3 cpu=12.4s
-  output=0 B ./build.sh` (`--json`: `processes`, `cpu_ms`), counting the processes in the
-  session the job leads and the CPU time they and their ended children used, so a job that
-  writes its own log file no longer looks dead. Where the server has no `/proc` (macOS) it is
-  left out.
-- **A cut-off `koh exec` says what cut it off** and what became of the command: stopped by a
-  signal after so long (the command hung up; a time limit calls for `koh run`), the link gone
-  quiet (the server hangs it up once it sees that), or the server shut down or restarted. It
-  said only `interrupted: the command was hung up` or `the server did not answer: timed out`.
-- **A download says its files were received**: `4 files received, 41 KB → ./src`, not `sent`.
-- **`koh connect SERVER -C DIR [-- PROG ARG...]`** starts the new session, its program or a
-  shell, in DIR; one not there exits 126, as `exec` does.
-- **A command that did not start exits the same from `exec` and `run`**: 127 no such program,
-  126 could not start (no `-C` directory there); `koh run` exited 1 for both.
-- **A `-C` directory in this machine's home that the server lacks** (an unquoted `-C ~/proj`,
-  which the local shell expands) is said to be so, with how to name the server's: `-C '~/proj'`
-  or `-C proj`.
-- **`koh connect` exits as soon as the session's end is here**, closing the link saying so
-  (which the server takes as the end delivered), not after waiting up to 2 s for the server.
-- **Leaving puts the cursor back after resetting the scroll margins** (`CSI r`, which sends it
-  home): the local prompt comes below the session's output, not over its top row.
-- **`koh cp --diff`**: a dry run that says, under each file it would replace, how its text
-  differs, as a unified diff (`a/` the destination's file, `b/` the source's; `diff` in
-  `--json`), for files up to 1 MiB; a binary or larger one says why it has none. The source's
-  file goes to the end with the destination's to be compared there, and only the diff comes
-  back. Which files differ was already the dry run's `replaced` list, by hash.
-- **`koh cp --dry-run`** changes nothing and sends no file's bytes: it lists each change
-  (`new`, `replaced`, `deleted`, `dir`, `link`) and the summary it would make.
-- **A burst of commands from one client is all served** (an agent's parallel reads): a full
-  table of pending handshakes gives up the oldest of the address holding the most, no longer any
-  address's third, and a connection past `--max-connections` waits up to 10 s for room, among at
-  most as many waiting. Past them both ends say `server busy: too many connections at once;
-  retry`, and koh exits 75 (`exec` too): nothing ran, so a retry is safe.
-- **`koh connect SERVER -- PROG ARG...`** runs one program on a terminal of its own (gdb, an
-  editor, a TUI) in a new session in place of the shell, and exits with its status when it ends.
-- **`koh logs` shows a job's last 200 lines** (`--tail N`, `--all` for all that is kept), saying
-  how many it left out, and ends on stderr with how the job stands: `· running 34s: koh wait
-  SERVER build waits for its end`, or `· exited 101 after 34s`.
-- **`koh wait SERVER JOB` prints the job's last 200 lines when it ends** (`--tail N`, `--tail 0`
-  for none), as every wait on a job was followed by `koh logs`.
-- **A command's stdout and stderr keep their order** when they go to one file here (`2>&1`, a
-  terminal): the server gives the command one pipe for both. A job's are always one pipe, so its
-  log is in the order it wrote them.
-- **A killed `koh exec` is found sooner**: a command connection's idle timeout is 10 s (5 missed
-  keepalives of 2 s), not 20 s. A SIGTERM, SIGHUP or SIGINT still hangs the command up at once.
-- **The state report is never early**: the server sends it after the output it read before it
-  (none left queued, and output held for the modes' read let go first); it says `busy` while keys
-  wait unread in the terminal or output waits unread, as fux's own check does; and it carries the
-  newest input written before it, so the client drops one made before the server had the keys it
-  sent last (fux saw `reading` before the program had taken them).
-- **`koh cp` says new and replaced files apart**, adding up to what was sent: `2 files sent, 18 B
-  → SERVER:proj (1 new, 1 replaced; 2 unchanged)`. A symlink already the same is no longer
-  counted among the unchanged files.
-- **Protocol `koh/9`**: `koh jobs` asks for one job by name, `koh cp`'s summary says where the
-  copy landed, and a missing `-C` directory and a nesting tree are told apart on the wire.
-- **`koh cp` says where things landed** (`→ SERVER:proj/src`, not `→ SERVER:proj`; `landed` in
-  `--json`, which replaces `to`), and **refuses to nest a tree in a directory of its own name**
-  that is there already (`koh cp -r X SERVER:X` run twice): cp's rule would land it as `X/X`.
-  `X/.` updates `X`; naming `SERVER:X/X` nests it. A destination ending in `/` still takes it in.
-- **`-C DIR` that is not there says so**: `koh: /home/u/dsp: no such directory on the server to
-  start in (...)`, and `koh exec` exits 126 (it could not start), no longer 127 (no such program).
-- **A `--sh` script the local shell split** (its quoting broke) says so in a line, with how to
-  send it whole (`koh exec SERVER -- sh -s < script.sh`; for a job, `--sh "$(cat script.sh)"`),
-  instead of clap's echo of the stray word and the usage.
-- **`koh jobs` shows one line a job**: its command's first line, cut at 60 characters, ` …`
-  marking a cut; `koh jobs SERVER NAME` shows that job with its command whole.
-- **`koh connect` with no terminal says what to use instead**: that it needs one, and that `koh
-  exec SERVER -- COMMAND` runs a command without one and `koh cp` copies files, rather than
-  `acquiring the terminal: No such device or address`. It says so before dialing.
-- **A version mismatch says both sides**: `this koh speaks protocol koh/9 and the server speaks
-  another; upgrade koh on whichever end is older`.
-- **The program's output reaches the user's terminal as it wrote it** (protocol `koh/8`), as over
-  ssh, less the questions the server's own terminal answers and the shell's marks, which travel
-  apart; the client no longer paints a copy of the server's screen. The user's terminal's own
-  scrollback, search and selection hold the session's output, and the scrollback view
-  (`Ctrl-^ [`) is gone. The server keeps the screen: a client attaching is sent a redraw of it
-  with 1000 rows of history, and one that redials, or falls too far behind on a slow link, a
-  redraw of the screen as it is, never a backlog. What the server sends waits for what the client
-  read, so a slow link holds no backlog. Prediction paints over the output and is taken back
-  before more of it is written. On leaving, every mode the program set is put back.
-- A connection opens with a request on the client's first stream saying what it is for, and the
-  server attaches or starts nothing before it; a client that makes none in 10 s is closed. A
-  shell's admission says the session it reached, and a reconnect goes back to that session by
-  number, never to another: one gone meanwhile ends the client with "no such session". A paste
-  goes whole in one message (up to 1 MiB); a refusal is a close code; the client sends input and
-  control messages on two streams.
-- The remote shell's marks (OSC 133) reach the user's terminal, each one, in its place in the
-  output, with the terminal's nonce: prompts, and each command's start and its end with its
-  status (`fux`'s `· done` and `last-output` work through koh).
-- **`koh serve` marks its shells' commands**, as fux does: a session's bash, zsh or fish, started
-  plainly (`$SHELL` or a lone `--shell`), reads the user's own startup files, then sends OSC 133
-  marks, so a terminal sees remote commands end, with their status, on a server nobody set up.
-  Only the shell's own marks count (each carries a nonce of its session), not marks a program
-  prints or fish 4's own; `--no-shell-marks` starts the shell as it is.
-- Prediction runs only on the primary screen with the PTY's modes known, on cells that keep their
-  style; a grapheme typed in pieces is one glyph; Backspace and Left stop where the line began,
-  which comes only from the real cursor; focus changes leave predictions alone.
-- The terminal's answers to the start-up questions are read by the session's own input decoder.
-- `Ctrl-^ Ctrl-^` or `Ctrl-^ ^` sends one Ctrl-^.
-- Removing a client with `koh clients rm` ends its session as well as its connection.
-- At most 2 handshakes are pending per address (an IPv6 /48 is one), its oldest given up for a new
-  one, which is never refused, and they hold no connection permit; when giving one up would cost
-  a handshake under way, an address not yet validated answers a QUIC retry first, so spoofed
-  addresses take no room. A clipboard write passes only as base64 within 16 KiB, a title cut to
-  256 characters; a key, list or `$KOH_LOG` file with another hard link is refused.
-- `--max-connections` and `--max-sessions` are at least 1.
-- A server started under `nohup` (SIGHUP ignored) survives the terminal's close; its sessions'
-  programs still get SIGHUP's default. Turned-away peers are logged at most once every 10 s.
-- Output that is no echo of typing waits for the PTY's modes to be read again, so a prompt printed
-  just before echo goes off (PAM's order) is never told with echo on.
-- The tests start every program with a home of their own, no history file and no `ENV` script:
-  a test run never writes to the developer's shell history.
-- Every queue in koh has a bound, and `clippy.toml` bans unbounded ones; the wire's sequences are
-  refused as they are decoded once past their bound.
-- `koh serve` reads the saved clients every 1.5 s: `koh clients rm` takes effect within 2 s. A read
-  that drops a client counts only once the next, 0.5 s later, agrees.
-- A session's program is hung up and given a second to exit (a shell saves its history) before it
-  is killed.
-- More keys in one read than anyone types (a paste into a terminal without bracketed paste, a
-  program writing to the client's terminal) are sent but not predicted one by one, which cost a
-  screenful of work each.
-- Updated `fux-vt` 0.3.4 → 0.11.0 and `fuxix` 0.1.7 → 0.6.2, including the test harnesses. The
-  minimum Rust version is unchanged.
-  - **`--scrollback` is now `--scrollback-bytes`**, the history each session keeps in bytes, 8 MiB
-    by default (about 20,000 lines of 50 characters), at most 1 GiB, as fux-vt bounds it.
-  - A session's program is started on its PTY as a session leader by fuxix between `fork` and
-    `exec`: the hidden `koh __launch` is gone.
-  - The server's terminal follows the standards more closely (fux's "refined" audit): among
-    others, primary device attributes now name selective erase, horizontal scrolling and
-    rectangular editing, which it carries out, and `CSI 3 J` clears the scrollback.
-  - Kitty's F13 to F35 reach the program; a mouse press on the wire always names its button.
-  - fux-vt 0.11 (its best-in-class pass): an unbracketed paste reaches the program with each LF
-    as CR, as xterm sends a paste; a mouse position past column 223 in the default encoding is
-    sent as a 0 byte, as xterm sends it, not dropped; the keypad follows DECKPAM; and an attaching
-    client gets back highlight tracking (1001), urxvt (1015) and SGR-pixel (1016) mouse modes and
-    a modifyOtherKeys mask (`CSI > 4 ; level : mask m`) a program set.
-- PTY input is bounded by bytes, including in-flight writes; backpressure retains pending
-  buffers and terminal replies stay behind earlier input. Reply overflow is bounded and logged.
-- Terminal dimensions are normalized once for the hosted emulator and PTY.
-- CI checks the standalone benchmark, test kit and hostile-peer harnesses. The tests start
-  programs, spawn tasks and make scratch directories (under `target/`, never the system temp dir)
-  only through `koh-testkit`; the comparison oracle is gone.
+
+- **The program's output reaches the user's terminal as it wrote it**: the server keeps a fux-vt
+  screen for redraws and answers the program's questions, and the client filters what reaches
+  the terminal; protocols koh/8 to koh/14 on the way.
+- A connection opens with a request saying what it is for. Handshakes, connections and every
+  queue are bounded; a burst of an agent's commands waits for room instead of being refused.
+- Prediction runs only on the primary screen with the PTY's modes known.
+- `koh clients rm` takes effect within 2 s and ends that client's sessions too.
+- Updated `fux-vt` 0.3.4 → 0.11.0 and `fuxix` 0.1.7 → 0.6.2.
 
 ### Fixed
-- **A character split across reads of `koh connect`'s input arrives whole**: its first bytes wait
-  for the rest however long that takes, where 35 ms later (the decoder's wait for a lone Escape)
-  each byte went on as `�` (`é世😀` typed a byte at a time arrived as nine of them).
-- **`koh logs` on a running job names the server as it was given**: `` `koh logs laptop build
-  --follow` ``, no longer `SERVER`.
-- **A client that fell behind keeps what scrolled off meanwhile**: its new epoch's redraw has
-  above it the history that scrolled off since the top row of what it read, into its terminal's
-  scrollback, where it had the screen alone and lost the rest (a slow link under a burst of
-  output; it made a scrollback test flaky on CI).
-- **A program `koh serve` hosts starts with every signal at its default** though koh was started
-  ignoring some (a script's `&` ignores SIGINT and SIGQUIT): a session's `Ctrl-\` quit nothing.
-  Linux and Android, where koh can read what it was started ignoring.
-- **A session's reports no longer say a program waits for input it has yet to get, or before the
-  output it wrote first.** Input still queued for the terminal, keys still on their way into it
-  (Linux hands them over on a worker), output the server had read but not yet taken, and output
-  held for the terminal's modes all count as the program being at work; keys are looked at before
-  the program and output after it, so neither slips between the looks.
-- **A password prompt printed just before echo goes off is never told with echo on**: a report
-  due in the moment between no longer sends the prompt before the modes are read again.
-- **`koh connect -- PROG` leaves no ended session behind.** The client's close saying it had the
-  end counts as the end delivered whichever way the server noticed the connection go; before, the
-  session could stay listed, its program exited, until its TTL ran out.
-- **A resize goes before the keys typed after it**, so a command typed at once sees the new size.
-- **A cut `koh cp` keeps what reached it**: the receiver lands the bytes already sent although the
-  sender is gone, so the next copy resumes from them.
-- The shell's marks koh writes count in a fux shell pane too: with `FUX_MARK_NONCE` in its
-  environment (fux 0.27 gives it to the programs a shell pane runs), every mark carries it, so
-  `koh connect` typed into a shell pane answers fux's `line` with `· done STATUS`.
-- A line typed in one go past 1 KiB (as an agent's terminal types it) no longer waits for the next
-  key: the client read stdin through a buffer `poll` cannot see, so the line's end, its Enter
-  among it, sat there until something more was typed.
-- A sixel picture can no longer make the server allocate: fux-vt 0.8 decodes pictures only for a
-  host that asks, and koh does not, so a crafted header of a few bytes no longer costs ~34 MiB.
-- A reconnect that landed as its exited session ended could wait for ever: the attach the
-  session had queued was kept alive until the next one. Sessions are reaped as they end.
-- An editor saving the `clients` file (missing or empty for a moment) could disconnect every saved
-  client and end their sessions.
-- Backspace or Left typed fast at a fresh line could appear to erase the prompt; a key could be
-  shown and then never sent when the outgoing queue was full; a terminal's answer cut by a drop
-  was reported as typing not sent.
-- `koh key info` and the menu said "none yet" for a key that exists but cannot be loaded.
-- A kitty-protocol key whose code is no Unicode scalar (a terminal's garbage) no longer makes a
-  message the client cannot send, losing the keys typed with it: the code is dropped.
-- A typo in the saved `clients` file disconnected every saved client and refused their redials;
-  the last list read well is now kept.
-- A server at capacity, or whose program could not start, left the client redialing forever with
-  no reason shown; a capacity close could also end a client for good. Both are redialed now, and
-  the banner says why; only "not authorized" ends the client.
-- A reconnect after the program exited got a fresh shell and never saw the exit; the final screen
-  could miss the program's last output; the exit status could be lost when the connection closed.
-- A double SIGHUP on a terminal's close skipped the drain; a forced exit returned 0.
-- Log lines could interleave on stderr, and a server's close reason could add lines to it.
-- Anyone who could reach the UDP port could block new connections with stalled handshakes.
-- A slow answer to the start-up questions reached the remote program as keys; a server granting no
-  stream could make the client impossible to quit; a suspend could take the terminal back before
-  the client was stopped.
-- tmux's or screen's `Ctrl-A` prefix was predicted as readline's; predicted text lost its colours;
-  the password hold missed prompts at the bottom of the screen.
-- Tests wrote under the system temp dir, and could lift the bans on starting programs.
-- A hostile server's close reason reached the user's terminal raw when the first connection was
-  refused (writing the clipboard despite `--no-clipboard`); stderr and every log line now escape
-  control characters, and log lines are uncoloured.
-- A program that closed its terminal and kept running left its client waiting forever; a
-  program that ignores SIGHUP outlived `koh serve`. `koh serve` handles SIGHUP, and a second
-  signal stops it waiting.
-- `koh clients rm` left the removed client's live connection open; a refused redial retried
-  forever.
-- Another local user could hang koh by locking its key directory; the menu's replace could lose
-  the saved name; `koh serve --key-file` needed `$HOME`; stalled handshakes could hold every
-  connection slot.
-- A test typed a wrong password into the real `sudo` and `passwd`.
-- A program that stopped reading its input, under a large paste, froze its connection's output,
-  and a client that left meanwhile kept its session attached and its connection slot held.
-- A paste cut off by a reconnect left the program's bracketed paste open.
-- Resuming from `Ctrl-^ Ctrl-Z` kept the window size from before the suspend; a client's first
-  connection rang the session's old bells.
-- `Esc` and then a key was predicted as `Alt` and the key; arrows were predicted under kernel
-  echo, which echoes them as `^[[D`.
-- A session's program that could not start was reported as the server being at capacity, and
-  starting one held up every other peer's attach.
-- Keys typed in the same read after `Ctrl-^ Ctrl-Z` were lost; a resize could wait behind a
-  stream of output, or behind input decoded in the same read; a flood of input starved the
-  output.
-- Forced PTY shutdown and ordinary drops reap children. Shutdown also stops pump threads when
-  a program leaves input unread or the output receiver is full.
-- Unwritable CLI output returns an error instead of panicking; diagnostic output is best effort.
-- An incomplete paste begun before an outage cannot finish into a reconnected shell. Fresh
-  keys after its end marker remain usable.
+
+- Characters split across reads arrive whole; a resize goes before keys typed after it; a cut
+  `koh cp` keeps what reached it; a reconnect as the session ended no longer waits for ever; a
+  program hosted by a server started with signals ignored gets them at their defaults.
 
 ## [0.13.0] — 2026-10-08
 

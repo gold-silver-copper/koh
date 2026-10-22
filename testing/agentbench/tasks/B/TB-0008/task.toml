@@ -1,9 +1,0 @@
-id = "TB-0008"
-title = "One value on a very long line"
-cat = "output"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/describe-node`. It prints the node's properties as `key=value`
-pairs separated by spaces, all on one very long line. Write the value of the key `shard_owner`
-(only the value) to `answer.txt` in your local directory.
-"""

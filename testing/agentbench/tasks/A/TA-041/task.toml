@@ -1,8 +1,0 @@
-id = "TA-041"
-title = "Confirm a cleanup"
-cat = "prompt"
-difficulty = "easy"
-goal = '''
-On the remote machine, run `~/bin/cleanup-cache` and confirm the deletion it asks about. It is
-done when it has emptied `~/cache`.
-'''

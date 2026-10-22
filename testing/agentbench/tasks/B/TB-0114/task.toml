@@ -1,9 +1,0 @@
-id = "TB-0114"
-title = "Stop the runaway worker"
-cat = "process"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/start-workers`; it starts four background workers and returns.
-One of the workers is a runaway that burns far more CPU than the other three. Stop that one worker
-and leave the other three running.
-"""

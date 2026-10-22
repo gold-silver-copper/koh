@@ -1,9 +1,0 @@
-id = "TA-032"
-title = "Upload files with hostile names"
-cat = "files"
-difficulty = "moderate"
-goal = '''
-Your local directory has `uploads/`, a folder of files with unusual names. Copy every file in it
-to `~/inbox/` on the remote machine (create it if needed), keeping each name exactly. It is
-done when `~/inbox/` holds exactly those files with the same names and contents.
-'''

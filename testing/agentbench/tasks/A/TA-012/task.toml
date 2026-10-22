@@ -1,9 +1,0 @@
-id = "TA-012"
-title = "Where the mismatch is"
-cat = "output"
-difficulty = "easy"
-goal = '''
-On the remote machine, run `~/bin/verify-archive`. Exactly one line of what it prints on
-standard output reports a checksum mismatch. Write that line's line number in its standard
-output (counting from 1, only the number) to `answer.txt` in your local directory.
-'''

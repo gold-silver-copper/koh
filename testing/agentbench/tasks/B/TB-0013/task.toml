@@ -1,9 +1,0 @@
-id = "TB-0013"
-title = "Final loss of a training run"
-cat = "wait"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/train`. It trains for a while (around a minute), printing one line
-per epoch, and ends with a line `final loss: ...`. Let it finish, then write the final loss (only
-the number, as printed) to `answer.txt` in your local directory.
-"""

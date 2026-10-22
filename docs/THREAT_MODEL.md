@@ -219,7 +219,7 @@ connecting a small set of machines you control — not a multi-user network serv
   exported to what it runs): a process of the same user can read it, as it can anything else of the
   user's. A program koh does not mark, or `--no-shell-marks`, counts every mark.
 
-The detailed finding history lives in [SECURITY.md's audit trail](../SECURITY.md#audit-trail).
+Past audits' findings and their fixes are in the git history ([SECURITY.md](../SECURITY.md#past-audits)).
 
 ## Non-goals (where koh does NOT match a hardened multi-user service)
 

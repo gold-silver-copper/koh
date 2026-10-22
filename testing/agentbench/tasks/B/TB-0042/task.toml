@@ -1,9 +1,0 @@
-id = "TB-0042"
-title = "Confirm a cleanup prompt"
-cat = "prompt"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/prune-builds`. It lists the builds in `~/builds/` that are older
-than 30 days and asks for confirmation before deleting them. Confirm, so that it deletes them. The
-task is done when the old builds are gone and the recent ones are still there.
-"""

@@ -1,3 +1,0 @@
-PREFIX = @prefix@
-all:
-	@echo building

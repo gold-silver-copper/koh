@@ -2,18 +2,19 @@
 //! questions, encodes the client's input as the program asked, and keeps the screen a client is
 //! redrawn from, the shell's commands and the window title.
 
-use crate::terminal::{Size, MAX_TITLE_LEN};
+use crate::request::MAX_TITLE;
+use crate::terminal::Size;
 
 use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
 use fux_vt::keys::encode::{key_bytes, paste};
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
-/// Decode an OSC title payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
+/// Decode an OSC title payload (lossy UTF-8) and clamp it to [`MAX_TITLE`] characters.
 fn title_from(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
-        .take(MAX_TITLE_LEN)
+        .take(MAX_TITLE)
         .collect()
 }
 
@@ -166,14 +167,8 @@ impl ServerTerminal {
         // Each entry the client gave, and none it did not: a reattaching client's palette
         // replaces the last client's whole. fux-vt answers a program's query of an entry it has
         // not set (OSC 4) with it; one the program set wins.
-        self.parser.set_host_palette(std::array::from_fn(|index| {
-            colours
-                .palette
-                .get(index)
-                .copied()
-                .flatten()
-                .map(Into::into)
-        }));
+        self.parser
+            .set_host_palette(colours.palette.map(|entry| entry.map(Into::into)));
         match (before, colours_now.scheme) {
             (Some(before), Some(now))
                 if before != now && self.parser.screen().mode(fux_vt::Mode::ColorSchemeUpdates) =>
@@ -468,7 +463,7 @@ mod tests {
             t.set_colours(&WireColours {
                 foreground: Some([0xdd, 0xdd, 0xdd]),
                 background: Some([0x1e, 0x1e, 0x20]),
-                palette: vec![Some([0, 0, 0])],
+                palette: [Some([0, 0, 0]); crate::events::PALETTE],
                 scheme: Some(crate::events::WireScheme::Dark),
             }),
             b"",
@@ -501,7 +496,7 @@ mod tests {
         // No client told its colours (`--no-colours`): xterm's defaults, as before.
         t.process(b"\x1b]4;1;?\x07");
         assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:cdcd/0000/0000\x07");
-        let mut palette = vec![None; crate::events::PALETTE];
+        let mut palette = [None; crate::events::PALETTE];
         palette[1] = Some([0xbf, 0x61, 0x6a]);
         palette[2] = Some([0xa3, 0xbe, 0x8c]);
         t.set_colours(&WireColours {
@@ -523,7 +518,7 @@ mod tests {
         );
         // A reattach from another terminal replaces the palette whole: an entry it did not
         // give goes back to xterm's.
-        let mut palette = vec![None; crate::events::PALETTE];
+        let mut palette = [None; crate::events::PALETTE];
         palette[2] = Some([0, 0, 0]);
         t.set_colours(&WireColours {
             palette,

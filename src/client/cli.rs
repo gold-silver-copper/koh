@@ -23,7 +23,7 @@ use crate::request::{
     ProblemKind, RemotePath, Request, Run, SessionInfo, SessionList, SessionNum, Signal, Started,
     Until, Wait, Waited, MAX_LOG_CHUNK, MAX_OUTPUT, MAX_REPLY,
 };
-use crate::transport_iroh::{bind_on, close_endpoint, generate_secret_key, Idle, Network};
+use crate::transport_iroh::{bind_on, close_endpoint, generate_secret_key, Idle, Network, Role};
 
 /// How long the first dial may take.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -182,12 +182,12 @@ impl BellHook {
 }
 
 /// Bind an endpoint to dial `remote` from, with a key of its own, its connections idle at most as
-/// `idle` says, and the connector that dials it, proving `identity` on each.
-async fn connector(
-    remote: &Remote,
-    identity: &crate::identity::Identity,
-    idle: Idle,
-) -> anyhow::Result<(iroh::Endpoint, IrohConnector)> {
+/// `idle` says, and the connector that dials it, proving the client key on each.
+async fn connector(remote: &Remote, idle: Idle) -> anyhow::Result<(iroh::Endpoint, IrohConnector)> {
+    let client_key = crate::identity::load(&crate::identity::KeyFile::locate(
+        remote.key_file.clone(),
+        "client",
+    )?)?;
     let server = remote.server;
     let (network, target) = match (remote.direct, remote.relay_url.clone()) {
         (Some(addr), _) => (
@@ -201,8 +201,8 @@ async fn connector(
         (None, None) => (Network::N0, server.into()),
     };
     // The endpoint's key is this process's alone; the client key is proven on each connection.
-    let endpoint = bind_on(generate_secret_key()?, (false, idle), &network, None).await?;
-    let connector = IrohConnector::new(endpoint.clone(), target, identity.secret.clone());
+    let endpoint = bind_on(generate_secret_key()?, Role::Client(idle), &network, None).await?;
+    let connector = IrohConnector::new(endpoint.clone(), target, client_key);
     Ok((endpoint, connector))
 }
 
@@ -232,8 +232,6 @@ pub(crate) struct Opened {
     /// The client's first stream, the request on it, open for what follows.
     pub(crate) control: SendStream,
     endpoint: iroh::Endpoint,
-    /// Held while connected: its lease stops `koh key reset`.
-    _identity: crate::identity::Identity,
 }
 
 impl Opened {
@@ -241,17 +239,12 @@ impl Opened {
     /// client killed where it stands is noticed within 10 seconds, and what it ran hung up.
     pub(crate) async fn dial(remote: &Remote, request: &Request) -> anyhow::Result<Self> {
         log_to_koh_log();
-        let identity = crate::identity::load(&crate::identity::KeyFile::locate(
-            remote.key_file.clone(),
-            "client",
-        )?)?;
-        let (endpoint, connector) = connector(remote, &identity, Idle::Command).await?;
+        let (endpoint, connector) = connector(remote, Idle::Command).await?;
         let (conn, control) = first_dial(&endpoint, connector.open(request)).await?;
         Ok(Self {
             conn,
             control,
             endpoint,
-            _identity: identity,
         })
     }
 
@@ -770,10 +763,10 @@ pub async fn logs(
                 crate::transport_iroh::read_framed(&mut recv, MAX_LOG_CHUNK.saturating_add(64))
                     .await?;
             // A job the server does not have answers as a problem instead.
-            if let Ok(Err(problem)) = crate::request::decode::<Answer<()>>(&body) {
+            if let Ok(Err(problem)) = postcard::from_bytes::<Answer<()>>(&body) {
                 return Err(problem.into());
             }
-            match crate::request::decode::<LogMsg>(&body)? {
+            match postcard::from_bytes::<LogMsg>(&body)? {
                 LogMsg::Dropped(n) => crate::log::stderr(format_args!(
                     "koh: {} of the job's output were dropped before this (the log keeps its newest)",
                     bytes(n)
@@ -1019,13 +1012,8 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
              `koh cp` copies files"
         )
     })?;
-    // Held for the session: its lease stops `koh key reset` while it may redial.
-    let identity = crate::identity::load(&crate::identity::KeyFile::locate(
-        args.remote.key_file.clone(),
-        "client",
-    )?)?;
     let size = backend.size().unwrap_or(crate::terminal::DEFAULT_SIZE);
-    let (endpoint, connector) = connector(&args.remote, &identity, Idle::Shell).await?;
+    let (endpoint, connector) = connector(&args.remote, Idle::Shell).await?;
     let admitted: Admitted = first_dial(
         &endpoint,
         connector.connect(args.pick, size, (args.program, args.cwd.clone())),
@@ -1045,13 +1033,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         }
         _ => error,
     })?;
-    // For the menu's "last connected"; failing to note it never stops the session.
-    let noted = crate::identity::KeyFile::path_for(args.remote.key_file.clone(), "client")
-        .map_err(anyhow::Error::from)
-        .and_then(|key| crate::names::record_connected(&key, args.remote.server));
-    if let Err(error) = noted {
-        tracing::debug!(error = %format!("{error:#}"), "noting when the server was reached");
-    }
     let dialed_at = std::time::SystemTime::now();
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
@@ -1076,7 +1057,6 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     )
     .await;
     let _ = close_endpoint(&endpoint).await;
-    drop(identity);
     super::io::first_error(result, tasks.shutdown().await)
 }
 

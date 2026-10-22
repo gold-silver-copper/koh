@@ -137,8 +137,11 @@ impl FaultNet {
         Ok(koh::transport_iroh::configure(
             Endpoint::builder(presets::Minimal),
             secret,
-            accept,
-            koh::transport_iroh::Idle::Shell,
+            if accept {
+                koh::transport_iroh::Role::Server
+            } else {
+                koh::transport_iroh::Role::Client(koh::transport_iroh::Idle::Shell)
+            },
         )
         .clear_ip_transports()
         .add_custom_transport(transport)

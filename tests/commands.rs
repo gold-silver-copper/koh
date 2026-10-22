@@ -305,7 +305,7 @@ fn quiet_commands_of_one_key_at_once_through_a_relay_all_keep_their_links() {
             let network = koh::transport_iroh::Network::Relay(url.clone());
             let endpoint = koh::transport_iroh::bind_on(
                 koh::transport_iroh::generate_secret_key().expect("a key"),
-                (true, koh::transport_iroh::Idle::Shell),
+                koh::transport_iroh::Role::Server,
                 &network,
                 None,
             )

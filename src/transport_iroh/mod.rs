@@ -45,11 +45,23 @@ impl Idle {
     }
 }
 
+/// What an endpoint is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// It accepts connections, each living as long as its client's [`Idle`] says.
+    Server,
+    /// It dials, its connections living `Idle`.
+    Client(Idle),
+}
+
 /// The server accepts only the client's two message streams, input and control; the client, a few
 /// streams of the server's (an epoch's, superseded ones reset, and answers), and no bi-stream on
 /// either side.
-fn koh_transport_config(accept: bool, idle: Idle) -> QuicTransportConfig {
-    let uni = if accept { 2 } else { 8 };
+fn koh_transport_config(role: Role) -> QuicTransportConfig {
+    let (uni, idle) = match role {
+        Role::Server => (2, Idle::Shell),
+        Role::Client(idle) => (8, idle),
+    };
     QuicTransportConfig::builder()
         .keep_alive_interval(idle.keepalive())
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle.millis()))))
@@ -106,7 +118,7 @@ pub async fn proven(
     conn: &Connection,
     recv: &mut iroh::endpoint::RecvStream,
 ) -> anyhow::Result<EndpointId> {
-    let proof: KeyProof = crate::request::decode(&read_framed(recv, MAX_PROOF).await?)?;
+    let proof: KeyProof = postcard::from_bytes(&read_framed(recv, MAX_PROOF).await?)?;
     proof
         .key
         .verify(&proof_message(conn)?, &proof.signature)
@@ -248,16 +260,14 @@ pub enum Network {
     Relay(RelayUrl),
 }
 
-/// Bind an endpoint on `network`, [`configure`]d, on UDP `port` for IPv4 and, where the host has
-/// it, IPv6; `None` binds ephemeral ports.
-///
-/// `accept` lets it accept connections (the server); its connections live `idle` without a word.
+/// Bind an endpoint for `role` on `network`, [`configure`]d, on UDP `port` for IPv4 and, where
+/// the host has it, IPv6; `None` binds ephemeral ports.
 ///
 /// A fixed port lets a client dialing an address find a restarted server where it was. A port in
 /// use is [`SetupError::PortInUse`].
 pub async fn bind_on(
     secret: SecretKey,
-    (accept, idle): (bool, Idle),
+    role: Role,
     network: &Network,
     port: Option<u16>,
 ) -> Result<Endpoint, SetupError> {
@@ -282,47 +292,48 @@ pub async fn bind_on(
             .map_err(|e| SetupError::Other(anyhow::Error::new(e)))?,
         None => builder,
     };
-    configure(builder, secret, accept, idle)
-        .bind()
-        .await
-        .map_err(|e| {
-            let error = anyhow::Error::new(e);
-            let in_use = error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
-            });
-            match port {
-                Some(port) if in_use => SetupError::PortInUse(port),
-                _ => SetupError::Other(error),
-            }
-        })
+    configure(builder, secret, role).bind().await.map_err(|e| {
+        let error = anyhow::Error::new(e);
+        let in_use = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+        });
+        match port {
+            Some(port) if in_use => SetupError::PortInUse(port),
+            _ => SetupError::Other(error),
+        }
+    })
 }
 
-/// Apply koh's identity, transport config, DNS resolver and (when `accept`ing) ALPN to `builder`.
+/// Apply koh's identity, transport config, DNS resolver and (for a server) ALPN to `builder`.
 /// Every endpoint koh binds goes through this, tests' included.
 pub fn configure(
     builder: iroh::endpoint::Builder,
     secret: SecretKey,
-    accept: bool,
-    idle: Idle,
+    role: Role,
 ) -> iroh::endpoint::Builder {
     let mut builder = builder
         .secret_key(secret)
-        .transport_config(koh_transport_config(accept, idle));
+        .transport_config(koh_transport_config(role));
     if let Some(resolver) = discovery_dns_resolver() {
         builder = builder.dns_resolver(resolver);
     }
-    if accept {
+    if role == Role::Server {
         builder = builder.alpns(vec![ALPN.to_vec()]);
     }
     builder
 }
 
-/// Bind an endpoint with no relay and no discovery, dialed by id and socket address (LAN,
-/// loopback, tests).
+/// Bind a server (`accept`) or a shell's client endpoint with no relay and no discovery, dialed by
+/// id and socket address (LAN, loopback, tests).
 pub async fn bind_endpoint_local(secret: SecretKey, accept: bool) -> Result<Endpoint, SetupError> {
-    bind_on(secret, (accept, Idle::Shell), &Network::Local, None).await
+    let role = if accept {
+        Role::Server
+    } else {
+        Role::Client(Idle::Shell)
+    };
+    bind_on(secret, role, &Network::Local, None).await
 }
 
 /// `ep`'s address on the IPv4 loopback interface.
@@ -449,13 +460,8 @@ mod tests {
                     .and_then(|socket| socket.local_addr())
                     .expect("a free port")
                     .port();
-                if let Ok(first) = bind_on(
-                    secret.clone(),
-                    (true, Idle::Shell),
-                    &Network::Local,
-                    Some(port),
-                )
-                .await
+                if let Ok(first) =
+                    bind_on(secret.clone(), Role::Server, &Network::Local, Some(port)).await
                 {
                     found = Some((port, first));
                     break;
@@ -475,7 +481,7 @@ mod tests {
                 "{bound:?}"
             );
             // The same port again, as a second server would: a clear error, not a random port.
-            match bind_on(secret, (true, Idle::Shell), &Network::Local, Some(port)).await {
+            match bind_on(secret, Role::Server, &Network::Local, Some(port)).await {
                 Err(SetupError::PortInUse(p)) => assert_eq!(p, port),
                 Err(e) => panic!("expected PortInUse, got {e}"),
                 Ok(_) => panic!("a taken port must not bind"),

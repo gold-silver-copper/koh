@@ -1,5 +1,5 @@
 //! The real `koh` binary's names for ids: `koh servers` and `koh clients`, `koh connect <name>`,
-//! `koh serve` allowing the saved clients, `koh key info` and `reset` for both keys, and the menu
+//! `koh serve` allowing the saved clients, `koh id` and `koh key reset` for both keys, and the menu
 //! `koh` alone opens on a terminal (and help, off one).
 //!
 //! Every run has its own `HOME` and `XDG_CONFIG_HOME`, so the keys and lists live in a scratch
@@ -25,7 +25,7 @@ use koh_testkit::{command, Scratch};
 fn unwritable_stdout_and_stderr_do_not_panic() {
     let home = Home::new("failed-output").expect("scratch home");
     for discard_diagnostics in [false, true] {
-        let mut command = home.command(&["key", "info"]).expect("spawn koh");
+        let mut command = home.command(&["help-agents"]).expect("spawn koh");
         command.stdout(
             std::fs::OpenOptions::new()
                 .write(true)
@@ -43,7 +43,7 @@ fn unwritable_stdout_and_stderr_do_not_panic() {
         let output = command.output().expect("run koh");
         assert_eq!(output.status.code(), Some(1));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
-        assert!(!home.koh_dir().exists(), "info must not create identities");
+        assert!(!home.koh_dir().exists(), "help must not create identities");
     }
 }
 
@@ -242,45 +242,40 @@ fn serve_without_allow_allows_the_saved_clients() {
 }
 
 #[test]
-fn key_info_shows_both_keys_and_reset_names_the_one() {
+fn id_prints_either_key_and_reset_removes_one_only_with_yes() {
     let home = Home::new("keys").unwrap();
-    let out = home.koh(&["key", "info"]).unwrap();
-    assert!(!out.status.success(), "no key yet: {}", text(&out));
-    let client = home.koh(&["id"]).unwrap();
-    let client = String::from_utf8_lossy(&client.stdout).trim().to_owned();
-    let out = home.koh(&["key", "info"]).unwrap();
-    let said = text(&out);
-    assert!(out.status.success(), "{said}");
-    assert!(
-        said.contains(&client) && said.contains("server key"),
-        "{said}"
-    );
-    assert!(said.contains("none yet (`koh serve` creates it)"), "{said}");
-    // A server key that is there but no key is said so, not taken for none.
+    let id = |argv: &[&str]| {
+        let out = home.koh(argv).unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    let (client, server) = (id(&["id"]), id(&["id", "server"]));
+    assert!(client != server && server.len() == 64, "{client} {server}");
+    assert_eq!(id(&["id", "client"]), client, "the same key again");
+    // A server key that is there but no key is said so, not replaced.
     let server_key = home.koh_dir().join("server.key");
     std::fs::write(&server_key, [7; 31]).unwrap();
     std::fs::set_permissions(&server_key, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let out = home.koh(&["key", "info"]).unwrap();
-    let said = text(&out);
+    let out = home.koh(&["id", "server"]).unwrap();
     assert!(
-        !out.status.success() && said.contains("koh key reset"),
-        "{said}"
+        !out.status.success() && text(&out).contains("koh key reset"),
+        "{}",
+        text(&out)
     );
-    std::fs::remove_file(&server_key).unwrap();
-    let out = home.koh(&["key", "reset", "client"]).unwrap();
+    let out = home.koh(&["key", "reset", "server"]).unwrap();
     assert!(
         !out.status.success() && text(&out).contains("--yes"),
         "{}",
         text(&out)
     );
+    assert!(server_key.exists());
+    let out = home.koh(&["key", "reset", "server", "--yes"]).unwrap();
     assert!(
-        text(&out).contains("every server that allows you"),
+        text(&out).contains("every client that connects here"),
         "{}",
         text(&out)
     );
-    let out = home.koh(&["key", "reset", "client", "--yes"]).unwrap();
-    assert!(out.status.success(), "{}", text(&out));
-    assert!(!home.koh_dir().join("client.key").exists());
+    assert!(!server_key.exists());
 }
 
 #[test]
@@ -318,7 +313,7 @@ fn koh_alone_on_a_terminal_opens_the_menu_and_q_leaves_it() {
 }
 
 #[test]
-fn connect_by_name_dials_the_saved_server_where_it_was_saved_and_notes_it() {
+fn connect_by_name_dials_the_saved_server_where_it_was_saved() {
     let home = Home::new("connect").unwrap();
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
@@ -338,8 +333,6 @@ fn connect_by_name_dials_the_saved_server_where_it_was_saved_and_notes_it() {
             let _ = client.write(vec![0x1e, b'.']);
             drop(client);
             task.abort();
-            let noted = std::fs::read_to_string(home.koh_dir().join("connected")).unwrap();
-            assert!(noted.starts_with(&id), "the connect is noted: {noted:?}");
         });
 }
 

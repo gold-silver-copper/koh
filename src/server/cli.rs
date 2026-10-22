@@ -27,7 +27,7 @@ use crate::request::{
 use crate::server::audit::{auth_event, Outcome, Throttle};
 use crate::server::place::Place;
 use crate::server::session::{AttachKind, Registry, SessionSpec};
-use crate::transport_iroh::{bind_on, close, Network, PROTOCOL};
+use crate::transport_iroh::{bind_on, close, Network, Role, PROTOCOL};
 use tracing::{debug, info, warn};
 
 /// Deadline on the QUIC handshake, so a stalled dial gives up its place among those pending rather
@@ -142,8 +142,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
-    let identity = crate::identity::load(&key_file)?;
-    let secret = identity.secret.clone();
+    let secret = crate::identity::load(&key_file)?;
 
     // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
     let network = match (&args.relay_url, args.local) {
@@ -151,14 +150,9 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
         (None, true) => Network::Local,
         (None, false) => Network::N0,
     };
-    let endpoint = bind_on(
-        secret,
-        (true, crate::transport_iroh::Idle::Shell),
-        &network,
-        args.port,
-    )
-    .await
-    .context("binding endpoint")?;
+    let endpoint = bind_on(secret, Role::Server, &network, args.port)
+        .await
+        .context("binding endpoint")?;
     let my_id = endpoint.id();
     let id_str = my_id.to_string();
     let port = endpoint
@@ -743,7 +737,7 @@ async fn opening(
 ) -> Option<(Request, iroh::endpoint::RecvStream)> {
     let read = async {
         let body = crate::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
-        let request: Request = crate::request::decode(&body)?;
+        let request: Request = postcard::from_bytes(&body)?;
         anyhow::Ok((request, control))
     };
     match tokio::time::timeout(REQUEST_TIMEOUT, read).await {

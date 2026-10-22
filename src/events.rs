@@ -9,12 +9,11 @@
 //! (`fux_vt::keys::encode`). So a program gets what it asked for from any terminal, and a
 //! reattach from another terminal changes nothing for it.
 //!
-//! The types here are the wire's own, so its encoding is pinned here and not by fux-vt's types.
-//! Decoding refuses what no terminal sends: a modifier mask with unknown bits, a function key past
-//! F35, a mouse press with no button, a kitty code that is no Unicode scalar, a paste over
-//! [`MAX_PASTE`] bytes, more
-//! than [`MAX_EVENTS`] events in a message, more than [`PALETTE`] palette entries ([`check_events`],
-//! [`WireColours::check`]).
+//! The types here are the wire's own, mirroring fux-vt's, so its encoding is pinned here and
+//! a fux-vt release never changes koh's protocol. Decoding refuses what no terminal sends: a
+//! modifier mask with unknown bits, a function key past F35, a mouse press with no button, a kitty
+//! code that is no Unicode scalar, a paste over [`MAX_PASTE`] bytes, more than [`MAX_EVENTS`]
+//! events in a message ([`check_events`]).
 
 use fux_vt::keys::colour::{Colours, Scheme};
 use fux_vt::keys::mouse::{MouseAction, MouseButton, MouseEvent};
@@ -125,18 +124,37 @@ pub enum WireMouseAction {
     Motion(Option<WireButton>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WireButton {
-    Left,
-    Middle,
-    Right,
-    WheelUp,
-    WheelDown,
-    WheelLeft,
-    WheelRight,
-    Back,
-    Forward,
+/// A wire enum of unit variants, and its conversions to and from fux-vt's of the same names.
+macro_rules! mirror {
+    ($wire:ident <-> $theirs:ident { $($variant:ident),* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum $wire {
+            $($variant),*
+        }
+
+        impl From<$wire> for $theirs {
+            fn from(wire: $wire) -> Self {
+                match wire {
+                    $($wire::$variant => Self::$variant),*
+                }
+            }
+        }
+
+        impl From<$theirs> for $wire {
+            fn from(theirs: $theirs) -> Self {
+                match theirs {
+                    $($theirs::$variant => Self::$variant),*
+                }
+            }
+        }
+    };
 }
+
+mirror!(WireButton <-> MouseButton {
+    Left, Middle, Right, WheelUp, WheelDown, WheelLeft, WheelRight, Back, Forward,
+});
+
+mirror!(WireScheme <-> Scheme { Dark, Light });
 
 /// What the user's terminal said of its colours, 8 bits a channel.
 ///
@@ -146,15 +164,8 @@ pub enum WireButton {
 pub struct WireColours {
     pub foreground: Option<[u8; 3]>,
     pub background: Option<[u8; 3]>,
-    #[serde(deserialize_with = "crate::bounded::at_most::<PALETTE, _, _>")]
-    pub palette: Vec<Option<[u8; 3]>>,
+    pub palette: [Option<[u8; 3]>; PALETTE],
     pub scheme: Option<WireScheme>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WireScheme {
-    Dark,
-    Light,
 }
 
 /// The modifier bits a key or mouse event may carry.
@@ -189,12 +200,6 @@ impl InputEvent {
             Self::Paste(text) if text.len() > MAX_PASTE => Err("paste too long"),
             Self::Mouse(_) | Self::Focus(_) | Self::Paste(_) => Ok(()),
         }
-    }
-
-    /// The bytes the event takes on the wire, for packing messages.
-    pub fn encoded_len(&self) -> usize {
-        postcard::serialize_with_flavor(self, postcard::ser_flavors::Size::default())
-            .unwrap_or(usize::MAX)
     }
 }
 
@@ -297,22 +302,11 @@ fn bits_of(mods: Modifiers) -> u8 {
 impl WireMouse {
     /// The event, as fux-vt's encoder takes it.
     pub fn event(&self) -> MouseEvent {
-        let button = |b: WireButton| match b {
-            WireButton::Left => MouseButton::Left,
-            WireButton::Middle => MouseButton::Middle,
-            WireButton::Right => MouseButton::Right,
-            WireButton::WheelUp => MouseButton::WheelUp,
-            WireButton::WheelDown => MouseButton::WheelDown,
-            WireButton::WheelLeft => MouseButton::WheelLeft,
-            WireButton::WheelRight => MouseButton::WheelRight,
-            WireButton::Back => MouseButton::Back,
-            WireButton::Forward => MouseButton::Forward,
-        };
         MouseEvent {
             action: match self.action {
-                WireMouseAction::Press(b) => MouseAction::Press(button(b)),
-                WireMouseAction::Release(b) => MouseAction::Release(b.map(button)),
-                WireMouseAction::Motion(b) => MouseAction::Motion(b.map(button)),
+                WireMouseAction::Press(b) => MouseAction::Press(b.into()),
+                WireMouseAction::Release(b) => MouseAction::Release(b.map(Into::into)),
+                WireMouseAction::Motion(b) => MouseAction::Motion(b.map(Into::into)),
             },
             mods: mods_of(self.mods),
             row: self.row,
@@ -323,22 +317,11 @@ impl WireMouse {
 
 impl From<MouseEvent> for WireMouse {
     fn from(event: MouseEvent) -> Self {
-        let button = |b: MouseButton| match b {
-            MouseButton::Left => WireButton::Left,
-            MouseButton::Middle => WireButton::Middle,
-            MouseButton::Right => WireButton::Right,
-            MouseButton::WheelUp => WireButton::WheelUp,
-            MouseButton::WheelDown => WireButton::WheelDown,
-            MouseButton::WheelLeft => WireButton::WheelLeft,
-            MouseButton::WheelRight => WireButton::WheelRight,
-            MouseButton::Back => WireButton::Back,
-            MouseButton::Forward => WireButton::Forward,
-        };
         Self {
             action: match event.action {
-                MouseAction::Press(b) => WireMouseAction::Press(button(b)),
-                MouseAction::Release(b) => WireMouseAction::Release(b.map(button)),
-                MouseAction::Motion(b) => WireMouseAction::Motion(b.map(button)),
+                MouseAction::Press(b) => WireMouseAction::Press(b.into()),
+                MouseAction::Release(b) => WireMouseAction::Release(b.map(Into::into)),
+                MouseAction::Motion(b) => WireMouseAction::Motion(b.map(Into::into)),
             },
             mods: bits_of(event.mods),
             row: event.row,
@@ -348,22 +331,12 @@ impl From<MouseEvent> for WireMouse {
 }
 
 impl WireColours {
-    /// Whether the message is within the wire's bounds.
-    pub fn check(&self) -> Result<(), &'static str> {
-        (self.palette.len() <= PALETTE)
-            .then_some(())
-            .ok_or("too many palette entries")
-    }
-
     /// The foreground, background and scheme, as fux-vt answers programs from them.
     pub fn colours(&self) -> Colours {
         Colours {
             foreground: self.foreground.map(Rgb::from),
             background: self.background.map(Rgb::from),
-            scheme: self.scheme.map(|s| match s {
-                WireScheme::Dark => Scheme::Dark,
-                WireScheme::Light => Scheme::Light,
-            }),
+            scheme: self.scheme.map(Into::into),
         }
     }
 

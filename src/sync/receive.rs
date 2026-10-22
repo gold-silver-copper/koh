@@ -318,7 +318,7 @@ impl<R: Read> Receiver<'_, R> {
         let len = crate::request::body_len(prefix, MAX_ITEM).map_err(|_bad| malformed())?;
         self.buf.resize(len, 0);
         self.input.read_exact(&mut self.buf).map_err(|_cut| cut())?;
-        crate::request::decode(&self.buf).map_err(|_bad| malformed())
+        postcard::from_bytes(&self.buf).map_err(|_bad| malformed())
     }
 
     /// Answer the sender. One gone hears nothing, but what it sent before it went is still

@@ -51,52 +51,6 @@ pub fn bad_value(error: &clap::Error) -> Option<&BadValue> {
     error.source()?.downcast_ref()
 }
 
-/// koh's message for `error` if it is a `--sh` script whose quoting broke on the way: the shell
-/// that ran koh split it, so words came after it that clap takes for arguments. The script is
-/// one word, or goes on stdin; what came is shown cut, not echoed whole.
-pub fn broken_sh(error: &clap::Error, argv: &[OsString]) -> Option<String> {
-    use clap::error::{ContextKind, ContextValue};
-    if error.kind() != ErrorKind::UnknownArgument {
-        return None;
-    }
-    let sub = argv.get(1)?.to_str()?;
-    let given = argv
-        .iter()
-        .skip(2)
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "--sh" || arg.as_bytes().starts_with(b"--sh="));
-    if !matches!(sub, "exec" | "run") || !given {
-        return None;
-    }
-    let came = match error.get(ContextKind::InvalidArg) {
-        Some(ContextValue::String(came)) => came.as_str(),
-        _ => "",
-    };
-    let mut cut: String = came
-        .chars()
-        .take(40)
-        .flat_map(|c| {
-            if c.is_control() {
-                c.escape_default().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect();
-    if came.chars().nth(40).is_some() {
-        cut.push('…');
-    }
-    let fix = if sub == "exec" {
-        "pipe the script in instead: koh exec SERVER -- sh -s < script.sh (or <<'EOF' ... EOF)"
-    } else {
-        "a job has no stdin: koh run SERVER --sh \"$(cat script.sh)\""
-    };
-    Some(format!(
-        "--sh takes the script as one word, and more came after it ('{cut}'): its quoting broke; \
-         {fix}"
-    ))
-}
-
 /// A `--allow` endpoint id.
 fn allow_id(value: &str) -> Result<EndpointId, BadValue> {
     parse_endpoint_id(value).map_err(|e| BadValue(format!("bad --allow id: {value}: {e}")))
@@ -274,90 +228,60 @@ impl ConnectArgs {
 
 /// What `koh help-agents` prints: everything an agent needs, short.
 pub const HELP_AGENTS: &str = "\
-koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID --direct IP:PORT`
-or an endpoint id. Nothing here needs a terminal but `connect`.
+koh for scripts and agents. SERVER is a name saved with `koh servers add NAME ID [--direct IP:PORT]`
+or an endpoint id. Only `connect` needs a terminal.
 
-Edit here, build there, in one call:
-  koh exec SERVER --sync proj -- cargo test   proj here synced to SERVER:proj (only the files that
-                                       changed, said in a line on stderr), then run in it
-  koh exec SERVER --sync . -C proj -- cargo test   from within the tree: -C names it there
-  koh run SERVER --sync proj --name b -- cargo build && koh wait SERVER b --timeout 600   a long
-                                       build that outlives a dropped link (rerun the wait if it
-                                       timed out: the job runs on)
-  koh cp -r --exclude target SERVER:proj/. proj   back here: what a command changed there
-                                       (rustfmt), only the files that differ
+Edit here, build there:
+  koh exec SERVER --sync proj -- cargo test   proj synced to SERVER:proj (changed files only), then
+                                              the command run in it
+  koh exec SERVER --sync . -C proj -- make     from inside the tree: -C names it there
+  koh run SERVER --sync proj --name b -- make; koh wait SERVER b --timeout 600
+                                              a build outliving a dropped link (124: wait again)
+  koh cp -r --exclude target SERVER:proj/. proj   bring back what a command changed there
 
-Run something:
-  koh exec SERVER -- PROG ARG...       words passed as they are, no shell; ~/x is in the home
-  koh exec SERVER --sh 'cd src && make'  a shell line, on purpose: one word, quoted whole
-  koh exec SERVER -- sh -s < script.sh  a longer script, or one with quotes in it, on stdin
-  koh exec SERVER -C proj -- PROG ...  start in DIR (relative: in the home). Not an unquoted
-                                       -C ~/proj: your shell makes that this machine's home
-  stdin goes to the command; stdout and stderr come back apart (sent to one file here, as
-  2>&1 or a terminal does, in the order it wrote them); exits with its status (127 no such
-  program, 126 could not start: no -C DIR there, 255 koh's own error). A killed koh hangs it up
-  at once (SIGTERM, SIGHUP, SIGINT), within 10 s if SIGKILLed.
-  koh connect SERVER -C proj -- gdb ./prog  one program on a terminal of its own (an editor, a
-                                       debugger, a TUI), in a terminal, started in DIR (else
-                                       the home); ends with its status
+Commands: stdin goes in, stdout and stderr come back apart, koh exits with the command's status, and
+a killed koh hangs the command up.
+  koh exec SERVER -- PROG ARG...      words as they are, no shell; ~/x is in the server's home
+  koh exec SERVER --sh 'cd src && make'   a shell line, as one quoted word
+  koh exec SERVER -- sh -s < script.sh    a longer script, on stdin
+  koh exec SERVER -C DIR -- PROG      start in DIR there (relative: in the home; quote a ~)
+  koh connect SERVER -C DIR -- gdb ./a    a program on a terminal of its own, in this terminal
 
-Jobs (survive koh exiting and the link dropping; output and status kept):
-  koh run SERVER [--name build] [-C DIR] -- make -j4   prints the job's name; 127 no such
-                                        program, 126 could not start (no -C DIR there)
-  koh wait SERVER build                 until it ends: prints its last 200 lines (--tail N, 0 for
-                                        none), exits with its status
-  koh wait SERVER build --text listening  until its output has the text (1 if it ended first)
-  koh wait SERVER build --timeout 60    gives up after 60s (exit 124), saying how the job
-                                        stands (processes, CPU time) and its last lines
-  koh wait SERVER --file out/done.txt   until the file exists
-  koh logs SERVER build [--follow]      its last 200 lines (--tail N, --all), then on stderr
-                                        `· running 34s: ...` or `· exited 101 after 34s`; with
-                                        --follow on as it writes until it ends, then that line,
-                                        and exits with its status
-  koh jobs SERVER [build]               one line a job; with a name, its command whole; a
-                                        running one's processes and CPU time (Linux servers)
+Jobs outlive koh and the link, their output and status kept:
+  koh run SERVER [--name build] [-C DIR] -- make -j4   prints the job's name
+  koh wait SERVER build               until it ends: prints its last 200 lines (--tail N), exits
+                                      with its status
+  koh wait SERVER build --text TEXT   until its output has TEXT (exit 1 if it ended first)
+  koh wait SERVER --file PATH         until PATH exists there
+  koh logs SERVER build [-f] [--all]  its last 200 lines (all, or on until it ends), then on
+                                      stderr how it stands
+  koh jobs SERVER [build]             one line a job, or one job's command whole
   koh kill SERVER build [--signal KILL]
 
-Copy (a sync: merges, makes parents, sends only files that changed, by hash):
-  koh cp -r ./src SERVER:proj/          src lands as proj/src; `./src/.` lands its contents
-  koh cp -r ./src SERVER:proj/src       updates proj/src, there already (as `./src/.` does; cp
-                                        would nest it as proj/src/src: name that, or end in /)
-  koh cp SERVER:proj/out.txt .          the other way
-  --delete removes what the source lacks; --exclude PAT (repeat); -p keeps mtimes (default:
-  arrival time, so builds see changes); --atomic lands nothing until all came; --dry-run
-  changes nothing and sends no file, listing each change (`new`, `replaced`, `deleted`, `dir`,
-  `link` and its path; a file's size, and the size of the one it replaces) before the summary.
-  --diff is that dry run, each replaced text file (to 1 MiB) followed by its unified diff
-  (a/ the destination's, b/ the source's): which files differ by content, and how.
-  Without --delete, what the source lacks is kept and counted, but for directories (most
-  often made there, as a build's target/). Prints one line,
-  where it landed: `3 files sent, 41 KB → SERVER:proj/src (1 new, 2 replaced; 120 unchanged)`
-  (`received` for a download). A cut copy resumes when rerun.
-  To build there what you edit here, sync in the same call as the build, so it never sees stale
-  code (an unchanged tree costs only hashes): `koh exec SERVER --sync proj -- make` (`--exclude
-  target` keeps a local build's output here). There is no watch mode, whose sync a build can
-  still overtake.
+Copy, as a sync: parents made, only files that differ sent, a cut copy resumed when rerun.
+  koh cp -r ./src SERVER:proj/        lands as proj/src; ./src/. lands its contents in proj/
+  koh cp SERVER:proj/out.txt .        the other way
+  --delete removes what the source lacks, --exclude PAT (repeatable) neither sends nor removes,
+  -p keeps mtimes, --dry-run lists each change and sends nothing.
 
-Shell sessions (`koh connect SERVER` in a terminal, or fux):
-  koh sessions SERVER                   number, attached, state (reading/busy/...), last status
-  koh wait SERVER --session N           until its running command ends; exits with its status
-  koh wait SERVER --session N --reading until its program waits for input
-  koh output SERVER --session N [--last]  its screen (no blank rows below what it shows), or
-                                        the last command's output
+Sessions (`koh connect SERVER`):
+  koh sessions SERVER                 number, attached, state, last status
+  koh wait SERVER --session N [--reading]   until its command ends, or its program reads input
+  koh output SERVER --session N [--last]    its screen, or its last command's output
 
 --json on sessions, output, exec, run, jobs, kill, wait and cp: one JSON value on stdout, and on
-failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait (exit 124).
-Exit codes: 0 ok, 1 failed, 2 usage, 3 server not reached, 4 refused (not allowed, or out of
-the key's scope), 75 server busy (too many connections at once: nothing ran, so retry), 124 wait
-timed out, 126 a command or session could not start (no -C DIR there), 127 no such program
-(exec, run); exec, wait and logs --follow exit with the remote status (75 too when busy).
+failure {\"error\":{\"kind\":...,\"message\":...}}. --timeout SECS on wait.
+Exit codes: 0 ok, 1 failed, 2 usage, 3 server not reached, 4 refused (not allowed, or out of the
+key's scope), 75 server busy (nothing ran: retry), 124 wait timed out, 126 could not start (no -C
+DIR there), 127 no such program; exec, wait and logs -f exit with the remote status, 255 for
+koh's own error.
 ";
 
 /// `koh`'s command line.
 pub fn command() -> Command {
     Command::new("koh")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("koh: a peer-to-peer remote shell over iroh. Alone on a terminal it opens a menu of your keys, servers and clients. Agents: `koh help-agents`")
+        .about("A peer-to-peer remote shell over iroh; alone on a terminal, a menu of your keys, servers and clients (agents: `koh help-agents`)")
         .subcommand(serve())
         .subcommand(connect())
         .subcommand(sessions())
@@ -373,9 +297,7 @@ pub fn command() -> Command {
         .subcommand(key())
         .subcommand(names(List::Servers))
         .subcommand(names(List::Clients))
-        .subcommand(Command::new("help-agents").about("What scripts and agents need of koh, in one short page"))
-        // `--help` ends with that page, so a script's first look has all it needs.
-        .after_long_help(HELP_AGENTS)
+        .subcommand(Command::new("help-agents").about("What scripts and agents need of koh, in one page"))
 }
 
 /// An optional path, `--NAME <VALUE_NAME>`.
@@ -455,7 +377,7 @@ fn serve() -> Command {
                 .value_name("N")
                 .default_value(DEFAULT_MAX_CONNECTIONS.to_string())
                 .value_parser(value_parser!(NonZeroU32))
-                .help("Most connections at once; as many more from allowed clients wait up to 10 s for room, then are told the server is busy"),
+                .help("Most connections at once; as many more wait up to 10 s, then are told the server is busy"),
         )
         .arg(
             Arg::new("max_sessions")
@@ -511,7 +433,7 @@ fn session(required: bool) -> Arg {
 }
 
 fn connect() -> Command {
-    remote(Command::new("connect").about("Open a shell on a server, in this terminal: your session there attached last, else a new one; with `-- PROG ARG...`, a new session running that program on a terminal of its own (an editor, a debugger, a TUI) in place of the shell, ending when it does with its status. Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends"))
+    remote(Command::new("connect").about("Open your last session on a server in this terminal, else a new one, or with `-- PROG` a new one running PROG (Ctrl-^ . detaches, Ctrl-^ Ctrl-Z suspends)"))
         .arg(flag("new", "new").conflicts_with("session").help("A new session, beside your others"))
         .arg(session(false))
         .arg(cwd().conflicts_with("session").help("A new session, starting in DIR (relative: in the server user's home)"))
@@ -531,14 +453,18 @@ fn connect() -> Command {
 }
 
 fn sessions() -> Command {
-    remote(Command::new("sessions").about("List your sessions: number, attached or detached, age, size, what its program is doing (reading, busy, ...; running: while a command runs), the last command's status, title"))
-        .arg(json())
+    remote(
+        Command::new("sessions")
+            .about("List your sessions: number, attached, age, size, state, last status and title"),
+    )
+    .arg(json())
 }
 
 fn output() -> Command {
-    remote(Command::new("output").about(
-        "Print a session's screen as text (no blank rows below the last that shows anything), or the output of the last command its shell finished",
-    ))
+    remote(
+        Command::new("output")
+            .about("Print a session's screen as text, or its last finished command's output"),
+    )
     .arg(session(true))
     .arg(flag("last", "last").help("The last finished command's output, not the screen"))
     .arg(json())
@@ -569,7 +495,7 @@ fn command_args(cmd: Command) -> Command {
             .long("sync")
             .value_name("LOCAL")
             .value_parser(value_parser!(PathBuf))
-            .help("First bring the directory there into line with LOCAL here, sending only the files that changed (as `koh cp -r LOCAL/. SERVER:DIR`), and say so in a line on stderr: DIR is -C's, else LOCAL's own path (relative: in the home), where the command then starts"),
+            .help("First sync LOCAL here to DIR there (-C's, else LOCAL's own path), as `koh cp -r LOCAL/. SERVER:DIR`"),
     )
     .arg(
         Arg::new("exclude")
@@ -592,18 +518,19 @@ fn command_args(cmd: Command) -> Command {
 }
 
 fn exec() -> Command {
-    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal and exit with its status: your stdin goes to it, its stdout and stderr come back apart. A killed or dropped koh hangs it up (at once on SIGTERM, SIGHUP or SIGINT; within 10 s on SIGKILL). 127: no such program; 126: it could not start (no -C DIR there, say); 75: the server was busy (nothing ran: retry); 255: koh's own error")))
+    command_args(remote(Command::new("exec").about("Run a command on a server with no terminal, stdin to it and its stdout and stderr back apart, and exit with its status")))
 }
 
 fn run() -> Command {
-    command_args(remote(Command::new("run").about("Start a job: a command that outlives this koh and the link, its stdout and stderr kept together (`koh logs`), its status too (`koh wait`, `koh jobs`). Prints its name")))
+    command_args(remote(Command::new("run").about("Start a job, a command that outlives this koh and the link with its output and status kept, and print its name")))
         .arg(Arg::new("name").long("name").value_name("NAME").value_parser(job_name).help("Its name (default: the next free number); one that ended is replaced"))
 }
 
 fn jobs() -> Command {
-    remote(Command::new("jobs").about(
-        "List your jobs, one line each: name, running or exited (status, how long it ran), output size, the command's first line; with JOB, that one, its command whole",
-    ))
+    remote(
+        Command::new("jobs")
+            .about("List your jobs one a line, or with JOB, that one's command whole"),
+    )
     .arg(job_arg(false))
     .arg(json())
 }
@@ -618,7 +545,7 @@ fn job_arg(required: bool) -> Arg {
 }
 
 fn logs() -> Command {
-    remote(Command::new("logs").about("Print a job's output, its last 200 lines unless asked for more (of the newest `--job-log-bytes` kept), then on stderr whether it runs on or how it ended; with --follow, until it ends, then exit with its status"))
+    remote(Command::new("logs").about("Print a job's output, then on stderr how it stands; with --follow, until it ends, exiting with its status"))
         .arg(job_arg(true))
         .arg(flag("follow", "follow").short('f').help("Go on until the job ends"))
         .arg(tail(DEFAULT_TAIL).conflicts_with("all"))
@@ -656,7 +583,7 @@ fn kill() -> Command {
 }
 
 fn wait() -> Command {
-    remote(Command::new("wait").about("Wait on the server: for a job to end (print its last lines, as `koh logs` does, and exit with its status), or a text in its output, or a file; for a session's running command to end (at once if none runs), its program to read its terminal, or a text on its screen"))
+    remote(Command::new("wait").about("Wait for a job or a session's command to end (exiting with its status), for a text in its output, for a file, or for a session to read input"))
         .arg(job_arg(false).conflicts_with("session"))
         .arg(session(false))
         .arg(Arg::new("text").long("text").value_name("TEXT").conflicts_with_all(["file", "reading"]).help("Until the text appears (exit 1 if the job ends first)"))
@@ -668,7 +595,7 @@ fn wait() -> Command {
 }
 
 fn cp() -> Command {
-    dialing(Command::new("cp").about("Copy files and trees between here and a server, as a sync: `koh cp SRC... SERVER:DST` or `koh cp SERVER:SRC... DST`. Into DST if it is a directory (or ends in /, or there are several SRC: it is made), else as DST, its parents made. Directories merge; only files that changed are sent (by hash); a cut copy resumes when run again. A file written gets its arrival time unless -p. `dir/.` copies what is in dir. A tree copied to a directory of its own name that is there updates it, as `X/.` does (`koh cp -r X S:X` again), where cp would nest it: `S:X/` or `S:X/X` nests it. Prints what it did and where it landed"))
+    dialing(Command::new("cp").about("Sync files and trees to a server or from it (`koh cp SRC... SERVER:DST`, `koh cp SERVER:SRC... DST`), into DST if it is a directory, ends in / or takes several SRC, else as DST"))
         .arg(
             Arg::new("paths")
                 .value_name("PATH")
@@ -689,32 +616,21 @@ fn cp() -> Command {
 
 fn id() -> Command {
     Command::new("id")
-        .about("Print this machine's koh id (add it to a server's --allow list)")
-        .arg(path("key_file", "key-file", "KEY_FILE").help("The client's secret-key file"))
+        .about("Print a key's endpoint id, creating the key if there is none")
+        .arg(role())
+        .arg(key_file_arg())
 }
 
 fn key() -> Command {
     Command::new("key")
-        .about("Show or reset this machine's identity key")
+        .about("Delete one of this machine's keys")
         .subcommand_required(true)
-        .arg_required_else_help(true)
-        .arg(
-            path("key_file", "key-file", "KEY_FILE")
-                .global(true)
-                // After the subcommand's own options, where the derive listed it.
-                .display_order(1)
-                .help("Which identity key to operate on. Defaults to the client key path (as `koh id` uses); pass a server key explicitly to manage it"),
-        )
-        .subcommand(
-            Command::new("info")
-                .about("Print the key files and their endpoint ids (never the secret): both keys, or the one named")
-                .arg(role()),
-        )
         .subcommand(
             Command::new("reset")
-                .about("Delete an unused identity; the next use creates a new endpoint ID")
+                .about("Delete a key: its next use makes a new endpoint id, which every peer must save again")
                 .arg(role())
-                .arg(flag("yes", "yes").help("Acknowledge permanent identity loss and required allowlist updates")),
+                .arg(key_file_arg())
+                .arg(flag("yes", "yes").required(true).help("Confirm the key is lost for good")),
         )
 }
 
@@ -724,7 +640,12 @@ fn role() -> Arg {
         .value_name("KEY")
         .value_parser(["client", "server"])
         .conflicts_with("key_file")
-        .help("Which key: client (as `koh id` and `koh connect` use; the default) or server (as `koh serve` uses)")
+        .help("client (the default; `koh connect`'s) or server (`koh serve`'s)")
+}
+
+/// `--key-file`, for `koh id` and `koh key reset`.
+fn key_file_arg() -> Arg {
+    path("key_file", "key-file", "KEY_FILE").help("The key file, if not the default path")
 }
 
 /// `koh servers` or `koh clients`.
@@ -1072,37 +993,11 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             })
         }
         Some(("help-agents", _)) => Ok(Cmd::HelpAgents),
-        Some(("id", m)) => Ok(Cmd::Key(KeyConfig {
-            op: KeyOp::Id,
-            role: "client",
-            key_file: m.get_one::<PathBuf>("key_file").cloned(),
-            role_named: false,
-        })),
-        Some(("key", m)) => {
-            let (op, sub) = match m.subcommand() {
-                Some(("info", sub)) => (KeyOp::Info, sub),
-                Some(("reset", sub)) => (
-                    KeyOp::Reset {
-                        confirmed: sub.get_flag("yes"),
-                    },
-                    sub,
-                ),
-                _ => return Err(missing("key subcommand")),
-            };
-            let key_file = global_key_file(m, sub);
-            let named = sub.get_one::<String>("role");
-            let role = if named.is_some_and(|r| r == "server") {
-                "server"
-            } else {
-                "client"
-            };
-            Ok(Cmd::Key(KeyConfig {
-                op,
-                role,
-                key_file,
-                role_named: named.is_some(),
-            }))
-        }
+        Some(("id", m)) => Ok(Cmd::Key(key_config(KeyOp::Id, m))),
+        Some(("key", m)) => match m.subcommand() {
+            Some(("reset", sub)) => Ok(Cmd::Key(key_config(KeyOp::Reset, sub))),
+            _ => Err(missing("key subcommand")),
+        },
         Some((list @ ("servers" | "clients"), m)) => {
             let list = if list == "servers" {
                 List::Servers
@@ -1151,6 +1046,16 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
         }
         None => Ok(Cmd::Menu),
         Some(_) => Err(missing("subcommand")),
+    }
+}
+
+/// `koh id`'s or `koh key reset`'s key, as `m` names it.
+fn key_config(op: KeyOp, m: &ArgMatches) -> KeyConfig {
+    let server = m.get_one::<String>("role").is_some_and(|r| r == "server");
+    KeyConfig {
+        op,
+        role: if server { "server" } else { "client" },
+        key_file: m.get_one::<PathBuf>("key_file").cloned(),
     }
 }
 
@@ -1298,32 +1203,6 @@ mod tests {
     #[test]
     fn the_command_line_is_consistent() {
         command().debug_assert();
-    }
-
-    /// A `--sh` script the shell split says so, short, and how to send it whole.
-    #[test]
-    fn a_split_sh_script_says_how_to_send_it_whole() {
-        let script = format!("print('a b'){}", "x".repeat(1000));
-        for (sub, fix) in [("exec", "-- sh -s"), ("run", "$(cat script.sh)")] {
-            let argv: Vec<std::ffi::OsString> = ["koh", sub, ID, "--sh", "python3 -c ", &script]
-                .iter()
-                .map(Into::into)
-                .collect();
-            let error = command().try_get_matches_from(&argv).expect_err("split");
-            let said = super::broken_sh(&error, &argv).expect("said");
-            assert!(
-                said.contains(fix) && said.contains("print('a b')xx"),
-                "{said}"
-            );
-            assert!(said.len() < 300, "{said}");
-        }
-        // Another unexpected word, with no --sh, is clap's to say.
-        let argv: Vec<std::ffi::OsString> = ["koh", "exec", ID, "ls", "-l"]
-            .iter()
-            .map(Into::into)
-            .collect();
-        let error = command().try_get_matches_from(&argv).expect_err("no --");
-        assert_eq!(super::broken_sh(&error, &argv), None);
     }
 
     #[test]
@@ -1547,24 +1426,6 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn key_reset_names_the_key_and_defaults_to_the_client_one() {
-        let Cmd::Key(c) = parsed(&["koh", "key", "reset", "server", "--yes"]) else {
-            panic!("key reset");
-        };
-        assert_eq!((c.role, c.role_named), ("server", true));
-        let Cmd::Key(c) = parsed(&["koh", "key", "reset", "--yes"]) else {
-            panic!("key reset");
-        };
-        assert_eq!((c.role, c.role_named), ("client", false));
-        assert!(
-            command()
-                .try_get_matches_from(["koh", "key", "reset", "server", "--key-file", "/k"])
-                .is_err(),
-            "a named key and a key file at once"
-        );
-    }
-
     /// `--sync DIR` sends DIR's contents to the same path there, made of its names alone, and
     /// starts the command in it; with -C, to -C's directory. A path with no name of its own
     /// there needs -C, and `--exclude` needs `--sync`.
@@ -1719,24 +1580,21 @@ mod tests {
     }
 
     #[test]
-    fn the_key_file_is_global_to_key() {
-        for argv in [
-            ["koh", "key", "--key-file", "/k", "reset", "--yes"],
-            ["koh", "key", "reset", "--key-file", "/k", "--yes"],
-        ] {
-            let Cmd::Key(c) = parsed(&argv) else {
-                panic!("key");
-            };
-            assert!(matches!(c.op, KeyOp::Reset { confirmed: true }), "{argv:?}");
-            assert_eq!(
-                c.key_file.as_deref(),
-                Some(std::path::Path::new("/k")),
-                "{argv:?}"
-            );
-        }
-        let Cmd::Key(c) = parsed(&["koh", "key", "info"]) else {
-            panic!("key");
+    fn id_and_key_reset_name_their_key_and_reset_needs_yes() {
+        let Cmd::Key(c) = parsed(&["koh", "key", "reset", "server", "--yes"]) else {
+            panic!("key reset");
         };
-        assert!(matches!(c.op, KeyOp::Info) && c.key_file.is_none());
+        assert_eq!((c.op, c.role, c.key_file), (KeyOp::Reset, "server", None));
+        let Cmd::Key(c) = parsed(&["koh", "id", "--key-file", "/k"]) else {
+            panic!("id");
+        };
+        assert_eq!((c.op, c.role), (KeyOp::Id, "client"));
+        assert_eq!(c.key_file.as_deref(), Some(std::path::Path::new("/k")));
+        for argv in [
+            &["koh", "key", "reset", "server"][..],
+            &["koh", "key", "reset", "server", "--key-file", "/k", "--yes"],
+        ] {
+            assert!(command().try_get_matches_from(argv).is_err(), "{argv:?}");
+        }
     }
 }

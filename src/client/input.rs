@@ -12,7 +12,7 @@ use fux_vt::keys::decode::{Decoder, Input as Decoded, Reply};
 use fux_vt::keys::encode::{key_bytes, KeyMode};
 use fux_vt::keys::Keystroke;
 
-use crate::events::{InputEvent, WireColours, WireScheme, MAX_PASTE, PALETTE};
+use crate::events::{InputEvent, WireColours, WireScheme, MAX_PASTE};
 use crate::stream::incomplete_utf8;
 
 use super::probe::{self, COLOUR_QUERIES};
@@ -75,10 +75,7 @@ impl Keys {
         Self {
             decoder,
             prefix: None,
-            colours: colours.then(|| WireColours {
-                palette: vec![None; PALETTE],
-                ..WireColours::default()
-            }),
+            colours: colours.then(WireColours::default),
             asked: colours,
             reports: false,
             ask: probe::queries(colours),

@@ -22,9 +22,6 @@ pub const DEFAULT_SIZE: Size = Size::new(24, 80);
 pub const MIN_DIM: u16 = 2;
 pub const MAX_DIM: u16 = 1000;
 
-/// Most characters in a window title, as mosh caps them.
-pub(crate) const MAX_TITLE_LEN: usize = 256;
-
 /// Clamp a peer-supplied size into `[MIN_DIM, MAX_DIM]` on both axes: the one gate every resize
 /// passes before a grid is built.
 #[must_use]

@@ -71,7 +71,7 @@ fn koh_transport_config(role: Role) -> QuicTransportConfig {
 }
 
 /// The protocol's name and version ([`crate::proto`]), its ALPN.
-pub const PROTOCOL: &str = "koh/16";
+pub const PROTOCOL: &str = "koh/17";
 
 /// The ALPN, [`PROTOCOL`]: a peer on another fails the TLS handshake instead of misparsing
 /// mid-session.

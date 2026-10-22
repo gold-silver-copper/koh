@@ -35,7 +35,7 @@ connecting a small set of machines you control — not a multi-user network serv
    request of at most 1 MiB, a command of at most 256 KiB and 4096 words with no NUL, paths of at
    most 4096 bytes with no NUL, at most 1024 sources, a job's name a short word, a wait's text at
    most 4 KiB, each refused as it is decoded, before anything is allocated for it. A shell reaches
-   the koh/16 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
+   the koh/17 data plane: it sends input, resizes, colours, its reads of the output (`Read`, which
    pace what the server sends) and redraw requests. Input comes as decoded events (`Keys`: keys,
    mouse events, focus changes, whole pastes); decoding refuses what no terminal sends (a modifier
    bit no key has, a function key past F12, a kitty code that is no Unicode scalar, a paste over
@@ -62,16 +62,18 @@ connecting a small set of machines you control — not a multi-user network serv
    forgotten once ended for the session TTL. A wait holds its connection and nothing else, and
    ends with it.
    A copy is a sync: the sender says each entry, and the receiver answers what it needs of each
-   file (all of it, the rest of a part it kept, or nothing when its hash matches), at most 64
-   files unanswered. It holds one file open, a chunk of 64 KiB, an item of at most 8 KiB and, for
-   a tree, a descriptor for each directory it is in, at most 128 directories deep; at most 4
-   million names seen and a million renames or removals deferred. Landing one, every name is one
+   file (all of it, the rest of a part it kept, or nothing when its hash matches), at most
+   `WINDOW` files unanswered or waiting for their bytes, a refusal past that (`src/sync/mod.rs`
+   holds the bounds). It holds one file open, a `CHUNK`, an item of at most `MAX_ITEM` and, for a
+   tree, a descriptor for each directory it is in, at most `MAX_DEPTH` deep, and at most
+   `MAX_SEEN` names seen. Landing one, every name is one
    entry (no `/`, NUL, `.` or `..`), and every directory on the way is opened from the one above
    it by its descriptor with `O_NOFOLLOW` (the destination's own path is followed as the user
    gave it), so no name the peer sends reaches outside the destination or through a symlink,
    whatever symlinks are already there or the copy brings. A file is written under a hidden
-   `.koh-….part` name beside its target and renamed into place once whole (with `--atomic`, all
-   of them only once the whole copy came); a part a cut copy left is resumed by the next. A file
+   `.koh-….part` name beside its target and renamed into place once whole; a part a cut copy left
+   is resumed by the next. A directory gets its mode and time once no file in it waits for its
+   bytes, so a read-only one still takes its files. A file
    lands with its mode less setuid and setgid, which no copy gives, so a peer cannot leave a
    program that runs as the server's user for whoever starts it. `--delete` removes, beneath the
    destination, what the source does not have, once the source said all a directory holds.
@@ -148,10 +150,7 @@ connecting a small set of machines you control — not a multi-user network serv
    left them on, as any program the user runs can. `koh output` prints a session's text, which
    the server's emulator made: printable characters and line breaks only. Nothing else of the
    server's reaches them raw: a listing's titles and commands are escaped, `--json` escapes what
-   it says, a server's error is a kind and an escaped message, and `koh cp --diff`'s diffs are
-   escaped but for their tabs and line breaks. With `--diff`, a file the copy would replace goes
-   to the end that has it, as the copy would send it, and comes back only as a diff of the two,
-   each at most 1 MiB, held in memory there.
+   it says, a server's error is a kind and an escaped message.
    **`koh cp` from a server** lands what the server sends under the rules a server lands a
    client's copy by (above): only beneath the destination the user named, through no symlink,
    with no setuid or setgid bit, each file whole. The server chooses the names, modes and symlink
@@ -183,10 +182,12 @@ connecting a small set of machines you control — not a multi-user network serv
   there is no passphrase/PAKE second factor. A leaked key file is a leaked identity: protect it
   like an SSH private key, and remove a lost machine's key from every allowlist (`koh clients rm`,
   which a running server heeds within 2 s, closing that peer's connections, which hangs up any
-  command it runs, and ending all of its sessions (a scope changed closes its connections too), and any `--allow`, which needs a restart). A saved list that cannot be read keeps the last one
-  read well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key, is held to the key's own
-  rules (`src/identity/key_file.rs`): a symlink, a hard-linked file or another user's file is
-  refused and a loose mode tightened, since whoever can write it can let a peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
+  command it runs, and ending all of its sessions and jobs; a scope changed does the same; and any
+  `--allow`, which needs a restart). A saved list that cannot be read keeps the last one read
+  well, so a typo in it disconnects no one. The saved allowlist, `clients` beside the server key,
+  is held to the key's own rules (`src/identity/key_file.rs`): a symlink, a hard-linked file or
+  another user's file is refused and a loose mode tightened, since whoever can write it can let a
+  peer in. The accept gauntlet (`src/server/cli.rs`) is the trust-boundary
   checkpoint; its outcomes are logged structured under the `koh::auth` target.
 - **Untrusted data plane:** the protocol (`src/proto.rs`, `src/request.rs`, `src/sync/`) and
   the connection cores (`src/server/attach.rs`, `src/client/mod.rs`) are panic-free by

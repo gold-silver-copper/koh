@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/16 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/17 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -52,8 +52,7 @@ src/
 │   ├── wait.rs      `koh wait`: a job's end or text, a session's command or state, a file
 │   ├── copy.rs      `koh cp` on the server
 │   ├── place.rs     where a request's paths are, and a scoped key's directory
-│   ├── marks.rs     the startup files that mark a shell's commands
-│   └── audit.rs     admission decisions as structured `koh::auth` events
+│   └── marks.rs     the startup files that mark a shell's commands
 ├── client/          `koh connect`'s loop and the commands that dial
 │   ├── display.rs   the user's terminal: output, marks, reports, the overlay
 │   ├── input.rs     what the user's terminal sends, decoded; the escape prefix
@@ -62,8 +61,8 @@ src/
 │   ├── copy.rs      `koh cp` at this end, and its summary
 │   ├── probe.rs     the start-up questions to the user's terminal
 │   └── backend/     KohBackend (raw mode, size, bytes, marks) + Tty (through fuxix::terminal)
-├── identity.rs      unlocked identities + the key lease `koh key reset` respects
-│   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
+├── identity.rs      loading and making identity keys
+│   └── key_file.rs  KeyFile, the one owner of trust in a key path, and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 ├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
 ├── names.rs         names for ids: `servers` and `clients` beside the keys, and client scopes
@@ -80,9 +79,9 @@ testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboar
 `predict` imports nothing from `crate::` (CI checks it), so it is a standalone
 terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/16)
+## The protocol (koh/17)
 
-The ALPN `koh/16` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/17` is the version check: a peer on another version fails the TLS handshake with a
 clear error. A client dials from a key made for its process alone: iroh routes by endpoint id, and
 two endpoints sharing one take each other's place at a relay and each other's paths, so every `koh`
 the client runs at once would knock the others' links down. Its own key, the one the allowlist
@@ -271,8 +270,8 @@ a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`
 user's own startup files, then marks each command. bash is given `--rcfile` with a file that
 sources `~/.bashrc` and then puts the marks first in `PROMPT_COMMAND` (an array's first element,
 after which the user's own hooks run with `$?` and `PIPESTATUS` as without koh), at the start of
-`PS1` and at the end of `PS0` (before bash 4.4, macOS's 3.2, a DEBUG trap armed before each prompt
-in its place); a variable the user made readonly is left unmarked. zsh is given a shim `ZDOTDIR`
+`PS1` and at the end of `PS0` (a bash older than 4.4, such as macOS's 3.2, is left unmarked); a
+variable the user made readonly is left unmarked. zsh is given a shim `ZDOTDIR`
 whose `.zshenv` puts the user's `ZDOTDIR` back, sources their `.zshenv` and adds a `preexec` and a
 `precmd` hook; fish an `--init-command` adding two event handlers. The files are written once a
 shell needs them, in a directory of this server run (`koh-shell-marks-PID-RANDOM`, 0700) under
@@ -421,7 +420,7 @@ per-connection state never lives in the session:
   attachment, so dropping one (on return **or** panic) detaches with no message to lose. The
   session starts the TTL when the last one drops and tears itself down at the TTL. Input comes only
   from the newest attachment, and only while the program runs. `Registry::end(peer)` ends all of a
-  peer's sessions, as revoking it does.
+  peer's sessions, and `Jobs::end(peer)` its jobs, as revoking it does.
 - **A listing asks each session.** `Registry::sessions(peer)` takes the peer's sessions from the
   registry, which never waits on one, then asks each how it stands (attached or since when not,
   its size, title, exit, its program's state, whether a command runs and the last one's status),
@@ -494,30 +493,26 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
 - **`koh cp`** (`sync`, `server::copy`, `client::copy`) is a sync, the same whichever end is the
   server. The sender walks its sources (each followed if it is a symlink, as `cp` follows its
   arguments, but not under a scoped key), its tree as it is (symlinks as symlinks, fifos, sockets
-  and devices said `Skipped`), at most 128 directories deep, and sends a header for each entry
-  (`sync::Item`: `Dir`, `File`, `Symlink`, with a `Name`, no `/`, NUL, `.` or `..`, a mode of at
-  most `0o7777` and a time), each at most 8 KiB, running ahead of the answers by 64 files. The
-  receiver answers each file (`sync::Answer`): `Want { have, prefix }`, all of it or the rest of
-  a part it kept (whose start's hash the sender checks), or `Check { hash }`, the blake3 hash of
-  a file of the same size it has, which the sender answers with the bytes or `Same`. A file's
-  bytes go in chunks of at most 64 KiB to `.koh-HASH.part` beside it and are renamed over it once
-  whole; `--atomic` holds every rename and removal until the whole copy came. In a dry run
+  and devices said `Skipped`), at most `MAX_DEPTH` directories deep, and sends a header for each
+  entry (`sync::Item`: `Dir`, `File`, `Symlink`, with a `Name`, no `/`, NUL, `.` or `..`, a mode
+  of at most `0o7777` and a time), each at most `MAX_ITEM`, running ahead of the answers by
+  `WINDOW` files (the receiver refuses more waiting than that). The receiver answers each file
+  (`sync::Answer`): `Want { have, prefix }`, all of it or the rest of a part it kept (whose
+  start's hash the sender checks), or `Check { hash }`, the blake3 hash of a file of the same size
+  it has, which the sender answers with the bytes or `Same`. A file's bytes go in chunks of at
+  most `CHUNK` to `.koh-HASH.part` beside it and are renamed over it once whole. In a dry run
   (`Opts::dry_run`) the receiver makes, writes and removes nothing, and the sender answers each
-  file it would send with `Differs { id, from }` in place of its bytes; the receiver lists each
-  change in its `Summary` (`changes`, the first 1000, the rest counted). With `Opts::diff`
-  (`--diff`) the receiver answers `Check` for any file it has of at most 1 MiB, whatever its
-  size, and the sender answers a differing one of at most 1 MiB with its bytes, which the
-  receiver holds in memory and compares with its own, giving the change a unified diff
-  (`Change::diff`, all of them together at most 128 KiB, a second spent on each). Every entry is
-  reached from the directory above it by its descriptor with `O_NOFOLLOW` (`sync::fsat`), so no
-  name reaches outside the destination or through a symlink. Directories merge; the destination's
-  missing parents are made; a file written gets its arrival time unless `-p`, and modes land less
-  setuid and setgid. `--delete` removes what the source does not have from each directory it
-  merges into, once the source said all it holds; `--exclude` patterns (`sync::glob`) match a name,
-  or a path from the source's top when they hold a `/`. The receiver ends with a `Summary`
-  (files new and replaced, unchanged, links, dirs, deleted, skipped, bytes), which the client says
-  in one line or as JSON. Each end runs on a blocking thread, joined to the stream's task by a
-  channel of at most 8 chunks.
+  file it would send with `Differs` in place of its bytes; the receiver lists each change in its
+  `Summary`. Every entry is reached from the directory above it by its descriptor with
+  `O_NOFOLLOW` (`sync::fsat`), so no name reaches outside the destination or through a symlink.
+  Directories merge; the destination's missing parents are made; a file written gets its arrival
+  time unless `-p`, and modes land less setuid and setgid; a directory gets its mode and time once
+  none of its files waits for bytes. `--delete` removes what the source does not have from each
+  directory it merges into, once the source said all it holds; `--exclude` patterns
+  (`sync::glob`) match a name, or, holding a `/`, a path from the top of the tree copied, the same
+  at both ends. The receiver ends with a `Summary`, which the client says in one line or as JSON.
+  Each end runs on a blocking thread, joined to the stream's task by a bounded channel
+  (`sync::send_on`, `sync::receive_on`).
 - **Scoped keys** (`names::Scope`, `server::cli::permitted`): a client saved with `cp=DIR` gets
   copies beneath `DIR` and waits for a file there; with `exec=DIR`, commands and jobs started in
   `DIR`; with no scope, everything. Any other request closes with `OutOfScope`. A scope changed

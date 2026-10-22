@@ -383,11 +383,11 @@ impl Remote {
         mosh_pid: Option<i32>,
     ) -> anyhow::Result<(Shown, Inner)> {
         let (pty, mut output) = Pty::spawn(
-            rows,
-            cols,
+            Size::new(rows, cols),
             argv,
             &[],
-            ("xterm-256color", &Home::isolated(&setup.home), None),
+            &Home::isolated(&setup.home),
+            None,
             &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;
@@ -569,7 +569,9 @@ impl Remote {
                 *size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
                 Ok(resize.send(()).await?)
             }
-            Inner::Pty { pty, .. } => pty.resize(rows, cols).map_err(|e| anyhow!("{e}")),
+            Inner::Pty { pty, .. } => pty
+                .resize(Size::new(rows, cols))
+                .map_err(|e| anyhow!("{e}")),
         }
     }
 

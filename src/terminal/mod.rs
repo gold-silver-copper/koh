@@ -9,9 +9,39 @@ use serde::{Deserialize, Serialize};
 mod redraw;
 mod server;
 
-pub use crate::predict::{Size, TtyModes};
 pub use redraw::{redraw, RESET};
 pub use server::{ServerTerminal, IDENTITY, OPTIONS};
+
+/// A terminal's geometry: `rows` lines of `cols` cells each. On the wire it is its two `u16`s,
+/// rows first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl Size {
+    pub const fn new(rows: u16, cols: u16) -> Self {
+        Self { rows, cols }
+    }
+}
+
+/// How the program's PTY takes typed keys: whether the kernel echoes them, and edits lines.
+///
+/// Line mode without echo is a password prompt (`getpass`, `read -s`, sudo, ssh, passwd); neither
+/// is a line editor or a full-screen program, which echo for themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TtyModes {
+    pub echo: bool,
+    pub line: bool,
+}
+
+impl TtyModes {
+    /// A password prompt: lines read without echo. Nothing typed may be shown.
+    pub const fn password(self) -> bool {
+        self.line && !self.echo
+    }
+}
 
 /// Default screen geometry, before a client says its own.
 pub const DEFAULT_SIZE: Size = Size::new(24, 80);

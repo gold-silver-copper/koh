@@ -373,7 +373,7 @@ fn sgr(out: &mut Vec<u8>, pen: &mut Option<Attributes>, attributes: Attributes) 
 mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
-    use crate::predict::TtyModes;
+    use crate::terminal::TtyModes;
     use fux_vt::keys::{Key, KeyPress};
 
     /// What a terminal shows after `bytes`, as a fux-vt parser holds it: each row's text and the

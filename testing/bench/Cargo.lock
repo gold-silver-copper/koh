@@ -833,9 +833,9 @@ dependencies = [
 
 [[package]]
 name = "fux-vt"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d4e4a064bac0aaeaf7adde2f1a9ef9c9010b74fbf94d8095990f322a4e1c1f2"
+checksum = "73a663fa645368669cd918f8ccb75b161697a9b74cf3a87e19b8488cb7024ca7"
 
 [[package]]
 name = "fuxix"

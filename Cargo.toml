@@ -38,7 +38,7 @@ iroh = "=1.3.0"
 # ends as it judges it, so koh needs no scanner of its own; 0.9 takes a second, nested nonce for
 # shell marks (koh's sessions pass none); 0.10 parses the state report (`OSC 133;S`), which koh's
 # client writes and its server leaves to the terminal it emulates.
-fux-vt = "0.12.0"
+fux-vt = "0.12.1"
 unicode-width = "0.2.2"
 # The system calls koh makes beyond std, each safe to call: the server's PTYs, the client's
 # terminal (raw mode, the window size), `poll` on stdin, signals and `O_NOFOLLOW`, and the PTY's

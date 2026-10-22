@@ -809,29 +809,23 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             into.push("/");
             let out = cp(&["-r".into(), from.clone().into(), into.clone()]);
             assert!(out.status.success(), "{out:?}");
-            // It says where the tree landed: in the directory, as its own name.
             let said = String::from_utf8_lossy(&out.stdout);
-            let landed = format!("{}a tree", into.to_string_lossy());
+            let landed = into.to_string_lossy().into_owned();
             assert!(
                 said.starts_with(&format!("3 files sent, 200 KB → {landed} (3 new; ")),
                 "{said}"
             );
             let want = tree(&from).expect("the tree");
             assert_eq!(tree(&there.join("a tree")).expect("there"), want);
-            // Named as the tree, which is there now: it is brought into line, as `a tree/.` would
-            // be, not nested inside it as cp's rule would.
+            // Into a directory of its own name, which is there now: nested in it, as cp's rule
+            // says, and --delete removes nothing beside it (as `koh cp -r --delete gsc S:` would,
+            // run by gsc, the tree once took the home's place).
             let same = remote.at(&there.join("a tree"));
-            let out = cp(&["-r".into(), from.clone().into(), same.clone()]);
+            let out = cp(&["-r".into(), "--delete".into(), from.clone().into(), same]);
             assert!(out.status.success(), "{out:?}");
-            assert!(!there.join("a tree/a tree").exists());
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.starts_with(&format!(
-                    "0 files sent, 0 B → {} (3 unchanged",
-                    same.to_string_lossy()
-                )),
-                "{said}"
-            );
+            assert_eq!(tree(&there.join("a tree/a tree")).expect("nested"), want);
+            std::fs::remove_dir_all(there.join("a tree/a tree")).expect("the nested tree");
+            assert_eq!(tree(&there.join("a tree")).expect("there"), want);
             // Again: nothing changed, nothing sent.
             let out = cp(&[from.clone().into(), into.clone()]);
             assert!(
@@ -888,13 +882,6 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             // --delete takes away what the source lacks, but what is excluded.
             std::fs::write(there.join("a tree/stray"), b"s").expect("a stray file");
             std::fs::write(there.join("a tree/kept.o"), b"o").expect("an excluded file");
-            // Without it, what the source lacks is kept, and said so.
-            let out = cp(&[from.clone().into(), into.clone()]);
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.contains("2 there not in the source, kept: --delete removes them"),
-                "{said}"
-            );
             // A dry run says what would change, one a line, and changes nothing, either way.
             let exclude = || ["--exclude".into(), "*.o".into()];
             let mut args: Vec<OsString> = vec!["--dry-run".into(), "--delete".into()];
@@ -919,21 +906,6 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
                 "{out:?}"
             );
             assert!(!back.join("stray").exists());
-            // --diff says how a file it would replace differs, the other end's text escaped but
-            // for its tabs, and changes nothing.
-            let note = dir.join("note");
-            std::fs::write(&note, b"a\tb\x1b\n").expect("a note");
-            std::fs::write(there.join("note"), b"a\n").expect("the note there");
-            let out = cp(&["--diff".into(), note.into(), remote.at(&there.join("note"))]);
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.starts_with(
-                    "replaced note (5 B, was 2 B)\n--- a/note\n+++ b/note\n@@ -1 +1 @@\n-a\n+a\tb\\u{1b}\n"
-                ),
-                "{out:?}"
-            );
-            assert!(said.contains("nothing changed"), "{said}");
-            assert_eq!(std::fs::read(there.join("note")).expect("there"), b"a\n");
             let out = cp(&[
                 "--delete".into(),
                 "--exclude".into(),
@@ -1033,11 +1005,6 @@ fn exec_and_run_sync_a_tree_first_and_run_in_it() {
                 said.starts_with(&format!("koh: synced 1 file sent, 4 B → {at} (1 replaced")),
                 "{said}"
             );
-            // What a command made there is kept, and said so, with nothing to act on.
-            koh("exec", &["--sync", &name, "--", "touch", "made"]);
-            let out = koh("exec", &["--sync", &name, "--", "true"]);
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert!(said.contains("1 there not in the source, kept)"), "{said}");
             // A job, the same way; and its JSON says the sync.
             let out = koh(
                 "run",

@@ -9,7 +9,9 @@ use koh::request::{
     Problem, ProblemKind, RemotePath, Request, Resume, Run, RunId, SessionNum, Until, Wait,
     WaitText,
 };
-use koh::sync::{Answer as SyncAnswer, FileId, Item, Mode, Name, Opts, Reply, SourceCount};
+use koh::sync::{
+    Answer as SyncAnswer, FileHeader, FileId, Item, Mode, Name, Opts, Reply, SourceCount,
+};
 use koh::terminal::{Activity, Size, TtyModes};
 
 fn path(p: &str) -> Option<RemotePath> {
@@ -70,7 +72,6 @@ fn requests() -> Option<Vec<Request>> {
             opts: Opts {
                 delete: true,
                 dry_run: true,
-                diff: true,
                 ..Opts::default()
             },
         }),
@@ -133,13 +134,13 @@ fn shown() -> Option<Vec<Shown>> {
 fn items() -> Option<Vec<Item>> {
     let name = |n: &str| Name::new(n.as_bytes().to_vec()).ok();
     Some(vec![
-        Item::File {
+        Item::File(FileHeader {
             id: FileId(1),
             name: name("a.rs")?,
             mode: Mode::new(0o644)?,
             mtime: None,
             size: 12,
-        },
+        }),
         Item::Data {
             id: FileId(1),
             from: 0,
@@ -169,7 +170,6 @@ fn replies() -> Vec<Reply> {
                 path: "src/a.rs".into(),
                 size: Some(12),
                 was: None,
-                diff: None,
             }],
             ..koh::sync::Summary::default()
         })),

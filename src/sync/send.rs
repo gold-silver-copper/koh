@@ -1,19 +1,22 @@
 //! The sending end of a copy: walk the sources, send each entry's header, answer each file's
 //! answer with its bytes or with [`Item::Same`] (in a dry run, [`Item::Differs`] in place of
-//! the bytes, but with [`super::Opts::diff`] a file the receiver has one of to compare).
+//! the bytes).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
+
+use tokio::sync::mpsc;
 
 use super::fsat::{self, Kind};
 use super::{
-    hash_of, write_item, Answer, DataLen, FailKind, Failure, FileId, Item, LinkTarget, Mode, Name,
-    Opts, Reply, Summary, CHUNK, MAX_DEPTH, MAX_ITEM, WINDOW,
+    cut, hash_of, malformed, Answer, DataLen, FailKind, Failure, FileHeader, FileId, Item,
+    LinkTarget, Mode, Name, Opts, Reply, Summary, CHUNK, MAX_DEPTH, MAX_ITEM, WINDOW,
 };
 
 /// A source of a copy.
@@ -27,311 +30,308 @@ pub enum Source {
     Beneath { root: PathBuf, path: Vec<Name> },
 }
 
-/// What sending one entry came to: `out` failing (outer), or the copy (inner).
-type Sending = io::Result<Result<(), Failure>>;
+/// Most bytes of a message to the stream's task: a chunk and its header, or a chunk's worth of
+/// items.
+const MESSAGE: usize = CHUNK + MAX_ITEM;
 
-/// Where the copy stopped early: the receiver said it was over.
-struct Over(Result<Summary, Failure>);
+/// What is written, gathered into messages of about a chunk for the stream's task.
+struct Out {
+    tx: mpsc::Sender<Vec<u8>>,
+    buf: Vec<u8>,
+}
 
-struct Sender<'a, W: Write> {
-    out: io::BufWriter<W>,
-    answers: &'a mut dyn FnMut(bool) -> Option<Reply>,
+impl Out {
+    /// Write `item`, then `data` if it brings any.
+    fn item(&mut self, item: &Item, data: &[u8]) -> Result<(), Failure> {
+        let head = crate::request::encode(item, MAX_ITEM)
+            .map_err(|_too_long| Failure::new(FailKind::Other, Path::new("")))?;
+        if self
+            .buf
+            .len()
+            .saturating_add(head.len())
+            .saturating_add(data.len())
+            > CHUNK
+        {
+            self.flush()?;
+        }
+        self.buf.extend_from_slice(&head);
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Hand what was written to the stream's task; the stream gone cuts the copy short.
+    fn flush(&mut self) -> Result<(), Failure> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let full = std::mem::replace(&mut self.buf, Vec::with_capacity(MESSAGE));
+        self.tx.blocking_send(full).map_err(|_gone| cut())
+    }
+}
+
+struct Sender<'a> {
+    out: Out,
+    replies: mpsc::Receiver<Reply>,
     opts: &'a Opts,
     /// The files whose headers went, awaiting their answers: each one's file, and its path to say.
     pending: HashMap<FileId, (File, PathBuf)>,
     next: u32,
-    /// The receiver ended the copy before the end: what it said.
-    over: Option<Over>,
+    /// The path of the directory sent at the top: `--exclude` matches paths from it, as the
+    /// receiver does.
+    tree: PathBuf,
+    buf: Vec<u8>,
+    /// The receiver's word, once it ended the copy.
+    over: Option<Result<Summary, Failure>>,
 }
 
-/// Send `sources` to `out` under `opts`, then [`Item::Done`]; the receiver's word for how it went.
-///
-/// The receiver's replies come from `answers` (waiting for one if asked, `None` once there are no
-/// more). On a failure here, [`Item::Failed`] goes in place of the rest. Fails itself only
-/// when `out` does: the other end is gone.
+/// Send `sources` on `out` under `opts`, then [`Item::Done`] (or, on a failure here,
+/// [`Item::Failed`]); the receiver's word for how it went, its replies coming on `replies`.
 pub fn send(
     sources: &[Source],
     opts: &Opts,
-    out: impl Write,
-    answers: &mut dyn FnMut(bool) -> Option<Reply>,
-) -> io::Result<Result<Summary, Failure>> {
+    out: mpsc::Sender<Vec<u8>>,
+    replies: mpsc::Receiver<Reply>,
+) -> Result<Summary, Failure> {
     let mut sender = Sender {
-        out: io::BufWriter::with_capacity(CHUNK.saturating_add(MAX_ITEM), out),
-        answers,
+        out: Out {
+            tx: out,
+            buf: Vec::with_capacity(MESSAGE),
+        },
+        replies,
         opts,
         pending: HashMap::new(),
         next: 0,
+        tree: PathBuf::new(),
+        buf: vec![0; CHUNK],
         over: None,
     };
-    let mut sent = Ok(());
-    for source in sources {
-        sent = sender.source(source)?;
-        if sent.is_err() || sender.over.is_some() {
-            break;
+    let sent = sender.all(sources);
+    if let Some(over) = sender.over {
+        return over;
+    }
+    let last = match &sent {
+        Ok(()) => Item::Done,
+        Err(failure) => Item::Failed(failure.clone()),
+    };
+    // The receiver gone, its word may still be on its way.
+    let _ = sender
+        .out
+        .item(&last, &[])
+        .and_then(|()| sender.out.flush());
+    while let Some(reply) = sender.replies.blocking_recv() {
+        if let Reply::End(end) = reply {
+            return end;
         }
     }
-    while sent.is_ok() && sender.over.is_none() && !sender.pending.is_empty() {
-        sent = sender.answers(true)?;
-    }
-    if let Some(Over(over)) = sender.over.take() {
-        sender.out.flush()?;
-        return Ok(over);
-    }
-    if let Err(failure) = sent {
-        write_item(&mut sender.out, &Item::Failed(failure.clone()), &[])?;
-        sender.out.flush()?;
-        return Ok(Err(failure));
-    }
-    write_item(&mut sender.out, &Item::Done, &[])?;
-    sender.out.flush()?;
-    // The receiver's word, once it has landed all.
-    loop {
-        match (sender.answers)(true) {
-            Some(Reply::End(end)) => return Ok(end),
-            Some(Reply::Answer(_)) => {}
-            None => return Ok(Err(Failure::new(FailKind::Truncated, Path::new("")))),
-        }
-    }
+    sent.and_then(|()| Err(cut()))
 }
 
-impl<W: Write> Sender<'_, W> {
+impl Sender<'_> {
+    fn all(&mut self, sources: &[Source]) -> Result<(), Failure> {
+        for source in sources {
+            self.source(source)?;
+        }
+        while !self.pending.is_empty() {
+            self.answers(true)?;
+        }
+        Ok(())
+    }
+
     /// Send `source`, as its own name, or what is in it if it ends in `.`.
-    fn source(&mut self, source: &Source) -> Sending {
+    fn source(&mut self, source: &Source) -> Result<(), Failure> {
         match source {
             Source::Path(path) => {
+                let io = |error: io::Error| Failure::io(path, &error);
                 let contents =
                     path.as_os_str().as_bytes().ends_with(b"/.") || path.as_os_str() == ".";
-                let name = path
-                    .file_name()
-                    .and_then(|name| Name::new(name.as_bytes().to_vec()).ok());
-                let name = match (contents, name) {
-                    (true, _) => None,
-                    (false, Some(name)) => Some(name),
-                    (false, None) => return Ok(Err(Failure::new(FailKind::NoName, path))),
+                let name = if contents {
+                    None
+                } else {
+                    let name = path.file_name().map(|name| name.as_bytes().to_vec());
+                    let name = name.and_then(|name| Name::new(name).ok());
+                    Some(name.ok_or_else(|| Failure::new(FailKind::NoName, path))?)
                 };
-                match std::fs::metadata(path) {
-                    Ok(meta) if meta.is_dir() => match fsat::open_dir_path(path) {
-                        Ok(dir) => self.dir(&dir, name, Path::new(""), 1),
-                        Err(error) => Ok(Err(Failure::io(path, &error))),
-                    },
-                    Ok(_) if contents => Ok(Err(Failure::new(FailKind::NotADirectory, path))),
-                    Ok(meta) if meta.is_file() => match (File::open(path), name) {
-                        (Ok(file), Some(name)) => self.file(file, name, path.clone()),
-                        (Err(error), _) => Ok(Err(Failure::io(path, &error))),
-                        (Ok(_), None) => Ok(Err(Failure::new(FailKind::NoName, path))),
-                    },
-                    Ok(_) => Ok(Err(Failure::new(FailKind::NotCopyable, path))),
-                    Err(error) => Ok(Err(Failure::io(path, &error))),
+                let meta = std::fs::metadata(path).map_err(io)?;
+                match name {
+                    _ if meta.is_dir() => {
+                        let dir = fsat::open_dir_path(path).map_err(io)?;
+                        let rel = name.as_ref().map_or_else(PathBuf::new, |n| n.os().into());
+                        self.dir(&dir, name, &rel, 1)
+                    }
+                    None => Err(Failure::new(FailKind::NotADirectory, path)),
+                    Some(name) if meta.is_file() => {
+                        self.file(File::open(path).map_err(io)?, name, path.clone())
+                    }
+                    Some(_) => Err(Failure::new(FailKind::NotCopyable, path)),
                 }
             }
             Source::Beneath { root, path } => {
                 let shown: PathBuf = path.iter().map(Name::os).collect();
-                let root_fd = match fsat::open_dir_path(root) {
-                    Ok(fd) => fd,
-                    Err(error) => return Ok(Err(Failure::io(&shown, &error))),
-                };
-                let Some((last, parents)) = path.split_last() else {
+                let io = |error: io::Error| Failure::io(&shown, &error);
+                let root_fd = fsat::open_dir_path(root).map_err(io)?;
+                match path.split_last() {
                     // The key's directory itself: what is in it.
-                    return self.dir(&root_fd, None, Path::new(""), 1);
-                };
-                let parent = match fsat::walk(root_fd, parents, false, &mut 0) {
-                    Ok(fd) => fd,
-                    Err(error) => return Ok(Err(Failure::io(&shown, &error))),
-                };
-                self.entry(&parent, last.clone(), &shown, 1, true)
+                    None => self.dir(&root_fd, None, &shown, 1),
+                    Some((last, parents)) => {
+                        let parent = fsat::walk(root_fd, parents).map_err(io)?;
+                        self.entry(&parent, last.clone(), shown, 1)
+                    }
+                }
             }
         }
     }
 
-    /// Send entry `name` of `dir`, at `rel` from the top: a directory, a file, a symlink as
-    /// itself, anything else skipped (or, at the top, refused).
-    fn entry(&mut self, dir: &OwnedFd, name: Name, rel: &Path, depth: usize, top: bool) -> Sending {
-        let entry = match fsat::stat(dir, name.os()) {
-            Ok(Some(entry)) => entry,
-            Ok(None) => return Ok(Err(Failure::new(FailKind::NotFound, rel))),
-            Err(error) => return Ok(Err(Failure::io(rel, &error))),
-        };
-        match entry.kind {
-            Kind::Dir => match fsat::open_dir(dir, name.os()) {
-                Ok(sub) => self.dir(&sub, Some(name), rel, depth),
-                Err(error) => Ok(Err(Failure::io(rel, &error))),
-            },
-            Kind::File => match fsat::open_file(dir, name.os()) {
-                Ok(file) => self.file(file, name, rel.to_path_buf()),
-                Err(error) => Ok(Err(Failure::io(rel, &error))),
-            },
-            Kind::Link => match fsat::read_link(dir, name.os()) {
-                Ok(target) => match LinkTarget::new(target) {
-                    Ok(target) => {
-                        write_item(&mut self.out, &Item::Symlink { name, target }, &[])?;
-                        self.answers(false)
-                    }
-                    Err(_) => Ok(Err(Failure::new(FailKind::NameTooLong, rel))),
-                },
-                Err(error) => Ok(Err(Failure::io(rel, &error))),
-            },
-            Kind::Other if top => Ok(Err(Failure::new(FailKind::NotCopyable, rel))),
-            Kind::Other => write_item(&mut self.out, &Item::Skipped(name), &[]).map(Ok),
+    /// Send entry `name` of `dir`, at `rel` from the top, `depth` deep: a directory, a file, a
+    /// symlink as itself, anything else skipped (or, at the top, refused).
+    fn entry(
+        &mut self,
+        dir: &OwnedFd,
+        name: Name,
+        rel: PathBuf,
+        depth: usize,
+    ) -> Result<(), Failure> {
+        let io = |error: io::Error| Failure::io(&rel, &error);
+        match fsat::stat(dir, name.os()).map_err(io)?.map(|e| e.kind) {
+            None => Err(Failure::new(FailKind::NotFound, &rel)),
+            Some(Kind::Dir) => {
+                let sub = fsat::open_dir(dir, name.os()).map_err(io)?;
+                self.dir(&sub, Some(name), &rel, depth)
+            }
+            Some(Kind::File) => {
+                let file = fsat::open_file(dir, name.os()).map_err(io)?;
+                self.file(file, name, rel)
+            }
+            Some(Kind::Link) => {
+                let target = LinkTarget::new(fsat::read_link(dir, name.os()).map_err(io)?)
+                    .map_err(|_too_long| Failure::new(FailKind::NameTooLong, &rel))?;
+                self.out.item(&Item::Symlink { name, target }, &[])?;
+                self.answers(false)
+            }
+            Some(Kind::Other) if depth == 1 => Err(Failure::new(FailKind::NotCopyable, &rel)),
+            Some(Kind::Other) => self.out.item(&Item::Skipped(name), &[]),
         }
     }
 
     /// Send directory `dir`, named `name` (`None`: what is in it, into the destination itself),
     /// at `rel` from the top, `depth` deep, and what is in it.
-    fn dir(&mut self, dir: &OwnedFd, name: Option<Name>, rel: &Path, depth: usize) -> Sending {
+    fn dir(
+        &mut self,
+        dir: &OwnedFd,
+        name: Option<Name>,
+        rel: &Path,
+        depth: usize,
+    ) -> Result<(), Failure> {
         if depth > MAX_DEPTH {
-            return Ok(Err(Failure::new(FailKind::TooDeep, rel)));
+            return Err(Failure::new(FailKind::TooDeep, rel));
         }
-        let meta = match fsat::stat_of(dir) {
-            Ok(meta) => meta,
-            Err(error) => return Ok(Err(Failure::io(rel, &error))),
-        };
-        let mut names = match fsat::names(dir) {
-            Ok(names) => names,
-            Err(error) => return Ok(Err(Failure::io(rel, &error))),
-        };
+        let io = |error: io::Error| Failure::io(rel, &error);
+        let meta = fsat::stat_of(dir).map_err(io)?;
+        let mut names = fsat::names(dir).map_err(io)?;
         names.sort();
-        let mode = Mode::new(meta.mode).unwrap_or(Mode(0o755));
-        let rel = match &name {
-            Some(name) => rel.join(name.os()),
-            None => rel.to_path_buf(),
-        };
+        let (mode, mtime) = (Mode::new(meta.mode).unwrap_or(Mode(0o755)), meta.mtime);
         let item = match name {
-            Some(name) => Item::Dir {
-                name,
-                mode,
-                mtime: meta.mtime,
-            },
-            None => Item::Contents {
-                mode,
-                mtime: meta.mtime,
-            },
+            Some(name) => Item::Dir { name, mode, mtime },
+            None => Item::Contents { mode, mtime },
         };
-        write_item(&mut self.out, &item, &[])?;
+        self.out.item(&item, &[])?;
+        if depth == 1 {
+            self.tree = rel.to_path_buf();
+        }
         for entry in names {
             let path = rel.join(OsStr::from_bytes(&entry));
             let Ok(name) = Name::new(entry) else {
-                return Ok(Err(Failure::new(FailKind::NameTooLong, &path)));
+                return Err(Failure::new(FailKind::NameTooLong, &path));
             };
-            if self
+            let tree = path.strip_prefix(&self.tree).unwrap_or(&path);
+            if !self
                 .opts
                 .excludes
-                .excludes(name.as_bytes(), path.as_os_str().as_bytes())
+                .excludes(name.as_bytes(), tree.as_os_str().as_bytes())
             {
-                continue;
-            }
-            match self.entry(dir, name, &path, depth.saturating_add(1), false)? {
-                Ok(()) if self.over.is_none() => {}
-                done => return Ok(done),
+                self.entry(dir, name, path, depth.saturating_add(1))?;
             }
         }
-        write_item(&mut self.out, &Item::End, &[]).map(Ok)
+        self.out.item(&Item::End, &[])
     }
 
     /// Send `file`'s header, named `name`, `path` to say; its bytes go once it is answered.
-    fn file(&mut self, file: File, name: Name, path: PathBuf) -> Sending {
-        let meta = match fsat::stat_of(&file) {
-            Ok(meta) => meta,
-            Err(error) => return Ok(Err(Failure::io(&path, &error))),
-        };
+    fn file(&mut self, file: File, name: Name, path: PathBuf) -> Result<(), Failure> {
+        let meta = fsat::stat_of(&file).map_err(|error| Failure::io(&path, &error))?;
         let id = FileId(self.next);
         self.next = self.next.wrapping_add(1);
-        let item = Item::File {
+        let header = FileHeader {
             id,
             name,
             mode: Mode::new(meta.mode).unwrap_or(Mode(0o644)),
             mtime: meta.mtime,
             size: meta.size,
         };
-        write_item(&mut self.out, &item, &[])?;
+        self.out.item(&Item::File(header), &[])?;
         self.pending.insert(id, (file, path));
         self.answers(self.pending.len() >= WINDOW)
     }
 
     /// Take the answers there are, waiting for one if `wait`: the receiver must answer the
-    /// oldest header before more go.
-    fn answers(&mut self, wait: bool) -> Sending {
-        if wait {
+    /// oldest header before more go. Once the receiver ended the copy, an error to stop at.
+    fn answers(&mut self, wait: bool) -> Result<(), Failure> {
+        let mut reply = if wait {
             // What was written must reach the receiver for it to answer.
             self.out.flush()?;
-        }
-        let mut block = wait;
-        while let Some(reply) = (self.answers)(block) {
-            block = false;
-            match reply {
-                Reply::Answer(answer) => {
-                    if let Err(failure) = self.answer(&answer)? {
-                        return Ok(Err(failure));
-                    }
-                }
+            Some(
+                self.replies
+                    .blocking_recv()
+                    .unwrap_or_else(|| Reply::End(Err(cut()))),
+            )
+        } else {
+            self.replies.try_recv().ok()
+        };
+        while let Some(next) = reply {
+            match next {
+                Reply::Answer(answer) => self.answer(&answer)?,
                 Reply::End(end) => {
-                    self.over = Some(Over(end));
-                    return Ok(Ok(()));
+                    self.over = Some(end);
+                    return Err(cut());
                 }
             }
+            reply = self.replies.try_recv().ok();
         }
-        if wait && block {
-            // No answer, and none will come: the receiver is gone.
-            self.over = Some(Over(Err(Failure::new(FailKind::Truncated, Path::new("")))));
-        }
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Act on `answer`: send the file's bytes, or say it is the same.
-    fn answer(&mut self, answer: &Answer) -> Sending {
-        let id = match answer {
-            Answer::Want { id, .. } | Answer::Check { id, .. } => *id,
-        };
-        let Some((file, path)) = self.pending.remove(&id) else {
-            return Ok(Err(Failure::new(FailKind::Malformed, Path::new(""))));
-        };
+    fn answer(&mut self, answer: &Answer) -> Result<(), Failure> {
+        let (Answer::Want { id, .. } | Answer::Check { id, .. }) = *answer;
+        let (file, path) = self.pending.remove(&id).ok_or_else(malformed)?;
+        let hash = |len| hash_of(&file, len).map_err(|error| Failure::io(&path, &error));
         let from = match answer {
-            Answer::Want { have, prefix, .. } => {
-                let kept = prefix.filter(|_| *have > 0);
-                match kept.map(|prefix| hash_of(&file, Some(*have)).map(|h| h == prefix)) {
-                    Some(Ok(true)) => *have,
-                    Some(Ok(false)) | None => 0,
-                    Some(Err(error)) => return Ok(Err(Failure::io(&path, &error))),
-                }
+            Answer::Want {
+                have,
+                prefix: Some(prefix),
+                ..
+            } if *have > 0 && hash(Some(*have))? == *prefix => *have,
+            Answer::Check { hash: theirs, .. } if hash(None)? == *theirs => {
+                return self.out.item(&Item::Same(id), &[]);
             }
-            Answer::Check { hash, .. } => match hash_of(&file, None) {
-                Ok(ours) if ours == *hash => {
-                    return write_item(&mut self.out, &Item::Same(id), &[]).map(Ok);
-                }
-                Ok(_) => 0,
-                Err(error) => return Ok(Err(Failure::io(&path, &error))),
-            },
+            Answer::Want { .. } | Answer::Check { .. } => 0,
         };
-        // A dry run sends a file only for its end to compare it with the one there (`Check`).
-        let compared = self.opts.diff
-            && matches!(answer, Answer::Check { .. })
-            && file
-                .metadata()
-                .is_ok_and(|m| u64::try_from(super::DIFF_MAX).is_ok_and(|max| m.len() <= max));
-        if self.opts.dry_run && !compared {
-            return write_item(&mut self.out, &Item::Differs { id, from }, &[]).map(Ok);
+        if self.opts.dry_run {
+            return self.out.item(&Item::Differs { id, from }, &[]);
         }
-        self.data(id, &file, from, &path)
-    }
-
-    /// Send file `id`'s bytes from `from` to its end.
-    fn data(&mut self, id: FileId, file: &File, from: u64, path: &Path) -> Sending {
-        use std::os::unix::fs::FileExt as _;
-        write_item(&mut self.out, &Item::Data { id, from }, &[])?;
-        let mut buf = vec![0u8; CHUNK];
+        self.out.item(&Item::Data { id, from }, &[])?;
         let mut at = from;
         loop {
-            let n = match file.read_at(&mut buf, at) {
+            let n = match file.read_at(&mut self.buf, at) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Ok(Err(Failure::io(path, &error))),
+                Err(error) => return Err(Failure::io(&path, &error)),
             };
-            let (Some(len), Some(data)) = (DataLen::new(n), buf.get(..n)) else {
-                return Ok(Err(Failure::new(FailKind::Other, path)));
+            let (Some(len), Some(data)) = (DataLen::new(n), self.buf.get(..n)) else {
+                return Err(Failure::new(FailKind::Other, &path));
             };
-            write_item(&mut self.out, &Item::Chunk(len), data)?;
+            self.out.item(&Item::Chunk(len), data)?;
             at = at.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
         }
-        write_item(&mut self.out, &Item::Sent, &[]).map(Ok)
+        self.out.item(&Item::Sent, &[])
     }
 }

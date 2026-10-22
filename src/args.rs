@@ -607,10 +607,8 @@ fn cp() -> Command {
         .arg(flag("recursive", "recursive").short('r').visible_short_alias('R').help("Accepted, as scp's: directories always copy whole"))
         .arg(flag("preserve", "preserve").short('p').help("Keep the source's modification times"))
         .arg(flag("delete", "delete").help("Remove from the destination's directories what the source does not have"))
-        .arg(flag("atomic", "atomic").help("Rename nothing into place, and remove nothing, until all of the copy came"))
         .arg(flag("dry_run", "dry-run").help("Change nothing and send no file's bytes: list what would be sent (new or replaced), deleted, made or linked, then the summary"))
-        .arg(flag("diff", "diff").help("A dry run that also shows how each replaced text file differs (a unified diff, a/ the destination's, b/ the source's; files up to 1 MiB): the source's file goes to the destination's end to be compared, nothing changed"))
-        .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: `*.o`, `target`, `src/gen/*` (repeatable)"))
+        .arg(Arg::new("exclude").long("exclude").value_name("PATTERN").action(ArgAction::Append).value_parser(value_parser!(OsString)).help("Neither send nor remove entries matching it: a name anywhere (`*.o`, `target`), or a path from the top of the tree copied (`src/gen/*`) (repeatable)"))
         .arg(json())
 }
 
@@ -970,9 +968,7 @@ pub fn parse(matches: &ArgMatches) -> Result<Cmd, clap::Error> {
             let opts = Opts {
                 keep_times: m.get_flag("preserve"),
                 delete: m.get_flag("delete"),
-                atomic: m.get_flag("atomic"),
-                dry_run: m.get_flag("dry_run") || m.get_flag("diff"),
-                diff: m.get_flag("diff"),
+                dry_run: m.get_flag("dry_run"),
                 excludes,
             };
             let shown = paths
@@ -1538,7 +1534,7 @@ mod tests {
             (remote.server, job, opts)
         };
         let (server, job, opts) = copy(&["-r", "-p", "--delete", "a", "./b:c", "laptop:~/x"]);
-        assert!(opts.keep_times && opts.delete && !opts.atomic);
+        assert!(opts.keep_times && opts.delete && !opts.dry_run);
         assert_eq!(server, super::ServerRef::Name("laptop".to_owned()));
         let CopyJob::Put { sources, dest } = job else {
             panic!("put");

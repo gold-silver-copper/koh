@@ -48,7 +48,7 @@ pub const MAX_SOURCES: usize = 1024;
 /// Most sessions or jobs a listing holds.
 pub const MAX_LISTED: usize = 1024;
 
-/// Most characters of a title, or of a job's command as listed.
+/// Most characters of a window title (as mosh cuts them), or of a job's command as listed.
 pub const MAX_TITLE: usize = 256;
 
 /// Most bytes of a job's name.
@@ -651,7 +651,6 @@ pub struct SessionInfo {
     pub age_secs: u64,
     pub presence: Presence,
     pub size: Size,
-    /// Its window title, at most [`MAX_TITLE`] characters.
     #[serde(deserialize_with = "title")]
     pub title: String,
     /// Its program's exit status, once it exited: the session is kept until a client sees it.
@@ -659,9 +658,14 @@ pub struct SessionInfo {
     pub state: ShellState,
 }
 
-fn title<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+/// A window title: at most [`MAX_TITLE`] characters, none a control.
+pub(crate) fn title<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
     let bytes = at_most::<{ MAX_TITLE * 4 }, D, u8>(deserializer)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(String::from_utf8_lossy(&bytes)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TITLE)
+        .collect())
 }
 
 fn command<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -808,11 +812,6 @@ pub fn body_len(prefix: [u8; 4], max: usize) -> Result<usize, ProtoError> {
     Ok(len)
 }
 
-/// Decode a message's body (its length prefix read already), all of it.
-pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, ProtoError> {
-    Ok(postcard::from_bytes(body)?)
-}
-
 /// Decode a whole framed message, prefix and body, as a reply stream carries it.
 pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T, ProtoError> {
     let (prefix, body) = bytes
@@ -821,7 +820,7 @@ pub fn decode_framed<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T,
     if body_len(*prefix, max)? != body.len() {
         return Err(ProtoError::Truncated);
     }
-    decode(body)
+    Ok(postcard::from_bytes(body)?)
 }
 
 #[cfg(test)]

@@ -3,15 +3,11 @@
 //! `servers`, the servers this machine connects to, sits beside the client key; `clients`, the
 //! clients allowed to connect to it, beside the server key. Each line is `name id`, and a server's
 //! may end with how to dial it, `direct=IP:PORT` or `relay=URL`, a client's with its scope
-//! (`cp=DIR`, `exec=DIR`, [`Scope`]); `#` lines and blank lines are kept as they are. Both files go through [`KeyFile`]'s rules, as the key does:
-//! `clients` decides who may open a shell here.
-//!
-//! When each server was last reached is kept apart, in `connected` beside the client key (`id
-//! seconds` lines), so a connect never rewrites the list the user edits.
+//! (`cp=DIR`, `exec=DIR`, [`Scope`]); `#` lines and blank lines are kept as they are. Both files
+//! go through [`KeyFile`]'s rules, as the key does: `clients` decides who may open a shell here.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
 use iroh::{EndpointId, RelayUrl};
@@ -530,56 +526,6 @@ pub fn shown(places: &Places, list: List) -> String {
         .with_file_name(list.file())
         .display()
         .to_string()
-}
-
-/// The file of when each server was last reached, beside the client key.
-const CONNECTED: &str = "connected";
-
-/// Note that `server` was reached now. A failure is the caller's to report, not to stop on.
-pub fn record_connected(client_key: &Path, server: EndpointId) -> anyhow::Result<()> {
-    let key = KeyFile::open(client_key)?;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs());
-    key.update_beside(CONNECTED, |text| {
-        let mut lines: Vec<String> = text
-            .as_deref()
-            .unwrap_or("")
-            .lines()
-            .filter(|line| !line.starts_with(&server.to_string()))
-            .map(str::to_owned)
-            .collect();
-        lines.push(format!("{server} {now}"));
-        let mut out = lines.join("\n");
-        out.push('\n');
-        Ok(Some(out))
-    })
-}
-
-/// When `server` was last reached, if it ever was. The file is koh's own state, so a line it cannot
-/// read is skipped rather than refused.
-pub fn last_connected(client_key: &Path, server: EndpointId) -> Option<SystemTime> {
-    let key = KeyFile::open(client_key).ok()?;
-    let text = key.read_beside(CONNECTED).ok().flatten()?;
-    let server = server.to_string();
-    text.lines().rev().find_map(|line| {
-        let (id, secs) = line.split_once(' ')?;
-        (id == server).then_some(())?;
-        let secs = secs.trim().parse::<u64>().ok()?;
-        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
-    })
-}
-
-/// How long ago `then` was, briefly: "2h ago".
-pub fn ago(then: SystemTime, now: SystemTime) -> String {
-    let secs = now.duration_since(then).map_or(0, |d| d.as_secs());
-    let (amount, unit) = match secs {
-        0..=59 => return "just now".to_owned(),
-        60..=3599 => (secs.checked_div(60).unwrap_or(0), "m"),
-        3600..=86_399 => (secs.checked_div(3600).unwrap_or(0), "h"),
-        _ => (secs.checked_div(86_400).unwrap_or(0), "d"),
-    };
-    format!("{amount}{unit} ago")
 }
 
 #[cfg(test)]

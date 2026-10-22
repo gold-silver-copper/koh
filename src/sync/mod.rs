@@ -828,7 +828,7 @@ pub async fn replies_from(mut recv: iroh::endpoint::RecvStream, tx: mpsc::Sender
         let Ok(body) = crate::transport_iroh::read_framed(&mut recv, MAX_REPLY_ITEM).await else {
             return;
         };
-        let Ok(reply) = crate::request::decode::<Reply>(&body) else {
+        let Ok(reply) = postcard::from_bytes::<Reply>(&body) else {
             return;
         };
         if tx.send(reply).await.is_err() {

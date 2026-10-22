@@ -58,74 +58,75 @@ pub const HEARTBEAT: Duration = Duration::from_secs(3);
 /// big-endian.
 pub const SHOWN_TAG: u8 = 0x5e;
 
-/// Why a connection was closed: its QUIC application close code.
-///
-/// The code is the only part read; the reason bytes a peer chooses are never shown, only
-/// [`Close::text`]. Code 0 is none of these: an endpoint closing (a server restarting) uses it.
-/// `NotAuthorized`, `NoSuchSession` and `OutOfScope` are for good: a shell's client redials after
-/// the others but `SessionEnded`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum Close {
-    NotAuthorized = 1,
-    /// The peer broke the protocol, or made no request in time.
-    ProtocolError = 2,
-    /// The hosted program exited, and the client was sent its end.
-    SessionEnded = 3,
-    /// The server holds its most sessions, and the client asked for a new one; or the session
-    /// has as many attaches waiting as it takes.
-    AtCapacity = 4,
-    /// The session's program, or the command asked for, could not start, or the server is
-    /// shutting down.
-    CouldNotStart = 5,
-    /// The session asked for by number is not the client's, or is gone.
-    NoSuchSession = 6,
-    /// The client's key is scoped to commands or copies, and asked for something else.
-    OutOfScope = 7,
-    /// The server has `--max-connections` connections, and as many waiting for one: nothing was
-    /// done, and a retry may get in.
-    Busy = 8,
-    /// The directory a new session was to start in is not there, or is not a directory.
-    NoSuchDir = 9,
+/// `Close`, each variant with its code and what it says, and the code's lookup.
+macro_rules! close_codes {
+    ($(#[$meta:meta])* pub enum Close {
+        $($(#[$vmeta:meta])* $name:ident = $code:literal => $text:expr,)*
+    }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(u32)]
+        pub enum Close {
+            $($(#[$vmeta])* $name = $code,)*
+        }
+
+        impl Close {
+            #[cfg(test)]
+            const ALL: &[Self] = &[$(Self::$name),*];
+
+            /// The reason close code `code` gives, if it is one of these.
+            pub const fn from_code(code: u64) -> Option<Self> {
+                match code {
+                    $($code => Some(Self::$name),)*
+                    _ => None,
+                }
+            }
+
+            /// What it says, for a person.
+            pub const fn text(self) -> &'static str {
+                match self {
+                    $(Self::$name => $text,)*
+                }
+            }
+        }
+    };
+}
+
+close_codes! {
+    /// Why a connection was closed: its QUIC application close code.
+    ///
+    /// The code is the only part read; the reason bytes a peer chooses are never shown, only
+    /// [`Close::text`]. Code 0 is none of these: an endpoint closing (a server restarting) uses it.
+    /// `NotAuthorized`, `NoSuchSession` and `OutOfScope` are for good: a shell's client redials
+    /// after the others but `SessionEnded`.
+    pub enum Close {
+        NotAuthorized = 1 => "not authorized (is this client on the server's allowlist?)",
+        /// The peer broke the protocol, or made no request in time.
+        ProtocolError = 2 => "protocol error",
+        /// The hosted program exited, and the client was sent its end.
+        SessionEnded = 3 => "session ended",
+        /// The server holds its most sessions, and the client asked for a new one; or the session
+        /// has as many attaches waiting as it takes.
+        AtCapacity = 4 => "the server holds its most sessions (`koh serve --max-sessions`)",
+        /// The session's program, or the command asked for, could not start, or the server is
+        /// shutting down.
+        CouldNotStart = 5 => "the server could not start the program",
+        /// The session asked for by number is not the client's, or is gone.
+        NoSuchSession = 6 => "no such session (it ended, or the server restarted)",
+        /// The client's key is scoped to commands or copies, and asked for something else.
+        OutOfScope = 7 =>
+            "this client's key is scoped on the server (`koh clients` there), and may not do that",
+        /// The server has `--max-connections` connections, and as many waiting for one: nothing
+        /// was done, and a retry may get in.
+        Busy = 8 => "server busy: too many connections at once; retry",
+        /// The directory a new session was to start in is not there, or is not a directory.
+        NoSuchDir = 9 => crate::request::ProblemKind::NoSuchDir.text(),
+    }
 }
 
 impl Close {
     pub const fn code(self) -> u32 {
         self as u32
-    }
-
-    /// The reason close code `code` gives, if it is one of these.
-    pub const fn from_code(code: u64) -> Option<Self> {
-        Some(match code {
-            1 => Self::NotAuthorized,
-            2 => Self::ProtocolError,
-            3 => Self::SessionEnded,
-            4 => Self::AtCapacity,
-            5 => Self::CouldNotStart,
-            6 => Self::NoSuchSession,
-            7 => Self::OutOfScope,
-            8 => Self::Busy,
-            9 => Self::NoSuchDir,
-            _ => return None,
-        })
-    }
-
-    /// What it says, for a person.
-    pub const fn text(self) -> &'static str {
-        match self {
-            Self::NotAuthorized => "not authorized (is this client on the server's allowlist?)",
-            Self::ProtocolError => "protocol error",
-            Self::SessionEnded => "session ended",
-            Self::AtCapacity => "the server holds its most sessions (`koh serve --max-sessions`)",
-            Self::CouldNotStart => "the server could not start the program",
-            Self::NoSuchSession => "no such session (it ended, or the server restarted)",
-            Self::OutOfScope => {
-                "this client's key is scoped on the server (`koh clients` there), and may not do \
-                 that"
-            }
-            Self::Busy => "server busy: too many connections at once; retry",
-            Self::NoSuchDir => crate::request::ProblemKind::NoSuchDir.text(),
-        }
     }
 }
 
@@ -186,8 +187,7 @@ impl ClientMsg {
     fn check(&self) -> Result<(), ProtoError> {
         match self {
             Self::Keys { events, .. } => check_events(events),
-            Self::Colours(colours) => colours.check(),
-            Self::Resize { .. } | Self::Read { .. } | Self::Redraw => Ok(()),
+            Self::Colours(_) | Self::Resize { .. } | Self::Read { .. } | Self::Redraw => Ok(()),
         }
         .map_err(ProtoError::BadInput)
     }
@@ -211,8 +211,8 @@ pub enum Shown {
     Echo(InputSeq),
     /// The bell has rung this many times in the session's life: a rise is a ring.
     Bell(u64),
-    /// The window title is now this, at most 256 characters.
-    Title(#[serde(deserialize_with = "title")] String),
+    /// The window title is now this.
+    Title(#[serde(deserialize_with = "crate::request::title")] String),
     /// The program exited with status `code`; the session ends. `read`: the input up to which
     /// (this connection's) was written to its terminal, if it read every key written there before
     /// it ended (none left in its terminal or on its way to it), so a terminal driving the client
@@ -220,16 +220,6 @@ pub enum Shown {
     Exit { code: u32, read: Option<InputSeq> },
     /// Nothing: the link lives.
     Beat,
-}
-
-fn title<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    let bytes = at_most::<{ crate::terminal::MAX_DIM as usize * 4 }, D, u8>(deserializer)?;
-    let title = String::from_utf8(bytes).map_err(de::Error::custom)?;
-    Ok(title
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(256)
-        .collect())
 }
 
 /// A shell mark as `OSC 133 ;` would carry it: printable ASCII, at most
@@ -278,13 +268,6 @@ pub enum ProtoError {
     BadInput(&'static str),
 }
 
-/// Refuse `len` past `max` as [`ProtoError::TooLarge`].
-fn at_most_len(len: usize, max: usize) -> Result<(), ProtoError> {
-    (len <= max)
-        .then_some(())
-        .ok_or(ProtoError::TooLarge { len, max })
-}
-
 /// Encode one client message with its length prefix.
 pub fn encode_client(msg: &ClientMsg) -> Result<Vec<u8>, ProtoError> {
     msg.check()?;
@@ -330,8 +313,7 @@ impl<const MAX: usize> Decoder<MAX> {
             self.compact();
             return Ok(None);
         };
-        let len = usize::try_from(u32::from_be_bytes(*len)).unwrap_or(usize::MAX);
-        at_most_len(len, MAX)?;
+        let len = crate::request::body_len(*len, MAX)?;
         if rest.len() < len {
             self.compact();
             return Ok(None);
@@ -386,18 +368,7 @@ mod tests {
     /// A close says why by its code alone, each code one reason; 0, an endpoint closing, is none.
     #[test]
     fn close_codes_round_trip_and_0_is_none_of_them() {
-        let all = [
-            Close::NotAuthorized,
-            Close::ProtocolError,
-            Close::SessionEnded,
-            Close::AtCapacity,
-            Close::CouldNotStart,
-            Close::NoSuchSession,
-            Close::OutOfScope,
-            Close::Busy,
-            Close::NoSuchDir,
-        ];
-        for close in all {
+        for &close in Close::ALL {
             assert_eq!(Close::from_code(u64::from(close.code())), Some(close));
             assert!(close.text().is_ascii() && !close.text().contains('\n'));
         }

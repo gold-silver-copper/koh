@@ -23,6 +23,8 @@
 //! sequence longer than its bound is dropped to its end, so a filter holds at most
 //! [`MAX_STRING`] bytes, whatever the program writes.
 
+use crate::request::MAX_TITLE;
+
 /// Most bytes of a control sequence (CSI) a filter gathers; a longer one is dropped.
 pub const MAX_CSI: usize = 256;
 
@@ -38,9 +40,6 @@ pub const MAX_MARK: usize = 256;
 
 /// Most bytes of base64 a clipboard write (OSC 52) carries; a longer one is dropped.
 pub const MAX_CLIPBOARD: usize = 16 * 1024;
-
-/// Most characters of a title (OSC 0, 1, 2), as mosh cuts them; the rest is cut off.
-pub const MAX_TITLE: usize = 256;
 
 /// What a filter passes on.
 #[derive(Clone, Debug, PartialEq, Eq)]

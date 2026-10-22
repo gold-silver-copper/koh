@@ -125,7 +125,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             session,
             last,
             json,
-        } => cli::output(&resolve(remote)?, (session, last), format(json), &mut out)
+        } => cli::output(&resolve(remote)?, session, last, format(json), &mut out)
             .await
             .map(|()| None),
         Cmd::Exec {
@@ -136,7 +136,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => {
             let remote = resolve(remote)?;
             let synced = synced(&remote, sync, json).await?;
-            koh::client::exec(&remote, (run, synced.as_ref()), format(json))
+            koh::client::exec(&remote, run, synced.as_ref(), format(json))
                 .await
                 .map(Some)
         }
@@ -149,14 +149,9 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => {
             let remote = resolve(remote)?;
             let synced = synced(&remote, sync, json).await?;
-            cli::run(
-                &remote,
-                (name, run, synced.as_ref()),
-                format(json),
-                &mut out,
-            )
-            .await
-            .map(|()| None)
+            cli::run(&remote, name, run, synced.as_ref(), format(json), &mut out)
+                .await
+                .map(|()| None)
         }
         Cmd::Jobs(remote, job, json) => cli::jobs(&resolve(remote)?, job, format(json), &mut out)
             .await
@@ -167,7 +162,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             follow,
             tail,
         } => {
-            let status = cli::logs(&resolve(remote)?, job, (follow, tail)).await?;
+            let status = cli::logs(&resolve(remote)?, job, follow, tail).await?;
             Ok(status.filter(|_| follow))
         }
         Cmd::Kill {
@@ -175,7 +170,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             job,
             signal,
             json,
-        } => cli::kill(&resolve(remote)?, (job, signal), format(json), &mut out)
+        } => cli::kill(&resolve(remote)?, job, signal, format(json), &mut out)
             .await
             .map(|()| None),
         Cmd::Wait {
@@ -186,7 +181,9 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             json,
         } => cli::wait(
             &resolve(remote)?,
-            (wait, timeout, tail),
+            wait,
+            timeout,
+            tail,
             format(json),
             &mut out,
         )

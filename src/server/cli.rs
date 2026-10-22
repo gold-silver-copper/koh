@@ -21,7 +21,7 @@ use crate::log::Peer;
 use crate::names::{List, Scope};
 use crate::proto::Close;
 use crate::request::{
-    Answer, Attached, On, Pick, Problem, ProblemKind, Request, Resume, SessionList, Until,
+    Answer, Attached, LogMsg, On, Pick, Problem, ProblemKind, Request, Resume, SessionList, Until,
     MAX_LISTED, MAX_OUTPUT, MAX_REQUEST,
 };
 use crate::server::audit::{auth_event, Outcome, Throttle};
@@ -715,7 +715,7 @@ async fn dispatch(
             if let Some(found) = host.jobs.get(peer, &job) {
                 super::jobs::logs(conn, &found, (follow, tail)).await;
             } else {
-                let none: Answer<()> = Err(Problem::new(ProblemKind::NoSuchJob, &job));
+                let none = LogMsg::Problem(Problem::new(ProblemKind::NoSuchJob, &job));
                 super::answer(conn, &none).await;
             }
         }

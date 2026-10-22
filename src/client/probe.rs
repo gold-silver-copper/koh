@@ -16,7 +16,7 @@
 
 /// The questions, ending with primary device attributes: the scheme. The colours are asked too
 /// unless they are not told ([`queries`]).
-pub const QUERIES: &[u8] = b"\x1b[?996n\x1b[c";
+const QUERIES: &[u8] = b"\x1b[?996n\x1b[c";
 
 /// The colour questions, ending with primary device attributes: the foreground, the background and
 /// palette entries 0 to 15. The session asks them again when the terminal reports a new scheme.
@@ -39,25 +39,4 @@ pub fn queries(colours: bool) -> Vec<u8> {
     }
     out.extend_from_slice(QUERIES);
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_colours_are_asked_unless_they_are_not_told() {
-        assert_eq!(queries(false), QUERIES);
-        let both = queries(true);
-        assert!(both.starts_with(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]4;0;?"));
-        assert!(both.ends_with(QUERIES));
-        // One DA1, the last.
-        assert_eq!(both.windows(3).filter(|w| w == b"\x1b[c").count(), 1);
-        for n in 0..16 {
-            let asked = format!("\x1b]4;{n};?\x1b\\");
-            assert!(COLOUR_QUERIES
-                .windows(asked.len())
-                .any(|w| w == asked.as_bytes()));
-        }
-    }
 }

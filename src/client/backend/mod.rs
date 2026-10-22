@@ -33,10 +33,6 @@ impl MarkNonce {
     pub fn from_env() -> Option<Self> {
         Self::new(&std::env::var("FUX_MARK_NONCE").ok()?)
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// The terminal `koh connect` writes to. Output is buffered until [`flush`](Self::flush).
@@ -67,11 +63,16 @@ pub trait KohBackend {
 
     /// Write `OSC 133 ; body`, with the terminal's nonce if it asks for one.
     fn mark(&mut self, body: fmt::Arguments<'_>) -> io::Result<()> {
-        let text = match self.mark_nonce() {
-            Some(nonce) => format!("\x1b]133;{body};nonce={}\x07", nonce.0),
-            None => format!("\x1b]133;{body}\x07"),
-        };
+        let text = mark(body, self.mark_nonce());
         self.write_bytes(text.as_bytes())
+    }
+}
+
+/// `OSC 133 ; body`, with `nonce` if the terminal asks for one.
+pub fn mark(body: fmt::Arguments<'_>, nonce: Option<&MarkNonce>) -> String {
+    match nonce {
+        Some(nonce) => format!("\x1b]133;{body};nonce={}\x07", nonce.0),
+        None => format!("\x1b]133;{body}\x07"),
     }
 }
 

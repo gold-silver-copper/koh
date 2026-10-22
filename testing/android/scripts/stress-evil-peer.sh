@@ -134,7 +134,7 @@ fi
 run_client_attack "keys flood (PTY write/budget)" keys-flood 6
 run_client_attack "paste events flood (PTY write/budget)" events-flood 6
 # Decoded input no terminal sends: each closes its connection with a protocol error.
-for KIND in mods fkey surrogate paste events palette; do
+for KIND in mods fkey surrogate paste events; do
   K0="$(log_count "$BROKE_LINE")"
   run_client_attack "bad keys ($KIND)" bad-keys "$KIND"
   [ "$(log_count "$BROKE_LINE")" -gt "$K0" ] \

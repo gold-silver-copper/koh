@@ -64,8 +64,6 @@ qrcode = { version = "=0.14.1", default-features = false }
 rustix = { version = "1.1.5", features = ["fs", "param", "process"] }
 # Whole-file hashes: `koh cp` sends only the files that changed. Already in the tree through iroh.
 blake3 = "1.8.7"
-# `koh cp --diff`: a unified diff of a replaced text file. No dependencies of its own.
-similar = { version = "2.7.0", default-features = false, features = ["text"] }
 # `--json` output.
 serde_json = "1.0.154"
 # utility

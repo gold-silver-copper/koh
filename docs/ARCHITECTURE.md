@@ -76,8 +76,8 @@ testing/corpus/      real programs' output (from fux), replayed by tests and ben
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
 ```
 
-`predict` imports nothing from `crate::` (CI checks it), so it is a standalone
-terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
+`predict` and `proto` import nothing of the client or the server (CI checks it); `stream`,
+`proto`, `request` and `sync`'s item types are pure.
 
 ## The protocol (koh/17)
 
@@ -207,7 +207,7 @@ holds at most that.
 
 `client::Display` writes to the user's terminal. It feeds what it writes to a mirror, a fux-vt
 parser with no history, which says where the cursor is, which screen is shown, what is under a
-cell; the predictor reads the mirror (`predict::ScreenView` is implemented for `fux_vt::Screen`).
+cell; the predictor reads the mirror's `fux_vt::Screen`.
 Over the program's output it paints an overlay: the predicted echo of what was typed, and the
 status line on the last row. The overlay is taken back before anything else is written (the cells
 it covered painted again from the mirror, the pen and the cursor put back), so the terminal is
@@ -310,7 +310,8 @@ key typed within 200 ms of a frame that moved the cursor to another row (a fresh
 predicted until the server has reflected it (`PredictionEngine::hold`); the hold keys on the cursor
 row's index, the history's newest row and the rows the frame moved, so it engages at the bottom of
 a full screen, where Enter scrolls. Kernel echo is trusted
-from the first key otherwise. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
+from the first key otherwise, until a key the predictor does not model (Tab, say), whose echo it
+then waits for. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
 of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
 reconnect to the same session carries the trust it had, given once the first output shows no
 password prompt, and only once the modes are known.
@@ -318,30 +319,22 @@ password prompt, and only once the modes are known.
 The predictor takes edit keys only (focus changes never reach it), and predicts only in a
 `Context`, which can be built only on the primary screen with the PTY's modes known and not a
 password prompt, so tmux's or screen's prefix and full-screen programs are never read as readline.
-Guesses are cells with their whole style: cells a line editor shifts keep theirs, and only the typed
-glyph borrows its left neighbour's (hidden included). A line starts at a `Confirmed` cursor, never a
-`Guessed` one, only once the screen shows the Enter that began it, and dies with discarded guesses;
+A typed glyph is guessed only onto blank cells, borrowing its left neighbour's style (hidden
+included), and nothing else on the row moves, so a right-side prompt (zsh's `RPROMPT`, fish's) or
+a full-screen program's border never contradicts a guess; typing over text waits for the echo. A
+line starts where the screen shows the Enter that began it, and dies with discarded guesses;
 Backspace and Left stop at it. A character that continues the glyph before the cursor (a combining
 mark, a skin-tone modifier) joins it, or nothing is predicted. Prediction is **always on** in koh, so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation and no-echo suppression. It predicts
-typed keys, whatever bytes the user's terminal sent for them (more than 32 in one read are a
-paste or a program writing to the terminal, not typing, and are not predicted): ASCII printables (with insert-mode
-row shift), backspace, Enter, the left/right arrow keys (not under kernel echo, which echoes them
-as `^[[D`), the line
-editor's keys where the guess is sure (`Ctrl-W` and `Alt-Backspace` back to a word's boundary,
-never into what is left of the line's start; `Ctrl-U`, `Ctrl-A` and Home only when where the line
-began is known; `Ctrl-E` and End to the end of an unwrapped
-row; `Alt-B` and `Alt-F` by readline's words), and whole graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
-predicted as two cells, the glyph and the cell it covers; the covered cell is right when the
-server shows a wide glyph's right half there, and never confirms an epoch. The insert-mode shift
-moves each wide glyph with its right half; one the shift splits (at the right edge, or typed
-inside) becomes unknown rather than half drawn. Backspace over a wide glyph, which a line editor
-takes back two cells, is not modelled. Control/escape sequences it doesn't model open a fresh epoch
-but make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
-is always reconciled away — it never corrupts the display: the overlay is taken back before
-the program's output is written.
+It predicts typed keys, whatever bytes the user's terminal sent for them (more than 32 in one read
+are a paste or a program writing to the terminal, not typing, and are not predicted): printable
+graphemes, double-width ones as two cells (the right one never confirms an epoch), Backspace at the
+end of the line, Enter, and the left and right arrows (not under kernel echo, which echoes them as
+`^[[D`). The line editor's own keys (`Ctrl-W`, `Ctrl-U`, `Ctrl-A`, `Ctrl-E`, Home, End, `Alt-B`,
+`Alt-F`) are not guessed: they wait one round trip. Other keys and control sequences open a fresh
+epoch but make no guess. A wrong or unconfirmed guess is always reconciled away: the overlay is
+taken back before the program's output is written.
 
 ## Reconnect & detachable sessions
 

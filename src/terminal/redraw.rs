@@ -190,9 +190,10 @@ pub fn redraw(screen: &fux_vt::Screen, title: &str, history: usize) -> Vec<Piece
     }
     if alternate {
         p.pen(Attributes::default());
-        // `?1049 h` saves the cursor where the paint left it, not where the program left the
-        // primary screen's: fux-vt 0.12 keeps that private (gold-silver-copper/fux#210 adds
-        // `Screen::main_saved_cursor`; move there first once koh takes it).
+        // `?1049 h` saves the cursor where it stands: where the program saved the primary
+        // screen's, so its `?1049 l` puts it back there.
+        let (row, col) = screen.main_saved_cursor();
+        p.cup(row, col);
         p.out.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
         let mut wraps = false;
         for (row_at, row) in (0_u16..).zip(screen.alternate_rows()) {
@@ -410,6 +411,8 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(main(got), main(want));
+                // Where leaving the alternate screen puts the cursor back.
+                assert_eq!(got.main_saved_cursor(), want.main_saved_cursor());
             }
         }
     }

@@ -1,4 +1,4 @@
-//! Hostile peers on koh/15, both directions.
+//! Hostile peers on koh/16, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
 //! real server; a malicious server throws it at a real client. Neither may crash or hang the
@@ -14,7 +14,7 @@ use koh::proto::{
 };
 use koh::request::{Attached, Pick, Request, Resume, RunId, SessionNum, MAX_REPLY, MAX_REQUEST};
 use koh::terminal::Size;
-use koh::transport_iroh::{generate_secret_key, ALPN};
+use koh::transport_iroh::{generate_secret_key, prove, ALPN};
 
 use crate::harness::{identity, Client, Options, Server};
 use crate::link::{FaultNet, Profile};
@@ -27,15 +27,16 @@ fn net() -> FaultNet {
 
 /// Connect to `server` as `secret`, ask for a shell on the first stream, wait for the server's
 /// first stream, which admits it, and keep the endpoint and that stream alive; the caller then
-/// speaks koh/15 by hand.
+/// speaks koh/16 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
     server: EndpointId,
 ) -> anyhow::Result<Connection> {
-    let endpoint = net.endpoint(secret, false).await?;
+    let endpoint = net.endpoint(generate_secret_key()?, false).await?;
     let conn = endpoint.connect(FaultNet::addr(server), ALPN).await?;
-    let request = koh::request::encode(
+    let mut opening = prove(&conn, &secret)?;
+    opening.extend(koh::request::encode(
         &Request::Shell {
             pick: Pick::Latest,
             size: Size::new(24, 80),
@@ -43,8 +44,8 @@ async fn admitted(
             cwd: None,
         },
         MAX_REQUEST,
-    )?;
-    raw_client_stream(&conn, &request).await?;
+    )?);
+    raw_client_stream(&conn, &opening).await?;
     conn.accept_uni().await?;
     Box::leak(Box::new(endpoint));
     Ok(conn)
@@ -276,6 +277,54 @@ fn a_full_session_queue_does_not_stop_the_output() -> anyhow::Result<()> {
     })
 }
 
+/// A client that does not prove an allowed key is closed as one not allowed, whatever it sends:
+/// a proof that is no proof, an allowed key's proof made on another connection (replayed), or a
+/// true proof of a key not on the list. None of it says which keys are.
+#[test]
+fn a_client_proving_no_allowed_key_is_refused() -> anyhow::Result<()> {
+    koh_testkit::multi_thread(4)?.block_on(async {
+        let net = net();
+        let allowed = identity()?;
+        let (server, mut good) = server_under_attack(&net, allowed.public()).await?;
+        let dial = || async {
+            let endpoint = net.endpoint(generate_secret_key()?, false).await?;
+            let conn = endpoint.connect(FaultNet::addr(server.id), ALPN).await?;
+            Box::leak(Box::new(endpoint));
+            anyhow::Ok(conn)
+        };
+        let elsewhere = dial().await?;
+        let replayed = prove(&elsewhere, &allowed)?;
+        let stranger = identity()?;
+        for (what, proof) in [
+            (
+                "a malformed proof",
+                Some(vec![0, 0, 0, 3, 0xff, 0xff, 0xff]),
+            ),
+            ("a proof replayed from another connection", Some(replayed)),
+            ("a key not allowed", None),
+        ] {
+            let conn = dial().await?;
+            let proof = match proof {
+                Some(proof) => proof,
+                None => prove(&conn, &stranger)?,
+            };
+            raw_client_stream(&conn, &proof).await?;
+            let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+                .await
+                .with_context(|| format!("the server must close a client with {what}"))?;
+            anyhow::ensure!(
+                matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(c)
+                    if c.error_code == Close::NotAuthorized.code().into()),
+                "{what}: closed with {closed:?}"
+            );
+        }
+        assert_good_client_still_works(&mut good).await?;
+        let _ = good.finish().await;
+        server.stop().await?;
+        Ok(())
+    })
+}
+
 #[test]
 fn an_opening_request_that_is_no_request_closes_the_connection_only() -> anyhow::Result<()> {
     koh_testkit::multi_thread(4)?.block_on(async {
@@ -286,9 +335,11 @@ fn an_opening_request_that_is_no_request_closes_the_connection_only() -> anyhow:
         // third kind, of 3 bytes), which no command line can.
         let nul = vec![0, 0, 0, 5, 2, 3, b'a', 0, b'b'];
         for request in [vec![0, 0, 0, 3, 0xff, 0xff, 0xff], nul] {
-            let endpoint = net.endpoint(evil.clone(), false).await?;
+            let endpoint = net.endpoint(generate_secret_key()?, false).await?;
             let conn = endpoint.connect(FaultNet::addr(server.id), ALPN).await?;
-            raw_client_stream(&conn, &request).await?;
+            let mut opening = prove(&conn, &evil)?;
+            opening.extend(request);
+            raw_client_stream(&conn, &opening).await?;
             closed_for_breaking_the_protocol(&conn, "a malformed request").await?;
         }
         assert_good_client_still_works(&mut good).await?;
@@ -340,10 +391,12 @@ fn a_flood_of_connections_and_garbage_does_not_take_the_server_down() -> anyhow:
     })
 }
 
-/// What admits a client: its request read, the first stream says it attached session 1. The
-/// request's stream, kept open as the client's control stream.
-async fn admit(conn: &Connection) -> anyhow::Result<iroh::endpoint::RecvStream> {
+/// What admits a client: its proof of `allow`'s key and its request read, the first stream says it
+/// attached session 1. The request's stream, kept open as the client's control stream.
+async fn admit(conn: &Connection, allow: EndpointId) -> anyhow::Result<iroh::endpoint::RecvStream> {
     let mut control = conn.accept_uni().await?;
+    let proven = koh::transport_iroh::proven(conn, &mut control).await?;
+    anyhow::ensure!(proven == allow, "not the client it serves");
     koh::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
     let attached = Attached {
         at: Resume {
@@ -372,10 +425,7 @@ where
             return;
         };
         let Ok(conn) = incoming.await else { return };
-        if conn.remote_id() != allow {
-            return;
-        }
-        let Ok(control) = admit(&conn).await else {
+        let Ok(control) = admit(&conn, allow).await else {
             return;
         };
         Box::leak(Box::new(control));

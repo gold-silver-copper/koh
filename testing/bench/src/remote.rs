@@ -314,8 +314,8 @@ impl Remote {
         let hosting = Hosting::from_config(&config)?;
         let shutdown = CancellationToken::new();
         let server = tokio::spawn(serve_endpoint(server_endpoint, hosting, shutdown.clone()));
-        let endpoint = net.endpoint(client_secret, false).await?;
-        let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id));
+        let endpoint = net.endpoint(client_secret.clone(), false).await?;
+        let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id), client_secret);
         let start = Size::new(rows, cols);
         let channel = connector
             .connect(koh::request::Pick::Latest, start, (None, None))

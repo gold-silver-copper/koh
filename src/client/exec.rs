@@ -216,15 +216,15 @@ fn stopped(signal: Option<&str>, ran: Duration) -> String {
 }
 
 /// Why a command that ran for `ran` was cut off when its connection ended for `reason`, as a
-/// person acts on it: the link went quiet, or the server went away. `None` for a close the server
-/// gave a reason for, which [`super::refusal`] says.
+/// person acts on it: nothing came for the idle timeout, or the server went away. `None` for a
+/// close the server gave a reason for, which [`super::refusal`] says.
 fn cut_short(reason: Option<&ConnectionError>, ran: Duration) -> Option<String> {
     let ran = super::cli::span(ran.as_secs());
     match reason? {
         ConnectionError::TimedOut => Some(format!(
-            "cut off after {ran}: the link went quiet for 10s (the network dropped, or the server \
-             went away); a server still up hangs the command up once it sees the link gone, \
-             within 10s; {AS_A_JOB}"
+            "cut off after {ran}: nothing came from the server for 10s (the network dropped, or \
+             the server or this machine stalled or went away); a server still up hangs the \
+             command up once it sees the link gone, within 10s; {AS_A_JOB}"
         )),
         ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == 0 => {
             Some(format!(
@@ -318,7 +318,7 @@ mod tests {
         assert!(said.contains("koh run SERVER"), "{said}");
         let quiet = super::cut_short(Some(&ConnectionError::TimedOut), ran).unwrap_or_default();
         assert!(
-            quiet.starts_with("cut off after 2m00s: the link went quiet"),
+            quiet.starts_with("cut off after 2m00s: nothing came from the server for 10s"),
             "{quiet}"
         );
         assert!(quiet.contains("koh run SERVER"), "{quiet}");

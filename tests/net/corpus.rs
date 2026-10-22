@@ -175,7 +175,8 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let secret = identity()?;
     let server = Server::start(net, &[secret.public()], &["bash", &script]).await?;
     let endpoint = net.endpoint(secret, false).await?;
-    let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id));
+    let key = endpoint.secret_key().clone();
+    let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id), key);
     let start = Size::new(recording.rows, recording.cols);
     let channel = connector
         .connect(koh::request::Pick::Latest, start, (None, None))
@@ -344,7 +345,8 @@ fn the_corpus_converges_over_a_lossy_link() {
                     },
                     seed,
                 );
-                if let Err(e) = replay(&net, recording, &dir.join(&recording.name)).await {
+                if let Err(e) = Box::pin(replay(&net, recording, &dir.join(&recording.name))).await
+                {
                     failures.push(format!("seed {seed}: {e:#}"));
                 }
             }

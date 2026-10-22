@@ -96,6 +96,9 @@ iroh = { version = "=1.3.0", features = ["unstable-custom-transports"] }
 iroh-base = "=1.3.0"
 n0-watcher = "=1.0.0"
 noq-udp = { version = "=1.3.0", default-features = false }
+# A relay in the test process (`tests/commands.rs`): clients of one key dialing through a relay,
+# as `koh exec SERVER` does through n0's.
+iroh-relay = { version = "=1.3.0", features = ["server"] }
 
 [profile.release]
 opt-level = 3

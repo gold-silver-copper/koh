@@ -495,13 +495,46 @@ struct Gate {
     turned_away: Arc<Throttle>,
 }
 
+/// `incoming`'s handshake, then the key its client proves on its first stream: the connection,
+/// the key, and the rest of that stream. A client that proves none, or proves it wrongly, is
+/// closed as one not allowed, which says nothing of which keys are.
+async fn handshake(
+    incoming: iroh::endpoint::Incoming,
+    gate: &Gate,
+) -> anyhow::Result<(
+    iroh::endpoint::Connection,
+    EndpointId,
+    iroh::endpoint::RecvStream,
+)> {
+    let conn = incoming.await?;
+    let proven = async {
+        let mut control = conn.accept_uni().await?;
+        let peer = crate::transport_iroh::proven(&conn, &mut control).await?;
+        anyhow::Ok((peer, control))
+    };
+    match proven.await {
+        Ok((peer, control)) => Ok((conn, peer, control)),
+        Err(e) => {
+            if gate.turned_away.ready() {
+                auth_event(Outcome::Rejected, &conn.remote_id(), "no key proved");
+            }
+            close(&conn, Close::NotAuthorized);
+            Err(e)
+        }
+    }
+}
+
 impl Gate {
-    /// Serve `conn` on a task of its own if its peer is allowed (the handshake authenticated its
-    /// id), once there is room for it: at once, or after a wait of at most [`QUEUED_FOR`] among
-    /// at most `--max-connections` others, as a burst of a client's commands needs. Else close it
-    /// saying why.
-    fn admit(self, conn: iroh::endpoint::Connection) {
-        let peer = conn.remote_id();
+    /// Serve `conn` on a task of its own if `peer`, the key its client proved, is allowed, once
+    /// there is room for it: at once, or after a wait of at most [`QUEUED_FOR`] among at most
+    /// `--max-connections` others, as a burst of a client's commands needs. Else close it saying
+    /// why. `control` is the client's first stream, after its proof.
+    fn admit(
+        self,
+        conn: iroh::endpoint::Connection,
+        peer: EndpointId,
+        control: iroh::endpoint::RecvStream,
+    ) {
         let Some(scope) = self.allowed.borrow().get(&peer).cloned() else {
             if self.turned_away.ready() {
                 auth_event(Outcome::Rejected, &peer, "not on allowlist");
@@ -516,7 +549,7 @@ impl Gate {
         } else if let Ok(place) = Arc::clone(&self.waiting).try_acquire_owned() {
             Some(place)
         } else {
-            self.busy(&conn);
+            self.busy(&conn, &peer);
             return;
         };
         #[expect(
@@ -531,13 +564,13 @@ impl Gate {
                 let waited = tokio::time::timeout(QUEUED_FOR, room).await;
                 drop(place);
                 let Ok(Ok(permit)) = waited else {
-                    self.busy(&conn);
+                    self.busy(&conn, &peer);
                     return;
                 };
                 permit
             };
             serve_connection(
-                conn,
+                (conn, peer, control),
                 (self.allowed, scope),
                 self.registry,
                 self.host,
@@ -547,30 +580,33 @@ impl Gate {
         }));
     }
 
-    /// Turn `conn` away for want of room, saying so.
-    fn busy(&self, conn: &iroh::endpoint::Connection) {
+    /// Turn `conn`, `peer`'s, away for want of room, saying so.
+    fn busy(&self, conn: &iroh::endpoint::Connection, peer: &EndpointId) {
         if self.turned_away.ready() {
-            warn!(peer = %conn.remote_id(), "refusing connection: busy (at --max-connections, and as many waiting)");
+            warn!(peer = %peer, "refusing connection: busy (at --max-connections, and as many waiting)");
         }
         close(conn, Close::Busy);
     }
 }
 
-/// Serve what `conn`'s opening request asks until it is done, or the peer is removed from the
-/// list, which ends its sessions too. The registry attaches no peer the list no longer allows: one
-/// removed as this connection was admitted starts no session. Holds `permit` throughout, the wait
-/// for the request included.
+/// Serve what the opening request on `control`, `conn`'s first stream, asks of `peer` until it is
+/// done, or the peer is removed from the list, which ends its sessions too. The registry attaches
+/// no peer the list no longer allows: one removed as this connection was admitted starts no
+/// session. Holds `permit` throughout, the wait for the request included.
 async fn serve_connection(
-    conn: iroh::endpoint::Connection,
+    (conn, peer, control): (
+        iroh::endpoint::Connection,
+        EndpointId,
+        iroh::endpoint::RecvStream,
+    ),
     (allowed, scope): (Allowed, Scope),
     registry: Registry,
     host: Arc<Host>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let _permit = permit;
-    let peer = conn.remote_id();
     let served = async {
-        let Some((request, control)) = opening(&conn).await else {
+        let Some((request, control)) = opening(&conn, control).await else {
             return;
         };
         let Some(place) = permitted(&request, &scope, &host) else {
@@ -580,7 +616,7 @@ async fn serve_connection(
             return;
         };
         auth_event(Outcome::Accepted, &peer, request.what());
-        dispatch(&conn, request, control, (&registry, &host, &place)).await;
+        dispatch((&conn, peer), request, control, (&registry, &host, &place)).await;
     };
     tokio::select! {
         () = served => {}
@@ -615,14 +651,13 @@ fn permitted(request: &Request, scope: &Scope, host: &Host) -> Option<Place> {
     root.map(|root| Place::new(home, Some(root)))
 }
 
-/// Serve `request` for `conn`'s client at `place`; `control` is the rest of its first stream.
+/// Serve `request` for `peer` on `conn` at `place`; `control` is the rest of its first stream.
 async fn dispatch(
-    conn: &iroh::endpoint::Connection,
+    (conn, peer): (&iroh::endpoint::Connection, EndpointId),
     request: Request,
     control: iroh::endpoint::RecvStream,
     (registry, host, place): (&Registry, &Host, &Place),
 ) {
-    let peer = conn.remote_id();
     match request {
         Request::Shell {
             pick,
@@ -644,7 +679,7 @@ async fn dispatch(
                     return;
                 }
             };
-            shell(conn, registry, (pick, size, program, cwd), control).await;
+            shell((conn, peer), registry, (pick, size, program, cwd), control).await;
         }
         Request::Sessions => {
             let mut sessions = registry.sessions(peer).await;
@@ -700,13 +735,13 @@ async fn dispatch(
     }
 }
 
-/// The request `conn`'s client opens with, and the rest of its stream, read within
+/// The request `conn`'s client opens with on `control`, and the rest of its stream, read within
 /// [`REQUEST_TIMEOUT`]: else the connection is closed, as one that broke the protocol.
 async fn opening(
     conn: &iroh::endpoint::Connection,
+    mut control: iroh::endpoint::RecvStream,
 ) -> Option<(Request, iroh::endpoint::RecvStream)> {
     let read = async {
-        let mut control = conn.accept_uni().await?;
         let body = crate::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
         let request: Request = crate::request::decode(&body)?;
         anyhow::Ok((request, control))
@@ -726,11 +761,11 @@ async fn opening(
     }
 }
 
-/// Attach `conn`'s peer to the session `pick` names (a new one running `program`, or starting in
-/// `cwd`, if given) and serve it until it detaches; the rest of the client's first stream,
+/// Attach `peer`, on `conn`, to the session `pick` names (a new one running `program`, or starting
+/// in `cwd`, if given) and serve it until it detaches; the rest of the client's first stream,
 /// `control`, is the session's control stream.
 async fn shell(
-    conn: &iroh::endpoint::Connection,
+    (conn, peer): (&iroh::endpoint::Connection, EndpointId),
     registry: &Registry,
     (pick, size, program, cwd): (
         Pick,
@@ -740,7 +775,6 @@ async fn shell(
     ),
     control: iroh::endpoint::RecvStream,
 ) {
-    let peer = conn.remote_id();
     // A PTY's program takes its words as text.
     let program = match program.map(|argv| {
         argv.words()
@@ -832,8 +866,8 @@ pub async fn serve_endpoint(
                 None => break, // endpoint closed
             },
         };
-        // In order: room for the handshake, the handshake within its deadline, the allowlist, a
-        // connection permit, then the session.
+        // In order: room for the handshake, the handshake and the client's key proof within its
+        // deadline, the allowlist, a connection permit, then the session.
         let source = SourceKey::of(&incoming.remote_addr());
         // When room would cost a handshake under way, an address must first show it can be
         // answered (a QUIC retry, one round trip), which a spoofed one never does: only real
@@ -860,11 +894,11 @@ pub async fn serve_endpoint(
             reason = "a handshake under way, at most `MOST_PENDING`"
         )]
         let handshake = tokio::spawn(async move {
-            match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, incoming).await {
-                Ok(Ok(conn)) => gate.admit(conn),
+            match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, handshake(incoming, &gate)).await {
+                Ok(Ok((conn, peer, control))) => gate.admit(conn, peer, control),
                 // Anyone can start one: said quietly, as a flood would say it often.
-                Ok(Err(e)) => debug!(error = %Peer(e), "incoming handshake failed"),
-                Err(_) => debug!("incoming handshake timed out (a stalled QUIC handshake)"),
+                Ok(Err(e)) => debug!(error = %Peer(format!("{e:#}")), "incoming handshake failed"),
+                Err(_) => debug!("incoming handshake timed out (stalled, or no key proved)"),
             }
         });
         pending.0.push_evicting((source, handshake.abort_handle()));

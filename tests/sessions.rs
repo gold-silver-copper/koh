@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/15 client.
+//! loopback iroh with a minimal koh/16 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -309,7 +309,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/15 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/16 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -322,10 +322,10 @@ struct RawClient {
 impl RawClient {
     /// Connect to `addr` as `secret`, and wait for the server to admit it.
     async fn connect(addr: iroh::EndpointAddr, secret: iroh::SecretKey) -> anyhow::Result<Self> {
-        let endpoint = bind_endpoint_local(secret, false).await?;
+        let endpoint = bind_endpoint_local(generate_secret_key()?, false).await?;
         let conn = endpoint.connect(addr, ALPN).await?;
-        // Its control stream, opened with its request: its bytes go before the input stream's, as
-        // the client's do.
+        // Its control stream, opened with its key's proof and its request: its bytes go before the
+        // input stream's, as the client's do.
         let mut send = conn.open_uni().await?;
         send.set_priority(1)?;
         let request = Request::Shell {
@@ -334,8 +334,9 @@ impl RawClient {
             program: None,
             cwd: None,
         };
-        send.write_all(&koh::request::encode(&request, MAX_REQUEST)?)
-            .await?;
+        let mut opening = koh::transport_iroh::prove(&conn, &secret)?;
+        opening.extend(koh::request::encode(&request, MAX_REQUEST)?);
+        send.write_all(&opening).await?;
         let mut first = tokio::time::timeout(Duration::from_secs(10), conn.accept_uni())
             .await
             .context("no admission came")??;
@@ -1039,10 +1040,10 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
         let secret = generate_secret_key()?;
         let (addr, shutdown, server) =
             loopback_serve(secret.public(), &["/nonexistent/koh-test-program"]).await?;
-        let endpoint = bind_endpoint_local(secret, false).await?;
+        let endpoint = bind_endpoint_local(secret.clone(), false).await?;
         let dialed = tokio::time::timeout(
             Duration::from_secs(10),
-            koh::client::IrohConnector::new(endpoint, addr).connect(
+            koh::client::IrohConnector::new(endpoint, addr, secret).connect(
                 Pick::Latest,
                 WINDOW,
                 (None, None),
@@ -1143,12 +1144,15 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
         // Under way before the client dials, and while it does.
         let _ = tokio::time::timeout(Duration::from_millis(500), flood()).await;
         let flood = koh_testkit::spawn(flood());
-        let near = bind_endpoint_local(good, false).await?;
+        let near = bind_endpoint_local(generate_secret_key()?, false).await?;
         let far = at(relay(server, Duration::from_millis(50), true).await?);
         let admitted = tokio::time::timeout(Duration::from_secs(20), async {
             for _ in 0..3 {
                 // Its first stream, after its request, admits it.
                 if let Ok(conn) = near.connect(far.clone(), ALPN).await {
+                    let Ok(mut opening) = koh::transport_iroh::prove(&conn, &good) else {
+                        return false;
+                    };
                     let request = koh::request::encode(
                         &Request::Shell {
                             pick: Pick::Latest,
@@ -1159,10 +1163,11 @@ fn an_allowed_client_far_away_gets_in_through_a_flood_of_stalled_handshakes() ->
                         MAX_REQUEST,
                     );
                     let Ok(request) = request else { return false };
+                    opening.extend(request);
                     let Ok(mut send) = conn.open_uni().await else {
                         return false;
                     };
-                    if send.write_all(&request).await.is_err() {
+                    if send.write_all(&opening).await.is_err() {
                         return false;
                     }
                     let admitted = conn.accept_uni().await.is_ok();

@@ -32,7 +32,7 @@ use crate::transport_iroh::{closed_because, ALPN, PROTOCOL};
 use display::Display;
 use input::Keys;
 use iroh::endpoint::{Connection, SendStream, TransportErrorCode};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -73,15 +73,23 @@ const NOTICE_FOR: Duration = Duration::from_secs(3);
 pub struct IrohConnector {
     endpoint: Endpoint,
     target: EndpointAddr,
+    /// The key the server allows, proven on each connection: not `endpoint`'s own, which is this
+    /// process's alone ([`crate::request::KeyProof`]).
+    key: SecretKey,
 }
 
 impl IrohConnector {
-    /// A connector dialing `target` from `endpoint`.
-    pub const fn new(endpoint: Endpoint, target: EndpointAddr) -> Self {
-        Self { endpoint, target }
+    /// A connector dialing `target` from `endpoint`, as `key`.
+    pub const fn new(endpoint: Endpoint, target: EndpointAddr, key: SecretKey) -> Self {
+        Self {
+            endpoint,
+            target,
+            key,
+        }
     }
 
-    /// Connect and make `request`, on the client's first stream, left open for what follows it.
+    /// Connect, prove the key, and make `request`, on the client's first stream, left open for
+    /// what follows it.
     pub async fn open(&self, request: &Request) -> anyhow::Result<(Connection, SendStream)> {
         let conn = match self.endpoint.connect(self.target.clone(), ALPN).await {
             Ok(conn) => conn,
@@ -100,9 +108,9 @@ impl IrohConnector {
             let mut control = conn.open_uni().await?;
             // The control stream's bytes go before input's.
             let _ = control.set_priority(1);
-            control
-                .write_all(&crate::request::encode(request, MAX_REQUEST)?)
-                .await?;
+            let mut opening = crate::transport_iroh::prove(&conn, &self.key)?;
+            opening.extend(crate::request::encode(request, MAX_REQUEST)?);
+            control.write_all(&opening).await?;
             anyhow::Ok(control)
         };
         match opened.await {

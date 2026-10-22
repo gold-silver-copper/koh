@@ -268,6 +268,101 @@ fn a_burst_of_commands_from_one_client_is_all_served() {
         });
 }
 
+/// Quiet commands from several koh processes of one key at once, each outlasting the others'
+/// starts, all keep their links through a relay, as agents' parallel calls do through n0's: each
+/// process dials from a key of its own and proves the client's, so none takes another's place at
+/// the relay, nor its paths at the server.
+#[test]
+fn quiet_commands_of_one_key_at_once_through_a_relay_all_keep_their_links() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let mut relaying = iroh_relay::server::ServerConfig::default();
+            relaying.relay = Some(iroh_relay::server::RelayConfig::new((
+                std::net::Ipv4Addr::LOCALHOST,
+                0_u16,
+            )));
+            let relay = iroh_relay::server::Server::spawn(relaying)
+                .await
+                .expect("the relay");
+            let url = koh::transport_iroh::parse_relay_url(&format!(
+                "http://{}",
+                relay.http_addr().expect("the relay's address")
+            ))
+            .expect("the relay's URL");
+            let dir = koh_testkit::scratch!("exec-relay").expect("a scratch directory");
+            let key = dir.join("client.key");
+            let hosting = koh::server::cli::Hosting::from_config(&koh::server::ServeConfig {
+                allow: vec![koh::transport_iroh::parse_endpoint_id(
+                    &endpoint_id(&key).expect("the client's id"),
+                )
+                .expect("an id")],
+                command: vec!["bash".to_owned()],
+                home: common::home(),
+                ..koh::server::ServeConfig::default()
+            })
+            .expect("the config");
+            let network = koh::transport_iroh::Network::Relay(url.clone());
+            let endpoint = koh::transport_iroh::bind_on(
+                koh::transport_iroh::generate_secret_key().expect("a key"),
+                (true, koh::transport_iroh::Idle::Shell),
+                &network,
+                None,
+            )
+            .await
+            .expect("the server's endpoint");
+            let id = endpoint.id().to_string();
+            let _server = koh_testkit::spawn(koh::server::cli::serve_endpoint(
+                endpoint,
+                hosting,
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let koh = |subcommand: &str| {
+                let mut koh =
+                    koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
+                        .expect("koh");
+                koh.arg(subcommand).arg("--key-file").arg(&key).args([
+                    "--relay-url",
+                    url.as_str(),
+                    &id,
+                ]);
+                koh
+            };
+            let mut calls = Vec::new();
+            for _ in 0..6 {
+                calls.push(
+                    koh("exec")
+                        .args(["--", "sleep", "20"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("exec"),
+                );
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            // More of the key's processes come and go while they run.
+            for _ in 0..5 {
+                let jobs = koh("jobs").output().expect("jobs");
+                assert!(
+                    jobs.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&jobs.stderr)
+                );
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            for call in calls {
+                let out = call.wait_with_output().expect("exec");
+                assert_eq!(
+                    out.status.code(),
+                    Some(0),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        });
+}
+
 /// A connection past `--max-connections` waits for room; one past as many waiting is turned away
 /// as busy, saying so, with its own status: nothing ran, so it may be retried.
 #[test]

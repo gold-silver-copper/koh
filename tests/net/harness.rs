@@ -205,7 +205,8 @@ impl Client {
         options: Options,
     ) -> anyhow::Result<Self> {
         let id = endpoint.id();
-        let connector = IrohConnector::new(endpoint, FaultNet::addr(server));
+        let key = endpoint.secret_key().clone();
+        let connector = IrohConnector::new(endpoint, FaultNet::addr(server), key);
         let channel = connector
             .connect(koh::request::Pick::Latest, Size::new(24, 80), (None, None))
             .await?;

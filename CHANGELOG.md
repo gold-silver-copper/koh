@@ -15,6 +15,21 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Fixed
+
+- Several `koh` processes of one client at once (an agent's parallel `koh exec`, `koh wait` and
+  `koh cp`, or a `koh connect` beside them) no longer knock each other's links down. They all
+  dialed as the client's one endpoint id, so a relay kept only the newest and the server sent one's
+  traffic down another's path; quiet commands were cut off after half a minute with `the link went
+  quiet for 10s` (#68). Each process now dials from a key of its own and proves the client's key on
+  the connection. The message for a link that timed out also says this machine may have stalled.
+
+### Changed
+
+- The protocol is koh/16: a connection opens with the client's key proof, its signature over what
+  the connection's TLS session exports, before its request. Both ends need the new version: a
+  koh/15 peer fails the handshake.
+
 ## [0.15.0] — 2026-10-20
 
 ### Added

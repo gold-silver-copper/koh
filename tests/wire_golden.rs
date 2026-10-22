@@ -1,4 +1,4 @@
-//! The koh/15 encoding.
+//! The koh/16 encoding.
 //!
 //! Messages built here by hand from the wire types, both ways, are pinned: the expected bytes were
 //! captured by running the encoder, and a change to the wire must change them in the same commit,
@@ -9,8 +9,9 @@
 use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, WireScheme};
 use koh::proto::{encode_client, encode_shown, ClientMsg, InputSeq, MarkText, Shown};
 use koh::request::{
-    Answer, Argv, Attached, Command, CommandLine, ExitStatus, JobName, LogMsg, On, Pick, Problem,
-    ProblemKind, RemotePath, Request, Resume, Run, RunId, SessionNum, Until, Wait, WaitText,
+    Answer, Argv, Attached, Command, CommandLine, ExitStatus, JobName, KeyProof, LogMsg, On, Pick,
+    Problem, ProblemKind, RemotePath, Request, Resume, Run, RunId, SessionNum, Until, Wait,
+    WaitText,
 };
 use koh::sync::{Answer as SyncAnswer, FileId, Item, Mode, Name, Opts, Reply, SourceCount};
 use koh::terminal::{Activity, Size, TtyModes};
@@ -188,6 +189,16 @@ fn replies() -> Vec<Reply> {
 }
 
 /// Every pinned message, framed, as it goes on the wire.
+/// What opens a connection: a key's proof, signed over a fixed message (Ed25519 signs the same way
+/// each time).
+fn key_proof() -> KeyProof {
+    let key = iroh::SecretKey::from_bytes(&[7; 32]);
+    KeyProof {
+        key: key.public(),
+        signature: key.sign(b"koh client key proof"),
+    }
+}
+
 fn framed() -> Option<Vec<(String, Vec<u8>)>> {
     let mut all = Vec::new();
     for r in requests()? {
@@ -236,12 +247,16 @@ fn framed() -> Option<Vec<(String, Vec<u8>)>> {
     for (n, a) in answers.into_iter().enumerate() {
         all.push((format!("answer {n}"), a));
     }
+    all.push((
+        "a key proof".to_owned(),
+        koh::request::encode(&key_proof(), usize::MAX).ok()?,
+    ));
     Some(all)
 }
 
 #[test]
 fn the_wire_is_pinned() {
-    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/15");
+    assert_eq!(koh::transport_iroh::PROTOCOL, "koh/16");
     let got: Vec<String> = framed()
         .unwrap()
         .iter()
@@ -262,6 +277,11 @@ fn the_wire_is_pinned() {
             r
         );
     }
+    let bytes = koh::request::encode(&key_proof(), usize::MAX).expect("encodes");
+    assert_eq!(
+        koh::request::decode_framed::<KeyProof>(&bytes, koh::request::MAX_PROOF).expect("decodes"),
+        key_proof()
+    );
     let mut decoder = koh::proto::ShownDecoder::default();
     for s in shown().unwrap() {
         decoder.push(&encode_shown(&s).expect("encodes"));
@@ -346,4 +366,5 @@ const PINNED: &[&str] = &[
     "0000000602046f75740a",
     "000000020103",
     "0000000403016522",
+    "00000060ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c51dcaa56c9b849e997169dfeff70a2c1a9320a8c9c741e00c546d2d2c7de27efb8643babafd50525888e47d9dc80cb37f2ee24d53fc1d1af9bde980d4a0d7e02",
 ];

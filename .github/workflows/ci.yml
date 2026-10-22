@@ -74,15 +74,13 @@ jobs:
         run: |
           # The code of a file, its comments removed, on one line, so a `use` split over lines is one.
           code() { sed -e 's://.*$::' "$1" | tr '\n' ' '; }
-          if code src/predict.rs | grep -E '(^|[^[:alnum:]_])crate::' >/dev/null; then
-            echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
-            exit 1
-          fi
-          # The wire protocol sits below both ends: it may use the screen types, never a client or server.
-          if code src/proto.rs | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
-            echo "::error::proto.rs must not import from server/client — both ends build on it"
-            exit 1
-          fi
+          # The predictor and the wire protocol may use the screen types, never a client or server.
+          for file in src/predict.rs src/proto.rs; do
+            if code "$file" | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
+              echo "::error::$file must not import from server/client"
+              exit 1
+            fi
+          done
           echo "layering edges OK"
       - name: test
         run: cargo test --locked

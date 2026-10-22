@@ -92,8 +92,7 @@ impl KohBackend for Tty {
 
 impl Drop for Tty {
     fn drop(&mut self) {
-        // `BackendTerminal::drop` already leaves raw mode; this also covers a `Tty` dropped before
-        // it was wrapped, so the user's terminal is never left raw.
+        // However the run ended, the user's terminal is never left raw.
         let _ = self.out.flush();
         let _ = self.leave_raw_mode();
     }

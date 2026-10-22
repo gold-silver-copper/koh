@@ -147,17 +147,6 @@ fn exec_passes_its_words_as_they_are_and_exits_with_the_commands_status() {
             let said = String::from_utf8_lossy(&out.stderr);
             assert_eq!(out.status.code(), Some(126), "{out:?}");
             assert!(said.contains("/no/such/dir: no such directory"), "{said}");
-            // One in this machine's home, as an unquoted `-C ~/x` reaches koh, is said to be so.
-            let local = koh_testkit::home!().join("no-such-proj");
-            let out = remote
-                .run("exec", &["-C", &local.to_string_lossy(), "--", "pwd"])
-                .expect("exec");
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(out.status.code(), Some(126), "{out:?}");
-            assert!(
-                said.contains("this machine's home") && said.contains("-C '~/no-such-proj'"),
-                "{said}"
-            );
             // Killed by a signal: 128 plus it, as a shell says, and nothing else on stderr.
             let out = remote.exec("kill -9 $$", b"").expect("exec");
             assert_eq!((out.status.code(), &out.stderr[..]), (Some(137), &b""[..]));
@@ -728,6 +717,11 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             let no_job = remote.run("wait", &["nope"]).expect("wait");
             assert_ne!(no_job.status.code(), Some(0));
             assert!(String::from_utf8_lossy(&no_job.stderr).contains("no such job"));
+            let no_log = remote.run("logs", &["nope"]).expect("logs");
+            assert!(
+                String::from_utf8_lossy(&no_log.stderr).contains("no such job"),
+                "{no_log:?}"
+            );
         });
 }
 

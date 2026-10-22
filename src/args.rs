@@ -1393,8 +1393,6 @@ mod tests {
         assert_eq!(c.bell_command.as_deref(), Some("termux-notification"));
         assert!(c.clipboard && c.hyperlinks && c.colours && c.remote.direct.is_none());
         assert_eq!(c.pick, Pick::Latest);
-        let d = koh::client::ConnectConfig::new(ID.parse().unwrap());
-        assert!(d.clipboard && d.hyperlinks && d.colours && d.bell_command.is_none());
         let c = connect(&["laptop"]);
         assert_eq!(c.remote.server, super::ServerRef::Name("laptop".to_owned()));
         assert_eq!(connect(&["laptop", "--new"]).pick, Pick::New);

@@ -179,7 +179,7 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
     let connector = IrohConnector::new(endpoint, FaultNet::addr(server.id), key);
     let start = Size::new(recording.rows, recording.cols);
     let channel = connector
-        .connect(koh::request::Pick::Latest, start, (None, None))
+        .connect(koh::request::Pick::Latest, start, None, None)
         .await?;
     let size = Arc::new(Mutex::new(start));
     // A terminal that does what the server's does: the same output shows the same.
@@ -206,13 +206,14 @@ async fn replay(net: &FaultNet, recording: &Recording, dir: &Path) -> anyhow::Re
         clipboard: true,
         links: true,
         bell: None,
+        input: input_rx,
+        resizes: resize_rx,
     };
     let task = koh_testkit::spawn(run_client(
         channel,
         std::time::SystemTime::now(),
         connector,
         run,
-        (input_rx, resize_rx),
         CancellationToken::new(),
     ));
     // The server's parser, with its options; the harness's server keeps no scrollback.

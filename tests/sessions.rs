@@ -1046,7 +1046,8 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             koh::client::IrohConnector::new(endpoint, addr, secret).connect(
                 Pick::Latest,
                 WINDOW,
-                (None, None),
+                None,
+                None,
             ),
         )
         .await;

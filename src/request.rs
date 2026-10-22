@@ -493,9 +493,6 @@ pub struct Problem {
     pub kind: ProblemKind,
     #[serde(deserialize_with = "detail")]
     pub detail: String,
-    /// What the client adds, said after the rest: never sent.
-    #[serde(skip)]
-    pub hint: Option<String>,
 }
 
 fn detail<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -513,24 +510,16 @@ impl Problem {
             }
             detail.truncate(end);
         }
-        Self {
-            kind,
-            detail,
-            hint: None,
-        }
+        Self { kind, detail }
     }
 
-    /// What it says, for a person: the detail, escaped, then the kind's words, then the hint.
+    /// What it says, for a person: the detail, escaped, then the kind's words.
     pub fn text(&self) -> String {
         let said = self.kind.text();
-        let text = if self.detail.is_empty() {
+        if self.detail.is_empty() {
             said.to_owned()
         } else {
             format!("{}: {said}", crate::log::Peer(&self.detail))
-        };
-        match &self.hint {
-            Some(hint) => format!("{text}; {hint}"),
-            None => text,
         }
     }
 }
@@ -749,6 +738,8 @@ pub enum LogMsg {
     /// The end of what is sent: the job's status if it ended, `None` if it runs on (no follow),
     /// and the seconds it ran, or has run so far.
     End { exit: Option<u32>, secs: u64 },
+    /// Why there is no log to send (no such job), in place of the rest.
+    Problem(Problem),
 }
 
 /// What a stream the server opens for `koh exec` carries, its first byte.

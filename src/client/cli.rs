@@ -43,19 +43,6 @@ pub struct Remote {
     pub relay_url: Option<RelayUrl>,
 }
 
-impl Remote {
-    /// `server`, dialed through n0's relays and discovery, as the default client key.
-    pub fn new(server: EndpointId) -> Self {
-        Self {
-            server,
-            named: server.to_string(),
-            key_file: None,
-            direct: None,
-            relay_url: None,
-        }
-    }
-}
-
 /// The clap-free form of `koh connect`'s arguments.
 #[derive(Debug, Clone)]
 pub struct ConnectConfig {
@@ -77,22 +64,6 @@ pub struct ConnectConfig {
     pub bell_command: Option<String>,
 }
 
-impl ConnectConfig {
-    /// A config for dialing `server` with every other option at the CLI default.
-    pub fn new(server: EndpointId) -> Self {
-        Self {
-            remote: Remote::new(server),
-            pick: Pick::Latest,
-            program: None,
-            cwd: None,
-            clipboard: true,
-            hyperlinks: true,
-            colours: true,
-            bell_command: None,
-        }
-    }
-}
-
 /// Runs a command (`sh -c`) when the remote bell rings (`--on-bell`), at most once a second.
 ///
 /// The command is detached, with its stdio on `/dev/null`, `KOH_BELL_COUNT` and `KOH_TITLE` set
@@ -101,31 +72,30 @@ impl ConnectConfig {
 #[derive(Debug, Clone)]
 pub struct BellHook {
     command: String,
-    last_count: u64,
+    /// The last count heard; the first, from before the run, rings nothing.
+    last_count: Option<u64>,
     last_spawn: Option<Instant>,
 }
 
 /// Minimum spacing between two hook spawns; a burst of bells inside it coalesces into one.
-pub const BELL_HOOK_MIN_INTERVAL: Duration = Duration::from_secs(1);
+const BELL_HOOK_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 impl BellHook {
     pub fn new(command: impl Into<String>) -> Self {
         Self {
             command: command.into(),
-            last_count: 0,
+            last_count: None,
             last_spawn: None,
         }
-    }
-
-    /// Take `count` as what was rung before: only rises past it ring.
-    pub const fn prime(&mut self, count: u64) {
-        self.last_count = count;
     }
 
     /// Note the bell count at `now`; whether to fire: it rose, and the last spawn was at least
     /// [`BELL_HOOK_MIN_INTERVAL`] ago. A rise within that is absorbed, not deferred.
     pub fn observe(&mut self, count: u64, now: Instant) -> bool {
-        let rose = count > std::mem::replace(&mut self.last_count, count);
+        let rose = self
+            .last_count
+            .replace(count)
+            .is_some_and(|last| count > last);
         let spaced = rose
             && self
                 .last_spawn
@@ -136,36 +106,24 @@ impl BellHook {
         spaced
     }
 
-    /// The command to spawn, with `parent_env` scrubbed of `KOH_*` (given, so tests can pass their
-    /// own).
-    pub(crate) fn command(
-        &self,
-        count: u64,
-        title: &str,
-        parent_env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-    ) -> std::process::Command {
+    /// Spawn the command, this process's `KOH_*` variables scrubbed, reaped on a thread of its own
+    /// so it can never block the session.
+    pub fn fire(&self, count: u64, title: &str) {
         #[expect(
             clippy::disallowed_methods,
             reason = "the user's own --on-bell command"
         )]
         let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(&self.command).env_clear();
-        for (k, v) in parent_env {
-            if !crate::pty::is_koh_env_key(&k) {
-                cmd.env(k, v);
-            }
-        }
-        cmd.env("KOH_BELL_COUNT", count.to_string())
+        cmd.arg("-c")
+            .arg(&self.command)
+            .env_clear()
+            .envs(std::env::vars_os().filter(|(k, _)| !crate::pty::is_koh_env_key(k)))
+            .env("KOH_BELL_COUNT", count.to_string())
             .env("KOH_TITLE", title)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        cmd
-    }
-
-    /// Spawn the command, reaped on a thread of its own so it can never block the session.
-    pub fn fire(&self, count: u64, title: &str) {
-        match self.command(count, title, std::env::vars_os()).spawn() {
+        match cmd.spawn() {
             Ok(mut child) => {
                 let reaper = std::thread::Builder::new()
                     .name("koh-bell-hook".into())
@@ -282,9 +240,31 @@ async fn ask<T: DeserializeOwned>(
     request: &Request,
     max: usize,
 ) -> anyhow::Result<T> {
-    let mut opened = Opened::dial(remote, request).await?;
-    opened.control.finish()?;
-    let answer = opened.answer(max).await;
+    let never = std::future::pending::<std::convert::Infallible>();
+    let answer = ask_until(remote, request, max, never).await?;
+    Ok(answer.unwrap_or_else(|never| match never {}))
+}
+
+/// [`ask`], unless `stop` comes first: then what it gave. The connection is closed either way.
+async fn ask_until<T: DeserializeOwned, S>(
+    remote: &Remote,
+    request: &Request,
+    max: usize,
+    stop: impl std::future::Future<Output = S>,
+) -> anyhow::Result<Result<T, S>> {
+    let mut stop = std::pin::pin!(stop);
+    let mut opened = tokio::select! {
+        opened = Opened::dial(remote, request) => opened?,
+        stopped = &mut stop => return Ok(Err(stopped)),
+    };
+    let answer = async {
+        opened.control.finish()?;
+        opened.answer(max).await
+    };
+    let answer = tokio::select! {
+        answer = answer => answer.map(Ok),
+        stopped = stop => Ok(Err(stopped)),
+    };
     opened.close().await;
     answer
 }
@@ -302,7 +282,7 @@ pub fn exit_code(error: &anyhow::Error) -> u8 {
         .and_then(|problem| problem.kind.not_started_status())
     {
         status
-    } else if error.is::<Unreached>() || error.downcast_ref::<Close>() == Some(&Close::AtCapacity) {
+    } else if error.is::<Unreached>() {
         3
     } else if error.is::<Refused>() {
         4
@@ -336,12 +316,7 @@ pub fn json_error(error: &anyhow::Error) -> String {
     } else if error.is::<Unreached>() {
         "unreached"
     } else if let Some(refused) = error.downcast_ref::<Refused>() {
-        match refused {
-            Refused::NotAuthorized => "not_authorized",
-            Refused::NoSuchSession => "no_such_session",
-            Refused::OutOfScope => "out_of_scope",
-            Refused::OtherProtocol => "other_protocol",
-        }
+        refused.kind()
     } else if let Some(problem) = error.downcast_ref::<Problem>() {
         problem.kind.name()
     } else if let Some(failure) = error.downcast_ref::<crate::sync::Failure>() {
@@ -431,55 +406,6 @@ pub async fn sessions(
     Ok(())
 }
 
-/// `error`, with a hint if it is that `cwd`, a directory to start in, is not on the server, and
-/// it looks like this machine's home expanded by the user's shell before koh saw it.
-pub(crate) fn hinted(error: anyhow::Error, cwd: Option<&RemotePath>) -> anyhow::Error {
-    match error.downcast::<Problem>() {
-        Ok(problem) => hint_problem(problem, cwd).into(),
-        Err(error) => error,
-    }
-}
-
-/// [`hinted`], of a [`Problem`].
-pub(crate) fn hint_problem(mut problem: Problem, cwd: Option<&RemotePath>) -> Problem {
-    if problem.kind == ProblemKind::NoSuchDir {
-        // This machine's home, only to tell a path the shell expanded from it.
-        let home = std::env::var_os("HOME");
-        problem.hint = cwd.zip(home).and_then(|(cwd, home)| {
-            use std::os::unix::ffi::OsStrExt as _;
-            local_home_hint(cwd.as_bytes(), home.as_bytes())
-        });
-    }
-    problem
-}
-
-/// What to say of a directory to start in, `cwd`, that is this machine's `home` or in it: the
-/// user's shell most likely expanded an unquoted `~` here, so the server looked in a path of
-/// this machine's.
-fn local_home_hint(cwd: &[u8], home: &[u8]) -> Option<String> {
-    let home = home.strip_suffix(b"/").unwrap_or(home);
-    if home.is_empty() {
-        return None;
-    }
-    let rest = cwd.strip_prefix(home)?;
-    let rest = match rest {
-        [] => &[][..],
-        [b'/', rest @ ..] => rest,
-        _ => return None,
-    };
-    let rest = escaped(&String::from_utf8_lossy(
-        rest.strip_suffix(b"/").unwrap_or(rest),
-    ));
-    let fix = if rest.is_empty() {
-        "quote it (-C '~') or leave -C out".to_owned()
-    } else {
-        format!("quote it (-C '~/{rest}') or name it from the server's home (-C {rest})")
-    };
-    Some(format!(
-        "it is in this machine's home: if your shell expanded ~ before koh saw it, {fix}"
-    ))
-}
-
 /// Text a program chose, safe to print on a line: nothing in it may move the cursor or reorder
 /// the line.
 pub(crate) fn escaped(text: &str) -> String {
@@ -561,7 +487,8 @@ fn cpu(ms: u64) -> String {
 /// `koh output`: session `session`'s screen, or the last command's output if `last`, to `out`.
 pub async fn output(
     remote: &Remote,
-    (session, last): (SessionNum, bool),
+    session: SessionNum,
+    last: bool,
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
@@ -624,14 +551,13 @@ impl<'a> From<&'a JobInfo> for JobView<'a> {
 /// `koh run`: start `run` as job `name` on `remote`; its name, to `out`.
 pub async fn run(
     remote: &Remote,
-    (name, run, synced): (Option<JobName>, Run, Option<&super::Synced>),
+    name: Option<JobName>,
+    run: Run,
+    synced: Option<&super::Synced>,
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
-    let cwd = run.cwd.clone();
-    let Started { name } = ask(remote, &Request::Start { name, run }, MAX_REPLY)
-        .await
-        .map_err(|error| hinted(error, cwd.as_ref()))?;
+    let Started { name } = ask(remote, &Request::Start { name, run }, MAX_REPLY).await?;
     if format.json {
         #[derive(Serialize)]
         struct View<'a> {
@@ -755,7 +681,8 @@ pub fn bytes(n: u64) -> String {
 pub async fn logs(
     remote: &Remote,
     job: JobName,
-    (follow, tail): (bool, Option<u32>),
+    follow: bool,
+    tail: Option<u32>,
 ) -> anyhow::Result<Option<u32>> {
     let interrupted = CancellationToken::new();
     crate::cancel_on_signals(&interrupted)?;
@@ -769,11 +696,8 @@ pub async fn logs(
             let body =
                 crate::transport_iroh::read_framed(&mut recv, MAX_LOG_CHUNK.saturating_add(64))
                     .await?;
-            // A job the server does not have answers as a problem instead.
-            if let Ok(Err(problem)) = crate::request::decode::<Answer<()>>(&body) {
-                return Err(problem.into());
-            }
             match crate::request::decode::<LogMsg>(&body)? {
+                LogMsg::Problem(problem) => return Err(problem.into()),
                 LogMsg::Dropped(n) => crate::log::stderr(format_args!(
                     "koh: {} of the job's output were dropped before this (the log keeps its newest)",
                     bytes(n)
@@ -800,9 +724,12 @@ pub async fn logs(
         }
     };
     let status = tokio::select! {
-        status = read => status.map_err(|e| match e.downcast::<Problem>() {
-            Ok(problem) => problem.into(),
-            Err(e) => refusal(&opened.conn, &e),
+        status = read => status.map_err(|e| {
+            if e.is::<Problem>() {
+                e
+            } else {
+                refusal(&opened.conn, &e)
+            }
         }),
         () = interrupted.cancelled() => Ok(None),
     };
@@ -813,7 +740,8 @@ pub async fn logs(
 /// `koh kill`: send job `job` on `remote` `signal`.
 pub async fn kill(
     remote: &Remote,
-    (job, signal): (JobName, Signal),
+    job: JobName,
+    signal: Signal,
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<()> {
@@ -844,7 +772,7 @@ pub async fn kill(
 }
 
 /// The status `koh wait` exits with when it gave up waiting: `timeout`'s.
-pub const TIMED_OUT: u32 = 124;
+const TIMED_OUT: u32 = 124;
 
 /// `koh wait`: wait on `remote` as `wait` says, at most `timeout`.
 ///
@@ -853,7 +781,9 @@ pub const TIMED_OUT: u32 = 124;
 /// waits.
 pub async fn wait(
     remote: &Remote,
-    (wait, timeout, tail): (Wait, Option<Duration>, u32),
+    wait: Wait,
+    timeout: Option<Duration>,
+    tail: u32,
     format: Format,
     out: &mut impl std::io::Write,
 ) -> anyhow::Result<u32> {
@@ -870,12 +800,19 @@ pub async fn wait(
         _ => None,
     };
     report_busy();
-    let waited = async { ask::<Waited>(remote, &Request::Wait(wait), MAX_REPLY).await };
-    let waited = tokio::select! {
-        waited = waited => Some(waited?),
-        () = sleep_for(timeout) => None,
-        () = interrupted.cancelled() => anyhow::bail!("interrupted"),
+    // Whether it was interrupted, else timed out.
+    let stop = async {
+        tokio::select! {
+            () = super::when(timeout.map(tokio::time::sleep)) => false,
+            () = interrupted.cancelled() => true,
+        }
     };
+    let waited = match ask_until(remote, &Request::Wait(wait), MAX_REPLY, stop).await? {
+        Ok(waited) => Some(waited),
+        Err(true) => anyhow::bail!("interrupted"),
+        Err(false) => None,
+    };
+    let timed_out = waited.is_none();
     let (status, said) = match (waited, &until) {
         (None, _) => (
             TIMED_OUT,
@@ -914,22 +851,22 @@ pub async fn wait(
             &View {
                 status,
                 waited: &said,
-                timed_out: status == TIMED_OUT,
+                timed_out,
             },
         )?;
-    } else if let (TIMED_OUT, Some(job)) = (status, job) {
-        timed_out(remote, &said, job, tail).await?;
-    } else if status == TIMED_OUT || (status == 1 && !matches!(until, Until::End)) {
+    } else if let (true, Some(job)) = (timed_out, job) {
+        gave_up(remote, &said, job, tail).await?;
+    } else if timed_out || (status == 1 && !matches!(until, Until::End)) {
         crate::log::stderr(format_args!("koh: {said}"));
     } else if let Some(job) = shown {
-        logs(remote, job, (false, Some(tail))).await?;
+        logs(remote, job, false, Some(tail)).await?;
     }
     Ok(status)
 }
 
 /// A wait on `job` that timed out: how the job stands (running on, its processes and CPU time),
 /// then its last `tail` lines, so that a job at work is not taken for a hung one.
-async fn timed_out(remote: &Remote, said: &str, job: JobName, tail: u32) -> anyhow::Result<()> {
+async fn gave_up(remote: &Remote, said: &str, job: JobName, tail: u32) -> anyhow::Result<()> {
     let JobList(jobs) = ask(
         remote,
         &Request::Jobs {
@@ -942,14 +879,7 @@ async fn timed_out(remote: &Remote, said: &str, job: JobName, tail: u32) -> anyh
         Some(info) => crate::log::stderr(format_args!("koh: {said}: {}", job_line(info))),
         None => crate::log::stderr(format_args!("koh: {said}")),
     }
-    logs(remote, job, (false, Some(tail))).await.map(|_| ())
-}
-
-async fn sleep_for(timeout: Option<Duration>) {
-    match timeout {
-        Some(timeout) => tokio::time::sleep(timeout).await,
-        None => std::future::pending().await,
-    }
+    logs(remote, job, false, Some(tail)).await.map(|_| ())
 }
 
 /// Tell a terminal that reads state reports (fux) that koh is busy: it waits on the server, not
@@ -961,10 +891,7 @@ pub fn report_busy() {
         return;
     }
     let nonce = crate::client::backend::MarkNonce::from_env();
-    let report = match nonce {
-        Some(nonce) => format!("\x1b]133;S;activity=busy;nonce={}\x07", nonce.as_str()),
-        None => "\x1b]133;S;activity=busy\x07".to_owned(),
-    };
+    let report = crate::client::backend::mark(format_args!("S;activity=busy"), nonce.as_ref());
     let mut stdout = stdout.lock();
     let _ = stdout.write_all(report.as_bytes());
     let _ = stdout.flush();
@@ -1028,7 +955,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let (endpoint, connector) = connector(&args.remote, &identity, Idle::Shell).await?;
     let admitted: Admitted = first_dial(
         &endpoint,
-        connector.connect(args.pick, size, (args.program, args.cwd.clone())),
+        connector.connect(args.pick, size, args.program, args.cwd.clone()),
     )
     .await
     .map_err(|error| match error.downcast_ref::<Close>() {
@@ -1037,11 +964,7 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
             let shown = args.cwd.as_ref().map_or_else(String::new, |cwd| {
                 String::from_utf8_lossy(cwd.as_bytes()).into_owned()
             });
-            hint_problem(
-                Problem::new(ProblemKind::NoSuchDir, shown),
-                args.cwd.as_ref(),
-            )
-            .into()
+            Problem::new(ProblemKind::NoSuchDir, shown).into()
         }
         _ => error,
     })?;
@@ -1056,7 +979,8 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
     let shutdown = CancellationToken::new();
     // Armed before raw mode is entered, so an install error surfaces while the terminal is cooked.
     crate::cancel_on_signals(&shutdown).context("installing the signal handlers")?;
-    let (channels, tasks) = super::spawn_client_io()?;
+    let (input, _reading) = super::io::spawn_stdin::<{ super::io::TYPED }>(64)?;
+    let (resizes, _resizing) = super::io::spawn_resizes()?;
     backend.enter_raw_mode().context("entering raw mode")?;
     let run = super::Run {
         backend,
@@ -1065,46 +989,23 @@ pub async fn connect(args: ConnectConfig) -> anyhow::Result<Option<u32>> {
         clipboard: args.clipboard,
         links: args.hyperlinks,
         bell: args.bell_command.map(BellHook::new),
+        input,
+        resizes,
     };
-    let result = crate::client::run_client(
-        admitted,
-        dialed_at,
-        connector,
-        run,
-        (channels.input_rx, channels.resize_rx),
-        shutdown,
-    )
-    .await;
+    let result = crate::client::run_client(admitted, dialed_at, connector, run, shutdown).await;
     let _ = close_endpoint(&endpoint).await;
     drop(identity);
-    super::io::first_error(result, tasks.shutdown().await)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `-C ~/proj` unquoted reaches koh as this machine's `$HOME/proj`: a path the server lacks,
-    /// said with how to name the server's.
-    #[test]
-    fn a_dir_in_this_machines_home_is_said_to_be_expanded_here() {
-        let hint = |cwd: &str, home: &str| local_home_hint(cwd.as_bytes(), home.as_bytes());
-        let said = hint("/home/me/proj/src", "/home/me").unwrap();
-        assert!(
-            said.contains("-C '~/proj/src'") && said.contains("-C proj/src"),
-            "{said}"
-        );
-        assert!(hint("/home/me/", "/home/me/").unwrap().contains("-C '~'"));
-        for elsewhere in ["/home/meg/proj", "/srv/proj", "proj", "~/proj"] {
-            assert_eq!(hint(elsewhere, "/home/me"), None, "{elsewhere}");
-        }
-        assert_eq!(hint("/proj", "/"), None);
-    }
-
     #[test]
     fn bell_hook_fires_on_a_rise_and_rate_limits_a_burst() {
-        // Counts [0,1,1,2,3] at times [0,0,10,20,1500] spawn at index 1 and 4 only — the
-        // first rise fires, the rises inside the 1 s window coalesce, the one past it fires.
+        // Counts [0,1,1,2,3] at times [0,0,10,20,1500] spawn at index 1 and 4 only: the first
+        // count primes it, the first rise fires, the rises inside the 1 s window coalesce, the one past it fires.
         let t0 = Instant::now();
         let at = |ms| t0 + Duration::from_millis(ms);
         let mut h = BellHook::new("true");
@@ -1118,33 +1019,6 @@ mod tests {
         assert_eq!(fired, [false, true, false, false, true]);
         // No rise, no spawn — even long after the window.
         assert!(!h.observe(3, at(10_000)));
-    }
-
-    #[test]
-    fn bell_hook_command_scrubs_parent_koh_vars_and_exports_its_own() {
-        use std::ffi::OsString;
-        let dir = crate::test_runtime::scratch("bell-env");
-        let out = dir.join("env.txt");
-        let hook = BellHook::new(format!("env > '{}'", out.display()));
-        let parent_env = [
-            ("KOH_DNS", "1.1.1.1"),
-            ("KOH_LOG", "/x"),
-            ("PATH", "/usr/bin:/bin"),
-            ("HOME", "/nonexistent"),
-        ]
-        .into_iter()
-        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
-        let status = hook
-            .command(42, "a title", parent_env)
-            .status()
-            .expect("spawn env");
-        let content = std::fs::read_to_string(&out).unwrap_or_default();
-        assert!(status.success(), "{content}");
-        assert!(content.contains("KOH_BELL_COUNT=42"), "{content}");
-        assert!(content.contains("KOH_TITLE=a title"), "{content}");
-        assert!(content.contains("PATH=/usr/bin:/bin"), "{content}");
-        assert!(!content.contains("KOH_DNS"), "{content}");
-        assert!(!content.contains("KOH_LOG"), "{content}");
     }
 
     #[test]

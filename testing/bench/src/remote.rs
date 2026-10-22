@@ -318,7 +318,7 @@ impl Remote {
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id), client_secret);
         let start = Size::new(rows, cols);
         let channel = connector
-            .connect(koh::request::Pick::Latest, start, (None, None))
+            .connect(koh::request::Pick::Latest, start, None, None)
             .await?;
         let size = Arc::new(Mutex::new(start));
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
@@ -346,8 +346,9 @@ impl Remote {
                 clipboard: false,
                 links: false,
                 bell: None,
+                input: input_rx,
+                resizes: resize_rx,
             },
-            (input_rx, resize_rx),
             CancellationToken::new(),
         ));
         Ok(Self {

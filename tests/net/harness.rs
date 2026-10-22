@@ -208,7 +208,7 @@ impl Client {
         let key = endpoint.secret_key().clone();
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server), key);
         let channel = connector
-            .connect(koh::request::Pick::Latest, Size::new(24, 80), (None, None))
+            .connect(koh::request::Pick::Latest, Size::new(24, 80), None, None)
             .await?;
         let first = channel.conn.clone();
         let size = Arc::new(Mutex::new(Size::new(24, 80)));
@@ -239,13 +239,14 @@ impl Client {
             clipboard: true,
             links: true,
             bell: options.bell,
+            input: input_rx,
+            resizes: resize_rx,
         };
         let task = koh_testkit::spawn(run_client(
             channel,
             options.dialed_at.unwrap_or_else(std::time::SystemTime::now),
             connector,
             run,
-            (input_rx, resize_rx),
             CancellationToken::new(),
         ));
         Ok(Self {

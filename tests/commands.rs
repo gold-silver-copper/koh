@@ -1083,11 +1083,12 @@ fn exec_and_run_sync_a_tree_first_and_run_in_it() {
 }
 
 /// An in-process loopback server for the client `client`, saved with the scope `scope`
-/// (`cp=DIR`, `exec=DIR`), as `koh clients add` saves one.
+/// (`cp=DIR`, `exec=DIR`), as `koh clients add` saves one: its id, its port, its saved clients
+/// and its task.
 async fn scoped_server(
     client: &str,
     scope: &str,
-) -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(String, u16, PathBuf, tokio::task::JoinHandle<()>)> {
     let dir = koh_testkit::scratch!("scoped-server")?;
     let server_key = dir.join("server.key");
     let clients = dir.join("clients");
@@ -1108,7 +1109,58 @@ async fn scoped_server(
         let _dir = dir;
         let _ = task.await;
     });
-    Ok((id, port, task))
+    Ok((id, port, clients, task))
+}
+
+/// A client removed from the saved clients is cut off, its jobs hung up with it.
+#[test]
+fn a_removed_clients_jobs_are_hung_up() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("revoked").expect("a scratch directory");
+            let key = dir.join("client.key");
+            let id = endpoint_id(&key).expect("the client's id");
+            let (server_id, port, clients, _server) =
+                scoped_server(&id, &format!("exec={}", dir.display()))
+                    .await
+                    .expect("the server");
+            let ran = koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
+                .expect("koh")
+                .args(["run", &server_id, "--sh", "echo $$ > pid; exec sleep 600"])
+                .arg("--key-file")
+                .arg(&key)
+                .args(["--direct", &format!("127.0.0.1:{port}")])
+                .output()
+                .expect("koh");
+            assert!(ran.status.success(), "{ran:?}");
+            let job = async {
+                loop {
+                    let pid = std::fs::read_to_string(dir.join("pid")).unwrap_or_default();
+                    if let Some(pid) = pid
+                        .trim()
+                        .parse()
+                        .ok()
+                        .and_then(fuxix::process::Pid::from_raw)
+                    {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            let job = tokio::time::timeout(Duration::from_secs(10), job)
+                .await
+                .expect("the job started");
+            std::fs::write(&clients, "").expect("the client removed");
+            let gone = async {
+                while fuxix::process::exists(job) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), gone)
+                .await
+                .expect("the removed client's job hung up");
+        });
 }
 
 #[test]
@@ -1121,7 +1173,7 @@ fn a_scoped_key_copies_only_in_its_directory_and_runs_no_shell() {
             std::fs::create_dir_all(&drop_dir).expect("the scope");
             let key = dir.join("client.key");
             let id = endpoint_id(&key).expect("the client's id");
-            let (server_id, port, _server) =
+            let (server_id, port, _, _server) =
                 scoped_server(&id, &format!("cp={}", drop_dir.display()))
                     .await
                     .expect("the server");

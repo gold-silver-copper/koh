@@ -30,11 +30,11 @@ pub fn endpoint_id(key: &std::path::Path) -> anyhow::Result<String> {
 pub fn on_pty(argv: &[String]) -> anyhow::Result<(Pty, Capture)> {
     let reaper = koh::pty::Reaper::start()?;
     let (pty, output) = Pty::spawn(
-        24,
-        80,
+        koh::terminal::Size::new(24, 80),
         argv,
         &[],
-        ("xterm-256color", &home(), None),
+        &home(),
+        None,
         &reaper,
     )?;
     Ok((pty, Capture::new(output)))

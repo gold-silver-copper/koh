@@ -7,7 +7,6 @@
 //! copy (`koh cp`) in [`copy`]; a wait in [`wait`].
 
 mod attach;
-mod audit;
 pub mod cli;
 mod copy;
 mod exec;

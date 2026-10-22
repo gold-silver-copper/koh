@@ -1,9 +1,0 @@
-crash report 20261016-0006
-program: physics-sim 0.31.6
-signal: SIGSEGV (address 0x0000000000000018)
-
-faulting frame:
-  #0 broadphase_sweep (src/broadphase.rs:402)
-backtrace:
-  #1 step_world (src/world.rs:310)
-  #2 main_loop (src/main.rs:77)

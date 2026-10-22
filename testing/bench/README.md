@@ -1,7 +1,7 @@
 # The scoreboard
 
 `testing/scoreboard.sh` writes a scoreboard to stdout (or the file `--out` names; it is not
-committed): koh beside mosh and plain ssh, on the corpus's 113 recordings (`testing/corpus/`) and
+committed): koh beside mosh and plain ssh, on the corpus's recordings (`testing/corpus/`) and
 on four synthetic workloads, by bytes on the wire and on the user's terminal, keystroke latency
 beside a flood, the time to a settled screen, server memory per session, and the instructions koh
 retires. It opens with a table of who wins each

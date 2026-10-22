@@ -1,9 +1,0 @@
-2026-10-04T00:33 worker-4 GC pause 12ms
-2026-10-04T01:55 worker-4 GC pause 12ms
-2026-10-04T02:50 worker-4 GC pause 12ms
-2026-10-04T03:23 worker-4 GC pause 12ms
-2026-10-04T04:40 worker-4 heartbeat
-2026-10-04T05:05 worker-4 heartbeat
-2026-10-04T06:20 worker-4 heartbeat
-2026-10-04T07:55 worker-4 processed batch
-2026-10-04T23:59 worker-4 heap usage 91% (OutOfMemory guard ok)

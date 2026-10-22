@@ -3,13 +3,12 @@
 //! transparently; `koh exec` runs a command there, `koh run` a job that outlives the connection,
 //! and `koh cp` brings files into line.
 //!
-//! [`transport_iroh`] sets up endpoints; [`identity`] loads identities
-//! and their reset leases; [`keycmd`] is `koh id` and `koh key`; [`names`] names the servers and clients
-//! a machine knows. [`request`] is what a connection opens with, [`proto`] a shell's wire
-//! protocol, [`stream`] what of a program's output reaches the user's terminal, [`events`] the
-//! input it carries, [`sync`] a copy's; [`terminal`], [`predict`] and [`pty`] the server's
-//! emulator, the prediction and the PTY; [`server`] hosts sessions, commands and jobs and
-//! [`client`] drives them. [`bounded`] holds every queue.
+//! [`transport_iroh`] sets up endpoints; [`identity`] loads the keys; [`keycmd`] is `koh id` and
+//! `koh key reset`; [`names`] names the servers and clients a machine knows. [`request`] is what a
+//! connection opens with, [`proto`] a shell's wire protocol, [`stream`] what of a program's output
+//! reaches the user's terminal, [`events`] the input it carries, [`sync`] a copy's; [`terminal`],
+//! [`predict`] and [`pty`] the server's emulator, the prediction and the PTY; [`server`] hosts
+//! sessions, commands and jobs and [`client`] drives them. [`bounded`] holds every queue.
 //!
 //! Production code is panic-free by construction: `Cargo.toml` forbids the panic lints, lossy casts
 //! and unchecked arithmetic, and a `forbid` cannot be lifted locally. Tests may panic.

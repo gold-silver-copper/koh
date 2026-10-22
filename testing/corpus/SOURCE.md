@@ -1,6 +1,6 @@
 # Where the corpus comes from
 
-The recordings in this directory (`NAME.bin` and `NAME.json`, 113 of them) are copied unchanged
+The recordings in this directory (`NAME.bin` and `NAME.json`, 15 of them) are copied unchanged
 from fux's corpus, `fux-vt/compare/corpus/` in https://github.com/gold-silver-copper/fux at commit
 `f6382e6` (fux 0.18.0). fux is MIT-licensed, by the same author as koh.
 
@@ -11,11 +11,12 @@ size, the replies the recording terminal gave, and each step's keys, resize and 
 ends. fux's `fux-vt/compare/README.md` ("The corpus") says how they were recorded, and its
 `corpus/INVENTORY.md` lists what each program sends.
 
-They are copied rather than fetched so that koh's tests run offline and on CI with no network.
-They are 3.6 MB, and `Cargo.toml` excludes `testing/` from the published crate.
+They are a spread of the kinds of program koh carries (shells, editors, full-screen tools, a
+pager, multiplexers), chosen from fux's 113. They are copied rather than fetched so that koh's
+tests run offline and on CI with no network. They are under 400 KB, and `Cargo.toml` excludes `testing/` from the published crate.
 
-`recording.rs` reads them. koh's corpus tests (`tests/corpus.rs`, `tests/net/corpus.rs`) and the
-harness crates include it by path.
+`recording.rs` reads them. koh's corpus test (`tests/corpus.rs`), the bench and the fuzzer
+include or read it by path.
 
-To update them, copy `fux-vt/compare/corpus/*.bin` and `*.json` from a newer fux commit, name that
+To update them, copy the same names' `.bin` and `.json` from a newer fux commit, name that
 commit here, and run `cargo test --test corpus`.

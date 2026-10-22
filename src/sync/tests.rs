@@ -13,21 +13,11 @@ fn copy_with(
 ) -> Result<Summary, Failure> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(PIPE_DEPTH);
     let (cut_tx, cut_rx) = mpsc::channel::<Vec<u8>>(PIPE_DEPTH);
-    let (reply_tx, mut reply_rx) = mpsc::channel::<Reply>(REPLY_DEPTH);
+    let (reply_tx, reply_rx) = mpsc::channel::<Reply>(REPLY_DEPTH);
     let count = sources.len();
-    let target = Target::resolve(dest, count, opts.dry_run);
     let sources = sources.to_vec();
     let send_opts = opts.clone();
-    let sender = std::thread::spawn(move || {
-        let mut answers = |wait: bool| {
-            if wait {
-                reply_rx.blocking_recv()
-            } else {
-                reply_rx.try_recv().ok()
-            }
-        };
-        let _ = send(&sources, &send_opts, ChannelWriter(tx), &mut answers);
-    });
+    let sender = std::thread::spawn(move || send(&sources, &send_opts, tx, reply_rx));
     // What the sender writes, cut short if asked.
     let pipe = std::thread::spawn(move || {
         let mut passed = 0_usize;
@@ -44,9 +34,8 @@ fn copy_with(
             }
         }
     });
-    let outcome = target.and_then(|(target, made)| {
-        let mut answer = |reply: Reply| reply_tx.try_send(reply).is_ok();
-        let summary = receive(ChannelReader::new(cut_rx), &target, opts, &mut answer);
+    let outcome = Target::resolve(dest, count, opts.dry_run).and_then(|(target, made)| {
+        let summary = receive(ChannelReader::new(cut_rx), target, opts, &reply_tx);
         let _ = reply_tx.try_send(Reply::End(summary.clone()));
         summary.map(|mut s| {
             s.dirs = s.dirs.saturating_add(made);
@@ -54,17 +43,11 @@ fn copy_with(
         })
     });
     drop(reply_tx);
-    let joined = pipe.join().is_ok() && sender.join().is_ok();
-    outcome.and_then(|summary| {
-        if joined {
-            Ok(summary)
-        } else {
-            Err(Failure::new(
-                FailKind::Other,
-                Path::new("a copy's thread panicked"),
-            ))
-        }
-    })
+    if pipe.join().is_err() || sender.join().is_err() {
+        let panicked = Path::new("a copy's thread panicked");
+        return Err(Failure::new(FailKind::Other, panicked));
+    }
+    outcome
 }
 
 fn copy(sources: &[&Path], dest: &Path, opts: &Opts) -> Result<Summary, Failure> {
@@ -124,6 +107,21 @@ fn mtime(path: &Path) -> (i64, i64) {
     (meta.mtime(), meta.mtime_nsec())
 }
 
+/// Set `path`'s modification time to `secs` (a file's or a directory's), and say it.
+fn filetime(path: &Path, secs: u64) -> (i64, i64) {
+    let at = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs));
+    fs::File::open(path)
+        .unwrap()
+        .set_modified(at.unwrap())
+        .unwrap();
+    mtime(path)
+}
+
+fn excluding(pattern: &str) -> glob::Excludes {
+    let pattern = glob::Pattern::new(pattern.as_bytes().to_vec()).unwrap();
+    glob::Excludes::new(vec![pattern]).unwrap()
+}
+
 #[test]
 fn a_tree_lands_then_only_what_changed_is_sent_and_gets_its_arrival_time() {
     let scratch = crate::test_runtime::scratch("sync-again");
@@ -167,14 +165,6 @@ fn a_tree_lands_then_only_what_changed_is_sent_and_gets_its_arrival_time() {
     assert_eq!(mode, 0o755);
 }
 
-/// Set `path`'s modification time to `secs`, and say it.
-fn filetime(path: &Path, secs: u64) -> (i64, i64) {
-    let file = fs::File::options().write(true).open(path).unwrap();
-    let at = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(secs));
-    file.set_modified(at.unwrap()).unwrap();
-    mtime(path)
-}
-
 #[test]
 fn a_tree_merges_into_one_there_and_delete_and_exclude_say_what_goes() {
     let scratch = crate::test_runtime::scratch("sync-merge");
@@ -186,17 +176,14 @@ fn a_tree_merges_into_one_there_and_delete_and_exclude_say_what_goes() {
     fs::create_dir_all(dest.join("a")).unwrap();
     fs::write(dest.join("a/theirs"), b"t").unwrap();
     fs::write(dest.join("cache.o"), b"c").unwrap();
-    fs::create_dir_all(dest.join("target/debug")).unwrap();
-    fs::write(dest.join("target/debug/x"), b"x").unwrap();
-    // Merged: what was there stays, without --delete, counted but for a directory made there.
+    // Merged: what was there stays, without --delete.
     let merged = copy(&[&src], &scratch.join("dest"), &Opts::default()).unwrap();
-    assert_eq!((merged.new, merged.kept), (2, 2), "{merged:?}");
-    fs::remove_dir_all(dest.join("target")).unwrap();
+    assert_eq!(merged.new, 2, "{merged:?}");
     assert!(dest.join("a/theirs").exists() && dest.join("a/one").exists());
     // With --delete, what the source lacks goes, but what is excluded stays and is not sent.
     let opts = Opts {
         delete: true,
-        excludes: glob::Excludes::new(vec![glob::Pattern::new(b"*.o".to_vec()).unwrap()]).unwrap(),
+        excludes: excluding("*.o"),
         ..Opts::default()
     };
     fs::remove_file(src.join("keep.o")).unwrap();
@@ -216,6 +203,76 @@ fn a_tree_merges_into_one_there_and_delete_and_exclude_say_what_goes() {
     )
     .unwrap();
     assert_eq!(fs::read(scratch.join("p/q/r/one")).unwrap(), b"1");
+}
+
+/// A pattern with a `/` matches the same path at both ends, from the top of the tree copied:
+/// what it names is neither sent nor removed, however deep and wherever the tree lands.
+#[test]
+fn delete_spares_what_a_path_pattern_excludes() {
+    let scratch = crate::test_runtime::scratch("sync-exclude-path");
+    let src = scratch.join("src");
+    fs::create_dir_all(src.join("a/b")).unwrap();
+    fs::write(src.join("a/b/ours"), b"o").unwrap();
+    fs::write(src.join("a/one"), b"1").unwrap();
+    let opts = Opts {
+        delete: true,
+        excludes: excluding("a/b/*"),
+        ..Opts::default()
+    };
+    // The tree into a directory, as its own name; and its contents into one.
+    for (source, dest, landed) in [
+        (src.clone(), scratch.join("into/"), scratch.join("into/src")),
+        (src.join("."), scratch.join("flat"), scratch.join("flat")),
+    ] {
+        fs::create_dir_all(landed.join("a/b")).unwrap();
+        fs::write(landed.join("a/b/theirs"), b"t").unwrap();
+        fs::write(landed.join("a/stray"), b"s").unwrap();
+        let done = copy(&[&source], &dest, &opts).unwrap();
+        assert_eq!((done.new, done.deleted), (1, 1), "{dest:?}: {done:?}");
+        assert!(landed.join("a/b/theirs").exists(), "{dest:?}");
+        assert!(!landed.join("a/b/ours").exists(), "{dest:?}");
+        assert!(!landed.join("a/stray").exists(), "{dest:?}");
+    }
+}
+
+/// A read-only directory gets its mode, and with -p its time, once its files landed: the end of
+/// a directory comes before the bytes of its last window of files.
+#[test]
+fn a_read_only_directory_lands_whole() {
+    let scratch = crate::test_runtime::scratch("sync-read-only");
+    let src = scratch.join("src");
+    fs::create_dir_all(src.join("ro/inner")).unwrap();
+    for n in 0..WINDOW * 2 {
+        fs::write(src.join(format!("ro/f{n}")), b"f").unwrap();
+    }
+    fs::write(src.join("ro/inner/last"), b"l").unwrap();
+    for dir in ["ro/inner", "ro"] {
+        fs::set_permissions(src.join(dir), fs::Permissions::from_mode(0o555)).unwrap();
+        filetime(&src.join(dir), 1_000_000);
+    }
+    let dest = scratch.join("dest");
+    let opts = Opts {
+        keep_times: true,
+        ..Opts::default()
+    };
+    let done = copy(&[&src.join(".")], &dest, &opts);
+    let again = copy(&[&src.join(".")], &dest, &opts);
+    let landed = (tree(&dest), mtime(&dest.join("ro")).0);
+    for at in [&src, &dest] {
+        for dir in ["ro", "ro/inner"] {
+            let _ = fs::set_permissions(at.join(dir), fs::Permissions::from_mode(0o755));
+        }
+    }
+    let files = u64::try_from(WINDOW * 2 + 1).unwrap();
+    assert_eq!(done.unwrap().new, files);
+    assert_eq!(again.unwrap().unchanged, files);
+    let mut want = tree(&src);
+    for entry in &mut want {
+        if entry.1 == 'd' {
+            entry.2 = 0o555;
+        }
+    }
+    assert_eq!(landed, (want, 1_000_000));
 }
 
 #[test]
@@ -379,56 +436,4 @@ fn a_dry_run_says_what_the_copy_would_do_and_changes_nothing() {
     let dry = copy_with(&[Source::Path(src)], &beneath, &opts(true), None).unwrap();
     assert_eq!((dry.new, dry.dirs), (4, 4), "{dry:?}");
     assert!(!scratch.join("gone").exists());
-}
-
-/// A dry run with `diff` says how each file it would replace differs, if both are text, and
-/// changes nothing; it counts what the dry run does.
-#[test]
-fn a_diff_says_how_each_replaced_text_file_differs() {
-    let scratch = crate::test_runtime::scratch("sync-diff");
-    let (src, dest) = (scratch.join("src"), scratch.join("dest"));
-    fs::create_dir_all(&src).unwrap();
-    fs::create_dir_all(&dest).unwrap();
-    for (name, ours, theirs) in [
-        ("edited", &b"one\n2\nthree\n"[..], &b"one\ntwo\nthree\n"[..]),
-        ("grown", b"a\n", b"a\nb\n"),
-        ("bin", b"\0x", b"\0y"),
-        ("same", b"s", b"s"),
-    ] {
-        fs::write(dest.join(name), ours).unwrap();
-        fs::write(src.join(name), theirs).unwrap();
-    }
-    fs::write(src.join("fresh"), b"new\n").unwrap();
-    let before = tree(&dest);
-    let opts = |diff| Opts {
-        dry_run: true,
-        diff,
-        ..Opts::default()
-    };
-    let diffed = copy(&[&src.join(".")], &dest, &opts(true)).unwrap();
-    assert_eq!(tree(&dest), before, "a diff changed the destination");
-    let said: Vec<(&str, Option<&str>)> = diffed
-        .changes
-        .iter()
-        .map(|c| (c.path.as_str(), c.diff.as_deref()))
-        .collect();
-    assert_eq!(
-        said,
-        [
-            ("bin", Some("no diff: not text\n")),
-            (
-                "edited",
-                Some("--- a/edited\n+++ b/edited\n@@ -1,3 +1,3 @@\n one\n-2\n+two\n three\n")
-            ),
-            ("fresh", None),
-            (
-                "grown",
-                Some("--- a/grown\n+++ b/grown\n@@ -1 +1,2 @@\n a\n+b\n")
-            ),
-        ],
-        "{diffed:?}"
-    );
-    let dry = copy(&[&src.join(".")], &dest, &opts(false)).unwrap();
-    let counts = |s: &Summary| (s.new, s.replaced, s.unchanged, s.bytes);
-    assert_eq!(counts(&diffed), counts(&dry), "{diffed:?} {dry:?}");
 }

@@ -196,30 +196,6 @@ fn a_loose_list_is_tightened() {
 }
 
 #[test]
-fn a_connect_is_remembered_beside_the_client_key() {
-    let dir = Scratch::new("connected");
-    let places = dir.places();
-    assert_eq!(last_connected(&places.client_key, id(1)), None);
-    record_connected(&places.client_key, id(1)).unwrap();
-    record_connected(&places.client_key, id(2)).unwrap();
-    record_connected(&places.client_key, id(1)).unwrap();
-    assert!(last_connected(&places.client_key, id(1)).is_some());
-    let text = std::fs::read_to_string(dir.0.join("connected")).unwrap();
-    assert_eq!(text.lines().count(), 2, "one line per server: {text}");
-    assert!(!dir.0.join("servers").exists(), "the list is not rewritten");
-}
-
-#[test]
-fn ago_says_how_long_ago_briefly() {
-    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-    let at = |secs| now - Duration::from_secs(secs);
-    assert_eq!(ago(at(5), now), "just now");
-    assert_eq!(ago(at(120), now), "2m ago");
-    assert_eq!(ago(at(7200), now), "2h ago");
-    assert_eq!(ago(at(3 * 86_400), now), "3d ago");
-}
-
-#[test]
 fn short_keeps_the_ends_of_an_id() {
     assert_eq!(short(A.parse().unwrap()), "d128…febf");
 }

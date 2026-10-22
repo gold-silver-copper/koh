@@ -33,7 +33,7 @@ src/
 ├── args.rs          the command line (clap's builder API), `koh help-agents`
 ├── lib.rs           crate root: module declarations
 ├── request.rs       the opening request (what a connection is for) and the replies sent whole
-├── proto.rs         the koh/16 shell protocol: client messages, what the program shows, caps
+├── proto.rs         the koh/17 shell protocol: client messages, what the program shows, caps
 ├── stream.rs        the output filter both ends run: questions out, marks apart, bounds
 ├── events.rs        decoded input (keys, mouse, focus, paste) and terminal colours on the wire
 ├── bounded.rs       fixed-capacity containers; the wire's bounded sequence decoding
@@ -52,8 +52,7 @@ src/
 │   ├── wait.rs      `koh wait`: a job's end or text, a session's command or state, a file
 │   ├── copy.rs      `koh cp` on the server
 │   ├── place.rs     where a request's paths are, and a scoped key's directory
-│   ├── marks.rs     the startup files that mark a shell's commands
-│   └── audit.rs     admission decisions as structured `koh::auth` events
+│   └── marks.rs     the startup files that mark a shell's commands
 ├── client/          `koh connect`'s loop and the commands that dial
 │   ├── display.rs   the user's terminal: output, marks, reports, the overlay
 │   ├── input.rs     what the user's terminal sends, decoded; the escape prefix
@@ -62,8 +61,8 @@ src/
 │   ├── copy.rs      `koh cp` at this end, and its summary
 │   ├── probe.rs     the start-up questions to the user's terminal
 │   └── backend/     KohBackend (raw mode, size, bytes, marks) + Tty (through fuxix::terminal)
-├── identity.rs      unlocked identities + the key lease `koh key reset` respects
-│   └── key_file.rs  KeyFile, the one owner of trust in a key path, its lock and $KOH_LOG
+├── identity.rs      loading and making identity keys
+│   └── key_file.rs  KeyFile, the one owner of trust in a key path, and $KOH_LOG
 ├── log.rs           the `RUST_LOG` filter `serve` and `connect` install (`target=level` directives)
 ├── keycmd.rs        `koh id` and `koh key` — print the endpoint id, show the identities, reset one
 ├── names.rs         names for ids: `servers` and `clients` beside the keys, and client scopes
@@ -71,19 +70,18 @@ src/
 └── test_runtime.rs  unit tests' runtime and scratch directories, through koh-testkit
 tests/net/           koh over a fault-injecting link between real iroh endpoints
 tests/               PTYs, sessions, the binary on a PTY, commands, jobs and copies, names,
-                     key creation races, wire goldens and the corpus
+                     key creation races, the wire's round-trips and the corpus
 testkit/             koh-testkit: what the tests share (starting programs, tasks, scratch dirs)
-testing/corpus/      113 real programs' output (from fux), replayed by tests and bench
+testing/corpus/      real programs' output (from fux), replayed by tests and bench
 testing/bench/       the scoreboard: koh beside mosh and ssh (`testing/scoreboard.sh`)
-testing/agentbench/  coding agents driving koh on task sets, scored
 ```
 
-`predict` imports nothing from `crate::` (CI checks it), so it is a standalone
-terminal-prediction library; `stream`, `proto`, `request` and `sync`'s item types are pure.
+`predict` and `proto` import nothing of the client or the server (CI checks it); `stream`,
+`proto`, `request` and `sync`'s item types are pure.
 
-## The protocol (koh/16)
+## The protocol (koh/17)
 
-The ALPN `koh/16` is the version check: a peer on another version fails the TLS handshake with a
+The ALPN `koh/17` is the version check: a peer on another version fails the TLS handshake with a
 clear error. A client dials from a key made for its process alone: iroh routes by endpoint id, and
 two endpoints sharing one take each other's place at a relay and each other's paths, so every `koh`
 the client runs at once would knock the others' links down. Its own key, the one the allowlist
@@ -209,7 +207,7 @@ holds at most that.
 
 `client::Display` writes to the user's terminal. It feeds what it writes to a mirror, a fux-vt
 parser with no history, which says where the cursor is, which screen is shown, what is under a
-cell; the predictor reads the mirror (`predict::ScreenView` is implemented for `fux_vt::Screen`).
+cell; the predictor reads the mirror's `fux_vt::Screen`.
 Over the program's output it paints an overlay: the predicted echo of what was typed, and the
 status line on the last row. The overlay is taken back before anything else is written (the cells
 it covered painted again from the mirror, the pen and the cursor put back), so the terminal is
@@ -272,8 +270,8 @@ a server nobody set up: a session's bash, zsh or fish, started plainly (`$SHELL`
 user's own startup files, then marks each command. bash is given `--rcfile` with a file that
 sources `~/.bashrc` and then puts the marks first in `PROMPT_COMMAND` (an array's first element,
 after which the user's own hooks run with `$?` and `PIPESTATUS` as without koh), at the start of
-`PS1` and at the end of `PS0` (before bash 4.4, macOS's 3.2, a DEBUG trap armed before each prompt
-in its place); a variable the user made readonly is left unmarked. zsh is given a shim `ZDOTDIR`
+`PS1` and at the end of `PS0` (a bash older than 4.4, such as macOS's 3.2, is left unmarked); a
+variable the user made readonly is left unmarked. zsh is given a shim `ZDOTDIR`
 whose `.zshenv` puts the user's `ZDOTDIR` back, sources their `.zshenv` and adds a `preexec` and a
 `precmd` hook; fish an `--init-command` adding two event handlers. The files are written once a
 shell needs them, in a directory of this server run (`koh-shell-marks-PID-RANDOM`, 0700) under
@@ -312,7 +310,8 @@ key typed within 200 ms of a frame that moved the cursor to another row (a fresh
 predicted until the server has reflected it (`PredictionEngine::hold`); the hold keys on the cursor
 row's index, the history's newest row and the rows the frame moved, so it engages at the bottom of
 a full screen, where Enter scrolls. Kernel echo is trusted
-from the first key otherwise. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
+from the first key otherwise, until a key the predictor does not model (Tab, say), whose echo it
+then waits for. Otherwise (a line editor, a full-screen program) the epoch logic decides: the first key
 of an epoch stays hidden until the server's echo confirms it, and a mispredict kills its epoch. A
 reconnect to the same session carries the trust it had, given once the first output shows no
 password prompt, and only once the modes are known.
@@ -320,30 +319,22 @@ password prompt, and only once the modes are known.
 The predictor takes edit keys only (focus changes never reach it), and predicts only in a
 `Context`, which can be built only on the primary screen with the PTY's modes known and not a
 password prompt, so tmux's or screen's prefix and full-screen programs are never read as readline.
-Guesses are cells with their whole style: cells a line editor shifts keep theirs, and only the typed
-glyph borrows its left neighbour's (hidden included). A line starts at a `Confirmed` cursor, never a
-`Guessed` one, only once the screen shows the Enter that began it, and dies with discarded guesses;
+A typed glyph is guessed only onto blank cells, borrowing its left neighbour's style (hidden
+included), and nothing else on the row moves, so a right-side prompt (zsh's `RPROMPT`, fish's) or
+a full-screen program's border never contradicts a guess; typing over text waits for the echo. A
+line starts where the screen shows the Enter that began it, and dies with discarded guesses;
 Backspace and Left stop at it. A character that continues the glyph before the cursor (a combining
 mark, a skin-tone modifier) joins it, or nothing is predicted. Prediction is **always on** in koh, so keystrokes engage on every link. Predictions are drawn plain, not underlined,
 and a cell it knows changed but not to what is not drawn at all, so the real cell shows.
 
-The port faithfully implements epoch-gated confirmation and no-echo suppression. It predicts
-typed keys, whatever bytes the user's terminal sent for them (more than 32 in one read are a
-paste or a program writing to the terminal, not typing, and are not predicted): ASCII printables (with insert-mode
-row shift), backspace, Enter, the left/right arrow keys (not under kernel echo, which echoes them
-as `^[[D`), the line
-editor's keys where the guess is sure (`Ctrl-W` and `Alt-Backspace` back to a word's boundary,
-never into what is left of the line's start; `Ctrl-U`, `Ctrl-A` and Home only when where the line
-began is known; `Ctrl-E` and End to the end of an unwrapped
-row; `Alt-B` and `Alt-F` by readline's words), and whole graphemes including double-width CJK/emoji (cursor advances by two cells). A wide glyph is
-predicted as two cells, the glyph and the cell it covers; the covered cell is right when the
-server shows a wide glyph's right half there, and never confirms an epoch. The insert-mode shift
-moves each wide glyph with its right half; one the shift splits (at the right edge, or typed
-inside) becomes unknown rather than half drawn. Backspace over a wide glyph, which a line editor
-takes back two cells, is not modelled. Control/escape sequences it doesn't model open a fresh epoch
-but make no concrete guess (they fall back to the server's real echo). A wrong or unconfirmed guess
-is always reconciled away — it never corrupts the display: the overlay is taken back before
-the program's output is written.
+It predicts typed keys, whatever bytes the user's terminal sent for them (more than 32 in one read
+are a paste or a program writing to the terminal, not typing, and are not predicted): printable
+graphemes, double-width ones as two cells (the right one never confirms an epoch), Backspace at the
+end of the line, Enter, and the left and right arrows (not under kernel echo, which echoes them as
+`^[[D`). The line editor's own keys (`Ctrl-W`, `Ctrl-U`, `Ctrl-A`, `Ctrl-E`, Home, End, `Alt-B`,
+`Alt-F`) are not guessed: they wait one round trip. Other keys and control sequences open a fresh
+epoch but make no guess. A wrong or unconfirmed guess is always reconciled away: the overlay is
+taken back before the program's output is written.
 
 ## Reconnect & detachable sessions
 
@@ -422,7 +413,7 @@ per-connection state never lives in the session:
   attachment, so dropping one (on return **or** panic) detaches with no message to lose. The
   session starts the TTL when the last one drops and tears itself down at the TTL. Input comes only
   from the newest attachment, and only while the program runs. `Registry::end(peer)` ends all of a
-  peer's sessions, as revoking it does.
+  peer's sessions, and `Jobs::end(peer)` its jobs, as revoking it does.
 - **A listing asks each session.** `Registry::sessions(peer)` takes the peer's sessions from the
   registry, which never waits on one, then asks each how it stands (attached or since when not,
   its size, title, exit, its program's state, whether a command runs and the last one's status),
@@ -495,30 +486,26 @@ relative in the home, unglobbed), or, for a scoped key, beneath its directory.
 - **`koh cp`** (`sync`, `server::copy`, `client::copy`) is a sync, the same whichever end is the
   server. The sender walks its sources (each followed if it is a symlink, as `cp` follows its
   arguments, but not under a scoped key), its tree as it is (symlinks as symlinks, fifos, sockets
-  and devices said `Skipped`), at most 128 directories deep, and sends a header for each entry
-  (`sync::Item`: `Dir`, `File`, `Symlink`, with a `Name`, no `/`, NUL, `.` or `..`, a mode of at
-  most `0o7777` and a time), each at most 8 KiB, running ahead of the answers by 64 files. The
-  receiver answers each file (`sync::Answer`): `Want { have, prefix }`, all of it or the rest of
-  a part it kept (whose start's hash the sender checks), or `Check { hash }`, the blake3 hash of
-  a file of the same size it has, which the sender answers with the bytes or `Same`. A file's
-  bytes go in chunks of at most 64 KiB to `.koh-HASH.part` beside it and are renamed over it once
-  whole; `--atomic` holds every rename and removal until the whole copy came. In a dry run
+  and devices said `Skipped`), at most `MAX_DEPTH` directories deep, and sends a header for each
+  entry (`sync::Item`: `Dir`, `File`, `Symlink`, with a `Name`, no `/`, NUL, `.` or `..`, a mode
+  of at most `0o7777` and a time), each at most `MAX_ITEM`, running ahead of the answers by
+  `WINDOW` files (the receiver refuses more waiting than that). The receiver answers each file
+  (`sync::Answer`): `Want { have, prefix }`, all of it or the rest of a part it kept (whose
+  start's hash the sender checks), or `Check { hash }`, the blake3 hash of a file of the same size
+  it has, which the sender answers with the bytes or `Same`. A file's bytes go in chunks of at
+  most `CHUNK` to `.koh-HASH.part` beside it and are renamed over it once whole. In a dry run
   (`Opts::dry_run`) the receiver makes, writes and removes nothing, and the sender answers each
-  file it would send with `Differs { id, from }` in place of its bytes; the receiver lists each
-  change in its `Summary` (`changes`, the first 1000, the rest counted). With `Opts::diff`
-  (`--diff`) the receiver answers `Check` for any file it has of at most 1 MiB, whatever its
-  size, and the sender answers a differing one of at most 1 MiB with its bytes, which the
-  receiver holds in memory and compares with its own, giving the change a unified diff
-  (`Change::diff`, all of them together at most 128 KiB, a second spent on each). Every entry is
-  reached from the directory above it by its descriptor with `O_NOFOLLOW` (`sync::fsat`), so no
-  name reaches outside the destination or through a symlink. Directories merge; the destination's
-  missing parents are made; a file written gets its arrival time unless `-p`, and modes land less
-  setuid and setgid. `--delete` removes what the source does not have from each directory it
-  merges into, once the source said all it holds; `--exclude` patterns (`sync::glob`) match a name,
-  or a path from the source's top when they hold a `/`. The receiver ends with a `Summary`
-  (files new and replaced, unchanged, links, dirs, deleted, skipped, bytes), which the client says
-  in one line or as JSON. Each end runs on a blocking thread, joined to the stream's task by a
-  channel of at most 8 chunks.
+  file it would send with `Differs` in place of its bytes; the receiver lists each change in its
+  `Summary`. Every entry is reached from the directory above it by its descriptor with
+  `O_NOFOLLOW` (`sync::fsat`), so no name reaches outside the destination or through a symlink.
+  Directories merge; the destination's missing parents are made; a file written gets its arrival
+  time unless `-p`, and modes land less setuid and setgid; a directory gets its mode and time once
+  none of its files waits for bytes. `--delete` removes what the source does not have from each
+  directory it merges into, once the source said all it holds; `--exclude` patterns
+  (`sync::glob`) match a name, or, holding a `/`, a path from the top of the tree copied, the same
+  at both ends. The receiver ends with a `Summary`, which the client says in one line or as JSON.
+  Each end runs on a blocking thread, joined to the stream's task by a bounded channel
+  (`sync::send_on`, `sync::receive_on`).
 - **Scoped keys** (`names::Scope`, `server::cli::permitted`): a client saved with `cp=DIR` gets
   copies beneath `DIR` and waits for a file there; with `exec=DIR`, commands and jobs started in
   `DIR`; with no scope, everything. Any other request closes with `OutOfScope`. A scope changed
@@ -568,108 +555,37 @@ construction rather than by care at each call:
   waiting; past them it is closed as `Busy` ("server busy: too many connections at once; retry"),
   which the client says, exiting 75.
 
-## Testing tiers
+## Testing
 
-You never need a second *machine* to develop koh — you need a second *process* and occasionally a
-second *container*. The verification is layered cheapest-first; everything but Tier 3 is headless.
+Everything but real devices runs headless, on one machine, in `cargo test`; each test says what
+it guards in its name and comment.
 
-### Tier 0 — pure logic, no infra (`cargo test`)
+- **Unit tests** beside the code: the filter, the redraw, the wire's round-trips and caps, the
+  pacing budget, the display's overlay, the predictor, and the sync (cut anywhere and resumed,
+  nothing landed through a symlink or outside a scoped directory).
+- **`tests/net/`**: a real server and client on iroh endpoints joined only by an in-process
+  fault-injecting link (`tests/net/link.rs`): loss, delay, reordering and outages under real QUIC;
+  convergence, ordered input, reattach, resize, backpressure, the bell hook, prediction, and
+  hostile clients and servers.
+- **`tests/pty.rs`, `tests/sessions.rs`**: real programs on real PTYs, the session registry, and
+  the real accept loop over loopback iroh.
+- **`tests/e2e_pty_binary.rs`, `tests/commands.rs`**: the real `koh` binary, on a PTY or as a
+  command: connect, suspend, exec, jobs, waits, copies, scoped keys, and a relay shared by one
+  key's processes.
+- **`tests/corpus.rs`**: real programs' output (`testing/corpus/`, from fux) through the server,
+  the wire and the client's display; a terminal reading what the client wrote must show what one
+  reading the program's output does, and so must one fed the server's redraw.
+- **Fuzzing** (`fuzz/`, weekly in CI): every decoder a peer reaches, the program's output through
+  the emulator and filter, and the user's terminal's input.
 
-The protocol, diff/apply, predictor and session registry need no network or TTY, so they're tested
-deterministically:
+Test crates start with `#![forbid(clippy::disallowed_methods)]`: they start programs, spawn tasks
+and make scratch directories only through **`koh-testkit`** (`testkit/`). Terminal I/O is behind
+`client::backend::KohBackend`, so the client's loop runs against a capturing terminal in tests.
 
-- **The filter and the redraw** — questions dropped and marks relayed however the output is
-  split, bounds, titles and the clipboard; a redrawn terminal shows what the program drew, in its
-  modes, history and prompts included.
-- **Protocol cores** — `proto` and `request` round-trips and size caps; the pacing budget; the
-  display's overlay painted and taken back; a sync cut anywhere resumes, merges, deletes and
-  excludes, and lands nothing through a symlink or outside a scoped directory.
-- **Predictor** — predict→confirm→clear, predict→no-echo→suppress.
-- **Property tests and fuzzing** on the attacker-reachable parsers — assert never-panic and bounded.
-  Coverage-guided fuzz targets (`fuzz/fuzz_targets/`): `proto_decode` (both directions of the
-  wire), `request_decode` (the opening request, the replies sent whole and a copy's items),
-  `server_process` (the hosted program's output, through the emulator and the filter, redrawn),
-  `server_input` (the client's input, encoded for the program) and `client_input` (what the
-  user's terminal sends, start-up answers included, read by the session's decoder).
-- **The corpus** (`tests/corpus.rs`) — 113 recordings of real programs (`testing/corpus/`, from
-  fux: shells, editors, pagers, TUIs, compilers, claude) through the whole pipeline in PTY-sized
-  pieces with their resizes: the server's emulator and filter, the wire's encoding, the client's
-  display. A fux-vt terminal reading every byte the client wrote must show what a fux-vt parser
-  fed the program's output shows, and so must one fed the redraw of the server's screen at every
-  step.
-
-### Tier 1 — real iroh endpoints on one machine (`cargo test`)
-
-A second host is just a second endpoint, and a TTY is just an allocated PTY.
-
-- **`tests/net/`** — a real `koh serve` accept loop and a real `koh connect` client loop on iroh
-  endpoints whose only path is an in-process fault-injecting link (`tests/net/link.rs`, an iroh
-  custom transport): loss, delay, jitter, duplication, reordering and outages under real QUIC. It
-  covers screen convergence, exactly-once ordered input, reattach, a forced mid-session drop,
-  scrollback in the user's terminal, exit status, resize, XON/XOFF, input backpressure, a program
-  that stops reading, the bell hook, prediction and the no-echo property, and hostile clients and
-  servers. The corpus runs
-  here too, through a real server and client under loss (eleven recordings by default, every one
-  with `KOH_NET_CORPUS=all`).
-- **`tests/pty.rs`** and **`tests/sessions.rs`** — real programs on real PTYs: output
-  streaming and teardown, exit statuses, the
-  reaped-PID gate, a program that cannot start, no leaked descriptors, a session leader owning its
-  terminal; the session registry's attach/reattach/cap/TTL/teardown; the real accept loop
-  (`serve_endpoint`, its allowlist and admission) and the per-connection echo-ack over loopback
-  iroh. On macOS `tests/pty.rs` first grows the kernel's PTY
-  table past what its tests hold at once: an open that finds the table full while another PTY is
-  being freed fails with ENXIO (the table grows 16 slots at a time and never shrinks), which its
-  many short-lived PTYs hit on a fresh machine.
-- **`tests/e2e_pty_binary.rs`** — the **real `koh` binary** attached to an allocated PTY (so
-  `isatty()` is true and raw mode runs for real), driven by scripted keystrokes with rendered
-  frames read back from the master, connected with `--direct` to an in-process server; the
-  `Ctrl-^ Ctrl-Z` suspend under a job-control bash; and a `koh serve --local --port` process
-  restarted under a connected client, which finds it again and hears its session is gone.
-- **`tests/commands.rs`** — the real binary's `koh exec` (words as they are, output apart,
-  statuses, stdin, the hang-up of a client stopped or killed), jobs (outliving their client,
-  waited for, followed and killed), `koh cp` both ways as a sync (changed files only, arrival
-  times, `--delete`), a scoped key, and `koh sessions`, `output` and `wait --session` beside `koh
-  connect --new` and `--session`, against an in-process server.
-
-The rules the tests keep are in their structure, not in lint lists a file can lift. Every test
-crate starts with `#![forbid(clippy::disallowed_methods)]`, so none can start a program, spawn a
-task or write to the system temp dir on its own: it does those through **`koh-testkit`**
-(`testkit/`, its own workspace), whose `command` starts only `koh` and a list of harmless tools
-(never one that authenticates, as `sudo` does), whose `spawn` runs a task on the test's runtime,
-and whose `Scratch` is a private directory under `target/`, removed on drop. It also holds the
-test runtimes, PTY output capture and the seeded random sequence the tests and the scoreboard use.
-
-The scoreboard sits beside the tests, in its own Cargo workspace:
-
-- **The scoreboard** (`testing/scoreboard.sh`, [`testing/bench/`](../testing/bench/README.md))
-  measures koh beside mosh and ssh by bytes on the wire for each recording and synthetic workload,
-  keystroke latency beside a flood on three links, server memory per session and instructions
-  retired.
-
-Terminal I/O is behind `client::backend::KohBackend`, so the same loop runs against the real
-terminal (binary) or a capturing one (tests), which can also be told what the overlay painted.
-
-### Tier 2 — Android emulator: runtime, network realism, resilience ([`testing/android/`](../testing/android/))
-
-The layer a single in-process test can't reach: the **real `koh` binary on a real Android OS**,
-driven over `adb` by scripts run directly, never part of `cargo test`. A **smoke** suite
-proves the Android iroh/DNS path binds without the `ndk-context` panic (a runtime-only bug
-cross-compilation can't catch); a **stress** suite hammers koh under load, churn, and adverse
-conditions (connection churn, concurrent sessions, throughput + memory-longevity leak checks, signal
-handling, a short screen-off freeze and a long one, reattach continuity, `tc netem`
-loss/jitter/reorder beneath real QUIC, a total-outage roaming analogue, and a bare-id connection over
-the public relay); and a **security** suite proves the data-plane and key defenses against a
-cross-compiled malicious-peer harness. The memory checks are part of the point: an emulator has the
-RAM to survive what would get the server killed on a phone, so the suites bound the server's RSS
-under attack rather than only its survival. Every check first proves its precondition (the attack
-ran, the client was attached) from the server's log, so a result cannot pass vacuously. The netem
-tests root only `tc` (`su 0`, on a userdebug image), never the shell koh runs in.
-
-### Tier 3 — real devices (manual)
-
-A small final human acceptance pass: paste the endpoint id on an actual phone, connect to an actual
-Mac over the public relay, type on a laggy cell link, and feel the predictions. The headless tiers
-prove correctness; only a real two-device run over a real radio proves *feel* and migration.
+Beside the tests: the scoreboard (`testing/scoreboard.sh`, `testing/bench/`) measures koh beside
+mosh and ssh (bytes on the wire, keystroke latency under a flood, server memory); the Android
+scripts (`testing/android/`) run the real binary on an emulator over `adb`: the Android DNS path,
+stress, netem loss, and a malicious peer. A real phone over a real radio is the last, manual check.
 
 ## Acceptance criteria (mosh feel)
 

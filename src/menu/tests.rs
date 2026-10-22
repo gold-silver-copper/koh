@@ -42,12 +42,11 @@ fn the_overview_shows_both_keys_and_both_lists() {
     let client =
         crate::identity::load(&crate::identity::KeyFile::open(&places.client_key).unwrap())
             .unwrap()
-            .endpoint_id();
+            .public();
     names::update(&places, List::Servers, |n| {
         n.add("laptop", id(1), None, names::Scope::default())
     })
     .unwrap();
-    names::record_connected(&places.client_key, id(1)).unwrap();
     let direct = Some(names::Route::Direct(([10, 0, 0, 2], 4433).into()));
     names::update(&places, List::Servers, |n| {
         n.add("desk", id(2), direct, names::Scope::default())
@@ -63,12 +62,9 @@ fn the_overview_shows_both_keys_and_both_lists() {
         shown.contains("none yet (`koh serve` creates it)"),
         "{shown}"
     );
+    assert!(shown.contains("1  laptop"), "{shown}");
     assert!(
-        shown.contains("1  laptop") && shown.contains("last connected just now"),
-        "{shown}"
-    );
-    assert!(
-        shown.contains("2  desk") && shown.contains("direct=10.0.0.2:4433   never connected"),
+        shown.contains("2  desk") && shown.contains("direct=10.0.0.2:4433"),
         "{shown}"
     );
     assert!(shown.contains("3  phone"), "{shown}");
@@ -194,40 +190,24 @@ fn rename_and_show_the_full_id() {
 }
 
 #[test]
-fn overwriting_a_name_asks_first() {
-    let dir = Scratch::new("overwrite");
+fn a_taken_name_is_refused_and_its_scope_kept() {
+    let dir = Scratch::new("taken");
     let places = dir.places();
-    names::update(&places, List::Servers, |n| {
-        n.add("laptop", id(1), None, names::Scope::default())
+    let scope = names::Scope {
+        cp: Some("/srv/drop".into()),
+        exec: None,
+    };
+    names::update(&places, List::Clients, |n| {
+        n.add("phone", id(1), None, scope.clone())
     })
     .unwrap();
-    let typed = format!("a\ns\nlaptop\n{}\nn\nq\n", id(2));
+    let typed = format!("a\nc\nphone\n{}\nq\n", id(2));
     let (_, shown) = menu(&places, &typed);
-    assert!(
-        shown.contains("replace it? [y/N]") && shown.contains("kept"),
-        "{shown}"
-    );
+    assert!(shown.contains("already saved"), "{shown}");
+    let saved = names::load(&places, List::Clients).unwrap();
     assert_eq!(
-        saved(&places, List::Servers),
-        [("laptop".to_owned(), id(1))]
-    );
-    let typed = format!("a\ns\nlaptop\n{}\ny\nq\n", id(2));
-    menu(&places, &typed);
-    assert_eq!(
-        saved(&places, List::Servers),
-        [("laptop".to_owned(), id(2))]
-    );
-    // A replacement that cannot be saved (the id is another name's) leaves the old one.
-    names::update(&places, List::Servers, |n| {
-        n.add("desk", id(3), None, names::Scope::default())
-    })
-    .unwrap();
-    let typed = format!("a\ns\nlaptop\n{}\ny\nq\n", id(3));
-    let (_, shown) = menu(&places, &typed);
-    assert!(shown.contains("already saved as"), "{shown}");
-    assert_eq!(
-        saved(&places, List::Servers),
-        [("laptop".to_owned(), id(2)), ("desk".to_owned(), id(3))]
+        saved.get("phone").map(|e| (e.id, &e.scope)),
+        Some((id(1), &scope))
     );
 }
 
@@ -257,26 +237,11 @@ fn a_reset_says_who_loses_access_and_needs_the_keys_name_typed() {
 }
 
 #[test]
-fn a_reset_is_refused_while_the_key_is_in_use() {
-    let dir = Scratch::new("in-use");
-    let places = dir.places();
-    let key = crate::identity::KeyFile::open(&places.server_key).unwrap();
-    let held = crate::identity::load(&key).unwrap();
-    let (_, shown) = menu(&places, "k\nr\nserver\nserver\nq\n");
-    assert!(
-        shown.contains("not reset") && shown.contains("in use"),
-        "{shown}"
-    );
-    assert!(places.server_key.exists());
-    drop(held);
-}
-
-#[test]
 fn keys_show_each_id_in_full_with_a_qr_code() {
     let dir = Scratch::new("keys");
     let places = dir.places();
     let key = crate::identity::KeyFile::open(&places.client_key).unwrap();
-    let client = crate::identity::load(&key).unwrap().endpoint_id();
+    let client = crate::identity::load(&key).unwrap().public();
     let (_, shown) = menu(&places, "k\nb\nq\n");
     assert!(shown.contains(&client.to_string()), "{shown}");
     assert!(

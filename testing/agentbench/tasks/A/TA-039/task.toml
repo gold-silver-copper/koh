@@ -1,9 +1,0 @@
-id = "TA-039"
-title = "A question for a database shell"
-cat = "repl"
-difficulty = "moderate"
-goal = '''
-On the remote machine, `~/bin/dbshell` is an SQL shell on the shop's database (SQLite dialect;
-type `\help` in it). Find the customer whose orders placed in 2025 add up to the largest total,
-and write that customer's name (only the name) to `answer.txt` in your local directory.
-'''

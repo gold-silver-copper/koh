@@ -23,6 +23,8 @@
 //! sequence longer than its bound is dropped to its end, so a filter holds at most
 //! [`MAX_STRING`] bytes, whatever the program writes.
 
+use crate::request::MAX_TITLE;
+
 /// Most bytes of a control sequence (CSI) a filter gathers; a longer one is dropped.
 pub const MAX_CSI: usize = 256;
 
@@ -38,9 +40,6 @@ pub const MAX_MARK: usize = 256;
 
 /// Most bytes of base64 a clipboard write (OSC 52) carries; a longer one is dropped.
 pub const MAX_CLIPBOARD: usize = 16 * 1024;
-
-/// Most characters of a title (OSC 0, 1, 2), as mosh cuts them; the rest is cut off.
-pub const MAX_TITLE: usize = 256;
 
 /// What a filter passes on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,9 +136,21 @@ impl Filter {
 
     /// Read `bytes`, giving `emit` what passes: whole sequences, and whole characters, held back
     /// until their end comes.
-    pub fn feed(&mut self, bytes: &[u8], emit: &mut impl FnMut(Piece)) {
-        for &byte in bytes {
-            self.byte(byte, emit);
+    pub fn feed(&mut self, mut bytes: &[u8], emit: &mut impl FnMut(Piece)) {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if self.state == State::Ground && byte != ESC && byte != ENQ {
+                // Text, up to the next sequence, passes whole.
+                let text = bytes
+                    .iter()
+                    .position(|&b| b == ESC || b == ENQ)
+                    .unwrap_or(bytes.len());
+                let (text, rest) = bytes.split_at(text);
+                self.pass(text, emit);
+                bytes = rest;
+            } else {
+                self.byte(byte, emit);
+                bytes = rest;
+            }
         }
         self.flush(emit);
     }
@@ -155,11 +166,17 @@ impl Filter {
         emit(Piece::Out(std::mem::replace(&mut self.out, rest)));
     }
 
-    /// Pass `byte`, giving out a full chunk at a character's end.
-    fn pass(&mut self, byte: u8, emit: &mut impl FnMut(Piece)) {
-        self.out.push(byte);
-        if self.out.len() >= MAX_OUT && incomplete_utf8(&self.out) == 0 {
-            emit(Piece::Out(std::mem::take(&mut self.out)));
+    /// Pass `bytes`, giving out a chunk of at most [`MAX_OUT`] at a character's end whenever one
+    /// fills.
+    fn pass(&mut self, mut bytes: &[u8], emit: &mut impl FnMut(Piece)) {
+        while !bytes.is_empty() {
+            let room = MAX_OUT.saturating_sub(self.out.len());
+            let (now, later) = bytes.split_at(room.min(bytes.len()));
+            self.out.extend_from_slice(now);
+            bytes = later;
+            if self.out.len() >= MAX_OUT {
+                self.flush(emit);
+            }
         }
     }
 
@@ -190,17 +207,9 @@ impl Filter {
         }
         let seq = std::mem::take(&mut self.seq);
         match judge(&seq, &self.policy) {
-            Judged::Pass => {
-                for &b in &seq {
-                    self.pass(b, emit);
-                }
-            }
+            Judged::Pass => self.pass(&seq, emit),
             Judged::Drop => {}
-            Judged::Out(bytes) => {
-                for &b in &bytes {
-                    self.pass(b, emit);
-                }
-            }
+            Judged::Out(bytes) => self.pass(&bytes, emit),
             Judged::Mark(mark) => {
                 self.flush(emit);
                 // A character cut short before the mark never ends now: it goes before it, as
@@ -221,7 +230,7 @@ impl Filter {
                 ESC => self.begin(State::Escape),
                 // The answerback: a question.
                 ENQ => {}
-                _ => self.pass(byte, emit),
+                _ => self.pass(&[byte], emit),
             },
             State::Escape => match byte {
                 b'[' => {
@@ -246,14 +255,14 @@ impl Filter {
                 }
                 ESC => {
                     // A lone ESC, then another sequence.
-                    self.pass(ESC, emit);
+                    self.pass(&[ESC], emit);
                     self.begin(State::Escape);
                 }
                 CAN | SUB => self.state = State::Ground,
                 _ => {
                     // A control inside the sequence is done as it comes, and the sequence goes
                     // on, as a terminal does.
-                    self.pass(byte, emit);
+                    self.pass(&[byte], emit);
                 }
             },
             State::EscapeIntermediate => match byte {
@@ -264,7 +273,7 @@ impl Filter {
                 }
                 ESC => self.begin(State::Escape),
                 CAN | SUB => self.state = State::Ground,
-                _ => self.pass(byte, emit),
+                _ => self.pass(&[byte], emit),
             },
             State::Csi => match byte {
                 0x20..=0x3f => self.gather(byte, MAX_CSI),
@@ -275,7 +284,7 @@ impl Filter {
                 ESC => self.begin(State::Escape),
                 CAN | SUB => self.state = State::Ground,
                 // A control inside a CSI is done as it comes, the CSI going on.
-                0x00..=0x1f => self.pass(byte, emit),
+                0x00..=0x1f => self.pass(&[byte], emit),
                 // DEL is ignored inside one; anything else ends it, malformed.
                 0x7f => {}
                 _ => self.state = State::Ground,
@@ -394,13 +403,12 @@ fn csi_asks(body: &[u8]) -> bool {
 /// Whether a DCS's `body` (after `ESC P`) asks the terminal something: DECRQSS (`$q`) and
 /// XTGETTCAP (`+q`).
 fn dcs_asks(body: &[u8]) -> bool {
-    let head: Vec<u8> = body
+    let head = body
         .iter()
-        .copied()
-        .skip_while(|b| b.is_ascii_digit() || *b == b';')
-        .take(2)
-        .collect();
-    head == b"$q" || head == b"+q"
+        .position(|b| !(b.is_ascii_digit() || *b == b';'))
+        .and_then(|at| body.get(at..))
+        .unwrap_or_default();
+    head.starts_with(b"$q") || head.starts_with(b"+q")
 }
 
 /// What an OSC, `seq` from its ESC to its terminator, comes to.

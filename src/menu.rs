@@ -7,7 +7,6 @@
 //! `koh clients`, `koh key`) runs. End of input at any prompt leaves, changing nothing more.
 
 use std::io::{BufRead, Write};
-use std::time::SystemTime;
 
 use iroh::EndpointId;
 
@@ -101,7 +100,6 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             let id = key_id(self.places, role).map_or_else(|shown| shown, names::short);
             writeln!(self.output, "  {label}   {id}   {path}")?;
         }
-        let now = SystemTime::now();
         let mut entries = Vec::new();
         for (list, heading) in [
             (List::Servers, "servers you connect to"),
@@ -125,21 +123,13 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
                     id: entry.id,
                     route: entry.route.clone(),
                 };
-                let mut line = format!(
+                writeln!(
+                    self.output,
                     "  {}  {:<10} {}",
                     entries.len().saturating_add(1),
                     picked.name,
                     picked.shown()
-                );
-                if list == List::Servers {
-                    let seen = names::last_connected(&self.places.client_key, entry.id)
-                        .map_or_else(
-                            || "never connected".to_owned(),
-                            |then| format!("last connected {}", names::ago(then, now)),
-                        );
-                    line = format!("{line}   {seen}");
-                }
-                writeln!(self.output, "{line}")?;
+                )?;
                 entries.push(picked);
             }
         }
@@ -255,13 +245,11 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
         if let Err(error) = names::check_name(&name) {
             return self.say(&format!("{error:#}"));
         }
-        let hint = match list {
-            List::Servers => {
-                "on that machine, `koh key info server` prints it, as `koh serve` does"
-            }
-            List::Clients => "on that machine, `koh id` prints it",
-        };
-        writeln!(self.output, "  ({hint})")?;
+        let role = list.noun();
+        writeln!(
+            self.output,
+            "  (on that machine, `koh id {role}` prints it)"
+        )?;
         let Some(id) = self.ask("its endpoint id: ")? else {
             return Ok(Some(Outcome::Quit));
         };
@@ -269,28 +257,7 @@ impl<R: BufRead, W: Write> Menu<'_, R, W> {
             Ok(id) => id,
             Err(error) => return self.say(&format!("not an endpoint id: {error}")),
         };
-        let saved = names::load(self.places, list)?;
-        if let Some(old) = saved.get(&name) {
-            let question = format!(
-                "{name} is saved already, as {}; replace it? [y/N] ",
-                names::short(old.id)
-            );
-            match self.confirm(&question)? {
-                None => return Ok(Some(Outcome::Quit)),
-                Some(false) => return self.say("kept"),
-                // One change, so a replacement that cannot be saved loses nothing.
-                Some(true) => {
-                    let replaced = names::update(self.places, list, |names| {
-                        names.remove(&name)?;
-                        names.add(&name, id, None, crate::names::Scope::default())
-                    });
-                    return match replaced {
-                        Ok(()) => self.say(&format!("replaced {name} ({})", names::short(id))),
-                        Err(error) => self.say(&format!("koh: {error:#}")),
-                    };
-                }
-            }
-        }
+        // A taken name is refused, never replaced: a replacement would drop a route or a scope.
         self.act(
             list,
             names::Op::Add {
@@ -421,7 +388,7 @@ fn tilde(path: &std::path::Path) -> String {
 /// Reading it creates nothing.
 fn key_id(places: &Places, role: &str) -> Result<EndpointId, String> {
     match crate::identity::load_existing(places.key(role)) {
-        Ok(Some(identity)) => Ok(identity.endpoint_id()),
+        Ok(Some(key)) => Ok(key.public()),
         Ok(None) => Err(format!("none yet ({})", crate::keycmd::creates(role))),
         Err(error) => Err(format!("cannot be loaded: {error:#}")),
     }

@@ -1,1 +1,0 @@
-ssh bench 'setsid nohup ~/bin/kvd > kvd.log 2>&1 < /dev/null & while [ ! -S ~/kv.sock ]; do sleep 0.1; done; ~/bin/kv-load && kill -TERM $(cat ~/.bench/kvd.pid); while kill -0 $(cat ~/.bench/kvd.pid) 2>/dev/null; do sleep 0.1; done'

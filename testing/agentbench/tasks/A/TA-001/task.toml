@@ -1,8 +1,0 @@
-id = "TA-001"
-title = "Exit status of the preflight"
-cat = "run"
-difficulty = "easy"
-goal = '''
-On the remote machine, run `~/bin/preflight`. Write its exit status (only the number) to
-`answer.txt` in your local directory.
-'''

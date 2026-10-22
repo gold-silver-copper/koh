@@ -92,12 +92,17 @@ impl Painter {
     /// Paint `row`, `width` columns, from where the cursor is (`at`, the row's place on the
     /// terminal, for moves). Whether it ended with the cursor waiting to wrap at the last column.
     fn row(&mut self, row: &fux_vt::Row<'_>, width: u16, at: Option<u16>) -> bool {
-        // The last column painted: blanks past it are left as the cleared terminal has them.
+        // The last column painted: blanks past it are left as the cleared terminal has them, but
+        // a soft-wrapped row is painted whole, so the terminal wraps it softly too.
         let cells: Vec<CellRef<'_>> = row.cells().take(usize::from(width)).collect();
-        let last = cells
-            .iter()
-            .rposition(|cell| cell.has_contents() || cell.attributes() != Attributes::default())
-            .map_or(0, |at| at.saturating_add(1));
+        let last = if row.wrapped() {
+            cells.len()
+        } else {
+            cells
+                .iter()
+                .rposition(|cell| cell.has_contents() || cell.attributes() != Attributes::default())
+                .map_or(0, |at| at.saturating_add(1))
+        };
         let mut moved = false;
         let mut col: u16 = 0;
         // The glyph printed before, which a terminal joins the next one to if it continues its
@@ -185,10 +190,17 @@ pub fn redraw(screen: &fux_vt::Screen, title: &str, history: usize) -> Vec<Piece
     }
     if alternate {
         p.pen(Attributes::default());
+        // `?1049 h` saves the cursor where it stands: where the program saved the primary
+        // screen's, so its `?1049 l` puts it back there.
+        let (row, col) = screen.main_saved_cursor();
+        p.cup(row, col);
         p.out.extend_from_slice(b"\x1b[?1049h\x1b[H\x1b[2J");
+        let mut wraps = false;
         for (row_at, row) in (0_u16..).zip(screen.alternate_rows()) {
-            p.cup(row_at, 0);
-            p.row(&row, cols, Some(row_at));
+            if !wraps {
+                p.cup(row_at, 0);
+            }
+            wraps = p.row(&row, cols, Some(row_at)) && row.wrapped();
         }
     }
     let out = &mut p.out;
@@ -349,11 +361,12 @@ mod tests {
             .collect()
     }
 
-    /// Each row's text and the cursor, as `screen` shows them.
-    fn shown(screen: &fux_vt::Screen) -> (Vec<String>, (u16, u16), bool) {
+    /// Each row's text and whether it wraps softly, and the cursor, as `screen` shows them.
+    fn shown(screen: &fux_vt::Screen) -> (Vec<(String, bool)>, (u16, u16), bool) {
         let rows = screen.rows().skip(screen.history_len());
         (
-            rows.map(|r| r.cells_text().trim_end().to_owned()).collect(),
+            rows.map(|r| (r.cells_text().trim_end().to_owned(), r.wrapped()))
+                .collect(),
             screen.cursor_position(),
             screen.pending_wrap(),
         )
@@ -365,8 +378,9 @@ mod tests {
             b"$ ls\r\nfile\r\n\x1b[1;31mred\x1b[0m wide \xe4\xb8\xad end\r\n$ ",
             // The alternate screen, a scroll region, origin mode, a hidden cursor and the mouse.
             b"main\x1b[?1049h\x1b[2;5r\x1b[?6h\x1b[2;3Hin region\x1b[?25l\x1b[?1002h\x1b[?1006h",
-            // A full row waiting to wrap, then a soft-wrapped line.
-            b"1234567890\r\nabcdefghijklmno",
+            // A full row waiting to wrap, then a soft-wrapped line, then one that wrapped a wide
+            // glyph and so ends blank.
+            b"1234567890\r\nabcdefghijklmno\r\nabcdefghi\xe4\xb8\xad",
         ];
         for bytes_in in cases {
             let program = parser(6, 10, bytes_in);
@@ -397,6 +411,8 @@ mod tests {
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(main(got), main(want));
+                // Where leaving the alternate screen puts the cursor back.
+                assert_eq!(got.main_saved_cursor(), want.main_saved_cursor());
             }
         }
     }

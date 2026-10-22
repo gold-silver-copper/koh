@@ -1,8 +1,8 @@
 //! The one owner of trust in an identity path. A [`KeyFile`] can only be made by [`KeyFile::open`]
-//! (or [`KeyFile::open_existing`], which creates nothing), which judges the key's directory once; every file in it (the key and its lock) is opened without
-//! following a symlink and judged by [`check_private`], as `$KOH_LOG` is. Its fields are private to
-//! this module, so the code that loads or resets a key cannot reach the path to apply rules of its
-//! own.
+//! (or [`KeyFile::open_existing`], which creates nothing), which judges the key's directory once;
+//! every file in it is opened without following a symlink and judged by [`check_private`], as
+//! `$KOH_LOG` is. Its fields are private to this module, so the code that loads or resets a key
+//! cannot reach the path to apply rules of its own.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{
@@ -99,39 +99,11 @@ impl KeyFile {
         })
     }
 
-    /// A `flock` on the key's lock file (`<key>.koh-lock`), shared by users and exclusive for a
-    /// reset.
-    pub(super) fn lease(&self, exclusive: bool) -> anyhow::Result<IdentityLease> {
-        let mut lock_name = self.path.as_os_str().to_os_string();
-        lock_name.push(".koh-lock");
-        let lock = open_private(
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .mode(0o600),
-            Path::new(&lock_name),
-            Kind::Identity,
-        )?;
-        let locked = if exclusive {
-            lock.try_lock()
-        } else {
-            lock.try_lock_shared()
-        };
-        locked.map_err(|error| {
-            anyhow::anyhow!(
-                "identity {self} is in use or being reset: {error}; stop its active users before \
-                 reset"
-            )
-        })?;
-        Ok(IdentityLease { _lock: lock })
-    }
-
     /// The key, or `None` if there is no file. A symlink (even a dangling one) is refused, never
     /// followed, and a file that is not exactly [`KEY_LEN`] bytes is not a key.
     pub(super) fn read_secret(&self) -> Result<Option<SecretKey>, SetupError> {
         use std::io::Read as _;
-        let file = match open_private(OpenOptions::new().read(true), &self.path, Kind::Identity) {
+        let file = match open_private(OpenOptions::new().read(true), &self.path, IDENTITY) {
             Ok(file) => file,
             Err(SetupError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None)
@@ -174,7 +146,7 @@ impl KeyFile {
     pub(crate) fn read_beside(&self, name: &str) -> Result<Option<String>, SetupError> {
         use std::io::Read as _;
         let path = self.beside(name)?;
-        let file = match open_private(OpenOptions::new().read(true), &path, Kind::Beside) {
+        let file = match open_private(OpenOptions::new().read(true), &path, BESIDE) {
             Ok(file) => file,
             Err(SetupError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(None)
@@ -218,7 +190,7 @@ impl KeyFile {
                 .create(true)
                 .mode(0o600),
             &self.dir.join(".koh-dir-lock"),
-            Kind::Beside,
+            BESIDE,
         )?;
         lock.lock()?;
         Ok(lock)
@@ -236,17 +208,15 @@ impl KeyFile {
         Ok(self.dir.join(name))
     }
 
-    /// Remove the key, whatever it holds, under an exclusive lease: fails while any koh process
-    /// still holds the key, and refuses only what every load refuses (a symlink, a file that is not
-    /// regular, or another user's file). The file is never opened, so a key the user cannot read
+    /// Remove the key, whatever it holds, refusing only what every load refuses (a symlink, a file
+    /// that is not regular, or another user's file). The file is never opened, so a key the user cannot read
     /// can still be reset, and a FIFO at the path is refused rather than waited on. The check and
     /// the unlink are two steps, but only users [`KeyFile::open`] trusted can write the directory,
     /// and an unlink never follows a link.
     pub fn reset(&self) -> anyhow::Result<()> {
-        let _lease = self.lease(true)?;
         let context = || format!("removing identity at {self}");
         let meta = std::fs::symlink_metadata(&self.path).with_context(context)?;
-        check_owned(&meta, &self.path, Kind::Identity).with_context(context)?;
+        check_owned(&meta, &self.path, IDENTITY).with_context(context)?;
         std::fs::remove_file(&self.path).with_context(context)
     }
 }
@@ -296,72 +266,29 @@ pub fn open_private_log(path: &Path) -> Result<File, SetupError> {
     let file = open_private(
         OpenOptions::new().write(true).create(true).mode(0o600),
         path,
-        Kind::Log,
+        LOG,
     )?;
     file.set_len(0)?;
     Ok(file)
 }
 
-#[cfg(test)]
-impl KeyFile {
-    /// [`reset`](Self::reset), tried again for a moment while its lock is refused. A test that
-    /// spawns a process elsewhere in the test binary gives the child a copy of every descriptor
-    /// open at that instant, a lease's lock among them, until the child execs; so a lease already
-    /// dropped can still refuse the exclusive lock briefly.
-    pub(crate) fn reset_settled(&self) -> anyhow::Result<()> {
-        let mut reset = self.reset();
-        for _ in 0..50 {
-            if reset.is_ok() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            reset = self.reset();
-        }
-        reset
-    }
+/// The error for a symlink, FIFO or device where a regular file, `what`, was expected.
+fn not_regular(path: &Path, what: &str) -> SetupError {
+    tracing::warn!(path = %path.display(), "refusing a {what} that is a symlink or not a regular file");
+    refuse(path, "it is a symlink or not a regular file")
 }
 
-/// A `flock` on the identity's lock file; closing the file releases it.
-pub(super) struct IdentityLease {
-    _lock: File,
-}
-
-/// What a private file is, for its errors and warnings.
-#[derive(Clone, Copy)]
-enum Kind {
-    /// A key or its lock file.
-    Identity,
-    /// `$KOH_LOG`.
-    Log,
-    /// A file beside the key: the names of servers or clients, when servers were last reached.
-    Beside,
-}
-
-impl Kind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Identity => "identity file",
-            Self::Log => "log file",
-            Self::Beside => "koh file",
-        }
-    }
-
-    /// The error for a symlink, FIFO or device where a `self` was expected.
-    fn not_regular(self, path: &Path) -> SetupError {
-        tracing::warn!(
-            path = %path.display(),
-            "refusing a {} that is a symlink or not a regular file",
-            self.name()
-        );
-        refuse(path, "it is a symlink or not a regular file")
-    }
-}
+/// What each private file is, for its errors and warnings.
+const IDENTITY: &str = "identity file";
+const LOG: &str = "log file";
+/// A file beside the key: the names of servers or clients, or the directory's lock.
+const BESIDE: &str = "koh file";
 
 /// Open `path` with `options` and no symlink followed, then [`check_private`] it. Anything but a
 /// regular file is refused before the open, so a FIFO cannot block it.
-fn open_private(options: &mut OpenOptions, path: &Path, kind: Kind) -> Result<File, SetupError> {
+fn open_private(options: &mut OpenOptions, path: &Path, what: &str) -> Result<File, SetupError> {
     match std::fs::symlink_metadata(path) {
-        Ok(meta) if !meta.is_file() => return Err(kind.not_regular(path)),
+        Ok(meta) if !meta.is_file() => return Err(not_regular(path, what)),
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -371,11 +298,11 @@ fn open_private(options: &mut OpenOptions, path: &Path, kind: Kind) -> Result<Fi
         // The open refused a symlink (ELOOP) planted since; asking afterwards only names the
         // refusal.
         Err(_) if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) => {
-            return Err(kind.not_regular(path));
+            return Err(not_regular(path, what));
         }
         Err(error) => return Err(error.into()),
     };
-    check_private(&file, path, kind)?;
+    check_private(&file, path, what)?;
     Ok(file)
 }
 
@@ -383,9 +310,9 @@ fn open_private(options: &mut OpenOptions, path: &Path, kind: Kind) -> Result<Fi
 /// link is another way in, and a truncation through it would reach this file), readable by no one
 /// else. A loose mode, say from a permissive backup, is tightened to 0600 through the descriptor; a file
 /// that cannot be tightened, or that stays loose (a filesystem that ignores chmod), is refused.
-fn check_private(file: &File, path: &Path, kind: Kind) -> Result<(), SetupError> {
+fn check_private(file: &File, path: &Path, what: &str) -> Result<(), SetupError> {
     let meta = file.metadata()?;
-    check_owned(&meta, path, kind)?;
+    check_owned(&meta, path, what)?;
     if meta.nlink() != 1 {
         return Err(refuse(
             path,
@@ -422,8 +349,7 @@ fn check_private(file: &File, path: &Path, kind: Kind) -> Result<(), SetupError>
         tracing::warn!(
             path = %path.display(),
             prev_mode = format!("{:o}", mode & 0o777),
-            "{} was group/other-accessible; tightened to 0600 (via fd)",
-            kind.name()
+            "{what} was group/other-accessible; tightened to 0600 (via fd)"
         );
     }
     Ok(())
@@ -431,9 +357,9 @@ fn check_private(file: &File, path: &Path, kind: Kind) -> Result<(), SetupError>
 
 /// The part of [`check_private`] a reset also applies: a regular file (not a symlink, FIFO or
 /// device) owned by this user.
-fn check_owned(meta: &std::fs::Metadata, path: &Path, kind: Kind) -> Result<(), SetupError> {
+fn check_owned(meta: &std::fs::Metadata, path: &Path, what: &str) -> Result<(), SetupError> {
     if !meta.is_file() {
-        return Err(kind.not_regular(path));
+        return Err(not_regular(path, what));
     }
     let euid = fuxix::process::geteuid();
     if meta.uid() != euid {
@@ -488,7 +414,6 @@ fn refuse(path: &Path, why: &str) -> SetupError {
 mod tests {
     use super::*;
     use crate::identity::{load, load_existing};
-    use crate::transport_iroh::{generate_secret_key, parse_endpoint_id};
 
     /// A fresh directory with `mode`, removed on drop.
     fn scratch(name: &str, mode: u32) -> koh_testkit::Scratch {
@@ -505,50 +430,39 @@ mod tests {
             & 0o7777
     }
 
-    #[test]
-    fn a_created_key_is_its_raw_bytes_and_loads_back_to_the_same_identity() {
-        let dir = scratch("key-test", 0o700);
-        let path = dir.join("id.key");
-        let key = KeyFile::open(&path).unwrap();
-        let first = load(&key).expect("create a key");
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            first.secret.to_bytes(),
-            "the file is the raw key"
-        );
-        assert_eq!(mode_of(&path), 0o600, "a created key is owner-only");
-        let second = load(&key).expect("load it back");
-        assert_eq!(first.endpoint_id(), second.endpoint_id(), "round-trips");
-        let id = first.endpoint_id();
-        assert_eq!(parse_endpoint_id(&id.to_string()).unwrap(), id);
+    fn write(path: &Path, bytes: &[u8], mode: u32) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
-    fn a_missing_directory_is_created_private() {
-        let dir = scratch("key-perm", 0o700);
+    fn a_key_is_created_private_as_its_raw_bytes_and_loads_back() {
+        let dir = scratch("key-create", 0o700);
         let path = dir.join("state").join("id.key");
-        load(&KeyFile::open(&path).unwrap()).expect("create a key");
-        assert_eq!(mode_of(&dir.join("state")), 0o700);
+        assert!(load_existing(&path).unwrap().is_none());
+        assert!(!dir.join("state").exists(), "load_existing created nothing");
+        let key = KeyFile::open(&path).unwrap();
+        // A temporary name planted where a creator might pick it blocks nothing.
+        let planted = path.with_extension(format!("tmp.{}.1", std::process::id()));
+        std::fs::write(&planted, b"attacker-owned").unwrap();
+        let first = load(&key).expect("create a key");
+        assert_eq!(std::fs::read(&path).unwrap(), first.to_bytes());
+        assert_eq!(std::fs::read(&planted).unwrap(), b"attacker-owned");
+        assert_eq!(
+            (mode_of(&dir.join("state")), mode_of(&path)),
+            (0o700, 0o600)
+        );
+        // A loose key still loads, tightened through its descriptor.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let again = load_existing(&path).unwrap().expect("there now");
+        assert_eq!(again.public(), first.public());
         assert_eq!(mode_of(&path), 0o600);
     }
 
     #[test]
-    fn preplanted_predictable_temporary_name_cannot_block_key_creation() {
-        let dir = scratch("key-preplant", 0o700);
-        let path = dir.join("id.key");
-        let predictable = path.with_extension(format!("tmp.{}.1", std::process::id()));
-        std::fs::write(&predictable, b"attacker-owned").unwrap();
-        let key = KeyFile::open(&path).unwrap();
-        let secret = key.create_secret().unwrap().unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), secret.to_bytes());
-        assert_eq!(std::fs::read(&predictable).unwrap(), b"attacker-owned");
-    }
-
-    #[test]
-    fn only_a_nonsticky_world_writable_directory_is_refused() {
-        // A merely group-writable dir (Android's /data/local/tmp is 0771) and a sticky
-        // world-writable one (/tmp's 1777, where only owners unlink) are allowed, else koh can't
-        // start in those standard locations.
+    fn only_a_directory_another_user_could_replace_the_key_in_is_refused() {
+        // Group-writable (Android's /data/local/tmp is 0771) and sticky world-writable (/tmp's
+        // 1777) are allowed, else koh can't start in those standard locations.
         let dir = scratch("ww", 0o777);
         let path = dir.join("id.key");
         assert!(KeyFile::open(&path).is_err(), "0777 is refused");
@@ -556,31 +470,50 @@ mod tests {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
             assert!(KeyFile::open(&path).is_ok(), "{mode:o} is allowed");
         }
+        let euid = 1000;
+        for (owner, mode, refused) in [
+            (euid, 0o700, false),
+            (0, 0o755, false),
+            (0, 0o1777, false),
+            (0, 0o777, true),
+            (1001, 0o700, true),
+        ] {
+            let refusal = directory_refusal(owner, mode, euid);
+            assert_eq!(refusal.is_some(), refused, "{owner} {mode:o}");
+        }
+        // A real root-owned directory: judged, with nothing created there.
+        KeyFile::open(Path::new("/koh-no-such.key")).expect("/ is root's");
+        assert!(!Path::new("/koh-no-such.key").exists());
     }
 
     #[test]
-    fn a_symlinked_key_is_refused_and_its_target_left_alone() {
-        let dir = scratch("symlink", 0o700);
+    fn symlinks_and_hard_links_are_refused_and_what_they_reach_left_alone() {
+        let dir = scratch("links", 0o700);
         let target = dir.join("victim");
-        std::fs::write(&target, [7u8; KEY_LEN]).unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write(&target, &[7u8; KEY_LEN], 0o644);
         let link = dir.join("server.key");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let key = KeyFile::open(&link).unwrap();
         assert!(matches!(key.read_secret(), Err(SetupError::Refused { .. })));
-        assert!(load(&key).is_err(), "load refuses it too");
-        assert!(key.reset().is_err(), "and so does reset");
+        assert!(load(&key).is_err() && key.reset().is_err());
+        let log_link = dir.join("koh.log");
+        std::os::unix::fs::symlink(&target, &log_link).unwrap();
+        let log = open_private_log(&log_link).expect_err("a symlinked log is refused");
+        assert!(
+            log.to_string().contains("symlink") && !log.to_string().contains("key"),
+            "{log}"
+        );
         assert_eq!(mode_of(&target), 0o644, "the target is not re-permissioned");
-        assert!(target.exists() && link.exists());
-    }
-
-    #[test]
-    fn a_dangling_symlink_is_refused_instead_of_creating_or_missing_a_key() {
-        let dir = scratch("dangling-keylink", 0o700);
-        let link = dir.join("server.key");
-        std::os::unix::fs::symlink(dir.join("missing"), &link).unwrap();
-        let key = KeyFile::open(&link).unwrap();
-        for error in [load(&key).err(), load_existing(&link).err()] {
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            [7u8; KEY_LEN],
+            "nor truncated"
+        );
+        // A dangling one is refused, not taken for no key.
+        let dangling = dir.join("client.key");
+        std::os::unix::fs::symlink(dir.join("missing"), &dangling).unwrap();
+        let key = KeyFile::open(&dangling).unwrap();
+        for error in [load(&key).err(), load_existing(&dangling).err()] {
             let error = error.expect("refused");
             assert!(
                 matches!(error.downcast_ref(), Some(SetupError::Refused { .. })),
@@ -588,138 +521,20 @@ mod tests {
             );
         }
         assert!(!dir.join("missing").exists(), "nothing was created");
-    }
-
-    #[test]
-    fn load_existing_finds_no_key_and_creates_nothing() {
-        let dir = scratch("no-key", 0o700);
-        for path in [dir.join("id.key"), dir.join("a").join("b").join("id.key")] {
-            assert!(load_existing(&path).unwrap().is_none());
-            let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-            assert!(left.is_empty(), "{}: created {left:?}", path.display());
-        }
-    }
-
-    #[test]
-    fn loose_key_and_lock_files_are_tightened_through_the_descriptor() {
-        let dir = scratch("loose", 0o700);
-        let path = dir.join("server.key");
-        let lock = dir.join("server.key.koh-lock");
-        let secret = generate_secret_key().unwrap();
-        std::fs::write(&path, secret.to_bytes()).unwrap();
-        std::fs::write(&lock, b"").unwrap();
-        for file in [&path, &lock] {
-            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        let identity = load(&KeyFile::open(&path).unwrap()).expect("a loose key still loads");
-        assert_eq!(identity.endpoint_id(), secret.public());
-        assert_eq!(mode_of(&path), 0o600);
-        assert_eq!(mode_of(&lock), 0o600);
-    }
-
-    #[test]
-    fn a_file_of_another_user_is_refused() {
-        // A file of root's, read as another user; to root, every file is its own.
-        let path = Path::new("/etc/passwd");
-        let Ok(file) = File::open(path) else {
-            return;
-        };
-        let owner = file.metadata().map(|meta| meta.uid());
-        if owner.ok() != Some(0) || fuxix::process::geteuid() == 0 {
-            return;
-        }
-        let error =
-            check_private(&file, path, Kind::Identity).expect_err("a foreign file is refused");
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "refusing /etc/passwd: it is owned by uid 0, not by uid {}",
-                fuxix::process::geteuid()
-            )
-        );
-    }
-
-    #[test]
-    fn a_directory_of_another_user_but_root_is_refused() {
-        let euid = 1000;
-        // The user's own, root's (as / and /home), root's sticky /tmp; then 0777, even root's.
-        for (owner, mode, refused) in [
-            (euid, 0o700, false),
-            (0, 0o755, false),
-            (0, 0o1777, false),
-            (euid, 0o777, true),
-            (0, 0o777, true),
-        ] {
-            let refusal = directory_refusal(owner, mode, euid);
-            assert_eq!(refusal.is_some(), refused, "{owner} {mode:o}");
-        }
-        let foreign = directory_refusal(1001, 0o700, euid).expect("another user's is refused");
-        assert!(foreign.contains("owned by uid 1001"), "{foreign}");
-        // A real root-owned directory: KeyFile::open judges /, without creating anything there.
-        KeyFile::open(Path::new("/koh-no-such.key")).expect("/ is root's");
-        assert!(!Path::new("/koh-no-such.key").exists());
-    }
-
-    #[test]
-    fn a_file_that_is_not_exactly_a_key_is_refused_with_the_reset_hint() {
-        let dir = scratch("notakey", 0o700);
+        // `$KOH_LOG` pointed at a key by another name: truncating it would destroy the key.
         let path = dir.join("id.key");
         let key = KeyFile::open(&path).unwrap();
-        let old_format = format!("koh-key-v1\n{}\n", "A".repeat(120));
-        for contents in [
-            Vec::new(),
-            vec![7u8; KEY_LEN - 1],
-            vec![7u8; KEY_LEN + 1],
-            old_format.into_bytes(),
-        ] {
-            std::fs::write(&path, &contents).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let error = key.read_secret().expect_err("refused");
-            assert!(matches!(error, SetupError::NotAKey(_)), "{error:?}");
-            let message = error.to_string();
-            assert!(message.contains("koh key reset"), "{message}");
-            assert!(message.contains(&path.display().to_string()), "{message}");
-            assert!(!message.contains("koh-key-v1"), "{message}");
-        }
-    }
-
-    #[test]
-    fn a_symlinked_log_is_refused_before_its_target_is_truncated() {
-        let dir = scratch("log", 0o700);
-        let target = dir.join("victim");
-        std::fs::write(&target, b"precious").unwrap();
-        let link = dir.join("koh.log");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        let error = open_private_log(&link).expect_err("a symlinked log is refused");
-        assert!(matches!(error, SetupError::Refused { .. }), "{error:?}");
-        assert!(error.to_string().starts_with("refusing "), "{error}");
-        assert!(error.to_string().contains("symlink"), "{error}");
-        assert!(
-            !error.to_string().contains("key"),
-            "a log is not a key: {error}"
-        );
-        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
-
-        let log = dir.join("real.log");
-        std::fs::write(&log, b"old").unwrap();
-        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
-        open_private_log(&log).expect("a real log opens");
-        assert_eq!(std::fs::read(&log).unwrap(), b"", "truncated");
-        assert_eq!(mode_of(&log), 0o600);
-    }
-
-    #[test]
-    fn a_hard_linked_key_or_log_is_refused_and_left_whole() {
-        let dir = scratch("hardlink", 0o700);
-        let path = dir.join("id.key");
-        let key = KeyFile::open(&path).unwrap();
-        let secret = load(&key).unwrap().secret.to_bytes();
-        // `$KOH_LOG` pointed at the key by another name: truncating it would destroy the key.
-        let log = dir.join("koh.log");
-        std::fs::hard_link(&path, &log).unwrap();
-        assert!(open_private_log(&log).is_err());
+        let secret = load(&key).unwrap().to_bytes();
+        std::fs::hard_link(&path, dir.join("linked.log")).unwrap();
+        assert!(open_private_log(&dir.join("linked.log")).is_err());
         assert!(load(&key).is_err(), "nor is the key itself used");
         assert_eq!(std::fs::read(&path).unwrap(), secret);
+        // A real log opens, emptied and tightened.
+        let real = dir.join("real.log");
+        write(&real, b"old", 0o644);
+        open_private_log(&real).expect("a real log opens");
+        assert_eq!(std::fs::read(&real).unwrap(), b"");
+        assert_eq!(mode_of(&real), 0o600);
     }
 
     #[test]
@@ -755,17 +570,56 @@ mod tests {
         );
     }
 
+    /// A file `load` refuses as no key says to reset it, and the reset then works, even on a key
+    /// its owner cannot read, in a loose (0755) directory `load` only warns about.
     #[test]
-    fn reset_removes_a_key_its_owner_cannot_read() {
-        let dir = scratch("unreadable", 0o700);
+    fn a_file_that_is_not_a_key_says_to_reset_and_reset_removes_it() {
+        let dir = scratch("notakey", 0o755);
         let path = dir.join("id.key");
         let key = KeyFile::open(&path).unwrap();
-        for mode in [0o000, 0o200] {
-            std::fs::write(&path, [7u8; KEY_LEN]).unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            key.reset_settled()
+        let old_format = format!("koh-key-v1\n{}\n", "A".repeat(120));
+        for contents in [
+            Vec::new(),
+            vec![7u8; KEY_LEN - 1],
+            vec![7u8; KEY_LEN + 1],
+            old_format.into_bytes(),
+        ] {
+            write(&path, &contents, 0o600);
+            let error = key.read_secret().expect_err("refused");
+            assert!(matches!(error, SetupError::NotAKey(_)), "{error:?}");
+            let message = error.to_string();
+            assert!(message.contains("koh key reset"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(!message.contains("koh-key-v1"), "{message}");
+            key.reset().unwrap();
+            assert!(!path.exists(), "reset left the file");
+        }
+        for mode in [0o000, 0o200, 0o600] {
+            write(&path, &[7u8; KEY_LEN], mode);
+            key.reset()
                 .unwrap_or_else(|error| panic!("mode {mode:o}: {error:#}"));
             assert!(!path.exists(), "mode {mode:o}: reset left the key");
         }
+    }
+
+    #[test]
+    fn a_file_of_another_user_is_refused() {
+        // A file of root's, read as another user; to root, every file is its own.
+        let path = Path::new("/etc/passwd");
+        let Ok(file) = File::open(path) else {
+            return;
+        };
+        let owner = file.metadata().map(|meta| meta.uid());
+        if owner.ok() != Some(0) || fuxix::process::geteuid() == 0 {
+            return;
+        }
+        let error = check_private(&file, path, IDENTITY).expect_err("a foreign file is refused");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "refusing /etc/passwd: it is owned by uid 0, not by uid {}",
+                fuxix::process::geteuid()
+            )
+        );
     }
 }

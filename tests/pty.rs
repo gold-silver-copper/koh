@@ -8,25 +8,25 @@
 
 use std::time::Duration;
 
-use koh::pty::{Exit, Pty, PtyError};
+use koh::pty::{Exit, Pty};
 use koh::terminal::TtyModes;
 use koh_testkit::{current_thread, multi_thread, read_until};
 use tokio::sync::mpsc::Receiver;
 
 /// `argv` on a 24×80 PTY, in [`home`]: the PTY, and what the program prints.
-fn spawn(argv: &[String]) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
+fn spawn(argv: &[String]) -> std::io::Result<(Pty, Receiver<Vec<u8>>)> {
     Pty::spawn(
-        24,
-        80,
+        koh::terminal::Size::new(24, 80),
         argv,
         &[],
-        ("xterm-256color", &home(), None),
+        &home(),
+        None,
         &koh::pty::Reaper::start()?,
     )
 }
 
 /// `sh -c script` on a PTY, as [`spawn`] starts it.
-fn sh(script: &str) -> Result<(Pty, Receiver<Vec<u8>>), PtyError> {
+fn sh(script: &str) -> std::io::Result<(Pty, Receiver<Vec<u8>>)> {
     spawn(&["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()])
 }
 
@@ -406,7 +406,6 @@ fn a_program_that_cannot_start_fails_the_spawn_and_is_named() {
     let Err(error) = result else {
         panic!("a missing program must fail the spawn, not yield a dead session");
     };
-    assert!(matches!(error, koh::pty::PtyError::Spawn(_)), "{error:?}");
     assert!(error.to_string().contains(missing), "{error}");
 }
 

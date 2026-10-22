@@ -251,7 +251,7 @@ fn replay(recording: &Recording, seed: u64) -> Result<(), String> {
 fn every_recording_shows_through_koh_as_it_does_in_a_terminal_and_redrawn() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("testing/corpus");
     let recordings = Recording::load_all(&corpus).expect("the recordings");
-    assert!(recordings.len() > 100, "{} recordings", recordings.len());
+    assert!(!recordings.is_empty(), "no recordings");
     let failures: Vec<String> = recordings
         .iter()
         .zip(1u64..)

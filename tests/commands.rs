@@ -147,17 +147,6 @@ fn exec_passes_its_words_as_they_are_and_exits_with_the_commands_status() {
             let said = String::from_utf8_lossy(&out.stderr);
             assert_eq!(out.status.code(), Some(126), "{out:?}");
             assert!(said.contains("/no/such/dir: no such directory"), "{said}");
-            // One in this machine's home, as an unquoted `-C ~/x` reaches koh, is said to be so.
-            let local = koh_testkit::home!().join("no-such-proj");
-            let out = remote
-                .run("exec", &["-C", &local.to_string_lossy(), "--", "pwd"])
-                .expect("exec");
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(out.status.code(), Some(126), "{out:?}");
-            assert!(
-                said.contains("this machine's home") && said.contains("-C '~/no-such-proj'"),
-                "{said}"
-            );
             // Killed by a signal: 128 plus it, as a shell says, and nothing else on stderr.
             let out = remote.exec("kill -9 $$", b"").expect("exec");
             assert_eq!((out.status.code(), &out.stderr[..]), (Some(137), &b""[..]));
@@ -305,7 +294,7 @@ fn quiet_commands_of_one_key_at_once_through_a_relay_all_keep_their_links() {
             let network = koh::transport_iroh::Network::Relay(url.clone());
             let endpoint = koh::transport_iroh::bind_on(
                 koh::transport_iroh::generate_secret_key().expect("a key"),
-                (true, koh::transport_iroh::Idle::Shell),
+                koh::transport_iroh::Role::Server,
                 &network,
                 None,
             )
@@ -728,6 +717,11 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
             let no_job = remote.run("wait", &["nope"]).expect("wait");
             assert_ne!(no_job.status.code(), Some(0));
             assert!(String::from_utf8_lossy(&no_job.stderr).contains("no such job"));
+            let no_log = remote.run("logs", &["nope"]).expect("logs");
+            assert!(
+                String::from_utf8_lossy(&no_log.stderr).contains("no such job"),
+                "{no_log:?}"
+            );
         });
 }
 
@@ -809,29 +803,23 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             into.push("/");
             let out = cp(&["-r".into(), from.clone().into(), into.clone()]);
             assert!(out.status.success(), "{out:?}");
-            // It says where the tree landed: in the directory, as its own name.
             let said = String::from_utf8_lossy(&out.stdout);
-            let landed = format!("{}a tree", into.to_string_lossy());
+            let landed = into.to_string_lossy().into_owned();
             assert!(
                 said.starts_with(&format!("3 files sent, 200 KB → {landed} (3 new; ")),
                 "{said}"
             );
             let want = tree(&from).expect("the tree");
             assert_eq!(tree(&there.join("a tree")).expect("there"), want);
-            // Named as the tree, which is there now: it is brought into line, as `a tree/.` would
-            // be, not nested inside it as cp's rule would.
+            // Into a directory of its own name, which is there now: nested in it, as cp's rule
+            // says, and --delete removes nothing beside it (as `koh cp -r --delete gsc S:` would,
+            // run by gsc, the tree once took the home's place).
             let same = remote.at(&there.join("a tree"));
-            let out = cp(&["-r".into(), from.clone().into(), same.clone()]);
+            let out = cp(&["-r".into(), "--delete".into(), from.clone().into(), same]);
             assert!(out.status.success(), "{out:?}");
-            assert!(!there.join("a tree/a tree").exists());
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.starts_with(&format!(
-                    "0 files sent, 0 B → {} (3 unchanged",
-                    same.to_string_lossy()
-                )),
-                "{said}"
-            );
+            assert_eq!(tree(&there.join("a tree/a tree")).expect("nested"), want);
+            std::fs::remove_dir_all(there.join("a tree/a tree")).expect("the nested tree");
+            assert_eq!(tree(&there.join("a tree")).expect("there"), want);
             // Again: nothing changed, nothing sent.
             let out = cp(&[from.clone().into(), into.clone()]);
             assert!(
@@ -888,13 +876,6 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
             // --delete takes away what the source lacks, but what is excluded.
             std::fs::write(there.join("a tree/stray"), b"s").expect("a stray file");
             std::fs::write(there.join("a tree/kept.o"), b"o").expect("an excluded file");
-            // Without it, what the source lacks is kept, and said so.
-            let out = cp(&[from.clone().into(), into.clone()]);
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.contains("2 there not in the source, kept: --delete removes them"),
-                "{said}"
-            );
             // A dry run says what would change, one a line, and changes nothing, either way.
             let exclude = || ["--exclude".into(), "*.o".into()];
             let mut args: Vec<OsString> = vec!["--dry-run".into(), "--delete".into()];
@@ -919,21 +900,6 @@ fn cp_brings_a_tree_into_line_both_ways_and_says_what_it_did() {
                 "{out:?}"
             );
             assert!(!back.join("stray").exists());
-            // --diff says how a file it would replace differs, the other end's text escaped but
-            // for its tabs, and changes nothing.
-            let note = dir.join("note");
-            std::fs::write(&note, b"a\tb\x1b\n").expect("a note");
-            std::fs::write(there.join("note"), b"a\n").expect("the note there");
-            let out = cp(&["--diff".into(), note.into(), remote.at(&there.join("note"))]);
-            let said = String::from_utf8_lossy(&out.stdout);
-            assert!(
-                said.starts_with(
-                    "replaced note (5 B, was 2 B)\n--- a/note\n+++ b/note\n@@ -1 +1 @@\n-a\n+a\tb\\u{1b}\n"
-                ),
-                "{out:?}"
-            );
-            assert!(said.contains("nothing changed"), "{said}");
-            assert_eq!(std::fs::read(there.join("note")).expect("there"), b"a\n");
             let out = cp(&[
                 "--delete".into(),
                 "--exclude".into(),
@@ -1033,11 +999,6 @@ fn exec_and_run_sync_a_tree_first_and_run_in_it() {
                 said.starts_with(&format!("koh: synced 1 file sent, 4 B → {at} (1 replaced")),
                 "{said}"
             );
-            // What a command made there is kept, and said so, with nothing to act on.
-            koh("exec", &["--sync", &name, "--", "touch", "made"]);
-            let out = koh("exec", &["--sync", &name, "--", "true"]);
-            let said = String::from_utf8_lossy(&out.stderr);
-            assert!(said.contains("1 there not in the source, kept)"), "{said}");
             // A job, the same way; and its JSON says the sync.
             let out = koh(
                 "run",
@@ -1083,11 +1044,12 @@ fn exec_and_run_sync_a_tree_first_and_run_in_it() {
 }
 
 /// An in-process loopback server for the client `client`, saved with the scope `scope`
-/// (`cp=DIR`, `exec=DIR`), as `koh clients add` saves one.
+/// (`cp=DIR`, `exec=DIR`), as `koh clients add` saves one: its id, its port, its saved clients
+/// and its task.
 async fn scoped_server(
     client: &str,
     scope: &str,
-) -> anyhow::Result<(String, u16, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(String, u16, PathBuf, tokio::task::JoinHandle<()>)> {
     let dir = koh_testkit::scratch!("scoped-server")?;
     let server_key = dir.join("server.key");
     let clients = dir.join("clients");
@@ -1108,7 +1070,58 @@ async fn scoped_server(
         let _dir = dir;
         let _ = task.await;
     });
-    Ok((id, port, task))
+    Ok((id, port, clients, task))
+}
+
+/// A client removed from the saved clients is cut off, its jobs hung up with it.
+#[test]
+fn a_removed_clients_jobs_are_hung_up() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("revoked").expect("a scratch directory");
+            let key = dir.join("client.key");
+            let id = endpoint_id(&key).expect("the client's id");
+            let (server_id, port, clients, _server) =
+                scoped_server(&id, &format!("exec={}", dir.display()))
+                    .await
+                    .expect("the server");
+            let ran = koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
+                .expect("koh")
+                .args(["run", &server_id, "--sh", "echo $$ > pid; exec sleep 600"])
+                .arg("--key-file")
+                .arg(&key)
+                .args(["--direct", &format!("127.0.0.1:{port}")])
+                .output()
+                .expect("koh");
+            assert!(ran.status.success(), "{ran:?}");
+            let job = async {
+                loop {
+                    let pid = std::fs::read_to_string(dir.join("pid")).unwrap_or_default();
+                    if let Some(pid) = pid
+                        .trim()
+                        .parse()
+                        .ok()
+                        .and_then(fuxix::process::Pid::from_raw)
+                    {
+                        return pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            let job = tokio::time::timeout(Duration::from_secs(10), job)
+                .await
+                .expect("the job started");
+            std::fs::write(&clients, "").expect("the client removed");
+            let gone = async {
+                while fuxix::process::exists(job) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(10), gone)
+                .await
+                .expect("the removed client's job hung up");
+        });
 }
 
 #[test]
@@ -1121,7 +1134,7 @@ fn a_scoped_key_copies_only_in_its_directory_and_runs_no_shell() {
             std::fs::create_dir_all(&drop_dir).expect("the scope");
             let key = dir.join("client.key");
             let id = endpoint_id(&key).expect("the client's id");
-            let (server_id, port, _server) =
+            let (server_id, port, _, _server) =
                 scoped_server(&id, &format!("cp={}", drop_dir.display()))
                     .await
                     .expect("the server");

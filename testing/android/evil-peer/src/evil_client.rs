@@ -19,8 +19,8 @@
 //!   garbage <n>              n random byte blobs on the stream           (decoder robustness)
 //!   bad-keys <kind>          decoded input no terminal sends: `mods` (a modifier bit no key has),
 //!                            `fkey` (F99), `surrogate` (a kitty code that is no scalar), `paste`
-//!                            (a paste piece over the cap), `events` (too many in one message),
-//!                            `palette` (17 colours)                       (event validation)
+//!                            (a paste piece over the cap), `events` (too many in one message)
+//!                                                                         (event validation)
 //!   events-flood <mib>       a mib-MiB paste as valid paste events        (PTY backpressure)
 //!   second-stream            open a third client stream                  (two-stream limit)
 //!   bad-alpn                 connect with the wrong ALPN                  (handshake rejects)
@@ -36,9 +36,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use iroh::endpoint::{Connection, SendStream};
-use koh::events::{
-    InputEvent, WireColours, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE, PALETTE,
-};
+use koh::events::{InputEvent, WireKey, WireKeyCode, WireKitty, MAX_EVENTS, MAX_PASTE};
 use koh::proto::{encode_client, ClientMsg, InputSeq, MAX_CLIENT_MESSAGE};
 use koh::terminal::Size;
 use koh::transport_iroh::{
@@ -304,10 +302,6 @@ async fn bad_keys(send: &mut SendStream, kind: &str) -> Result<()> {
         )]),
         "paste" => keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
         "events" => keys(vec![InputEvent::Focus(true); MAX_EVENTS + 1]),
-        "palette" => ClientMsg::Colours(WireColours {
-            palette: vec![None; PALETTE + 1],
-            ..WireColours::default()
-        }),
         other => return Err(anyhow!("unknown bad-keys kind '{other}'")),
     };
     let body = postcard::to_allocvec(&msg)?;

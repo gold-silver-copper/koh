@@ -1,8 +1,0 @@
-2026-10-03T00:55 worker-2 heartbeat
-2026-10-03T01:56 worker-2 GC pause 12ms
-2026-10-03T02:53 worker-2 GC pause 12ms
-2026-10-03T03:14 worker-2 GC pause 12ms
-2026-10-03T04:50 worker-2 heartbeat
-2026-10-03T05:36 worker-2 processed batch
-2026-10-03T06:52 worker-2 processed batch
-2026-10-03T07:44 worker-2 flushed cache

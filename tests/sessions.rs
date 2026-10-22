@@ -1,5 +1,5 @@
 //! Sessions with real programs behind them: the registry's lifecycle, and connections to it over
-//! loopback iroh with a minimal koh/16 client.
+//! loopback iroh with a minimal koh/17 client.
 #![forbid(clippy::disallowed_methods)]
 
 use std::time::Duration;
@@ -9,7 +9,7 @@ use koh::proto::{encode_client, ClientMsg, Close, InputSeq, Shown, ShownDecoder,
 use koh::pty::Home;
 use koh::request::{Attached, Pick, Request, MAX_REPLY, MAX_REQUEST};
 use koh::server::cli::{serve_endpoint, Hosting, ServeConfig};
-use koh::server::session::{AttachKind, Event, SessionClient, Start};
+use koh::server::session::{AttachKind, Event, Launch, SessionClient, Start};
 use koh::server::{Registry, SessionSpec};
 use koh::terminal::{clamp_dims, Activity, Size, TtyModes};
 use koh::transport_iroh::{bind_endpoint_local, generate_secret_key, loopback_addr, ALPN};
@@ -198,7 +198,7 @@ fn registry(
 
 /// Attach `peer` and say how.
 async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKind> {
-    reg.attach(peer, Pick::Latest, WINDOW, (None, None))
+    reg.attach(peer, Pick::Latest, WINDOW, Launch::default())
         .await
         .ok()
         .map(|(_, _, kind)| kind)
@@ -207,7 +207,7 @@ async fn attach_kind(reg: &Registry, peer: iroh::EndpointId) -> Option<AttachKin
 /// Attach `peer`, and watch what it is shown.
 async fn watch(reg: &Registry, peer: iroh::EndpointId) -> anyhow::Result<(Watched, AttachKind)> {
     let (client, start, kind) = reg
-        .attach(peer, Pick::Latest, WINDOW, (None, None))
+        .attach(peer, Pick::Latest, WINDOW, Launch::default())
         .await
         .map_err(|close| anyhow::anyhow!("refused: {close}"))?;
     Ok((Watched::new((client, start))?, kind))
@@ -226,7 +226,7 @@ fn attach_creates_then_reattaches_the_same_peer() -> anyhow::Result<()> {
         anyhow::ensure!(kind == AttachKind::Created, "first attach: {kind:?}");
         let (_c2, kind) = watch(&reg, peer).await.context("second attach")?;
         anyhow::ensure!(
-            matches!(kind, AttachKind::Reattached { .. }),
+            matches!(kind, AttachKind::Reattached),
             "same peer reattaches: {kind:?}"
         );
         drop(client);
@@ -245,16 +245,13 @@ fn max_sessions_refuses_a_new_peer_but_allows_a_reattach() -> anyhow::Result<()>
             .context("A creates the one allowed session")?;
         anyhow::ensure!(
             matches!(
-                reg.attach(b, Pick::Latest, WINDOW, (None, None)).await,
+                reg.attach(b, Pick::Latest, WINDOW, Launch::default()).await,
                 Err(Close::AtCapacity)
             ),
             "a second distinct peer is refused at the cap, for now"
         );
         anyhow::ensure!(
-            matches!(
-                attach_kind(&reg, a).await,
-                Some(AttachKind::Reattached { .. })
-            ),
+            matches!(attach_kind(&reg, a).await, Some(AttachKind::Reattached)),
             "the existing peer still reattaches at the cap"
         );
         drop(a_client);
@@ -309,7 +306,7 @@ fn the_last_detach_starts_the_ttl_a_concurrent_one_does_not() -> anyhow::Result<
     })
 }
 
-/// A bare koh/16 client: writes messages, and reads what the server shows on its newest epoch.
+/// A bare koh/17 client: writes messages, and reads what the server shows on its newest epoch.
 struct RawClient {
     conn: iroh::endpoint::Connection,
     send: iroh::endpoint::SendStream,
@@ -650,7 +647,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
         drop(c1);
         let (mut c2, kind) = watch(&reg, a).await.context("reconnect")?;
         anyhow::ensure!(
-            matches!(kind, AttachKind::Reattached { .. }),
+            matches!(kind, AttachKind::Reattached),
             "reconnect: {kind:?}"
         );
         anyhow::ensure!(
@@ -673,7 +670,7 @@ fn a_reconnect_after_exit_sees_the_exit_until_a_client_has_it() -> anyhow::Resul
         drop(c3);
         reg.shutdown().await;
         anyhow::ensure!(
-            matches!(again, Some(AttachKind::Reattached { .. })),
+            matches!(again, Some(AttachKind::Reattached)),
             "c3's session stays registered, got {again:?}"
         );
         anyhow::ensure!(other.is_none(), "and holds the one slot, got {other:?}");
@@ -717,7 +714,7 @@ fn a_reconnect_racing_the_end_of_an_exited_session_is_answered() -> anyhow::Resu
             anyhow::ensure!(
                 match kind {
                     AttachKind::Created => acknowledged || ending,
-                    AttachKind::Reattached { .. } => shown == Some(0),
+                    AttachKind::Reattached => shown == Some(0),
                 },
                 "round {round}: acknowledged {acknowledged}, got {kind:?} showing exit {shown:?}"
             );
@@ -823,7 +820,7 @@ fn ending_a_peers_session_ends_it_at_once() -> anyhow::Result<()> {
         let (mut client, _) = watch(&reg, a).await.context("attach")?;
         allowed.store(false, Relaxed);
         let refused = reg
-            .attach(a, Pick::Latest, WINDOW, (None, None))
+            .attach(a, Pick::Latest, WINDOW, Launch::default())
             .await
             .err();
         anyhow::ensure!(refused == Some(Close::NotAuthorized), "{refused:?}");
@@ -1046,7 +1043,8 @@ fn a_program_that_cannot_start_is_refused_as_such() -> anyhow::Result<()> {
             koh::client::IrohConnector::new(endpoint, addr, secret).connect(
                 Pick::Latest,
                 WINDOW,
-                (None, None),
+                None,
+                None,
             ),
         )
         .await;

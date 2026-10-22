@@ -77,7 +77,7 @@ impl Sessions {
         self.live
             .retain(|_, live| !live.handles.control.is_closed());
         let named = match pick {
-            _ if attach.program.is_some() || attach.cwd.is_some() => None,
+            _ if attach.launch.program.is_some() || attach.launch.cwd.is_some() => None,
             Pick::Latest => self
                 .live
                 .iter()

@@ -10,9 +10,8 @@ use koh::names::{List, Places};
 
 // An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
 fn main() -> std::process::ExitCode {
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let cmd = match args::command()
-        .try_get_matches_from(&argv)
+        .try_get_matches()
         .and_then(|matches| args::parse(&matches))
     {
         Ok(cmd) => cmd,
@@ -20,10 +19,6 @@ fn main() -> std::process::ExitCode {
             if let Some(bad) = args::bad_value(&e) {
                 koh::log::stderr(format_args!("koh: {bad}"));
                 return std::process::ExitCode::FAILURE;
-            }
-            if let Some(broken) = args::broken_sh(&e, &argv) {
-                koh::log::stderr(format_args!("koh: {broken}"));
-                return std::process::ExitCode::from(2);
             }
             e.exit()
         }
@@ -130,7 +125,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             session,
             last,
             json,
-        } => cli::output(&resolve(remote)?, (session, last), format(json), &mut out)
+        } => cli::output(&resolve(remote)?, session, last, format(json), &mut out)
             .await
             .map(|()| None),
         Cmd::Exec {
@@ -141,7 +136,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => {
             let remote = resolve(remote)?;
             let synced = synced(&remote, sync, json).await?;
-            koh::client::exec(&remote, (run, synced.as_ref()), format(json))
+            koh::client::exec(&remote, run, synced.as_ref(), format(json))
                 .await
                 .map(Some)
         }
@@ -154,14 +149,9 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
         } => {
             let remote = resolve(remote)?;
             let synced = synced(&remote, sync, json).await?;
-            cli::run(
-                &remote,
-                (name, run, synced.as_ref()),
-                format(json),
-                &mut out,
-            )
-            .await
-            .map(|()| None)
+            cli::run(&remote, name, run, synced.as_ref(), format(json), &mut out)
+                .await
+                .map(|()| None)
         }
         Cmd::Jobs(remote, job, json) => cli::jobs(&resolve(remote)?, job, format(json), &mut out)
             .await
@@ -172,7 +162,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             follow,
             tail,
         } => {
-            let status = cli::logs(&resolve(remote)?, job, (follow, tail)).await?;
+            let status = cli::logs(&resolve(remote)?, job, follow, tail).await?;
             Ok(status.filter(|_| follow))
         }
         Cmd::Kill {
@@ -180,7 +170,7 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             job,
             signal,
             json,
-        } => cli::kill(&resolve(remote)?, (job, signal), format(json), &mut out)
+        } => cli::kill(&resolve(remote)?, job, signal, format(json), &mut out)
             .await
             .map(|()| None),
         Cmd::Wait {
@@ -191,7 +181,9 @@ async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
             json,
         } => cli::wait(
             &resolve(remote)?,
-            (wait, timeout, tail),
+            wait,
+            timeout,
+            tail,
             format(json),
             &mut out,
         )
@@ -315,14 +307,10 @@ mod tests {
     use super::exit_status;
 
     #[test]
-    fn exit_status_passes_8_bit_codes_through() {
+    fn exit_status_passes_8_bit_codes_and_never_turns_a_wider_one_into_success() {
         for code in [0, 1, 42, 127, 128, 255] {
             assert_eq!(u32::from(exit_status(code)), code);
         }
-    }
-
-    #[test]
-    fn exit_status_never_turns_an_out_of_range_code_into_success() {
         // `code as u8` made 256 and 512 exit 0 and 257 exit 1.
         for code in [256, 257, 512, 65_536, u32::MAX] {
             assert_eq!(exit_status(code), u8::MAX, "code {code}");

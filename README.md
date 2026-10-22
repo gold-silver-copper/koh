@@ -69,7 +69,7 @@ koh wait <name> JOB       # until the job ends, then its last 200 lines (--tail 
                           # --file PATH; --session N [--reading]
 koh logs <name> JOB       # its last 200 lines (--tail N, --all; --follow), then whether it runs
 koh cp SRC... <name>:DST  # copy files and trees there, or `koh cp <name>:SRC... DST` back
-koh key info              # show both identity key files and their endpoint ids
+koh id [client|server]    # a key's endpoint id (the client's by default), made if missing
 koh key reset [client|server] --yes  # delete a key (client by default); the next use makes a new id
 koh help-agents           # the page for scripts and agents
 ```
@@ -94,28 +94,21 @@ Useful flags:
 ```
 
 **`koh cp` is a sync.** A source lands in the destination if that is a directory (or ends in `/`,
-or there are several sources: then it is made), else as the destination, its parents made.
-Directories merge into what is there. A file the destination already has with the same size and
-content (by hash) is not sent again; one that changed is written beside its target under a
-hidden `.koh-….part` name and renamed into place once whole, so a cut copy leaves nothing
-half-written that looks complete, and the next copy resumes the part. A file written gets the
-time it arrived (so `make` and `cargo` see it changed) unless `-p` keeps the source's. `dir/.`
-copies what is in `dir`. `--delete` removes what the source does not have, `--exclude PAT`
-leaves entries alone, and `--atomic` lands nothing until the whole copy came. `--dry-run`
-changes nothing and sends no file's bytes: it lists each change it would make (`new`,
-`replaced`, `deleted`, `dir`, `link`, and the path, with a file's size and that of the one it
-replaces), then the summary; `--diff` is that dry run, each replaced text file (up to 1 MiB)
-followed by a unified diff of it (`a/` the destination's, `b/` the source's), for which the
-source's file goes to the destination's end, nothing else coming back but the diff. Without `--delete`, what the destination has that the source lacks
-is kept, and the summary counts it (`2 there not in the source, kept: --delete removes them`), but for directories, most often made there (a build's `target/`). It ends with one
-line saying where it landed: `3 files sent, 41 KB → laptop:proj/src (1 new, 2 replaced; 120 unchanged)` (`files received` for a download), or
-`--json`. A tree copied to a directory of its own name that is there already updates it, as `src/.` does
-(`koh cp -r src laptop:src` run twice, which `cp` would land as `src/src`); `laptop:src/` or
-`laptop:src/src` nests it. A
-source given on the command line is followed if it is a symlink, as `cp` does; symlinks inside a tree are copied
-as symlinks, never followed on either side, and fifos, sockets and devices are skipped and said
-so. Remote paths are taken as the server user's shell would take them, but not globbed: no
-remote shell runs.
+or there are several sources: then it is made), else as the destination, its parents made, as
+`cp` would; `dir/.` copies what is in `dir`. Directories merge into what is there. A file the
+destination already has with the same content (by hash) is not sent again; one that changed is
+written beside its target under a hidden `.koh-….part` name and renamed into place once whole,
+so a cut copy leaves nothing half-written that looks complete, and the next copy resumes the
+part. A file written gets the time it arrived (so `make` and `cargo` see it changed) unless `-p`
+keeps the source's. `--delete` removes what the source does not have; `--exclude PAT` leaves
+matching entries alone on both ends, its paths taken from the top of the tree copied
+(`--exclude 'src/gen/*'` when `proj` is copied). `--dry-run` changes nothing and sends no file's
+bytes: it lists each change it would make, then the summary. It ends with one line,
+`3 files sent, 41 KB → laptop:proj/ (1 new, 2 replaced; 120 unchanged)` (`received` for a
+download), or `--json`. A source given on the command line is followed if it is a symlink, as
+`cp` does; symlinks inside a tree are copied as symlinks, never followed on either side, and
+fifos, sockets and devices are skipped and counted. Remote paths are taken as the server user's
+shell would take them, but not globbed: no remote shell runs.
 
 **Exit codes** are the same for every command: 0 ok, 1 failed, 2 usage, 3 the server was not
 reached, 4 refused (not allowed, or out of the key's scope), 75 the server was busy (more
@@ -185,7 +178,7 @@ Copy files and trees either way, sending only what changed:
 ```sh
 koh cp -r ./src box:app/              # here to there: lands as app/src
 koh cp box:app/target/report.json .   # there to here
-koh cp --diff -r ./src box:app/       # change nothing: which files differ, and how
+koh cp --dry-run -r ./src box:app/    # change nothing: what a copy would change
 ```
 
 To build there what you edit here, sync in the same call as the build: `--sync DIR` on `exec`

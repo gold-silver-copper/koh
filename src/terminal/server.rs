@@ -2,18 +2,19 @@
 //! questions, encodes the client's input as the program asked, and keeps the screen a client is
 //! redrawn from, the shell's commands and the window title.
 
-use crate::terminal::{Size, MAX_TITLE_LEN};
+use crate::request::MAX_TITLE;
+use crate::terminal::Size;
 
 use crate::events::{InputEvent, WireColours};
 use fux_vt::keys::colour::Colours;
 use fux_vt::keys::encode::{key_bytes, paste};
 use fux_vt::{Event, Options, Parser, Sink, Unhandled};
 
-/// Decode an OSC title payload (lossy UTF-8) and clamp it to [`MAX_TITLE_LEN`] characters.
+/// Decode an OSC title payload (lossy UTF-8) and clamp it to [`MAX_TITLE`] characters.
 fn title_from(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
         .chars()
-        .take(MAX_TITLE_LEN)
+        .take(MAX_TITLE)
         .collect()
 }
 
@@ -166,14 +167,8 @@ impl ServerTerminal {
         // Each entry the client gave, and none it did not: a reattaching client's palette
         // replaces the last client's whole. fux-vt answers a program's query of an entry it has
         // not set (OSC 4) with it; one the program set wins.
-        self.parser.set_host_palette(std::array::from_fn(|index| {
-            colours
-                .palette
-                .get(index)
-                .copied()
-                .flatten()
-                .map(Into::into)
-        }));
+        self.parser
+            .set_host_palette(colours.palette.map(|entry| entry.map(Into::into)));
         match (before, colours_now.scheme) {
             (Some(before), Some(now))
                 if before != now && self.parser.screen().mode(fux_vt::Mode::ColorSchemeUpdates) =>
@@ -264,6 +259,9 @@ impl ServerTerminal {
         let rows: Vec<fux_vt::Row<'_>> = screen.main_rows().collect();
         let from = rows.iter().position(|row| row.id() == start.row)?;
         let to = rows.iter().position(|row| row.id() == end.row)?;
+        if (from, start.col) == (to, end.col) {
+            return Some(String::new());
+        }
         let span = rows.get(from..=to)?;
         // The output ends where the end mark was: a mark at a row's first column ends it on the
         // row before.
@@ -303,6 +301,9 @@ mod tests {
             "its end, within the bound"
         );
         assert_eq!(t.screen_text(1 << 20), "one\n0123456789abcdefghijklmn\n$\n");
+        // A command that wrote nothing has no output, not the prompt after it.
+        t.process(b"true\r\n\x1b]133;C\x07\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert_eq!(t.last_output(1 << 20).as_deref(), Some(""));
         // The blank rows below what shows are left out, but not one painted in a colour.
         let mut t = ServerTerminal::new(24, 20, 0).expect("emulator");
         t.process(b"$ ls\r\none\r\n\r\n$ ");
@@ -313,120 +314,6 @@ mod tests {
         let mut t = ServerTerminal::new(2, 20, 0).expect("emulator");
         t.process(b"\x1b]133;C\x07a\r\nb\r\nc\r\n\x1b]133;D;0\x07");
         assert_eq!(t.last_output(1 << 20), None);
-    }
-
-    #[test]
-    fn answers_reports_and_queries() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        for (asked, answer) in [
-            // DSR and DECXCPR at row 5, column 3, 1-indexed.
-            (&b"\x1b[5;3H\x1b[6n"[..], &b"\x1b[5;3R"[..]),
-            (b"\x1b[?6n", b"\x1b[?5;3R"),
-            // DECRQM: reset, set, unknown.
-            (
-                b"\x1b[?2004$p\x1b[?2004h\x1b[?2004$p\x1b[?4242$p",
-                b"\x1b[?2004;2$y\x1b[?2004;1$y\x1b[?4242;0$y",
-            ),
-            // Primary DA: level 2, with selective erase, horizontal scrolling, ANSI colour and
-            // rectangular editing.
-            (b"\x1b[c", b"\x1b[?62;6;21;22;28c"),
-        ] {
-            t.process(asked);
-            assert_eq!(t.take_host_replies(), answer, "{asked:?}");
-        }
-        assert_eq!(t.take_host_replies(), b"", "drained");
-        // Secondary DA: koh's version as major * 10000 + minor * 100 + patch.
-        let mut parts = env!("CARGO_PKG_VERSION")
-            .split('.')
-            .map(|p| p.parse::<u32>().expect("a number"));
-        let (major, minor, patch) = (
-            parts.next().unwrap(),
-            parts.next().unwrap(),
-            parts.next().unwrap(),
-        );
-        t.process(b"\x1b[>c");
-        assert_eq!(
-            t.take_host_replies(),
-            format!("\x1b[>1;{};0c", major * 10000 + minor * 100 + patch).as_bytes()
-        );
-        t.process(b"\x1b[>q"); // XTVERSION
-        assert_eq!(
-            t.take_host_replies(),
-            format!("\x1bP>|koh {}\x1b\\", env!("CARGO_PKG_VERSION")).as_bytes()
-        );
-    }
-
-    #[test]
-    fn answers_the_size_query_and_reports_a_resize_to_a_program_that_asked() {
-        let mut t = ServerTerminal::new(24, 80, 0).expect("emulator");
-        t.process(b"\x1b[18t");
-        assert_eq!(t.take_host_replies(), b"\x1b[8;24;80t");
-        // No report before a program sets mode 2048.
-        t.resize(Size::new(30, 90));
-        assert_eq!(t.resize_report(), None);
-        t.process(b"\x1b[?2048h");
-        // Setting it reports the size at once.
-        assert_eq!(t.take_host_replies(), b"\x1b[48;30;90;0;0t");
-        t.resize(Size::new(20, 60));
-        assert_eq!(
-            t.resize_report().as_deref(),
-            Some(&b"\x1b[48;20;60;0;0t"[..])
-        );
-    }
-
-    #[test]
-    fn keys_mouse_and_focus_reach_a_program_as_it_asked_from_any_terminal() {
-        // The user's terminal reports in SGR: a press at row 5, column 10, and its release.
-        let click = &b"\x1b[<0;10;5M\x1b[<0;10;5m"[..];
-        // A drag: motion with a button held, in 1002 and 1003 but not 1000; a hover, motion with
-        // none, in 1003 alone.
-        let (drag, hover) = (&b"\x1b[<32;11;5M"[..], &b"\x1b[<35;11;5M"[..]);
-        let (sgr_1000, sgr_1002) = (
-            &b"\x1b[?1000h\x1b[?1006h"[..],
-            &b"\x1b[?1002h\x1b[?1006h"[..],
-        );
-        for (mode, sent, gets) in [
-            // Legacy bytes back to a legacy program, cursor keys in its cursor mode.
-            (&b""[..], &b"ls\r\x1b[A\x01"[..], &b"ls\r\x1b[A\x01"[..]),
-            (b"\x1b[?1h", b"\x1b[A\x1bOB", b"\x1bOA\x1bOB"),
-            // A program that pushed kitty's disambiguate gets kitty's keys, from a legacy
-            // terminal: Ctrl-A and Escape are escapes, text stays text.
-            (b"\x1b[>1u", b"a\x01", b"a\x1b[97;5u"),
-            (b"\x1b[>1u", b"\x1b", b"\x1b[27u"),
-            // And from a kitty terminal, which tells Ctrl-I from Tab.
-            (b"\x1b[>1u", b"\x1b[105;5u\t", b"\x1b[105;5u\t"),
-            // A legacy program gets a kitty terminal's keys as legacy bytes.
-            (b"", b"\x1b[105;5u\x1b[1;5C", b"\t\x1b[1;5C"),
-            // xterm's modifyOtherKeys 2.
-            (b"\x1b[>4;2m", b"\x01", b"\x1b[27;5;97~"),
-            // A pop restores the legacy keys.
-            (b"\x1b[>1u\x1b[<u", b"\x01", b"\x01"),
-            // Focus, only to a program that asked.
-            (b"", b"\x1b[I\x1b[O", b""),
-            (b"\x1b[?1004h", b"\x1b[I\x1b[O", b"\x1b[I\x1b[O"),
-            (b"\x1b[?1004h\x1b[?1004l", b"\x1b[I", b""),
-            // The mouse.
-            (b"", click, b""),
-            (b"\x1b[?9h", click, b"\x1b[M *%"),
-            (b"\x1b[?1000h", click, b"\x1b[M *%\x1b[M#*%"),
-            (sgr_1000, click, click),
-            (
-                b"\x1b[?1000h\x1b[?1005h",
-                b"\x1b[<0;100;5M",
-                "\x1b[M \u{84}%".as_bytes(),
-            ),
-            (sgr_1000, drag, b""),
-            (sgr_1002, drag, drag),
-            (sgr_1002, hover, b""),
-            (b"\x1b[?1003h\x1b[?1006h", hover, hover),
-            // The wheel.
-            (sgr_1000, b"\x1b[<65;3;4M", b"\x1b[<65;3;4M"),
-            // Past 223 the default encoding carries a 0 byte, as xterm 411 sends it.
-            (b"\x1b[?1000h", b"\x1b[<0;224;1M", b"\x1b[M \0!"),
-            (b"\x1b[?1000h", b"\x1b[<0;223;1M", b"\x1b[M \xff!"),
-        ] {
-            assert_eq!(program_gets(mode, sent), gets, "{mode:?} {sent:?}");
-        }
     }
 
     #[test]
@@ -468,7 +355,7 @@ mod tests {
             t.set_colours(&WireColours {
                 foreground: Some([0xdd, 0xdd, 0xdd]),
                 background: Some([0x1e, 0x1e, 0x20]),
-                palette: vec![Some([0, 0, 0])],
+                palette: [Some([0, 0, 0]); crate::events::PALETTE],
                 scheme: Some(crate::events::WireScheme::Dark),
             }),
             b"",
@@ -501,7 +388,7 @@ mod tests {
         // No client told its colours (`--no-colours`): xterm's defaults, as before.
         t.process(b"\x1b]4;1;?\x07");
         assert_eq!(t.take_host_replies(), b"\x1b]4;1;rgb:cdcd/0000/0000\x07");
-        let mut palette = vec![None; crate::events::PALETTE];
+        let mut palette = [None; crate::events::PALETTE];
         palette[1] = Some([0xbf, 0x61, 0x6a]);
         palette[2] = Some([0xa3, 0xbe, 0x8c]);
         t.set_colours(&WireColours {
@@ -523,7 +410,7 @@ mod tests {
         );
         // A reattach from another terminal replaces the palette whole: an entry it did not
         // give goes back to xterm's.
-        let mut palette = vec![None; crate::events::PALETTE];
+        let mut palette = [None; crate::events::PALETTE];
         palette[2] = Some([0, 0, 0]);
         t.set_colours(&WireColours {
             palette,
@@ -558,39 +445,5 @@ mod tests {
             "",
             "an over-limit title is dropped, not truncated"
         );
-    }
-
-    #[test]
-    fn split_osc_and_csi_keep_their_meaning() {
-        let mut terminal = ServerTerminal::new(24, 80, 0).expect("emulator");
-        for chunk in [
-            &b"\x1b"[..],
-            &b"]2;split"[..],
-            &b" title\x1b"[..],
-            &b"\\\x1b"[..],
-            &b"[5;3Hok"[..],
-        ] {
-            terminal.process(chunk);
-        }
-        assert_eq!(terminal.title(), "split title");
-        assert!(terminal.screen_text(1 << 20).contains("ok"));
-    }
-
-    /// The bytes a program that wrote `setup` gets for `events`, as the client decoded them from
-    /// what the user's terminal sent (`sent`).
-    fn program_gets(setup: &[u8], sent: &[u8]) -> Vec<u8> {
-        let mut t = ServerTerminal::new(24, 300, 0).expect("emulator");
-        t.process(setup);
-        let mut inputs = Vec::new();
-        let mut decoder = fux_vt::keys::decode::Decoder::default();
-        decoder.bytes(sent, &mut inputs);
-        decoder.timeout(&mut inputs);
-        let events: Vec<InputEvent> = inputs
-            .into_iter()
-            .filter_map(InputEvent::from_input)
-            .collect();
-        let mut out = Vec::new();
-        t.encode_input(&events, &mut out);
-        out
     }
 }

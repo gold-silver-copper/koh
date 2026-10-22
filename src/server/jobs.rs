@@ -2,21 +2,23 @@
 //! their output and status kept.
 //!
 //! A job is a peer's, by name: given, or the next number. Its stdout and stderr are one pipe, so
-//! they go into its log in the order it wrote them: a log of at most `job_log_bytes`, the oldest dropped past it (and counted); its stdin is
-//! `/dev/null`. It runs until it exits, is signalled (`koh kill`), or the server stops, which
-//! hangs it up. A job that ended is kept, with its log and status, until its name is used again,
-//! room is needed for a new one, or the session TTL has passed since it ended.
+//! they go into its log in the order it wrote them: a log of at most `job_log_bytes`, the oldest
+//! dropped past it (and counted); its stdin is `/dev/null`. It runs until it exits, is signalled
+//! (`koh kill`), its peer is removed from the allowlist, or the server stops, which hang it up. A
+//! job that ended is kept, with its log and status, until its name is used again, room is needed
+//! for a new one, or the session TTL has passed since it ended.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use iroh::EndpointId;
-use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use super::cli::Host;
+use super::exec::{Drain, Spawned};
 use super::place::Place;
 use crate::request::{
     JobInfo, JobList, JobName, JobState, LogMsg, Problem, ProblemKind, Run, Signal, Started, Usage,
@@ -26,14 +28,11 @@ use crate::request::{
 /// Most jobs kept, all peers', running and ended together.
 pub const MAX_JOBS: usize = 64;
 
-/// How often a job's exit is looked for while it writes.
-const EXIT_POLL: Duration = Duration::from_millis(50);
-
-/// How long a job's output must be quiet, after it exited, to count as drained.
-const DRAINED: Duration = Duration::from_millis(100);
-
 /// The status of a job hung up by the server's shutdown, as one hung up by its terminal.
 const HUNG_UP: u32 = 128 + 1;
+
+/// The status of a job that did not start, as a shell says of a command it cannot run.
+const NOT_STARTED: u32 = 127;
 
 /// A job's log: the newest bytes it wrote, at most twice its budget held at once.
 #[derive(Debug, Default)]
@@ -96,12 +95,6 @@ impl Log {
             u64::try_from(before).unwrap_or(u64::MAX),
         )
     }
-
-    /// Whether `text` is in what is kept from byte `from` on.
-    fn find(&self, text: &[u8], from: u64) -> bool {
-        let (_, rest) = self.read(from, usize::MAX);
-        !text.is_empty() && rest.windows(text.len()).any(|w| w == text)
-    }
 }
 
 /// How a job stands, published on each change.
@@ -109,21 +102,23 @@ impl Log {
 pub struct Status {
     /// Bytes it wrote.
     pub written: u64,
-    /// Its status, once it ended.
+    /// Its status, once it ended, and when.
     pub exit: Option<u32>,
+    ended: Option<Instant>,
 }
 
 /// One job.
 pub struct Job {
-    pub name: JobName,
+    name: JobName,
     command: String,
-    /// The session it leads, by its pid.
-    session: Option<fuxix::process::Pid>,
+    /// The session it leads, by its pid, once it started.
+    session: OnceLock<i32>,
     started: Instant,
-    ended: Mutex<Option<Instant>>,
     log: Mutex<Log>,
     status: watch::Sender<Status>,
     signals: mpsc::Sender<Signal>,
+    /// Hangs it up: its peer was removed, or the server is stopping.
+    stop: CancellationToken,
 }
 
 impl Job {
@@ -132,18 +127,43 @@ impl Job {
         self.status.subscribe()
     }
 
-    /// Whether `text` is in its output from byte `from` on.
-    pub fn found(&self, text: &str, from: u64) -> bool {
-        self.log
-            .lock()
-            .is_ok_and(|log| log.find(text.as_bytes(), from))
+    /// Whether `text` is in its output from byte `*from` on; `*from` moves on past where it could
+    /// now begin, so a search again looks only at what came since. The log is held only to copy.
+    pub fn find(&self, text: &str, from: &mut u64) -> bool {
+        let Ok((at, kept)) = self.log.lock().map(|log| {
+            let (skipped, kept) = log.read(*from, usize::MAX);
+            (from.saturating_add(skipped), kept.to_vec())
+        }) else {
+            return false;
+        };
+        let text = text.as_bytes();
+        let len = u64::try_from(kept.len()).unwrap_or(u64::MAX);
+        let overlap = u64::try_from(text.len().saturating_sub(1)).unwrap_or(u64::MAX);
+        *from = at.max(at.saturating_add(len).saturating_sub(overlap));
+        !text.is_empty() && kept.windows(text.len()).any(|w| w == text)
+    }
+
+    fn append(&self, bytes: &[u8]) {
+        let Ok(total) = self.log.lock().map(|mut log| {
+            log.append(bytes);
+            log.total
+        }) else {
+            return;
+        };
+        self.status.send_modify(|s| s.written = total);
+    }
+
+    fn end(&self, code: u32) {
+        self.status.send_modify(|s| {
+            s.exit = Some(code);
+            s.ended = Some(Instant::now());
+        });
     }
 
     /// How it stands at `now`, its command whole if `whole`, else cut for a listing; `usage` says
     /// what each session's processes use.
     fn info(&self, now: Instant, whole: bool, usage: Option<&Sessions>) -> JobInfo {
         let status = *self.status.borrow();
-        let ended = self.ended.lock().ok().and_then(|e| *e);
         let dropped = self.log.lock().map_or(0, |log| log.dropped());
         JobInfo {
             name: self.name.clone(),
@@ -154,21 +174,24 @@ impl Job {
                 self.command.chars().take(MAX_TITLE).collect()
             },
             age_secs: now.saturating_duration_since(self.started).as_secs(),
-            ran_secs: ended.map(|at| at.saturating_duration_since(self.started).as_secs()),
+            ran_secs: status
+                .ended
+                .map(|at| at.saturating_duration_since(self.started).as_secs()),
             state: status.exit.map_or(JobState::Running, JobState::Exited),
             output_bytes: status.written,
             dropped_bytes: dropped,
             usage: (status.exit.is_none())
-                .then(|| usage.zip(self.session))
+                .then(|| usage.zip(self.session.get()))
                 .flatten()
-                .map(|(usage, session)| usage.get(&session.as_raw()).copied().unwrap_or_default()),
+                .map(|(usage, session)| usage.get(session).copied().unwrap_or_default()),
         }
     }
 
     /// The seconds it ran, or has run so far.
     fn secs(&self) -> u64 {
-        let ended = self.ended.lock().ok().and_then(|e| *e);
-        ended
+        self.status
+            .borrow()
+            .ended
             .unwrap_or_else(Instant::now)
             .saturating_duration_since(self.started)
             .as_secs()
@@ -179,11 +202,7 @@ impl Job {
     }
 
     fn ended_before(&self, cutoff: Instant) -> bool {
-        self.ended
-            .lock()
-            .ok()
-            .and_then(|e| *e)
-            .is_some_and(|at| at < cutoff)
+        self.status.borrow().ended.is_some_and(|at| at < cutoff)
     }
 }
 
@@ -226,9 +245,8 @@ fn sessions() -> Option<Sessions> {
 type Table = BTreeMap<(EndpointId, JobName), Arc<Job>>;
 
 /// Every peer's jobs.
-#[derive(Clone)]
 pub struct Jobs {
-    table: Arc<Mutex<Table>>,
+    table: Mutex<Table>,
     /// The bytes of output each keeps.
     log_bytes: usize,
     /// How long an ended job is kept.
@@ -238,7 +256,7 @@ pub struct Jobs {
 impl Jobs {
     pub fn new(log_bytes: usize, ttl: Duration) -> Self {
         Self {
-            table: Arc::default(),
+            table: Mutex::default(),
             log_bytes,
             ttl,
         }
@@ -278,8 +296,9 @@ impl Jobs {
         ))
     }
 
-    /// Start `run` at `place` as `peer`'s job `name` (else the next number free).
-    pub fn start(
+    /// Start `run` at `place` as `peer`'s job `name` (else the next number free). Its place in the
+    /// table is taken first, then it is started off the table's lock.
+    pub async fn start(
         &self,
         peer: EndpointId,
         name: Option<JobName>,
@@ -287,12 +306,46 @@ impl Jobs {
         host: &Host,
         place: &Place,
     ) -> Result<Started, Problem> {
+        let (job, signals) = self.reserve(peer, name, run, &host.shutdown)?;
+        let key = (peer, job.name.clone());
+        let spawned = super::exec::spawn(run, host, place, false, true).await;
+        let spawned = match spawned {
+            Ok(spawned) => spawned,
+            Err(problem) => {
+                job.end(NOT_STARTED);
+                if let Ok(mut table) = self.table.lock() {
+                    if table.get(&key).is_some_and(|kept| Arc::ptr_eq(kept, &job)) {
+                        table.remove(&key);
+                    }
+                }
+                return Err(problem);
+            }
+        };
+        if let Some(session) = spawned.process.session() {
+            let _ = job.session.set(session.as_raw());
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a job's runner, one a job: at most `MAX_JOBS` run"
+        )]
+        tokio::spawn(runner(job, spawned, signals));
+        Ok(Started { name: key.1 })
+    }
+
+    /// Take `peer`'s job `name` (else the next number free) in the table for `run`, room made
+    /// from the oldest ended job if need be; hung up by `shutdown` too.
+    fn reserve(
+        &self,
+        peer: EndpointId,
+        name: Option<JobName>,
+        run: &Run,
+        shutdown: &CancellationToken,
+    ) -> Result<(Arc<Job>, mpsc::Receiver<Signal>), Problem> {
         let mut table = self
             .table
             .lock()
             .map_err(|_poisoned| Problem::new(ProblemKind::Failed, "the job table"))?;
         let now = Instant::now();
-        // Ended jobs past their time go.
         if let Some(cutoff) = now.checked_sub(self.ttl) {
             table.retain(|_, job| !job.ended_before(cutoff));
         }
@@ -310,7 +363,6 @@ impl Jobs {
             None => {}
         }
         if table.len() >= MAX_JOBS {
-            // Room is made from the oldest ended job.
             let oldest = table
                 .iter()
                 .filter(|(_, job)| !job.running())
@@ -321,35 +373,22 @@ impl Jobs {
                 None => return Err(Problem::new(ProblemKind::TooManyJobs, "")),
             }
         }
-        // One pipe for both: the log holds them in the order the job wrote them.
-        let (process, _, output, _) = super::exec::spawn(run, host, place, (false, true))?;
         let (signals, signals_rx) = mpsc::channel(4);
         let job = Arc::new(Job {
             name: name.clone(),
             command: run.command.display(),
-            session: process.session(),
+            session: OnceLock::new(),
             started: now,
-            ended: Mutex::new(None),
             log: Mutex::new(Log {
                 budget: self.log_bytes,
                 ..Log::default()
             }),
             status: watch::channel(Status::default()).0,
             signals,
+            stop: shutdown.child_token(),
         });
-        table.insert((peer, name.clone()), Arc::clone(&job));
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a job's runner, one a job: at most `MAX_JOBS` run"
-        )]
-        tokio::spawn(runner(
-            job,
-            process,
-            output,
-            signals_rx,
-            host.shutdown.clone(),
-        ));
-        Ok(Started { name })
+        table.insert((peer, name), Arc::clone(&job));
+        Ok((job, signals_rx))
     }
 
     /// Send `peer`'s job `name` `signal`.
@@ -364,66 +403,42 @@ impl Jobs {
             .try_send(signal)
             .map_err(|_full| Problem::new(ProblemKind::Failed, "signals are waiting for that job"))
     }
+
+    /// Hang up and forget `peer`'s jobs: it may no longer connect.
+    pub fn end(&self, peer: EndpointId) {
+        if let Ok(mut table) = self.table.lock() {
+            table.retain(|(owner, _), job| {
+                let keep = *owner != peer;
+                if !keep {
+                    job.stop.cancel();
+                }
+                keep
+            });
+        }
+    }
 }
 
-/// Run `job`'s `process`: its output into the log, its signals to it, its end into its status.
-async fn runner(
-    job: Arc<Job>,
-    mut process: super::exec::Process,
-    mut output: super::exec::Output,
-    mut signals: mpsc::Receiver<Signal>,
-    shutdown: tokio_util::sync::CancellationToken,
-) {
-    let mut buf = vec![0u8; 16 * 1024];
-    let mut done = false;
-    let mut exit: Option<(u32, Instant)> = None;
-    let append = |bytes: &[u8]| {
-        if let Ok(mut log) = job.log.lock() {
-            log.append(bytes);
-            let total = log.total;
-            job.status.send_modify(|s| s.written = total);
+/// Run `job`, started as `spawned`: its output into the log, `signals` to it, its end into its
+/// status.
+async fn runner(job: Arc<Job>, spawned: Spawned, mut signals: mpsc::Receiver<Signal>) {
+    let Spawned {
+        process, stdout, ..
+    } = spawned;
+    let (exited, told) = watch::channel(false);
+    let output = async {
+        let mut drain = Drain::new(stdout, told);
+        while let Some(bytes) = drain.next().await {
+            job.append(bytes);
         }
     };
-    let code = loop {
-        if let Some((code, at)) = exit {
-            if done || at.elapsed() >= DRAINED {
-                break code;
-            }
-        }
-        tokio::select! {
-            read = output.read(&mut buf), if !done => match read {
-                Ok(n) if n > 0 => append(buf.get(..n).unwrap_or_default()),
-                Ok(_) | Err(_) => done = true,
-            },
-            Some(signal) = signals.recv() => process.signal(match signal {
-                Signal::Term => fuxix::process::Signal::Term,
-                Signal::Kill => fuxix::process::Signal::Kill,
-                Signal::Int => fuxix::process::Signal::Int,
-                Signal::Hup => fuxix::process::Signal::Hup,
-            }),
-            () = tokio::time::sleep(EXIT_POLL), if exit.is_none() => {
-                exit = process.exit().map(|code| (code, Instant::now()));
-            }
-            () = tokio::time::sleep(DRAINED), if exit.is_some() => {}
-            () = shutdown.cancelled() => {
-                drop(process);
-                break HUNG_UP;
-            }
-        }
-    };
-    if let Ok(mut ended) = job.ended.lock() {
-        *ended = Some(Instant::now());
-    }
-    job.status.send_modify(|s| s.exit = Some(code));
+    let stop = job.stop.cancelled();
+    let code = super::exec::finish(process, output, exited, &mut signals, stop).await;
+    job.end(code.unwrap_or(HUNG_UP));
 }
 
 /// Send `job`'s log on a stream of `conn`'s: what is kept (its last `tail` lines, if given), then,
 /// if `follow`, what it writes until it ends; then the end. The connection's end stops it.
-pub async fn logs(
-    conn: &iroh::endpoint::Connection,
-    job: &Job,
-    (follow, tail): (bool, Option<u32>),
-) {
+pub async fn logs(conn: &iroh::endpoint::Connection, job: &Job, follow: bool, tail: Option<u32>) {
     let sent = async {
         let mut send = conn.open_uni().await?;
         let mut status = job.watch();
@@ -503,9 +518,6 @@ mod tests {
         assert_eq!(log.dropped(), 11);
         assert_eq!(log.read(0, 100), (11, &b"abcdefghijk"[1..]));
         assert_eq!(log.read(15, 3), (0, &b"fgh"[..]));
-        assert!(log.find(b"hij", 0));
-        assert!(!log.find(b"012", 0), "dropped");
-        assert!(!log.find(b"cde", 15), "before where the search starts");
         assert_eq!(log.read(21, 10), (0, &b""[..]));
     }
 

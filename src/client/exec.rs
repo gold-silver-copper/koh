@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::cli::{Format, Opened, Remote};
 use super::copy::Synced;
-use crate::request::{ExecStream, ExitStatus, RemotePath, Request, Run, MAX_REPLY};
+use crate::request::{ExecStream, ExitStatus, Request, Run, MAX_REPLY};
 
 /// Most bytes moved at once from a stream.
 const CHUNK: usize = 64 * 1024;
@@ -39,7 +39,8 @@ const BROKEN_PIPE: u32 = 128 + 13;
 /// value says.
 pub async fn exec(
     remote: &Remote,
-    (run, synced): (Run, Option<&Synced>),
+    run: Run,
+    synced: Option<&Synced>,
     format: Format,
 ) -> anyhow::Result<u32> {
     let interrupted = CancellationToken::new();
@@ -47,19 +48,10 @@ pub async fn exec(
     // Apart, its stdout and stderr could come back in another order than it wrote them: when they
     // go to one file here (`2>&1`, a terminal), they are one pipe there.
     let together = !format.json && one_file();
-    let cwd = run.cwd.clone();
     let mut opened = Opened::dial(remote, &Request::Exec { run, together }).await?;
     super::cli::report_busy();
-    let (stdin, reading) = super::io::spawn_stdin()?;
-    let ran = drive(
-        &opened.conn,
-        &mut opened.control,
-        stdin,
-        (&interrupted, cwd.as_ref(), synced),
-        format,
-    )
-    .await;
-    reading.cancel();
+    let (stdin, _reading) = super::io::spawn_stdin::<{ super::io::PIPED }>(8)?;
+    let ran = drive(&mut opened, stdin, &interrupted, synced, format).await;
     opened.close().await;
     ran
 }
@@ -111,18 +103,18 @@ impl Sink {
     }
 }
 
-/// Feed `stdin` to the command on `conn`, through `control`, and its output to the user, until
-/// its status comes; `cwd` is where it was to start.
+/// Feed `stdin` to the command `opened` runs, and its output to the user, until its status comes.
 async fn drive(
-    conn: &Connection,
-    control: &mut SendStream,
+    opened: &mut Opened,
     stdin: mpsc::Receiver<Vec<u8>>,
-    (interrupted, cwd, synced): (&CancellationToken, Option<&RemotePath>, Option<&Synced>),
+    interrupted: &CancellationToken,
+    synced: Option<&Synced>,
     format: Format,
 ) -> anyhow::Result<u32> {
     let started = Instant::now();
+    let conn = &opened.conn;
     // Apart, so a command that does not read its stdin never holds up its output.
-    let mut feeding = pin!(feed(stdin, control));
+    let mut feeding = pin!(feed(stdin, &mut opened.control));
     let (mut out, mut err) = if format.json {
         (Sink::Kept(Vec::new(), 0), Sink::Kept(Vec::new(), 0))
     } else {
@@ -152,7 +144,6 @@ async fn drive(
     let code = match status {
         Ok(ExitStatus::Exited(code)) => Ok(code),
         Ok(ExitStatus::NotStarted(problem)) => {
-            let problem = super::cli::hint_problem(problem, cwd);
             if !format.json {
                 crate::log::stderr(format_args!("koh: {problem}"));
             }

@@ -5,8 +5,8 @@ on:
     branches: [master]
   pull_request:
   schedule:
-    # Weekly (Mon 06:00 UTC): re-run the advisory scan so a newly-disclosed CVE against the
-    # deliberately `=`-pinned dependency tree surfaces even with no code change.
+    # Weekly (Mon 06:00 UTC): the fuzzers, and the advisory scan again, so a newly-disclosed CVE
+    # against the deliberately `=`-pinned dependency tree surfaces even with no code change.
     - cron: "0 6 * * 1"
 
 # Cancel superseded runs on the same ref.
@@ -74,16 +74,19 @@ jobs:
         run: |
           # The code of a file, its comments removed, on one line, so a `use` split over lines is one.
           code() { sed -e 's://.*$::' "$1" | tr '\n' ' '; }
-          if code src/predict.rs | grep -E '(^|[^[:alnum:]_])crate::' >/dev/null; then
-            echo "::error::predict.rs must import nothing from crate:: — keep it a standalone library"
-            exit 1
-          fi
-          # The wire protocol sits below both ends: it may use the screen types, never a client or server.
-          if code src/proto.rs | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
-            echo "::error::proto.rs must not import from server/client — both ends build on it"
-            exit 1
-          fi
+          # The predictor and the wire protocol may use the screen types, never a client or server.
+          for file in src/predict.rs src/proto.rs; do
+            if code "$file" | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
+              echo "::error::$file must not import from server/client"
+              exit 1
+            fi
+          done
           echo "layering edges OK"
+      - name: a bash koh marks, on macOS (its own is 3.2, which koh leaves unmarked)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: test
         run: cargo test --locked
       - name: test with nvim (ignored elsewhere, as it needs nvim 0.10 or later)
@@ -135,7 +138,9 @@ jobs:
   # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
   # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run of each
   # that MUST stay crash-free.
+  # Weekly only: the harnesses job already lints the fuzz targets on every push.
   fuzz:
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

@@ -1,4 +1,4 @@
-//! Hostile peers on koh/16, both directions.
+//! Hostile peers on koh/17, both directions.
 //!
 //! A malicious client (admitted, so on the allowlist) throws malformed and oversized traffic at a
 //! real server; a malicious server throws it at a real client. Neither may crash or hang the
@@ -27,7 +27,7 @@ fn net() -> FaultNet {
 
 /// Connect to `server` as `secret`, ask for a shell on the first stream, wait for the server's
 /// first stream, which admits it, and keep the endpoint and that stream alive; the caller then
-/// speaks koh/16 by hand.
+/// speaks koh/17 by hand.
 async fn admitted(
     net: &FaultNet,
     secret: SecretKey,
@@ -137,11 +137,10 @@ fn an_oversized_client_message_closes_the_connection_only() -> anyhow::Result<()
 }
 
 /// A client that sends input no terminal sends (a modifier bit no key has, a paste piece over
-/// the cap, a palette past 16 entries) loses its connection, each, and
-/// the server goes on serving the good client.
+/// the cap) loses its connection, each, and the server goes on serving the good client.
 #[test]
-fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> {
-    use koh::events::{InputEvent, WireColours, WireKey, WireKeyCode, MAX_PASTE, PALETTE};
+fn malformed_keys_close_the_connection_only() -> anyhow::Result<()> {
+    use koh::events::{InputEvent, WireKey, WireKeyCode, MAX_PASTE};
     koh_testkit::multi_thread(4)?.block_on(async {
         let net = net();
         let evil = identity()?;
@@ -160,10 +159,6 @@ fn malformed_keys_and_colours_close_the_connection_only() -> anyhow::Result<()> 
         for msg in [
             keys(vec![key(WireKeyCode::Char('x'), 0x80)]),
             keys(vec![InputEvent::Paste("x".repeat(MAX_PASTE + 1))]),
-            ClientMsg::Colours(WireColours {
-                palette: vec![None; PALETTE + 1],
-                ..WireColours::default()
-            }),
         ] {
             // Built by hand: `encode_client` refuses to.
             let body = postcard::to_allocvec(&msg)?;

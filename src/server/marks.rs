@@ -22,13 +22,14 @@ use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
-/// bash: the user's own startup, then the marks, set by `__koh_marks`, a function defined first. A
-/// function inherits no DEBUG or RETURN trap (unless `set -T`), so a trap the user's startup set
-/// sees one command of koh's: its call. With `set -T` it sees what the function runs too, but what
-/// it prints goes nowhere (the function's output, and END's, go to /dev/null; END writes its marks
-/// to a copy of stderr), and nothing of koh's reads it (no command substitution, from bash 4.4).
-/// The marks run no command of the shell's own either, so the user's DEBUG, ERR and RETURN traps
-/// see nothing of them, and `$?` and `PIPESTATUS` stay the command's, for the user's hooks too:
+/// bash, 4.4 or later (an older one, macOS's 3.2, is left unmarked): the user's own startup, then
+/// the marks, set by `__koh_marks`, a function defined first. A function inherits no DEBUG or
+/// RETURN trap (unless `set -T`), so a trap the user's startup set sees one command of koh's: its
+/// call. With `set -T` it sees what the function runs too, but what it prints goes nowhere (the
+/// function's output, and END's, go to /dev/null; END writes its marks to a copy of stderr), and
+/// nothing of koh's reads it (no command substitution). The marks run no command of the shell's
+/// own either, so the user's DEBUG, ERR and RETURN traps see nothing of them, and `$?` and
+/// `PIPESTATUS` stay the command's, for the user's hooks too:
 ///
 /// - `END`, first in `PROMPT_COMMAND` (its first element, an array's too, so that setting it anew
 ///   replaces the user's hooks, as without koh), so before the user's own hooks print: subshells,
@@ -42,44 +43,30 @@ use std::path::{Path, PathBuf};
 ///   the marks go to fd 3, stderr's copy.
 /// - `PS1` ends a command too, in case `PROMPT_COMMAND` is set anew while the shell runs (a `D`
 ///   that ends no command does nothing); its hooks then print before that end.
-/// - bash 4.4 and later print `PS0` as a command's output begins. Older ones (macOS's 3.2) mark it
-///   from a DEBUG trap, set after the function (there a function's own is dropped as it returns),
-///   and armed last thing before the prompt, so it fires once, for the command typed; and there
-///   `HISTCMD` reads 1 in `PROMPT_COMMAND`, so `history 1` tells the history number. The user's
-///   own DEBUG trap runs on in it, after the mark, with its `$?`; it sees the command that sets
-///   the trap too, as nothing a function sets outlasts its call there.
+/// - `PS0` marks a command's output beginning.
 ///
-/// A variable the user made readonly is left as it is, unmarked (told from its attributes, before
-/// bash 4.4 `declare -p`: an assignment tried in a subshell leaves bash 3.2's subshell reading the
-/// terminal in the shell's place). Marks go to stderr, as the prompt does; koh's PROMPT_COMMAND is
-/// not exported, so shells started from this one do not inherit it.
+/// A variable the user made readonly is left as it is, unmarked. Marks go to stderr, as the
+/// prompt does; koh's PROMPT_COMMAND is not exported, so shells started from this one do not
+/// inherit it.
 const BASHRC: &str = r"if [ -r ~/.bashrc ]; then . ~/.bashrc; fi
 ";
 
-/// A command's end, `{H}` the next history number, `{K}` keeping the command's `PIPESTATUS` and
-/// `{P}` making it again (see [`BASHRC`]). No single quotes: the startup file quotes it with them.
-const END: &str = r#"{ if ([ "$__koh_m" = 1 ] && printf "\033]133;C;late;nonce=%s\007" "$__koh_k" >&3; printf "\033]133;D;%s;nonce=%s\007\033]133;A;nonce=%s\007" "$__koh_s" "$__koh_k" "$__koh_k" >&3; exit $((__koh_c != 1))); then {P}; fi; } >/dev/null 3>&$((__koh_s = $?, {K}__koh_c = ${#PIPESTATUS[@]}, __koh_n = {H}, __koh_m = ${__koh_w-0} && __koh_n != ${__koh_h-0}, __koh_w = 1, __koh_h = __koh_n, 2)) 2>/dev/null"#;
+/// A command's end, `{K}` keeping the command's `PIPESTATUS` and `{P}` making it again (see
+/// [`BASHRC`]). No single quotes: the startup file quotes it with them.
+const END: &str = r#"{ if ([ "$__koh_m" = 1 ] && printf "\033]133;C;late;nonce=%s\007" "$__koh_k" >&3; printf "\033]133;D;%s;nonce=%s\007\033]133;A;nonce=%s\007" "$__koh_s" "$__koh_k" "$__koh_k" >&3; exit $((__koh_c != 1))); then {P}; fi; } >/dev/null 3>&$((__koh_s = $?, {K}__koh_c = ${#PIPESTATUS[@]}, __koh_n = ${HISTCMD-0}, __koh_m = ${__koh_w-0} && __koh_n != ${__koh_h-0}, __koh_w = 1, __koh_h = __koh_n, 2)) 2>/dev/null"#;
 /// The longest pipeline whose statuses `END` gives the user's hooks in `PIPESTATUS`; of a longer
 /// one they see its status alone.
 const PIPES: usize = 8;
-const HISTORY_NEW: &str = "${HISTCMD-0}";
-const HISTORY_OLD: &str = r#"$(__koh_n=$(history 1); __koh_n=${__koh_n#"${__koh_n%%[0-9]*}"}; echo "${__koh_n%%[!0-9]*}") + 1"#;
-/// Before bash 4.4: the DEBUG trap, as a `printf` format of the user's own trap twice (`trap -p`
-/// in a command substitution still shows it): once armed, the start mark (a `case`, as a command
-/// there would change `PIPESTATUS`) and `$?` put back, then theirs. Its arming, last in
-/// `PROMPT_COMMAND` and in `PS1`.
-const START: &str = r#"case ${__koh_a-}${__koh_z[__koh_q = $?]-} in 1) __koh_a=0; __koh_w=0; printf "\\033]133;C;nonce=${__koh_k-}\\007" >&2; (exit $__koh_q)\n%s\n;; *) %s\n;; esac"#;
-const ARM: &str = "{ (:); } 2>&$((__koh_a = 1, 2))";
-/// What `PS1` starts with: a command's end, should `END` not have run, and the trap's arming.
-const PS1_END: &str = r"\[\033]133;D;$?;nonce=${__koh_k-}\007\033]133;A;nonce=${__koh_k-}\007${__koh_z[__koh_a = 1]-}\]";
+/// What `PS1` starts with: a command's end, should `END` not have run.
+const PS1_END: &str = r"\[\033]133;D;$?;nonce=${__koh_k-}\007\033]133;A;nonce=${__koh_k-}\007\]";
 /// What `PS0` ends with: a command's start.
 const PS0_START: &str = r"\033]133;C;nonce=${__koh_k-}\007${__koh_z[__koh_w = 0]-}";
 
-/// `END` for bash 4.4 and later, and for older ones. The command's `PIPESTATUS` is kept
-/// (`__koh_p`, its length `__koh_c`) and made again last, for the user's hooks after: a pipeline of
-/// as many subshells, each exiting with a status, run twice (`&&`: once if it fails, as a failure
-/// there would set off the ERR trap; again if not, so that it is the last pipeline run).
-fn ends() -> (String, String) {
+/// `END`, the command's `PIPESTATUS` kept (`__koh_p`, its length `__koh_c`) and made again last,
+/// for the user's hooks after: a pipeline of as many subshells, each exiting with a status, run
+/// twice (`&&`: once if it fails, as a failure there would set off the ERR trap; again if not, so
+/// that it is the last pipeline run).
+fn end() -> String {
     let kept = (0..PIPES)
         .map(|i| format!("__koh_p[{i}] = ${{PIPESTATUS[{i}]-0}}, "))
         .collect::<Vec<_>>()
@@ -100,30 +87,24 @@ fn ends() -> (String, String) {
         .collect::<Vec<_>>()
         .join("; ");
     let made = format!("{made}; else (exit \"$__koh_s\") && (:)");
-    let end = END.replace("{K}", &kept).replace("{P}", &made);
-    (
-        end.replace("{H}", HISTORY_NEW),
-        end.replace("{H}", HISTORY_OLD),
-    )
+    END.replace("{K}", &kept).replace("{P}", &made)
 }
 
 /// The bash startup file: koh's function, the user's `~/.bashrc`, then the marks.
 fn bash_rc() -> String {
-    let (new, old) = ends();
     format!(
         r#"# koh: OSC 133 shell marks, after your own startup. Off: `koh serve --no-shell-marks`.
 __koh_marks() {{
   unset -f __koh_marks
   export -n __koh_k
-  __koh_free() {{ local d; if [ $__koh_new = 1 ]; then d=${{!1@a}}; else d=$(declare -p "$1" 2>/dev/null); d=${{d#declare -}}; d=${{d%% *}}; fi; case $d in *r*) return 1 ;; esac; }}
-  local __koh_new=0 __koh_end
-  if [ "${{BASH_VERSINFO[0]}}${{BASH_VERSINFO[1]}}" -ge 44 ]; then __koh_new=1; __koh_end='{new}'; else __koh_end='{old}'; fi
+  [ "${{BASH_VERSINFO[0]}}${{BASH_VERSINFO[1]}}" -ge 44 ] || return
+  __koh_free() {{ case ${{!1@a}} in *r*) return 1 ;; esac; }}
+  local __koh_end='{end}'
   if __koh_free PROMPT_COMMAND; then
     PROMPT_COMMAND="$__koh_end${{PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}}"
-    if [ $__koh_new = 0 ]; then PROMPT_COMMAND="$PROMPT_COMMAND"$'\n''{ARM}'; fi
     export -n PROMPT_COMMAND
   fi
-  if [ $__koh_new = 1 ] && __koh_free PS0; then
+  if __koh_free PS0; then
     PS0="${{PS0-}}"'{PS0_START}'
     export -n PS0
   fi
@@ -131,8 +112,8 @@ __koh_marks() {{
   unset -f __koh_free
 }} >/dev/null 2>&1
 {BASHRC}__koh_marks
-([ "${{BASH_VERSINFO[0]}}${{BASH_VERSINFO[1]}}" -ge 44 ]) >/dev/null || trap -- "$(eval "set -- $(trap -p DEBUG)"; printf '{START}' "${{3-}}" "${{3-}}")" DEBUG
 "#,
+        end = end(),
     )
 }
 

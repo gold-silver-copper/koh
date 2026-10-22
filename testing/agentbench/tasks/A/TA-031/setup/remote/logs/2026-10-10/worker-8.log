@@ -1,8 +1,0 @@
-2026-10-10T00:44 worker-8 GC pause 12ms
-2026-10-10T01:39 worker-8 heartbeat
-2026-10-10T02:53 worker-8 heartbeat
-2026-10-10T03:52 worker-8 flushed cache
-2026-10-10T04:56 worker-8 GC pause 12ms
-2026-10-10T05:30 worker-8 processed batch
-2026-10-10T06:44 worker-8 GC pause 12ms
-2026-10-10T07:36 worker-8 flushed cache

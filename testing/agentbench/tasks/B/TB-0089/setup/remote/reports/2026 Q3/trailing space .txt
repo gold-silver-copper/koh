@@ -1,8 +1,0 @@
-report 2026 Q3/trailing space .txt
-row 0: 0.67276
-row 1: 0.86324
-row 2: 0.51616
-row 3: 0.69233
-row 4: 0.88726
-row 5: 0.47717
-row 6: 0.51486

@@ -1,9 +1,0 @@
-id = "TA-004"
-title = "Configure with a prefix"
-cat = "run"
-difficulty = "easy"
-goal = '''
-On the remote machine, the source tree in `~/work/app` has a `configure` script. Configure the
-project so that its install prefix is the directory `opt/app` in the remote home directory
-(given as an absolute path). It is done when `~/work/app/config.status` records that prefix.
-'''

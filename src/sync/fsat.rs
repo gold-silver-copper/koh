@@ -133,10 +133,10 @@ pub(super) fn read_link(dir: impl AsFd, name: &OsStr) -> io::Result<Vec<u8>> {
     Ok(rustix::fs::readlinkat(dir, name, Vec::new())?.into_bytes())
 }
 
-/// Set the mode of `name` in `dir`, a directory reached by its descriptor.
-pub(super) fn chmod(dir: impl AsFd, mode: u32) -> io::Result<()> {
+/// Set the mode of `file` (a file or a directory).
+pub(super) fn chmod(file: impl AsFd, mode: u32) -> io::Result<()> {
     let raw = narrow(mode & 0o7777).ok_or_else(|| io::Error::other("a mode past 0o7777"))?;
-    Ok(rustix::fs::fchmod(dir, RawMode::from_raw_mode(raw))?)
+    Ok(rustix::fs::fchmod(file, RawMode::from_raw_mode(raw))?)
 }
 
 /// A system's mode bits (`u32` on Linux, `u16` on macOS) as a `u32`.
@@ -217,44 +217,39 @@ pub(super) fn remove(dir: impl AsFd, name: &OsStr, depth: usize, dry: bool) -> i
     }
 }
 
-/// As [`walk`], making nothing: the directory, or `None` from the first that is missing, and
-/// how many it and those below it are, which a walk would make.
-pub(super) fn walk_dry(dir: OwnedFd, names: &[Name]) -> io::Result<(Option<OwnedFd>, u64)> {
+/// The directory `names` reach from `dir`, each opened from the last, none a symlink.
+pub(super) fn walk(dir: OwnedFd, names: &[Name]) -> io::Result<OwnedFd> {
+    names
+        .iter()
+        .try_fold(dir, |at, name| open_dir(&at, name.os()))
+}
+
+/// As [`walk`], making each directory missing (mode 0755), counted in `made`; in a dry run only
+/// counted, `None` from the first missing.
+pub(super) fn walk_making(
+    dir: OwnedFd,
+    names: &[Name],
+    dry: bool,
+    made: &mut u64,
+) -> io::Result<Option<OwnedFd>> {
     let mut at = dir;
     for (n, name) in names.iter().enumerate() {
         at = match open_dir(&at, name.os()) {
             Ok(next) => next,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+            Err(_missing) if dry => {
                 let missing = u64::try_from(names.len().saturating_sub(n)).unwrap_or(u64::MAX);
-                return Ok((None, missing));
+                *made = made.saturating_add(missing);
+                return Ok(None);
             }
-            Err(error) => return Err(error),
-        };
-    }
-    Ok((Some(at), 0))
-}
-
-/// The directory `names` reach from `dir`, each opened from the last, none a symlink; made where
-/// missing if `make`, each a directory made counted in `made`.
-pub(super) fn walk(
-    dir: OwnedFd,
-    names: &[Name],
-    make: bool,
-    made: &mut u64,
-) -> io::Result<OwnedFd> {
-    let mut at = dir;
-    for name in names {
-        at = match open_dir(&at, name.os()) {
-            Ok(next) => next,
-            Err(error) if make && error.kind() == io::ErrorKind::NotFound => {
+            Err(_missing) => {
                 make_dir(&at, name.os())?;
                 *made = made.saturating_add(1);
                 let next = open_dir(&at, name.os())?;
                 chmod(&next, 0o755)?;
                 next
             }
-            Err(error) => return Err(error),
         };
     }
-    Ok(at)
+    Ok(Some(at))
 }

@@ -1,8 +1,0 @@
-id = "TB-0066"
-title = "Names of the failing self-checks"
-cat = "run"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/selftest`. Write the names of the checks that FAIL, one per line,
-sorted alphabetically, to `answer.txt` in your local directory (only the names, like `net.dns`).
-"""

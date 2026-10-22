@@ -1,9 +1,0 @@
-id = "TB-0054"
-title = "Stop the leaking worker only"
-cat = "process"
-difficulty = "easy"
-goal = """
-On the remote machine, run `~/bin/start-workers`; it starts four background worker processes
-(`worker --id 1` to `worker --id 4`). One of them leaks memory: its memory use keeps growing while
-the others stay small. Find that worker and stop it. The other three must keep running.
-"""

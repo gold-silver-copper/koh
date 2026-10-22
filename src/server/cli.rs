@@ -1,8 +1,11 @@
-//! The `koh serve` command: admit only the clients on the allowlist, and serve each what it asks.
+//! The `koh serve` command: admit only the clients on the allowlist.
 //!
-//! It binds an endpoint with a persistent identity, and serves each connection what its opening
-//! request asks: a session, the peer's sessions, a command or a copy. There is no "accept any
-//! peer" mode.
+//! Each is served what its opening request asks: a session, the peer's sessions, a command, a job
+//! or a copy. There is no "accept any peer" mode.
+//!
+//! Admission decisions are logged as sshd logs them: the fields `event`, `outcome`, `peer` and
+//! `reason` under the `koh::auth` target. There is no address to ban: a peer may come through a
+//! relay, and a new endpoint id costs nothing, so the allowlist is the gate.
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -11,9 +14,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use iroh::endpoint::{Connection, Incoming, RecvStream};
 use iroh::{EndpointId, RelayUrl};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::bounded::Bounded;
 use crate::identity::KeyFile;
@@ -21,26 +26,23 @@ use crate::log::Peer;
 use crate::names::{List, Scope};
 use crate::proto::Close;
 use crate::request::{
-    Answer, Attached, On, Pick, Problem, ProblemKind, Request, Resume, SessionList, Until,
+    Answer, Attached, LogMsg, On, Problem, ProblemKind, Request, Resume, SessionList, Until,
     MAX_LISTED, MAX_OUTPUT, MAX_REQUEST,
 };
-use crate::server::audit::{auth_event, Outcome, Throttle};
 use crate::server::place::Place;
-use crate::server::session::{AttachKind, Registry, SessionSpec};
-use crate::transport_iroh::{bind_on, close, Network, PROTOCOL};
+use crate::server::session::{AttachKind, Launch, Registry, SessionSpec};
+use crate::transport_iroh::{bind_on, close, Network, Role, PROTOCOL};
 use tracing::{debug, info, warn};
 
-/// Deadline on the QUIC handshake, so a stalled dial gives up its place among those pending rather
-/// than keep it for the 5-minute idle timeout; a real handshake takes far less, even on a slow
-/// mobile link.
+/// Deadline on the QUIC handshake and the key proof, so a stalled dial gives up its place among
+/// those pending; a real one takes far less, even on a slow mobile link.
 const ACCEPT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long an allowed client's connection may wait for room among `--max-connections` before it
 /// is turned away as busy: a burst of its commands is served as others end.
 const QUEUED_FOR: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
 
-/// Deadline on the opening request, as on the handshake: a peer that says nothing is closed, and
-/// holds its permit no longer.
+/// Deadline on the opening request: a peer that says nothing holds its permit no longer.
 const REQUEST_TIMEOUT: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
 
 /// The clap-free form of `koh serve`'s arguments. [`Default`] gives the CLI's defaults, with an
@@ -142,43 +144,32 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
-    let identity = crate::identity::load(&key_file)?;
-    let secret = identity.secret.clone();
-
-    // Pick the network profile: self-hosted relay, relay-less LAN/loopback, or default n0.
+    let secret = crate::identity::load(&key_file)?;
     let network = match (&args.relay_url, args.local) {
         (Some(relay), _) => Network::Relay(relay.clone()),
         (None, true) => Network::Local,
         (None, false) => Network::N0,
     };
-    let endpoint = bind_on(
-        secret,
-        (true, crate::transport_iroh::Idle::Shell),
-        &network,
-        args.port,
-    )
-    .await
-    .context("binding endpoint")?;
-    let my_id = endpoint.id();
-    let id_str = my_id.to_string();
+    let endpoint = bind_on(secret, Role::Server, &network, args.port)
+        .await
+        .context("binding endpoint")?;
+    let id_str = endpoint.id().to_string();
     let port = endpoint
         .bound_sockets()
         .iter()
         .find(|s| s.is_ipv4())
         .map_or(0, std::net::SocketAddr::port);
 
-    // How a client should dial us, given the chosen profile.
     let connect_hint = match &network {
         Network::Relay(url) => format!("koh connect {id_str} --relay-url {url}"),
         Network::Local => format!("koh connect {id_str} --direct <this-host-ip>:{port}"),
         Network::N0 => format!("koh connect {id_str}"),
     };
     let port_note = if args.port.is_some() {
-        String::new()
+        ""
     } else {
-        " (ephemeral; --port fixes it across restarts)".to_owned()
+        " (ephemeral; --port fixes it across restarts)"
     };
-
     let clients = hosting.allowed.len();
     // A phone camera can read the id instead of anyone copying 64 hex digits.
     let qr = connect_qr(&id_str).map_or_else(
@@ -206,7 +197,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     );
     crate::log::stderr(banner.trim_end());
 
-    // What protects the link, iroh's choice: so an operator sees post-quantum KEX is not on.
+    // iroh's choice, said so an operator sees post-quantum KEX is not on.
     info!(
         transport = "QUIC + TLS 1.3 (iroh)",
         kex = "X25519",
@@ -223,7 +214,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
 }
 
 /// How soon a client removed from the saved clients, or added to them, is seen: one removed is
-/// cut off, its session ended, within this.
+/// cut off, its sessions and jobs ended, within this.
 pub const REVOKE_CHECK: Duration = Duration::from_secs(2);
 
 /// How long after a read that drops a client the list is read again, to confirm it.
@@ -301,13 +292,9 @@ impl Settling {
 }
 
 /// Read `list` again and again, publishing each change on `allowed`, until no one watches; and end
-/// in `registry` the session of each peer a change drops, connected or not. The one reader of the
-/// list: every [`REVOKE_CHECK`], [`CONFIRM`] included, so a removal is seen within it.
-async fn watch_allowlist(
-    list: Allowlist,
-    allowed: watch::Sender<Arc<Clients>>,
-    registry: Registry,
-) {
+/// the sessions and jobs of each peer a change drops or rescopes, connected or not. The one reader
+/// of the list: every [`REVOKE_CHECK`], [`CONFIRM`] included, so a removal is seen within it.
+async fn watch_allowlist(list: Allowlist, allowed: watch::Sender<Arc<Clients>>, host: Arc<Host>) {
     let list = Arc::new(list);
     let mut settling = Settling::default();
     loop {
@@ -327,17 +314,17 @@ async fn watch_allowlist(
             .and_then(|read| read);
         let now = allowed.borrow().clone();
         if let Some(next) = settling.settle(&now, read) {
-            // Removed, or scoped where it was not: its sessions end.
             let gone: Vec<EndpointId> = now
-                .keys()
-                .filter(|id| next.get(*id).is_none_or(|scope| !scope.is_full()))
-                .copied()
+                .iter()
+                .filter(|(id, scope)| next.get(*id) != Some(scope))
+                .map(|(id, _)| *id)
                 .collect();
             // Published first: the registry refuses an attach the list no longer allows, so none
             // can start a session after the end below.
             allowed.send_replace(Arc::new(next));
             for peer in gone {
-                registry.end(peer).await;
+                host.registry.end(peer).await;
+                host.jobs.end(peer);
             }
         }
     }
@@ -361,6 +348,11 @@ impl Hosting {
             "scrollback of {} bytes exceeds the maximum of {MAX_SCROLLBACK_BYTES}",
             args.scrollback_bytes
         );
+        anyhow::ensure!(
+            args.job_log_bytes <= MAX_JOB_LOG_BYTES,
+            "a job log of {} bytes exceeds the maximum of {MAX_JOB_LOG_BYTES}",
+            args.job_log_bytes
+        );
         let saved = args
             .saved_clients
             .as_ref()
@@ -369,11 +361,6 @@ impl Hosting {
                 anyhow::Ok((key, crate::names::shown(places, List::Clients)))
             })
             .transpose()?;
-        anyhow::ensure!(
-            args.job_log_bytes <= MAX_JOB_LOG_BYTES,
-            "a job log of {} bytes exceeds the maximum of {MAX_JOB_LOG_BYTES}",
-            args.job_log_bytes
-        );
         let allow = Allowlist {
             given: args
                 .allow
@@ -415,7 +402,7 @@ impl Hosting {
 
 /// Where a handshake comes from, for sharing out the room: an IPv4 address, or an IPv6 /48 (one
 /// site's share: a /64 a host, a site has 65k of them). None through a relay, where an address
-/// says nothing; built from nothing else.
+/// says nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SourceKey(std::net::IpAddr);
 
@@ -433,7 +420,7 @@ impl SourceKey {
     }
 }
 
-/// Most handshakes under way at once.
+/// Most handshakes, key proofs included, under way at once.
 const MOST_PENDING: usize = 256;
 
 /// The handshakes under way, oldest first, each with its address and its handle `H`: at most `N`,
@@ -471,20 +458,22 @@ impl<H, const N: usize> Pending<H, N> {
     }
 }
 
-/// What a connection's request may use beside the sessions: where commands run and copies
-/// land, what reaps commands hung up, and the server's shutdown, which hangs them up.
+/// What a connection's request may use: the sessions, the jobs, where commands run and copies
+/// land, and the server's shutdown, which hangs commands and jobs up.
 pub(super) struct Host {
     pub(super) home: crate::pty::Home,
-    pub(super) reaper: crate::pty::Reaper,
-    pub(super) shutdown: CancellationToken,
+    pub(super) registry: Registry,
     pub(super) jobs: super::jobs::Jobs,
+    pub(super) shutdown: CancellationToken,
+    /// The commands and jobs running: the shutdown waits for each to be hung up before the last
+    /// reaping.
+    pub(super) running: TaskTracker,
 }
 
 /// What a finished handshake needs to be admitted, cloned for each.
 #[derive(Clone)]
 struct Gate {
     allowed: Allowed,
-    registry: Registry,
     host: Arc<Host>,
     /// One permit a connection, held for its life.
     connections: Arc<tokio::sync::Semaphore>,
@@ -495,17 +484,44 @@ struct Gate {
     turned_away: Arc<Throttle>,
 }
 
-/// `incoming`'s handshake, then the key its client proves on its first stream: the connection,
-/// the key, and the rest of that stream. A client that proves none, or proves it wrongly, is
-/// closed as one not allowed, which says nothing of which keys are.
-async fn handshake(
-    incoming: iroh::endpoint::Incoming,
-    gate: &Gate,
-) -> anyhow::Result<(
-    iroh::endpoint::Connection,
-    EndpointId,
-    iroh::endpoint::RecvStream,
-)> {
+/// A connection whose client proved its key on its first stream.
+struct Proven {
+    conn: Connection,
+    peer: EndpointId,
+    /// The rest of that first stream.
+    control: RecvStream,
+}
+
+/// Log an admission `peer` passed, as sshd's Accepted.
+fn accepted(peer: &EndpointId, reason: &str) {
+    info!(target: "koh::auth", event = "authz", outcome = "accepted", peer = %peer, reason);
+}
+
+/// Log an admission refused by policy, as sshd's Refused.
+fn rejected(peer: &EndpointId, reason: &str) {
+    warn!(target: "koh::auth", event = "authz", outcome = "rejected", peer = %peer, reason);
+}
+
+/// A warning said at most once every ten seconds, however often its cause comes: a flood would
+/// say it at the flood's rate.
+#[derive(Default)]
+struct Throttle(std::sync::Mutex<Option<std::time::Instant>>);
+
+impl Throttle {
+    /// Whether to say it now: the first time, then once ten seconds have passed since it was.
+    fn ready(&self) -> bool {
+        let (Ok(mut said), now) = (self.0.lock(), std::time::Instant::now()) else {
+            return false;
+        };
+        let ready = said.is_none_or(|at| now.saturating_duration_since(at).as_secs() >= 10);
+        ready.then(|| *said = Some(now)).is_some()
+    }
+}
+
+/// `incoming`'s handshake, then the key its client proves on its first stream. A client that
+/// proves none, or proves it wrongly, is closed as one not allowed, which says nothing of which
+/// keys are.
+async fn handshake(incoming: Incoming, gate: &Gate) -> anyhow::Result<Proven> {
     let conn = incoming.await?;
     let proven = async {
         let mut control = conn.accept_uni().await?;
@@ -513,10 +529,14 @@ async fn handshake(
         anyhow::Ok((peer, control))
     };
     match proven.await {
-        Ok((peer, control)) => Ok((conn, peer, control)),
+        Ok((peer, control)) => Ok(Proven {
+            conn,
+            peer,
+            control,
+        }),
         Err(e) => {
             if gate.turned_away.ready() {
-                auth_event(Outcome::Rejected, &conn.remote_id(), "no key proved");
+                rejected(&conn.remote_id(), "no key proved");
             }
             close(&conn, Close::NotAuthorized);
             Err(e)
@@ -525,21 +545,15 @@ async fn handshake(
 }
 
 impl Gate {
-    /// Serve `conn` on a task of its own if `peer`, the key its client proved, is allowed, once
-    /// there is room for it: at once, or after a wait of at most [`QUEUED_FOR`] among at most
-    /// `--max-connections` others, as a burst of a client's commands needs. Else close it saying
-    /// why. `control` is the client's first stream, after its proof.
-    fn admit(
-        self,
-        conn: iroh::endpoint::Connection,
-        peer: EndpointId,
-        control: iroh::endpoint::RecvStream,
-    ) {
-        let Some(scope) = self.allowed.borrow().get(&peer).cloned() else {
+    /// Serve `proven` on a task of its own if its key is allowed, once there is room for it: at
+    /// once, or after a wait of at most [`QUEUED_FOR`] among at most `--max-connections` others,
+    /// as a burst of a client's commands needs. Else close it saying why.
+    fn admit(self, proven: Proven) {
+        let Some(scope) = self.allowed.borrow().get(&proven.peer).cloned() else {
             if self.turned_away.ready() {
-                auth_event(Outcome::Rejected, &peer, "not on allowlist");
+                rejected(&proven.peer, "not on allowlist");
             }
-            close(&conn, Close::NotAuthorized);
+            close(&proven.conn, Close::NotAuthorized);
             return;
         };
         // Room now, or else a place among those waiting for it.
@@ -549,7 +563,7 @@ impl Gate {
         } else if let Ok(place) = Arc::clone(&self.waiting).try_acquire_owned() {
             Some(place)
         } else {
-            self.busy(&conn, &peer);
+            self.busy(&proven);
             return;
         };
         #[expect(
@@ -557,72 +571,60 @@ impl Gate {
             reason = "a task a connection, each holding a permit, or a place among those waiting"
         )]
         drop(tokio::spawn(async move {
-            let permit = if let Some(permit) = room {
+            let _permit = if let Some(permit) = room {
                 permit
             } else {
                 let room = Arc::clone(&self.connections).acquire_owned();
                 let waited = tokio::time::timeout(QUEUED_FOR, room).await;
                 drop(place);
                 let Ok(Ok(permit)) = waited else {
-                    self.busy(&conn, &peer);
+                    self.busy(&proven);
                     return;
                 };
                 permit
             };
-            serve_connection(
-                (conn, peer, control),
-                (self.allowed, scope),
-                self.registry,
-                self.host,
-                permit,
-            )
-            .await;
+            self.serve(proven, scope).await;
         }));
     }
 
-    /// Turn `conn`, `peer`'s, away for want of room, saying so.
-    fn busy(&self, conn: &iroh::endpoint::Connection, peer: &EndpointId) {
+    /// Turn `proven` away for want of room, saying so.
+    fn busy(&self, proven: &Proven) {
         if self.turned_away.ready() {
-            warn!(peer = %peer, "refusing connection: busy (at --max-connections, and as many waiting)");
+            warn!(peer = %proven.peer, "refusing connection: busy (at --max-connections, and as many waiting)");
         }
-        close(conn, Close::Busy);
+        close(&proven.conn, Close::Busy);
     }
-}
 
-/// Serve what the opening request on `control`, `conn`'s first stream, asks of `peer` until it is
-/// done, or the peer is removed from the list, which ends its sessions too. The registry attaches
-/// no peer the list no longer allows: one removed as this connection was admitted starts no
-/// session. Holds `permit` throughout, the wait for the request included.
-async fn serve_connection(
-    (conn, peer, control): (
-        iroh::endpoint::Connection,
-        EndpointId,
-        iroh::endpoint::RecvStream,
-    ),
-    (allowed, scope): (Allowed, Scope),
-    registry: Registry,
-    host: Arc<Host>,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _permit = permit;
-    let served = async {
-        let Some((request, control)) = opening(&conn, control).await else {
-            return;
+    /// Serve what the opening request on `proven`'s first stream asks of its key, of `scope`,
+    /// until it is done, or the key is removed from the list or rescoped, which ends its sessions
+    /// and jobs too. The registry attaches no peer the list no longer allows: one removed as this
+    /// connection was admitted starts no session.
+    async fn serve(self, proven: Proven, scope: Scope) {
+        let Proven {
+            conn,
+            peer,
+            control,
+        } = proven;
+        let host = &*self.host;
+        let served = async {
+            let Some((request, control)) = opening(&conn, control).await else {
+                return;
+            };
+            let Some(place) = permitted(&request, &scope, host) else {
+                rejected(&peer, "out of its scope");
+                info!(peer = %peer, asked = request.what(), "a scoped key asked for more than its scope");
+                close(&conn, Close::OutOfScope);
+                return;
+            };
+            accepted(&peer, request.what());
+            dispatch(&conn, peer, request, control, host, &place).await;
         };
-        let Some(place) = permitted(&request, &scope, &host) else {
-            auth_event(Outcome::Rejected, &peer, "out of its scope");
-            info!(peer = %peer, asked = request.what(), "a scoped key asked for more than its scope");
-            close(&conn, Close::OutOfScope);
-            return;
-        };
-        auth_event(Outcome::Accepted, &peer, request.what());
-        dispatch((&conn, peer), request, control, (&registry, &host, &place)).await;
-    };
-    tokio::select! {
-        () = served => {}
-        () = revoked(allowed, peer, scope.clone()) => {
-            auth_event(Outcome::Rejected, &peer, "removed from the allowlist, or its scope changed");
-            close(&conn, Close::NotAuthorized);
+        tokio::select! {
+            () = served => {}
+            () = revoked(self.allowed.clone(), peer, scope.clone()) => {
+                rejected(&peer, "removed from the allowlist, or its scope changed");
+                close(&conn, Close::NotAuthorized);
+            }
         }
     }
 }
@@ -653,10 +655,12 @@ fn permitted(request: &Request, scope: &Scope, host: &Host) -> Option<Place> {
 
 /// Serve `request` for `peer` on `conn` at `place`; `control` is the rest of its first stream.
 async fn dispatch(
-    (conn, peer): (&iroh::endpoint::Connection, EndpointId),
+    conn: &Connection,
+    peer: EndpointId,
     request: Request,
-    control: iroh::endpoint::RecvStream,
-    (registry, host, place): (&Registry, &Host, &Place),
+    control: RecvStream,
+    host: &Host,
+    place: &Place,
 ) {
     match request {
         Request::Shell {
@@ -679,15 +683,55 @@ async fn dispatch(
                     return;
                 }
             };
-            shell((conn, peer), registry, (pick, size, program, cwd), control).await;
+            // A PTY's program takes its words as text.
+            let program = program.map(|argv| {
+                argv.words()
+                    .iter()
+                    .map(|word| String::from_utf8(word.clone()))
+                    .collect::<Result<Arc<[String]>, _>>()
+            });
+            let Ok(program) = program.transpose() else {
+                info!(peer = %peer, "refusing a session: its program's words are not UTF-8");
+                close(conn, Close::CouldNotStart);
+                return;
+            };
+            let launch = Launch { program, cwd };
+            let attached = host.registry.attach(peer, pick, size, launch).await;
+            let (client, start, kind) = match attached {
+                Ok(attached) => attached,
+                Err(refused) => {
+                    warn!(peer = %peer, reason = %refused, "refusing session");
+                    close(conn, refused);
+                    return;
+                }
+            };
+            let session = client.session();
+            let how = match kind {
+                AttachKind::Created => "started a new session",
+                AttachKind::Reattached => "reattached to its session",
+            };
+            info!(peer = %peer, %session, "{how}");
+            // The session is the proof the peer is allowed: the registry attaches no other.
+            let run = host.registry.run();
+            if super::reply(
+                conn,
+                &Attached {
+                    at: Resume { run, session },
+                },
+            )
+            .await
+            .is_ok()
+            {
+                super::attach::serve(conn, client, start, control).await;
+            }
         }
         Request::Sessions => {
-            let mut sessions = registry.sessions(peer).await;
+            let mut sessions = host.registry.sessions(peer).await;
             sessions.truncate(MAX_LISTED);
             super::answer(conn, &Answer::Ok(SessionList(sessions))).await;
         }
         Request::Output { session, last } => {
-            let text: Answer<String> = match registry.find(peer, session).await {
+            let text: Answer<String> = match host.registry.find(peer, session).await {
                 Some(found) => found.text(last).await.ok_or_else(|| {
                     Problem::new(
                         ProblemKind::NotFound,
@@ -701,10 +745,10 @@ async fn dispatch(
             }
         }
         Request::Exec { run, together } => {
-            super::exec::serve(conn, control, (&run, together), host, place).await;
+            super::exec::serve(conn, control, &run, together, host, place).await;
         }
         Request::Start { name, run } => {
-            let started = host.jobs.start(peer, name, &run, host, place);
+            let started = host.jobs.start(peer, name, &run, host, place).await;
             if let Ok(started) = &started {
                 info!(peer = %peer, job = %started.name, "started a job");
             }
@@ -719,106 +763,36 @@ async fn dispatch(
         }
         Request::Logs { job, follow, tail } => {
             if let Some(found) = host.jobs.get(peer, &job) {
-                super::jobs::logs(conn, &found, (follow, tail)).await;
+                super::jobs::logs(conn, &found, follow, tail).await;
             } else {
-                let none: Answer<()> = Err(Problem::new(ProblemKind::NoSuchJob, &job));
+                let none = LogMsg::Problem(Problem::new(ProblemKind::NoSuchJob, &job));
                 super::answer(conn, &none).await;
             }
         }
         Request::Kill { job, signal } => {
             super::answer(conn, &host.jobs.kill(peer, &job, signal)).await;
         }
-        Request::Wait(wait) => {
-            super::wait::serve(conn, peer, &wait, (registry, &host.jobs), place).await;
-        }
+        Request::Wait(wait) => super::wait::serve(conn, peer, &wait, host, place).await,
         Request::Copy(copy) => super::copy::serve(conn, control, copy, place).await,
     }
 }
 
 /// The request `conn`'s client opens with on `control`, and the rest of its stream, read within
 /// [`REQUEST_TIMEOUT`]: else the connection is closed, as one that broke the protocol.
-async fn opening(
-    conn: &iroh::endpoint::Connection,
-    mut control: iroh::endpoint::RecvStream,
-) -> Option<(Request, iroh::endpoint::RecvStream)> {
+async fn opening(conn: &Connection, mut control: RecvStream) -> Option<(Request, RecvStream)> {
     let read = async {
         let body = crate::transport_iroh::read_framed(&mut control, MAX_REQUEST).await?;
-        let request: Request = crate::request::decode(&body)?;
+        let request: Request = postcard::from_bytes(&body)?;
         anyhow::Ok((request, control))
     };
-    match tokio::time::timeout(REQUEST_TIMEOUT, read).await {
-        Ok(Ok(opened)) => Some(opened),
-        Ok(Err(error)) => {
+    let opened = tokio::time::timeout(REQUEST_TIMEOUT, read).await;
+    match opened.map_err(anyhow::Error::from).and_then(|read| read) {
+        Ok(opened) => Some(opened),
+        Err(error) => {
             debug!(error = %Peer(format!("{error:#}")), "no opening request");
             close(conn, Close::ProtocolError);
             None
         }
-        Err(_) => {
-            debug!("no opening request in time");
-            close(conn, Close::ProtocolError);
-            None
-        }
-    }
-}
-
-/// Attach `peer`, on `conn`, to the session `pick` names (a new one running `program`, or starting
-/// in `cwd`, if given) and serve it until it detaches; the rest of the client's first stream,
-/// `control`, is the session's control stream.
-async fn shell(
-    (conn, peer): (&iroh::endpoint::Connection, EndpointId),
-    registry: &Registry,
-    (pick, size, program, cwd): (
-        Pick,
-        crate::terminal::Size,
-        Option<crate::request::Argv>,
-        Option<std::path::PathBuf>,
-    ),
-    control: iroh::endpoint::RecvStream,
-) {
-    // A PTY's program takes its words as text.
-    let program = match program.map(|argv| {
-        argv.words()
-            .iter()
-            .map(|word| String::from_utf8(word.clone()))
-            .collect::<Result<Arc<[String]>, _>>()
-    }) {
-        Some(Err(_)) => {
-            info!(peer = %peer, "refusing a session: its program's words are not UTF-8");
-            close(conn, Close::CouldNotStart);
-            return;
-        }
-        Some(Ok(words)) => Some(words),
-        None => None,
-    };
-    let (client, start, attach_kind) = match registry.attach(peer, pick, size, (program, cwd)).await
-    {
-        Ok(attached) => attached,
-        Err(refused) => {
-            warn!(peer = %peer, reason = %refused, "refusing session");
-            close(conn, refused);
-            return;
-        }
-    };
-    let session = client.session();
-    match attach_kind {
-        AttachKind::Created => info!(peer = %peer, %session, "started a new session"),
-        AttachKind::Reattached { detached_for } => info!(
-            peer = %peer,
-            %session,
-            detached_secs = detached_for.map(|d| d.as_secs()),
-            "reattaching to this peer's session"
-        ),
-    }
-    // Its first stream tells the client it was admitted, and to which session. The session is
-    // the proof the peer is allowed: the registry attaches no other.
-    let attached = Attached {
-        at: Resume {
-            run: registry.run(),
-            session,
-        },
-    };
-    if super::reply(conn, &attached).await.is_ok() {
-        super::attach::serve(conn, client, start, control).await;
     }
 }
 
@@ -831,24 +805,27 @@ pub async fn serve_endpoint(
 ) -> anyhow::Result<()> {
     let (allowed_tx, allowed) = watch::channel(Arc::new(hosting.allowed));
     let allows = allowed.clone();
-    let home = hosting.spec.home.clone();
+    let (home, ttl) = (hosting.spec.home.clone(), hosting.spec.ttl);
     // Only a key that may do everything gets a session.
-    let ttl = hosting.spec.ttl;
     let registry = Registry::spawn(hosting.spec, move |peer| {
         allows.borrow().get(peer).is_some_and(Scope::is_full)
     })
     .context("starting the child reaper")?;
     let host = Arc::new(Host {
         home,
-        reaper: registry.reaper(),
-        shutdown: shutdown.clone(),
+        registry,
         jobs: super::jobs::Jobs::new(hosting.job_log_bytes, ttl),
+        shutdown: shutdown.clone(),
+        running: TaskTracker::new(),
     });
     #[expect(clippy::disallowed_methods, reason = "one allowlist reader a server")]
-    tokio::spawn(watch_allowlist(hosting.allow, allowed_tx, registry.clone()));
+    tokio::spawn(watch_allowlist(
+        hosting.allow,
+        allowed_tx,
+        Arc::clone(&host),
+    ));
     let gate = Gate {
         allowed,
-        registry: registry.clone(),
         host: Arc::clone(&host),
         connections: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
         waiting: Arc::new(tokio::sync::Semaphore::new(hosting.max_connections)),
@@ -861,13 +838,13 @@ pub async fn serve_endpoint(
         let incoming = tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
-            inc = endpoint.accept() => match inc {
-                Some(i) => i,
-                None => break, // endpoint closed
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => break,
             },
         };
         // In order: room for the handshake, the handshake and the client's key proof within its
-        // deadline, the allowlist, a connection permit, then the session.
+        // deadline, the allowlist, a connection permit, then the request.
         let source = SourceKey::of(&incoming.remote_addr());
         // When room would cost a handshake under way, an address must first show it can be
         // answered (a QUIC retry, one round trip), which a spoofed one never does: only real
@@ -895,7 +872,7 @@ pub async fn serve_endpoint(
         )]
         let handshake = tokio::spawn(async move {
             match tokio::time::timeout(ACCEPT_HANDSHAKE_TIMEOUT, handshake(incoming, &gate)).await {
-                Ok(Ok((conn, peer, control))) => gate.admit(conn, peer, control),
+                Ok(Ok(proven)) => gate.admit(proven),
                 // Anyone can start one: said quietly, as a flood would say it often.
                 Ok(Err(e)) => debug!(error = %Peer(format!("{e:#}")), "incoming handshake failed"),
                 Err(_) => debug!("incoming handshake timed out (stalled, or no key proved)"),
@@ -904,15 +881,17 @@ pub async fn serve_endpoint(
         pending.0.push_evicting((source, handshake.abort_handle()));
     }
 
-    // Sessions first, with their programs reaped (or killed after their grace), then the endpoint;
-    // the commands hung up as the shutdown reached them are reaped last.
+    // Sessions first, their programs reaped (or killed after their grace); then the commands and
+    // jobs, hung up as the shutdown reached them; then the endpoint; then their reaping.
     info!("draining: stopping the registry and closing endpoint");
     shutdown.cancel();
-    registry.shutdown().await;
+    host.registry.shutdown().await;
+    host.running.close();
+    host.running.wait().await;
     if !crate::transport_iroh::close_endpoint(&endpoint).await {
         warn!("peers did not see the endpoint close in time; exiting anyway");
     }
-    let reaper = host.reaper.clone();
+    let reaper = host.registry.reaper().clone();
     let _ = tokio::task::spawn_blocking(move || reaper.drain()).await;
     Ok(())
 }
@@ -1008,5 +987,11 @@ mod tests {
         // Done, it is forgotten, and the room it took is free.
         assert_eq!(begin(&mut pending, 1, 40), None);
         assert!(pending.0.iter().all(|&(_, n)| n != 99));
+    }
+
+    #[test]
+    fn a_flood_of_turned_away_peers_is_said_once() {
+        let throttle = Throttle::default();
+        assert_eq!((0..1000).filter(|_| throttle.ready()).count(), 1);
     }
 }

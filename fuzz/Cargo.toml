@@ -17,7 +17,9 @@ cargo-fuzz = true
 koh = { path = ".." }
 libfuzzer-sys = "0.4"
 # The user's terminal the client writes to, in `server_process`; koh's own version.
-fux-vt = "0.12.0"
+fux-vt = "0.12.1"
+# The wire's decoding, as koh does it; koh's own version.
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 
 [[bin]]
 name = "proto_decode"

@@ -21,12 +21,13 @@ use crate::predict::{Overlay, PredictionEngine};
 use crate::stream::{Filter, Marks, Piece, Policy};
 use crate::terminal::{Activity, Size};
 
-/// A cell painted over the program's: where, and what was painted.
+/// The overlay as painted: the cells it covers, the status line's row if it was painted, and the
+/// bytes that painted it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Painted {
     cells: Vec<(u16, u16)>,
-    /// The status line's row, if it was painted.
     status: Option<u16>,
+    bytes: Vec<u8>,
 }
 
 /// The user's terminal as the client writes to it.
@@ -37,7 +38,7 @@ pub struct Display {
     /// What the overlay covers now, if it is painted.
     painted: Option<Painted>,
     /// The status line, if one is shown.
-    status: Option<String>,
+    status: Option<&'static str>,
     /// The last state report, written again after each mark: a terminal forgets one at a mark.
     report: Option<Activity>,
     /// Whether the terminal's pen and modes are the program's (not reset by `leave`).
@@ -97,11 +98,16 @@ impl Display {
 
     /// Write the program's `output`, as the filter passes it.
     pub fn output(&mut self, backend: &mut impl KohBackend, output: &[u8]) -> io::Result<()> {
-        let mut out = Vec::with_capacity(output.len());
-        self.filter.feed(output, &mut |piece| match piece {
-            Piece::Out(bytes) => out.extend_from_slice(&bytes),
-            // Marks come apart, never in the output.
-            Piece::Mark(_) => {}
+        let mut out = Vec::new();
+        // Marks come apart, never in the output.
+        self.filter.feed(output, &mut |piece| {
+            if let Piece::Out(bytes) = piece {
+                if out.is_empty() {
+                    out = bytes;
+                } else {
+                    out.extend_from_slice(&bytes);
+                }
+            }
         });
         if out.is_empty() {
             return Ok(());
@@ -166,7 +172,7 @@ impl Display {
     }
 
     /// Show `status` on the status line, or none.
-    pub fn set_status(&mut self, status: Option<String>) {
+    pub const fn set_status(&mut self, status: Option<&'static str>) {
         self.status = status;
     }
 
@@ -183,20 +189,17 @@ impl Display {
     }
 
     /// Paint the overlay, if there is one to paint and it can be: the predictions, the status
-    /// line, and the cursor where the predictions put it.
+    /// line, and the cursor where the predictions put it. An overlay painted as it is stays.
     pub fn paint(&mut self, backend: &mut impl KohBackend) -> io::Result<()> {
-        self.unpaint(backend)?;
         let overlay: Overlay = self.predictor.overlay();
         if (overlay.is_empty() && self.status.is_none()) || !self.paintable() {
-            return Ok(());
+            return self.unpaint(backend);
         }
         let screen = self.mirror.screen();
         let (rows, cols) = screen.size().into();
         let mut out = b"\x1b[?2026h".to_vec();
-        let mut painted = Painted {
-            cells: Vec::new(),
-            status: None,
-        };
+        let mut cells = Vec::new();
+        let mut status_row = None;
         let mut pen = None;
         for ((row, col), cell) in overlay.cells() {
             if cell.covered() || row >= rows || col >= cols {
@@ -210,12 +213,12 @@ impl Display {
                 cell.text()
             };
             out.extend_from_slice(glyph.as_bytes());
-            painted.cells.push((row, col));
+            cells.push((row, col));
             if unicode_width::UnicodeWidthStr::width(glyph) > 1 {
-                painted.cells.push((row, col.saturating_add(1)));
+                cells.push((row, col.saturating_add(1)));
             }
         }
-        if let Some(status) = &self.status {
+        if let Some(status) = self.status {
             let row = rows.saturating_sub(1);
             cup(&mut out, row, 0);
             let mut line: String = status.chars().take(usize::from(cols)).collect();
@@ -224,8 +227,7 @@ impl Display {
             }
             out.extend_from_slice(b"\x1b[0;7m\x1b[2K");
             out.extend_from_slice(line.as_bytes());
-            pen = None;
-            painted.status = Some(row);
+            status_row = Some(row);
         }
         let (row, col) = overlay.cursor().unwrap_or_else(|| screen.cursor_position());
         cup(
@@ -233,12 +235,19 @@ impl Display {
             row.min(rows.saturating_sub(1)),
             col.min(cols.saturating_sub(1)),
         );
-        let _ = pen;
         out.extend_from_slice(b"\x1b[?2026l");
+        if self.painted.as_ref().is_some_and(|p| p.bytes == out) {
+            return Ok(());
+        }
+        self.unpaint(backend)?;
         backend.write_bytes(&out)?;
         let predicted: String = overlay.cells().map(|(_, cell)| cell.text()).collect();
-        backend.overlay(&predicted, self.status.as_deref());
-        self.painted = Some(painted);
+        backend.overlay(&predicted, self.status);
+        self.painted = Some(Painted {
+            cells,
+            status: status_row,
+            bytes: out,
+        });
         Ok(())
     }
 
@@ -364,7 +373,7 @@ fn sgr(out: &mut Vec<u8>, pen: &mut Option<Attributes>, attributes: Attributes) 
 mod tests {
     use super::*;
     use crate::client::backend::CaptureBackend;
-    use crate::predict::TtyModes;
+    use crate::terminal::TtyModes;
     use fux_vt::keys::{Key, KeyPress};
 
     /// What a terminal shows after `bytes`, as a fux-vt parser holds it: each row's text and the
@@ -431,7 +440,7 @@ mod tests {
         display
             .output(&mut backend, b"a\r\nb\r\ncdef\x1b[1;1H")
             .unwrap();
-        display.set_status(Some("reconnecting".into()));
+        display.set_status(Some("reconnecting"));
         display.paint(&mut backend).unwrap();
         assert_eq!(shown(3, 10, &backend.written).0[2], "reconnecti");
         display.set_status(None);

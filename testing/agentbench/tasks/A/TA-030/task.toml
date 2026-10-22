@@ -1,9 +1,0 @@
-id = "TA-030"
-title = "Replace a config, keep a backup"
-cat = "files"
-difficulty = "easy"
-goal = '''
-Your local directory has a new `config.yaml`. On the remote machine, the service's config is
-`~/app/config/config.yaml`. Replace it with your local `config.yaml`, keeping the old one beside
-it as `~/app/config/config.yaml.bak`.
-'''

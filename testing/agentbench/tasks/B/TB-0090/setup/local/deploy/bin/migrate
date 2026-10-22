@@ -1,2 +1,0 @@
-#!/bin/sh
-echo "migrating schema to v42"

@@ -318,7 +318,7 @@ impl Remote {
         let connector = IrohConnector::new(endpoint, FaultNet::addr(server_id), client_secret);
         let start = Size::new(rows, cols);
         let channel = connector
-            .connect(koh::request::Pick::Latest, start, (None, None))
+            .connect(koh::request::Pick::Latest, start, None, None)
             .await?;
         let size = Arc::new(Mutex::new(start));
         let shown = Arc::new(Mutex::new(parser(rows, cols)?));
@@ -346,8 +346,9 @@ impl Remote {
                 clipboard: false,
                 links: false,
                 bell: None,
+                input: input_rx,
+                resizes: resize_rx,
             },
-            (input_rx, resize_rx),
             CancellationToken::new(),
         ));
         Ok(Self {
@@ -382,11 +383,11 @@ impl Remote {
         mosh_pid: Option<i32>,
     ) -> anyhow::Result<(Shown, Inner)> {
         let (pty, mut output) = Pty::spawn(
-            rows,
-            cols,
+            Size::new(rows, cols),
             argv,
             &[],
-            ("xterm-256color", &Home::isolated(&setup.home), None),
+            &Home::isolated(&setup.home),
+            None,
             &koh::pty::Reaper::start()?,
         )
         .map_err(|e| anyhow!("{e}"))?;
@@ -568,7 +569,9 @@ impl Remote {
                 *size.lock().unwrap_or_else(PoisonError::into_inner) = Size::new(rows, cols);
                 Ok(resize.send(()).await?)
             }
-            Inner::Pty { pty, .. } => pty.resize(rows, cols).map_err(|e| anyhow!("{e}")),
+            Inner::Pty { pty, .. } => pty
+                .resize(Size::new(rows, cols))
+                .map_err(|e| anyhow!("{e}")),
         }
     }
 

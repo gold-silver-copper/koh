@@ -11,9 +11,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0 and 0.15.0 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0 and 0.16.0 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.16.0] — 2026-10-21
 
 ### Fixed
 
@@ -773,7 +775,10 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/gold-silver-copper/koh/compare/v0.15.0...v0.16.0
+[0.15.0]: https://github.com/gold-silver-copper/koh/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/gold-silver-copper/koh/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gold-silver-copper/koh/compare/v0.12.1...v0.13.0
 [0.9.1]: https://github.com/gold-silver-copper/koh/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/gold-silver-copper/koh/releases/tag/v0.9.0

@@ -846,10 +846,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73a663fa645368669cd918f8ccb75b161697a9b74cf3a87e19b8488cb7024ca7"
 
 [[package]]
-name = "fuxix"
-version = "0.6.2"
+name = "fux-vt"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "770130e56836963c2c01994462c4eb322002a8bddb3d4e67ad02245821d8cbe6"
+checksum = "093b3297edbb68ad69d233d14dec620ccd08e6ae1a3f78137cd8bbd941ebe018"
+
+[[package]]
+name = "fuxix"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64170a895059353784ffabc2a0b43e7dd75ca20b30f176a10801022e71a819ae"
 dependencies = [
  "libc",
 ]
@@ -1546,7 +1552,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
- "fux-vt",
+ "fux-vt 0.13.0",
  "fuxix",
  "getrandom 0.4.3",
  "iroh",
@@ -1567,7 +1573,7 @@ dependencies = [
 name = "koh-fuzz"
 version = "0.0.0"
 dependencies = [
- "fux-vt",
+ "fux-vt 0.12.1",
  "koh",
  "libfuzzer-sys",
  "postcard",

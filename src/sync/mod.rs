@@ -635,7 +635,9 @@ pub async fn send_on(
             Err(failure)
         }
     });
-    let sent = async {
+    // Each pump owns its channel end: when transport fails, dropping it wakes the blocking
+    // worker. Borrowing it here keeps the channel open while `sending.await` waits for it.
+    let sent = async move {
         while let Some(bytes) = rx.recv().await {
             if out.write_chunk(bytes.into()).await.is_err() {
                 return;
@@ -643,7 +645,7 @@ pub async fn send_on(
         }
         let _ = out.finish();
     };
-    let replied = async {
+    let replied = async move {
         let Some(mut recv) = replies.await else {
             return;
         };
@@ -704,7 +706,8 @@ pub async fn receive_on(
         let _ = end_tx.send(Reply::End(outcome.clone())).await;
         outcome
     };
-    let replied = async {
+    // Drop the receiver when writing fails, so the final reply cannot wait on a full queue.
+    let replied = async move {
         while let Some(reply) = reply_rx.recv().await {
             let Ok(bytes) = crate::request::encode(&reply, MAX_REPLY_ITEM) else {
                 return;

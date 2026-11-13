@@ -544,7 +544,7 @@ impl Remote {
                     to_client: count(net.delivered(*client_id)),
                 }
             }
-            Inner::Pty { proxy, .. } => proxy.as_ref().map(Proxy::counts).unwrap_or_default(),
+            Inner::Pty { proxy, .. } => proxy.as_ref().map_or_default(Proxy::counts),
         }
     }
 

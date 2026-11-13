@@ -153,8 +153,7 @@ fn first_line(program: &str, args: &[&str]) -> String {
 
 fn load() -> String {
     std::fs::read_to_string("/proc/loadavg")
-        .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-        .unwrap_or_default()
+        .map_or_default(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
 }
 
 /// The machine, the commit and the tools, for the scoreboard's head.

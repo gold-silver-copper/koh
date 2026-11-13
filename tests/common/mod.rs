@@ -74,8 +74,16 @@ pub async fn loopback_server(allow: &str) -> anyhow::Result<(String, u16, JoinHa
 pub async fn serve_in_process(
     config: &koh::server::ServeConfig,
 ) -> anyhow::Result<(String, u16, JoinHandle<()>)> {
+    serve_in_process_as(config, generate_secret_key()?).await
+}
+
+/// [`serve_in_process`] with the server key `secret`.
+pub async fn serve_in_process_as(
+    config: &koh::server::ServeConfig,
+    secret: iroh::SecretKey,
+) -> anyhow::Result<(String, u16, JoinHandle<()>)> {
     let hosting = koh::server::cli::Hosting::from_config(config)?;
-    let endpoint = bind_endpoint_local(generate_secret_key()?, true).await?;
+    let endpoint = bind_endpoint_local(secret, true).await?;
     let id = endpoint.id().to_string();
     let port = endpoint
         .bound_sockets()

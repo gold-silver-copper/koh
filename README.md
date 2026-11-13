@@ -130,7 +130,9 @@ Keys live under `$XDG_CONFIG_HOME/koh/` (else `~/.config/koh/`) by default (`cli
 server key, one `name id` a line (`#` comments allowed); a server's may end `direct=IP:PORT` or
 `relay=URL`, how to dial it, and a client's `cp=DIR` or `exec=DIR`, its scope. They are checked as
 the keys are, since `clients` decides who may open a shell: a file that is a symlink or someone
-else's is refused, and a loose mode is tightened.
+else's is refused, and a loose mode is tightened. One `koh serve` at a time serves with a key
+(it holds `server.key.serving` beside it): a second on the same key, which would have the same
+endpoint id and take some of the first's connections, is refused.
 
 **Keys, mouse and pastes** reach the remote program as it asked, whatever terminal you type on:
 the program's keyboard, mouse and paste modes reach your terminal with its output (and with the

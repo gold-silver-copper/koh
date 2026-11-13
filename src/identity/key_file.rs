@@ -180,6 +180,32 @@ impl KeyFile {
         Ok(())
     }
 
+    /// The key held for one server until the file this returns is dropped. A second server on the
+    /// key is refused: it would have the same endpoint id, and each client connection would reach
+    /// one server or the other, each with its own jobs and sessions.
+    pub(crate) fn hold_for_serving(&self) -> anyhow::Result<File> {
+        let (name, _) = split(&self.path)?;
+        let path = self.beside(&format!("{}.serving", name.to_string_lossy()))?;
+        let lock = open_private(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600),
+            &path,
+            BESIDE,
+        )?;
+        match lock.try_lock() {
+            Ok(()) => Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
+                "another koh server is serving with the key {self}: two servers on one key share \
+                 its endpoint id, and clients reach one or the other at random; stop that one, or \
+                 give this one a key of its own (--key-file)"
+            ),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+
     /// The directory's lock, held until dropped: a private file in it, which no other user can
     /// open, and so hold to hang koh, as they could the directory itself.
     fn lock_dir(&self) -> Result<File, SetupError> {

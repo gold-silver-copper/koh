@@ -336,6 +336,41 @@ fn connect_by_name_dials_the_saved_server_where_it_was_saved() {
         });
 }
 
+/// A second `koh serve` on a key one already serves with is refused, saying why: it would have the
+/// same endpoint id, and clients would reach one server or the other, each with its own jobs.
+/// Once the first is gone, the key serves again.
+#[test]
+fn a_second_server_on_the_same_key_is_refused() {
+    let home = Home::new("one-server").unwrap();
+    home.koh(&["clients", "add", "phone", &some_id(3)]).unwrap();
+    let serve_cmd = || {
+        home.command(&["serve", "--local", "--shell", "sh"])
+            .unwrap()
+    };
+    let (first, _) = serve(serve_cmd()).unwrap();
+    let mut second = serve_cmd()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while second.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = second.kill();
+    let out = second.wait_with_output().unwrap();
+    assert!(!out.status.success(), "a second server ran: {}", text(&out));
+    assert!(
+        text(&out).contains("another koh server is serving with the key"),
+        "{}",
+        text(&out)
+    );
+    drop(first);
+    let (again, _) = serve(serve_cmd()).unwrap();
+    drop(again);
+}
+
 /// Clients added and removed with `koh clients` take effect at a running server's next connection,
 /// with no restart: a lost machine's key is refused at once.
 #[test]

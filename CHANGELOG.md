@@ -15,6 +15,16 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Fixed
+
+- `koh serve` refuses to start on a key another `koh serve` is already serving with. Two servers
+  on one key share an endpoint id, so each client connection reached one or the other: a job
+  started on one was "no such job" to a wait that reached the other.
+- `koh wait` that saw its job end exits with the job's status even when the job's last lines,
+  asked for afterwards on a new connection, cannot be shown; it says why on stderr. It used to
+  exit 255 with that error ("no such job"), as if the wait itself had failed. A wait that timed
+  out keeps its 124 the same way.
+
 ## [0.17.1] — 2026-10-22
 
 fux-vt 0.13.0 and fuxix 0.6.3, with fux's review fixes.

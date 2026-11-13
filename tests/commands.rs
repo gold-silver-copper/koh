@@ -725,6 +725,109 @@ fn a_job_outlives_its_client_and_is_waited_for_followed_and_killed() {
         });
 }
 
+/// One address in front of `first` and `second`, as one endpoint id is in front of two servers
+/// that share a key: the first `to_first` sockets that send to it reach `first`, later ones
+/// `second`. Each `koh` command dials from a socket of its own. Its port, and its task.
+async fn split(
+    first: std::net::SocketAddr,
+    second: std::net::SocketAddr,
+    to_first: usize,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<()>)> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::net::UdpSocket;
+    let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let port = front.local_addr()?.port();
+    let task = koh_testkit::spawn(async move {
+        let mut backs: HashMap<std::net::SocketAddr, Arc<UdpSocket>> = HashMap::new();
+        let mut buf = vec![0; 65536];
+        while let Ok((n, from)) = front.recv_from(&mut buf).await {
+            if !backs.contains_key(&from) {
+                let to = if backs.len() < to_first {
+                    first
+                } else {
+                    second
+                };
+                let Ok(back) = UdpSocket::bind("127.0.0.1:0").await else {
+                    break;
+                };
+                if back.connect(to).await.is_err() {
+                    break;
+                }
+                let back = Arc::new(back);
+                let (to_client, from_server) = (Arc::clone(&front), Arc::clone(&back));
+                koh_testkit::spawn(async move {
+                    let mut buf = vec![0; 65536];
+                    while let Ok(n) = from_server.recv(&mut buf).await {
+                        let packet = buf.get(..n).unwrap_or_default();
+                        let _ = to_client.send_to(packet, from).await;
+                    }
+                });
+                backs.insert(from, back);
+            }
+            if let Some(back) = backs.get(&from) {
+                let _ = back.send(buf.get(..n).unwrap_or_default()).await;
+            }
+        }
+    });
+    Ok((port, task))
+}
+
+/// A wait that saw its job end exits with the job's status, even if the last lines it then asks
+/// for on a new connection cannot be had: here that connection reaches a second server sharing the
+/// first's key, which never had the job, as a stray `koh serve` on the same key did.
+#[test]
+fn a_wait_that_saw_its_job_end_keeps_its_status_if_its_last_lines_cannot_be_shown() {
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let dir = koh_testkit::scratch!("split").expect("scratch");
+            let key = dir.join("client.key");
+            let config = koh::server::ServeConfig {
+                allow: vec![koh::transport_iroh::parse_endpoint_id(
+                    &endpoint_id(&key).expect("client key"),
+                )
+                .expect("id")],
+                command: vec!["bash".to_owned()],
+                home: common::home(),
+                ..koh::server::ServeConfig::default()
+            };
+            let secret = koh::transport_iroh::generate_secret_key().expect("server key");
+            let (id, first, a) = common::serve_in_process_as(&config, secret.clone())
+                .await
+                .expect("first server");
+            let (_, second, b) = common::serve_in_process_as(&config, secret)
+                .await
+                .expect("second server");
+            // `koh run`, then `koh wait`, reach the first; the wait's last lines the second.
+            let (port, front) = split(
+                ([127, 0, 0, 1], first).into(),
+                ([127, 0, 0, 1], second).into(),
+                2,
+            )
+            .await
+            .expect("split");
+            let remote = Remote {
+                id,
+                port,
+                key,
+                _server: koh_testkit::spawn(async move {
+                    let _ = tokio::join!(a, b, front);
+                }),
+                _dir: dir,
+            };
+            let started = remote
+                .run("run", &["--name", "fmt", "--sh", "echo checked"])
+                .expect("run");
+            assert!(started.status.success(), "{started:?}");
+            let waited = remote.run("wait", &["fmt"]).expect("wait");
+            let said = String::from_utf8_lossy(&waited.stderr);
+            assert_eq!(waited.status.code(), Some(0), "{said}");
+            assert!(said.contains("could not be shown"), "{said}");
+            assert!(said.contains("no such job"), "{said}");
+        });
+}
+
 /// One entry of a tree: its path in it, kind, mode and contents (a file's bytes, a symlink's
 /// target).
 type Entry = (PathBuf, char, u32, Vec<u8>);

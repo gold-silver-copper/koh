@@ -144,6 +144,7 @@ pub async fn serve(args: ServeConfig) -> anyhow::Result<()> {
     let hosting = Hosting::from_config(&args)?;
 
     let key_file = crate::identity::KeyFile::locate(args.key_file.clone(), "server")?;
+    let _serving = key_file.hold_for_serving()?;
     let secret = crate::identity::load(&key_file)?;
     let network = match (&args.relay_url, args.local) {
         (Some(relay), _) => Network::Relay(relay.clone()),

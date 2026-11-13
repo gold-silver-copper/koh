@@ -848,31 +848,42 @@ pub async fn wait(
             },
         )?;
     } else if let (true, Some(job)) = (timed_out, job) {
-        gave_up(remote, &said, job, tail).await?;
+        gave_up(remote, &said, job, tail).await;
     } else if timed_out || (status == 1 && !matches!(until, Until::End)) {
         crate::log::stderr(format_args!("koh: {said}"));
     } else if let Some(job) = shown {
-        logs(remote, job, false, Some(tail)).await?;
+        // Asked for on a connection of its own: the status above stands if it cannot be shown.
+        if let Err(error) = logs(remote, job, false, Some(tail)).await {
+            crate::log::stderr(format_args!(
+                "koh: {said}; its last lines could not be shown: {error:#}"
+            ));
+        }
     }
     Ok(status)
 }
 
 /// A wait on `job` that timed out: how the job stands (running on, its processes and CPU time),
-/// then its last `tail` lines, so that a job at work is not taken for a hung one.
-async fn gave_up(remote: &Remote, said: &str, job: JobName, tail: u32) -> anyhow::Result<()> {
-    let JobList(jobs) = ask(
+/// then its last `tail` lines, so that a job at work is not taken for a hung one. Each is asked on
+/// a connection of its own; one that fails is said, and the wait's status stands.
+async fn gave_up(remote: &Remote, said: &str, job: JobName, tail: u32) {
+    let listed = ask::<JobList>(
         remote,
         &Request::Jobs {
             job: Some(job.clone()),
         },
         MAX_REPLY,
     )
-    .await?;
-    match jobs.first() {
-        Some(info) => crate::log::stderr(format_args!("koh: {said}: {}", job_line(info))),
-        None => crate::log::stderr(format_args!("koh: {said}")),
+    .await;
+    match listed.as_ref().map(|JobList(jobs)| jobs.first()) {
+        Ok(Some(info)) => crate::log::stderr(format_args!("koh: {said}: {}", job_line(info))),
+        Ok(None) => crate::log::stderr(format_args!("koh: {said}")),
+        Err(error) => crate::log::stderr(format_args!("koh: {said}; {error:#}")),
     }
-    logs(remote, job, false, Some(tail)).await.map(|_| ())
+    if let Err(error) = logs(remote, job, false, Some(tail)).await {
+        crate::log::stderr(format_args!(
+            "koh: its last lines could not be shown: {error:#}"
+        ));
+    }
 }
 
 /// Tell a terminal that reads state reports (fux) that koh is busy: it waits on the server, not

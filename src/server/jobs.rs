@@ -333,7 +333,7 @@ impl Jobs {
     }
 
     /// Take `peer`'s job `name` (else the next number free) in the table for `run`, room made
-    /// from the oldest ended job if need be; hung up by `shutdown` too.
+    /// from the job that ended longest ago if need be; hung up by `shutdown` too.
     fn reserve(
         &self,
         peer: EndpointId,
@@ -365,9 +365,9 @@ impl Jobs {
         if table.len() >= MAX_JOBS {
             let oldest = table
                 .iter()
-                .filter(|(_, job)| !job.running())
-                .min_by_key(|(_, job)| job.started)
-                .map(|(key, _)| key.clone());
+                .filter_map(|(key, job)| Some((job.status.borrow().ended?, key)))
+                .min_by_key(|&(ended, _)| ended)
+                .map(|(_, key)| key.clone());
             match oldest {
                 Some(key) => drop(table.remove(&key)),
                 None => return Err(Problem::new(ProblemKind::TooManyJobs, "")),
@@ -503,7 +503,42 @@ async fn send_msg(send: &mut iroh::endpoint::SendStream, msg: &LogMsg) -> anyhow
 
 #[cfg(test)]
 mod tests {
-    use super::Log;
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::{Jobs, Log, MAX_JOBS};
+    use crate::request::{Command, CommandLine, JobName, Run};
+
+    #[test]
+    fn room_for_a_new_job_is_made_from_the_one_that_ended_longest_ago() {
+        let jobs = Jobs::new(100, Duration::from_secs(3600));
+        let peer = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let run = Run {
+            command: Command::Shell(CommandLine::new(b"true".to_vec()).unwrap()),
+            cwd: None,
+        };
+        let shutdown = CancellationToken::new();
+        let name = |name: &str| JobName::new(name).unwrap();
+        let reserve = |name| {
+            jobs.reserve(peer, Some(name), &run, &shutdown)
+                .map(|(job, _)| job)
+        };
+
+        // A long job starts first, then short ones fill the table and end while it still runs.
+        let long = reserve(name("long")).unwrap();
+        for n in 1..MAX_JOBS {
+            reserve(name(&n.to_string())).unwrap().end(0);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        long.end(0);
+
+        // The long job ended last: whoever started it has yet to read its status and log.
+        reserve(name("new")).unwrap();
+        assert!(jobs.get(peer, &name("long")).is_some());
+        assert!(jobs.get(peer, &name("1")).is_none());
+        assert!(jobs.get(peer, &name("2")).is_some());
+    }
 
     #[test]
     fn a_log_keeps_its_newest_bytes_and_says_how_many_went() {

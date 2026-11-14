@@ -6,6 +6,7 @@
 
 mod bell;
 mod convergence;
+mod copy;
 mod harness;
 mod hostile_peer;
 mod keys;

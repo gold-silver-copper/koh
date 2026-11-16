@@ -237,19 +237,9 @@ async fn put(
     outcome
 }
 
-/// How long a copy may go on once its connection is gone, to say itself how it ended: past it,
-/// it was cut short.
-const OUTLIVES: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Return [`OUTLIVES`] after `conn` closed, whoever closed it, or its idle timeout did.
-async fn gone(conn: &iroh::endpoint::Connection) {
-    conn.closed().await;
-    tokio::time::sleep(OUTLIVES).await;
-}
-
-/// What `copying` on `conn` came to, unless a signal stopped it or the connection went and it
-/// did not end ([`OUTLIVES`]). A stream cut short by the
-/// server closing the connection with a reason says that reason.
+/// What `copying` on `conn` came to, unless a signal stopped it, or the connection went and the
+/// copy did not end within [`OUTLIVES`](crate::transport_iroh::OUTLIVES): it was cut short. A
+/// stream cut short by the server closing the connection with a reason says that reason.
 async fn finished(
     conn: &iroh::endpoint::Connection,
     copying: impl Future<Output = Result<Summary, Failure>>,
@@ -267,7 +257,7 @@ async fn finished(
         }),
         () = interrupted.cancelled() => Err(anyhow::anyhow!(INTERRUPTED)),
         // Whatever this end still waits for, no server is there to send it.
-        () = gone(conn) => {
+        () = crate::transport_iroh::gone(conn) => {
             let cut = Failure::new(FailKind::Truncated, std::path::Path::new("")).into();
             Err(match crate::transport_iroh::closed_because(conn) {
                 Some(_) => super::refusal(conn, &cut),

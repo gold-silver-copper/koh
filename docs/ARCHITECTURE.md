@@ -555,7 +555,8 @@ construction rather than by care at each call:
   waiting; past them it is closed as `Busy` ("server busy: too many connections at once; retry"),
   which the client says, exiting 75. A permit is its connection's: the request is dropped, and
   the permit with it, 5 s after the connection is gone (closed, or idle for its timeout),
-  whatever the request still waits for (`server::cli::gone`); the server's log says which it was.
+  whatever the request still waits for (`transport_iroh::gone`), and the server's log says which
+  request it was. A connection that stays open keeps its permit.
 
 ## Testing
 

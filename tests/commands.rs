@@ -1468,39 +1468,68 @@ fn landing(dir: &Path) -> bool {
     })
 }
 
-/// Wait, at most 30 s, until `under_way` or `client` ended on its own (turned away, say); then
-/// stop it with `signal` and reap it.
-async fn stop_once(
+/// Wait at most `within` for `child` to end: whether it did. Killed and reaped if it did not.
+fn ended_within(child: &mut std::process::Child, within: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while !matches!(child.try_wait(), Ok(Some(_))) {
+        if started.elapsed() >= within {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    true
+}
+
+/// Stop `client` with `signal` once `under_way` says it is where the test wants it, and reap it.
+/// An error, the client killed, if it never got there within 30 s (it said why on its stderr, if
+/// that was piped) or did not end within 10 s of the signal.
+fn stop_once(
     mut client: std::process::Child,
     signal: fuxix::process::Signal,
     under_way: impl Fn() -> bool,
-) {
+) -> Result<(), String> {
     let started = std::time::Instant::now();
-    while !under_way()
-        && started.elapsed() < Duration::from_secs(30)
-        && client.try_wait().is_ok_and(|ended| ended.is_none())
-    {
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    while !under_way() {
+        let ended = !matches!(client.try_wait(), Ok(None));
+        if ended || started.elapsed() >= Duration::from_secs(30) {
+            let _ = client.kill();
+            let said = client.wait_with_output().map(|out| out.stderr);
+            return Err(format!(
+                "a client never got under way (it ended first: {ended}): {}",
+                String::from_utf8_lossy(&said.unwrap_or_default())
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    if let Some(pid) = fuxix::process::Pid::of(&client) {
-        let _ = fuxix::process::kill(pid, signal);
+    let pid = fuxix::process::Pid::of(&client).ok_or("the client has no pid")?;
+    fuxix::process::kill(pid, signal).map_err(|e| format!("signalling the client: {e}"))?;
+    if ended_within(&mut client, Duration::from_secs(10)) {
+        Ok(())
+    } else {
+        Err(format!("a client still ran 10 s after {signal:?}"))
     }
-    let _ = client.wait();
 }
 
 /// A connection's place among `--max-connections` is given back when its client goes, wherever
 /// the client was: dialing, reading a command's output, or in the middle of a copy either way;
-/// stopped by a signal it takes (as `timeout` stops it) or killed where it stood. More clients go
-/// that way here than the server has places, and the next one is still served.
+/// stopped by a signal it takes (as `timeout` stops it), killed where it stood, or stalled. More
+/// clients go that way here than the server has places, and the next one is still served.
 #[test]
 fn a_server_whose_clients_went_at_any_point_serves_the_next() {
     use fuxix::process::Signal;
     koh_testkit::multi_thread(2)
         .expect("tokio runtime")
         .block_on(async {
-            let remote = Remote::serving("slots", |config| koh::server::ServeConfig {
-                max_connections: std::num::NonZeroU32::MIN.saturating_add(3),
-                ..config
+            // A key for the dialers that stall, allowed beside the client's.
+            let stalling = koh::transport_iroh::generate_secret_key().expect("a key");
+            let remote = Remote::serving("slots", |mut config| {
+                config.allow.push(stalling.public());
+                koh::server::ServeConfig {
+                    max_connections: std::num::NonZeroU32::MIN.saturating_add(3),
+                    ..config
+                }
             })
             .await
             .expect("the server");
@@ -1510,7 +1539,7 @@ fn a_server_whose_clients_went_at_any_point_serves_the_next() {
             let spawn = |koh: &mut Command| {
                 koh.stdin(Stdio::null())
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
+                    .stderr(Stdio::piped())
                     .spawn()
                     .expect("koh")
             };
@@ -1520,7 +1549,7 @@ fn a_server_whose_clients_went_at_any_point_serves_the_next() {
                 std::fs::create_dir(&into).expect("a directory");
                 let mut cp = remote.koh("cp").expect("koh");
                 let client = spawn(cp.arg(remote.at(&file)).arg(&into));
-                async move { stop_once(client, signal, || landing(&into)).await }
+                stop_once(client, signal, || landing(&into)).expect("a copy from the server");
             };
             // A copy to the server, stopped once its file is landing there.
             let put = |n: usize, signal| {
@@ -1528,38 +1557,66 @@ fn a_server_whose_clients_went_at_any_point_serves_the_next() {
                 std::fs::create_dir(&into).expect("a directory");
                 let mut cp = remote.koh("cp").expect("koh");
                 let client = spawn(cp.arg(&file).arg(remote.at(&into)));
-                async move { stop_once(client, signal, || landing(&into)).await }
+                stop_once(client, signal, || landing(&into)).expect("a copy to the server");
             };
-            // A command stopped once its output is coming.
+            // A command stopped once it runs, its output coming faster than its client, whose
+            // stdout no one reads, takes it.
             let exec = |signal| {
                 let mut exec = remote.koh("exec").expect("koh");
-                let mut client = spawn(exec.args([&remote.id, "--", "yes"]));
-                let mut line = String::new();
-                let _ = std::io::BufReader::new(client.stdout.take().expect("stdout"))
-                    .read_line(&mut line);
-                stop_once(client, signal, || true)
+                let mut client =
+                    spawn(exec.args([&remote.id, "--sh", "echo started >&2; exec yes"]));
+                let said = koh_testkit::stderr_lines(&mut client);
+                let started = || said.try_recv().is_ok_and(|line| line == "started");
+                stop_once(client, signal, started).expect("a command");
             };
             // Stopped by a signal, the client closes its connection: its place is free at once,
             // so more of them than there are places all get one.
             for n in 0..5 {
-                get(n, Signal::Term).await;
+                get(n, Signal::Term);
             }
-            put(0, Signal::Term).await;
-            exec(Signal::Int).await;
+            put(0, Signal::Term);
+            exec(Signal::Int);
+            // Two dialers that stall, in this process so that where they stall is known: one once
+            // connected, proving no key, which takes no place; one once it proved its key,
+            // asking nothing, which holds a place. The server gives up on each within its 10 s
+            // deadline: the second as one that broke the protocol, so it had been let in.
+            let addr = iroh::EndpointAddr::new(remote.id.parse().expect("the server's id"))
+                .with_ip_addr(std::net::SocketAddr::from(([127, 0, 0, 1], remote.port)));
+            let dial = || async {
+                let key = koh::transport_iroh::generate_secret_key()?;
+                let endpoint = koh::transport_iroh::bind_endpoint_local(key, false).await?;
+                let conn = endpoint.connect(addr.clone(), koh::transport_iroh::ALPN);
+                anyhow::Ok((conn.await?, endpoint))
+            };
+            let (unproven, _its_endpoint) = dial().await.expect("a dialer");
+            let (proven, _its_endpoint) = dial().await.expect("a dialer");
+            let mut control = proven.open_uni().await.expect("its first stream");
+            let proof = koh::transport_iroh::prove(&proven, &stalling).expect("its proof");
+            control.write_all(&proof).await.expect("its proof, sent");
             // Killed where it stood, a client says nothing: its place is free once its
-            // connection's 10 s idle timeout is over. As many as there are places, at most.
-            for ms in [5, 60] {
-                let mut dialing = remote.koh("exec").expect("koh");
-                let client = spawn(dialing.args([&remote.id, "--", "true"]));
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                stop_once(client, Signal::Kill, || true).await;
+            // connection's 10 s idle timeout is over. With the dialer let in, fewer than there
+            // are places.
+            get(5, Signal::Kill);
+            put(1, Signal::Kill);
+            for (stalled, why) in [
+                (&unproven, None),
+                (&proven, Some(koh::proto::Close::ProtocolError)),
+            ] {
+                tokio::time::timeout(Duration::from_secs(30), stalled.closed())
+                    .await
+                    .expect("the server gives up on a dialer that stalled");
+                if why.is_some() {
+                    assert_eq!(koh::transport_iroh::closed_because(stalled), why);
+                }
             }
-            get(5, Signal::Kill).await;
-            put(1, Signal::Kill).await;
             // The next client is served: within the idle timeout and the wait for a place.
             let started = std::time::Instant::now();
             let served = loop {
-                let out = remote.run("exec", &["--", "echo", "served"]).expect("exec");
+                let mut exec = remote.koh("exec").expect("koh");
+                let mut client = spawn(exec.args([&remote.id, "--", "echo", "served"]));
+                let ended = ended_within(&mut client, Duration::from_secs(30));
+                let out = client.wait_with_output().expect("exec");
+                assert!(ended, "a command still waited after 30 s: {out:?}");
                 if out.status.success() || started.elapsed() > Duration::from_secs(40) {
                     break out;
                 }

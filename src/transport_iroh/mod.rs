@@ -82,6 +82,17 @@ pub fn close(conn: &Connection, why: Close) {
     conn.close(why.code().into(), b"");
 }
 
+/// How long what a connection was for may go on once the connection is gone, to end on its own:
+/// past it, it is dropped, at either end.
+pub const OUTLIVES: Duration = Duration::from_secs(5);
+
+/// Return [`OUTLIVES`] after `conn` closed: either end closed it, or nothing was heard on it for
+/// its idle timeout ([`Idle`]). Never while it is open, however quiet what it carries.
+pub async fn gone(conn: &Connection) {
+    conn.closed().await;
+    tokio::time::sleep(OUTLIVES).await;
+}
+
 /// Why the peer closed `conn`, if it did with one of koh's codes.
 pub fn closed_because(conn: &Connection) -> Option<Close> {
     let iroh::endpoint::ConnectionError::ApplicationClosed(close) = conn.close_reason()? else {

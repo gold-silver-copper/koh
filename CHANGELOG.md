@@ -21,16 +21,20 @@ A server that stayed busy until restarted, and a copy that never ended. The prot
 
 ### Fixed
 
-- `koh serve` gives a connection's place among `--max-connections` back when its client goes.
-  A copy whose client was stopped or killed partway (`timeout 20 koh cp …`, a retry loop) left
-  the server's end of it waiting for ever, holding its place; once as many had gone that way as
-  the server has places (64), every client was told `server busy: too many connections at once`
-  with nothing running, until the server was restarted. The copy's end now sees its stream gone
-  and ends, and whatever a request still waits for, it is dropped 5 s after its connection is
-  gone; the server's log says which request that was.
-- `koh cp`, and the `--sync` of `koh exec` and `koh run`, fail when the server stops answering
-  or closes the connection partway, within the 10 s idle timeout and 5 s more, saying the copy
-  was cut short, or the server's reason (busy, say). They used to wait for ever.
+- `koh serve` gives a connection's place among `--max-connections` back once the connection is
+  gone: closed by either end, or silent for its idle timeout (10 s for a command or a copy). A
+  copy whose client was stopped or killed partway (`timeout 20 koh cp …`, a retry loop) left the
+  server's end of it waiting for ever, holding its place; once as many had gone that way as the
+  server has places (64), every client was told `server busy: too many connections at once` with
+  nothing running, until the server was restarted. The copy's end now sees its stream gone and
+  ends, and whatever a request still waits for, it is dropped 5 s after its connection is gone;
+  the server's log says which request that was. A connection that stays open keeps its place, as
+  before.
+- `koh cp`, and the `--sync` of `koh exec` and `koh run`, fail once their connection is gone:
+  the server closed it (busy, say, which they then say), or nothing came from it for the 10 s
+  idle timeout (its machine froze, the link went); 5 s later at most they say the copy was cut
+  short. They used to wait for ever. A server that keeps its connection alive and sends nothing
+  is still waited for.
 - `koh serve` refuses to start on a key another `koh serve` is already serving with. Two servers
   on one key share an endpoint id, so each client connection reached one or the other: a job
   started on one was "no such job" to a wait that reached the other.

@@ -237,8 +237,9 @@ async fn put(
     outcome
 }
 
-/// What `copying` on `conn` came to, unless a signal stopped it. A stream cut short by the
-/// server closing the connection with a reason says that reason.
+/// What `copying` on `conn` came to, unless a signal stopped it, or the connection went and the
+/// copy did not end within [`OUTLIVES`](crate::transport_iroh::OUTLIVES): it was cut short. A
+/// stream cut short by the server closing the connection with a reason says that reason.
 async fn finished(
     conn: &iroh::endpoint::Connection,
     copying: impl Future<Output = Result<Summary, Failure>>,
@@ -255,5 +256,13 @@ async fn finished(
             }
         }),
         () = interrupted.cancelled() => Err(anyhow::anyhow!(INTERRUPTED)),
+        // Whatever this end still waits for, no server is there to send it.
+        () = crate::transport_iroh::gone(conn) => {
+            let cut = Failure::new(FailKind::Truncated, std::path::Path::new("")).into();
+            Err(match crate::transport_iroh::closed_because(conn) {
+                Some(_) => super::refusal(conn, &cut),
+                None => cut,
+            })
+        }
     }
 }

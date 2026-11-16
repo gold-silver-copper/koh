@@ -553,7 +553,10 @@ construction rather than by care at each call:
   can still give up an allowed client's handshake, and delay it, while it lasts. An allowed
   client's connection past `--max-connections` waits up to 10 s for room, among at most as many
   waiting; past them it is closed as `Busy` ("server busy: too many connections at once; retry"),
-  which the client says, exiting 75.
+  which the client says, exiting 75. A permit is its connection's: the request is dropped, and
+  the permit with it, 5 s after the connection is gone (closed, or idle for its timeout),
+  whatever the request still waits for (`transport_iroh::gone`), and the server's log says which
+  request it was. A connection that stays open keeps its permit.
 
 ## Testing
 

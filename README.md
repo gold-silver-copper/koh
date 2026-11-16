@@ -108,7 +108,9 @@ bytes: it lists each change it would make, then the summary. It ends with one li
 download), or `--json`. A source given on the command line is followed if it is a symlink, as
 `cp` does; symlinks inside a tree are copied as symlinks, never followed on either side, and
 fifos, sockets and devices are skipped and counted. Remote paths are taken as the server user's
-shell would take them, but not globbed: no remote shell runs.
+shell would take them, but not globbed: no remote shell runs. A copy whose connection
+closes, or goes silent (the server's machine froze, the link went), fails within 15 s, saying it
+was cut short; run again, it sends the rest.
 
 **Exit codes** are the same for every command: 0 ok, 1 failed, 2 usage, 3 the server was not
 reached, 4 refused (not allowed, or out of the key's scope), 75 the server was busy (more

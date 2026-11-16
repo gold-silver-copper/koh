@@ -31,7 +31,7 @@ use crate::request::{
 };
 use crate::server::place::Place;
 use crate::server::session::{AttachKind, Launch, Registry, SessionSpec};
-use crate::transport_iroh::{bind_on, close, Network, Role, PROTOCOL};
+use crate::transport_iroh::{bind_on, close, gone, Network, Role, PROTOCOL};
 use tracing::{debug, info, warn};
 
 /// Deadline on the QUIC handshake and the key proof, so a stalled dial gives up its place among
@@ -598,7 +598,8 @@ impl Gate {
 
     /// Serve what the opening request on `proven`'s first stream asks of its key, of `scope`,
     /// until it is done, or the key is removed from the list or rescoped, which ends its sessions
-    /// and jobs too. The registry attaches no peer the list no longer allows: one removed as this
+    /// and jobs too, or the connection has been gone for [`crate::transport_iroh::OUTLIVES`]: a place among
+    /// `--max-connections` is a connection's, never a request's that outlived one. The registry attaches no peer the list no longer allows: one removed as this
     /// connection was admitted starts no session.
     async fn serve(self, proven: Proven, scope: Scope) {
         let Proven {
@@ -607,10 +608,12 @@ impl Gate {
             control,
         } = proven;
         let host = &*self.host;
+        let asked = std::sync::OnceLock::new();
         let served = async {
             let Some((request, control)) = opening(&conn, control).await else {
                 return;
             };
+            let _ = asked.set(request.what());
             let Some(place) = permitted(&request, &scope, host) else {
                 rejected(&peer, "out of its scope");
                 info!(peer = %peer, asked = request.what(), "a scoped key asked for more than its scope");
@@ -625,6 +628,13 @@ impl Gate {
             () = revoked(self.allowed.clone(), peer, scope.clone()) => {
                 rejected(&peer, "removed from the allowlist, or its scope changed");
                 close(&conn, Close::NotAuthorized);
+            }
+            // Whatever the request still waits for, its client is not there to have it. Time
+            // enough has passed for it to end on its own: a command hung up, a session told its
+            // client left.
+            () = gone(&conn) => {
+                let asked = asked.get().copied().unwrap_or("nothing yet");
+                warn!(peer = %peer, asked, "a request outlived its connection: dropped, its place freed");
             }
         }
     }

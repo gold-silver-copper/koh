@@ -6,7 +6,7 @@
 
 #[expect(
     dead_code,
-    reason = "no `koh serve` process here: the server runs in process"
+    reason = "most servers here run in process, and none hosts a shell on a PTY"
 )]
 mod common;
 
@@ -1451,4 +1451,190 @@ fn connect_picks_a_session_by_number_or_a_new_one_and_sessions_lists_them() {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         });
+}
+
+/// A sparse file of `len` bytes at `path`: big enough that a copy of it is still under way when
+/// its other end goes.
+fn big(path: &Path, len: u64) -> std::io::Result<()> {
+    std::fs::File::create(path)?.set_len(len)
+}
+
+/// Whether a copy into `dir` is under way: a file's part is there.
+fn landing(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().as_bytes().ends_with(b".part"))
+    })
+}
+
+/// Wait, at most 30 s, until `under_way` or `client` ended on its own (turned away, say); then
+/// stop it with `signal` and reap it.
+async fn stop_once(
+    mut client: std::process::Child,
+    signal: fuxix::process::Signal,
+    under_way: impl Fn() -> bool,
+) {
+    let started = std::time::Instant::now();
+    while !under_way()
+        && started.elapsed() < Duration::from_secs(30)
+        && client.try_wait().is_ok_and(|ended| ended.is_none())
+    {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    if let Some(pid) = fuxix::process::Pid::of(&client) {
+        let _ = fuxix::process::kill(pid, signal);
+    }
+    let _ = client.wait();
+}
+
+/// A connection's place among `--max-connections` is given back when its client goes, wherever
+/// the client was: dialing, reading a command's output, or in the middle of a copy either way;
+/// stopped by a signal it takes (as `timeout` stops it) or killed where it stood. More clients go
+/// that way here than the server has places, and the next one is still served.
+#[test]
+fn a_server_whose_clients_went_at_any_point_serves_the_next() {
+    use fuxix::process::Signal;
+    koh_testkit::multi_thread(2)
+        .expect("tokio runtime")
+        .block_on(async {
+            let remote = Remote::serving("slots", |config| koh::server::ServeConfig {
+                max_connections: std::num::NonZeroU32::MIN.saturating_add(3),
+                ..config
+            })
+            .await
+            .expect("the server");
+            let dir = koh_testkit::scratch!("slots-trees").expect("a scratch directory");
+            let file = dir.join("big");
+            big(&file, 1 << 30).expect("a big file");
+            let spawn = |koh: &mut Command| {
+                koh.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("koh")
+            };
+            // A copy from the server, stopped once its file is landing here.
+            let get = |n: usize, signal| {
+                let into = dir.join(format!("got-{n}"));
+                std::fs::create_dir(&into).expect("a directory");
+                let mut cp = remote.koh("cp").expect("koh");
+                let client = spawn(cp.arg(remote.at(&file)).arg(&into));
+                async move { stop_once(client, signal, || landing(&into)).await }
+            };
+            // A copy to the server, stopped once its file is landing there.
+            let put = |n: usize, signal| {
+                let into = dir.join(format!("put-{n}"));
+                std::fs::create_dir(&into).expect("a directory");
+                let mut cp = remote.koh("cp").expect("koh");
+                let client = spawn(cp.arg(&file).arg(remote.at(&into)));
+                async move { stop_once(client, signal, || landing(&into)).await }
+            };
+            // A command stopped once its output is coming.
+            let exec = |signal| {
+                let mut exec = remote.koh("exec").expect("koh");
+                let mut client = spawn(exec.args([&remote.id, "--", "yes"]));
+                let mut line = String::new();
+                let _ = std::io::BufReader::new(client.stdout.take().expect("stdout"))
+                    .read_line(&mut line);
+                stop_once(client, signal, || true)
+            };
+            // Stopped by a signal, the client closes its connection: its place is free at once,
+            // so more of them than there are places all get one.
+            for n in 0..5 {
+                get(n, Signal::Term).await;
+            }
+            put(0, Signal::Term).await;
+            exec(Signal::Int).await;
+            // Killed where it stood, a client says nothing: its place is free once its
+            // connection's 10 s idle timeout is over. As many as there are places, at most.
+            for ms in [5, 60] {
+                let mut dialing = remote.koh("exec").expect("koh");
+                let client = spawn(dialing.args([&remote.id, "--", "true"]));
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                stop_once(client, Signal::Kill, || true).await;
+            }
+            get(5, Signal::Kill).await;
+            put(1, Signal::Kill).await;
+            // The next client is served: within the idle timeout and the wait for a place.
+            let started = std::time::Instant::now();
+            let served = loop {
+                let out = remote.run("exec", &["--", "echo", "served"]).expect("exec");
+                if out.status.success() || started.elapsed() > Duration::from_secs(40) {
+                    break out;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            assert_eq!(
+                (served.status.code(), &served.stdout[..]),
+                (Some(0), &b"served\n"[..]),
+                "no place was given back {:?} after the clients went: {}",
+                started.elapsed(),
+                String::from_utf8_lossy(&served.stderr)
+            );
+        });
+}
+
+/// A copy whose server stops answering (stopped here; a machine that froze, or a link that went)
+/// fails once the connection's 10 s idle timeout is over, saying to run it again: it does not
+/// wait for ever on a server that is not there.
+#[test]
+fn a_copy_whose_server_stops_answering_fails_and_does_not_hang() {
+    use fuxix::process::{kill, Pid, Signal};
+    let dir = koh_testkit::scratch!("cp-server-gone").expect("a scratch directory");
+    let key = dir.join("client.key");
+    let mut serve =
+        koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!()).expect("koh");
+    serve
+        .args(["serve", "--local", "--shell", "sh", "--allow"])
+        .arg(endpoint_id(&key).expect("the client's id"))
+        .arg("--key-file")
+        .arg(dir.join("server.key"));
+    let (server, _banner) = common::serve(serve).expect("koh serve");
+    let file = dir.join("big");
+    big(&file, 1 << 30).expect("a big file");
+    let into = dir.join("there");
+    std::fs::create_dir(&into).expect("a directory");
+    let mut dest = OsString::from(format!("{}:", server.id));
+    dest.push(&into);
+    let mut cp = koh_testkit::command(env!("CARGO_BIN_EXE_koh"), &koh_testkit::home!())
+        .expect("koh")
+        .args(["cp", "--key-file"])
+        .arg(&key)
+        .args(["--direct", &format!("127.0.0.1:{}", server.port)])
+        .arg(&file)
+        .arg(&dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cp");
+    // The file is landing: the server stops where it stands.
+    let started = std::time::Instant::now();
+    while !landing(&into) {
+        assert!(
+            started.elapsed() < Duration::from_secs(30) && cp.try_wait().expect("cp").is_none(),
+            "the copy never got under way"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    kill(
+        Pid::of(&server.child).expect("the server's pid"),
+        Signal::Stop,
+    )
+    .expect("stop it");
+    let stopped = std::time::Instant::now();
+    while cp.try_wait().expect("cp").is_none() && stopped.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let hung = cp.try_wait().expect("cp").is_none();
+    let _ = cp.kill();
+    let out = cp.wait_with_output().expect("cp");
+    assert!(
+        !hung,
+        "the copy still waited 30 s after its server stopped answering"
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("run it again"), "{said}");
 }

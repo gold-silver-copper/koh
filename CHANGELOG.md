@@ -11,12 +11,26 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0 and 0.17.1 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1 and 0.17.2 (0.12.1 is tag-only).
 
 ## [Unreleased]
 
+## [0.17.2] — 2026-11-16
+
+A server that stayed busy until restarted, and a copy that never ended. The protocol is 0.17.1's.
+
 ### Fixed
 
+- `koh serve` gives a connection's place among `--max-connections` back when its client goes.
+  A copy whose client was stopped or killed partway (`timeout 20 koh cp …`, a retry loop) left
+  the server's end of it waiting for ever, holding its place; once as many had gone that way as
+  the server has places (64), every client was told `server busy: too many connections at once`
+  with nothing running, until the server was restarted. The copy's end now sees its stream gone
+  and ends, and whatever a request still waits for, it is dropped 5 s after its connection is
+  gone; the server's log says which request that was.
+- `koh cp`, and the `--sync` of `koh exec` and `koh run`, fail when the server stops answering
+  or closes the connection partway, within the 10 s idle timeout and 5 s more, saying the copy
+  was cut short, or the server's reason (busy, say). They used to wait for ever.
 - `koh serve` refuses to start on a key another `koh serve` is already serving with. Two servers
   on one key share an endpoint id, so each client connection reached one or the other: a job
   started on one was "no such job" to a wait that reached the other.
@@ -573,7 +587,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/gold-silver-copper/koh/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/gold-silver-copper/koh/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/gold-silver-copper/koh/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/gold-silver-copper/koh/compare/v0.15.0...v0.16.0

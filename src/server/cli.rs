@@ -45,6 +45,17 @@ const QUEUED_FOR: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
 /// Deadline on the opening request: a peer that says nothing holds its permit no longer.
 const REQUEST_TIMEOUT: Duration = ACCEPT_HANDSHAKE_TIMEOUT;
 
+/// How long a request may go on once its connection is gone, to end on its own (a command hung
+/// up, a session told its client left): past it the request is dropped, and its place among
+/// `--max-connections` with it. A place is a connection's, never a request's that outlived one.
+const OUTLIVES: Duration = Duration::from_secs(5);
+
+/// Return [`OUTLIVES`] after `conn` closed, whoever closed it, or its idle timeout did.
+async fn gone(conn: &Connection) {
+    conn.closed().await;
+    tokio::time::sleep(OUTLIVES).await;
+}
+
 /// The clap-free form of `koh serve`'s arguments. [`Default`] gives the CLI's defaults, with an
 /// empty `allow`, which [`serve`] rejects.
 #[derive(Debug, Clone)]
@@ -598,7 +609,7 @@ impl Gate {
 
     /// Serve what the opening request on `proven`'s first stream asks of its key, of `scope`,
     /// until it is done, or the key is removed from the list or rescoped, which ends its sessions
-    /// and jobs too. The registry attaches no peer the list no longer allows: one removed as this
+    /// and jobs too, or the connection has been gone for [`OUTLIVES`]. The registry attaches no peer the list no longer allows: one removed as this
     /// connection was admitted starts no session.
     async fn serve(self, proven: Proven, scope: Scope) {
         let Proven {
@@ -607,10 +618,12 @@ impl Gate {
             control,
         } = proven;
         let host = &*self.host;
+        let asked = std::sync::OnceLock::new();
         let served = async {
             let Some((request, control)) = opening(&conn, control).await else {
                 return;
             };
+            let _ = asked.set(request.what());
             let Some(place) = permitted(&request, &scope, host) else {
                 rejected(&peer, "out of its scope");
                 info!(peer = %peer, asked = request.what(), "a scoped key asked for more than its scope");
@@ -625,6 +638,11 @@ impl Gate {
             () = revoked(self.allowed.clone(), peer, scope.clone()) => {
                 rejected(&peer, "removed from the allowlist, or its scope changed");
                 close(&conn, Close::NotAuthorized);
+            }
+            // Whatever the request still waits for, its client is not there to have it.
+            () = gone(&conn) => {
+                let asked = asked.get().copied().unwrap_or("nothing yet");
+                warn!(peer = %peer, asked, "a request outlived its connection: dropped, its place freed");
             }
         }
     }

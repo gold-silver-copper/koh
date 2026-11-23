@@ -1446,3 +1446,85 @@ async fn a_command_that_fails_gives_its_place_back_at_once() {
 
     srv.shutdown().await;
 }
+
+/// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.
+fn deep(root: &std::path::Path, dirs: usize) -> PathBuf {
+    let inner = (0..dirs).fold(root.to_path_buf(), |at, _| at.join("d"));
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(inner.join("f"), "deep").unwrap();
+    inner.join("f")
+}
+
+#[tokio::test]
+async fn a_tree_is_copied_to_128_directories_deep_on_both_ends_and_no_deeper() {
+    let (tmp, srv, client, _, _) = boot_pair("depth").await;
+    let dst = tmp.0.join("dst");
+    let push = |src: &[PathBuf], delete: bool| {
+        let (client, dst, src) = (&client, dst.display().to_string(), src.to_vec());
+        async move {
+            client
+                .cp_push_many(&src, &dst, &[], delete, false, false)
+                .await
+        }
+    };
+    // A file 128 directories beneath its tree is copied: that is the bound, on both ends.
+    let fits = tmp.0.join("fits");
+    let file = deep(&fits, 128);
+    let landed = push(std::slice::from_ref(&fits), false).await.unwrap();
+    assert_eq!(landed.added.len(), 1);
+    let there = dst.join(file.strip_prefix(&fits).unwrap());
+    assert_eq!(fs::read_to_string(there).unwrap(), "deep");
+
+    // One more is too deep. The end that reads it says so plainly (exit 1: nothing was refused,
+    // its own tree is too deep), before it sends anything.
+    let over = tmp.0.join("over");
+    deep(&over, 129);
+    let err = push(&[over], false).await.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+
+    // Sent beside another tree, a tree's own name is one of the 128.
+    let (keep, one, two) = (tmp.0.join("keep"), tmp.0.join("one"), tmp.0.join("two"));
+    fs::create_dir_all(&keep).unwrap();
+    fs::write(keep.join("keep"), "new").unwrap();
+    deep(&one, 127);
+    deep(&two, 128);
+    assert_eq!(
+        push(&[keep.clone(), one], false).await.unwrap().added.len(),
+        2
+    );
+    let err = push(&[keep.clone(), two], false).await.unwrap_err();
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+
+    // With --delete the receiving end reads its own tree too, by the same bound, before it
+    // removes anything: a destination that is too deep stops the copy, and nothing has gone.
+    let pruned = tmp.0.join("pruned");
+    deep(&pruned, 129);
+    fs::write(pruned.join("zzz"), "stays").unwrap();
+    let err = client
+        .cp_push(
+            &keep,
+            pruned.display().to_string(),
+            Vec::new(),
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+    assert_eq!(fs::read_to_string(pruned.join("zzz")).unwrap(), "stays");
+
+    client.close().await;
+    srv.shutdown().await;
+}

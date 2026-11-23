@@ -87,7 +87,7 @@ pub fn paths(data: &[u8]) {
     let mut lines = text.split('\n');
     let path = lines.next().unwrap_or_default();
     if let Ok(names) = koh::sync::wire_names(path) {
-        assert!((1..=128).contains(&names.len()));
+        assert!((1..=129).contains(&names.len()));
         let plain = |name: &&str| !matches!(*name, "" | "." | "..") && !name.contains(['/', '\0']);
         assert!(names.iter().all(plain));
         assert_eq!(names.join("/"), path);

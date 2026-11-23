@@ -23,7 +23,8 @@ use crate::{KohError, Result};
 
 /// Most entries a tree may hold, on either end.
 pub const MAX_FILES: usize = 100_000;
-/// Most directories deep an entry may be.
+/// Most directories an entry may be beneath its tree: its path there has that many names and its own.
+/// (Both ends count the names of the path as it is sent, so they agree on what is too deep.)
 const MAX_DEPTH: usize = 128;
 const CHUNK_SIZE: usize = 64 << 10;
 
@@ -229,11 +230,12 @@ fn open_file(dir: &File, name: &str, rel: &str) -> Result<File> {
 }
 
 /// The names of the wire path `rel`: a path beneath a tree, and nothing else. Each is one plain
-/// name (not empty, `.` or `..`, with no `/` or NUL), and there are at most 128.
+/// name (not empty, `.` or `..`, with no `/` or NUL), and there are at most 129: an entry's own,
+/// and those of the 128 directories it may be beneath.
 pub fn wire_names(rel: &str) -> Result<Vec<&str>> {
     let names: Vec<&str> = rel.split('/').collect();
     let plain = |n: &&str| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0');
-    if names.len() > MAX_DEPTH || !names.iter().all(plain) {
+    if names.len() > MAX_DEPTH + 1 || !names.iter().all(plain) {
         return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
     }
     Ok(names)
@@ -381,6 +383,8 @@ fn hash_file(mut file: &File, rel: &str) -> Result<[u8; 32]> {
 
 /// The directories and regular files beneath `dir`, into `out`: a symlink is not an entry and
 /// is not entered. With `hash`, each file's size, time, mode and blake3; without, its path alone.
+/// `depth` is how many names the path of `dir` has as it is sent: an entry in a directory that
+/// is itself as deep as an entry may be is too deep, and the tree is not read further.
 fn scan(
     dir: &File,
     rel: &str,
@@ -390,11 +394,6 @@ fn scan(
     depth: usize,
     out: &mut Vec<SyncEntry>,
 ) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(KohError::failed(format!(
-            "{rel}: more than {MAX_DEPTH} directories deep"
-        )));
-    }
     let failed = |e: io::Error| KohError::failed(format!("read_dir {rel:?}: {e}"));
     let mut names = Vec::new();
     for item in rustix::fs::Dir::read_from(dir).map_err(|e| failed(e.into()))? {
@@ -421,6 +420,11 @@ fn scan(
             Ok(Some(FileType::RegularFile)) => false,
             _ => continue,
         };
+        if depth > MAX_DEPTH {
+            return Err(KohError::failed(format!(
+                "{child}: more than {MAX_DEPTH} directories deep"
+            )));
+        }
         if out.len() >= MAX_FILES {
             return Err(KohError::failed("tree exceeds maximum file count (100000)"));
         }
@@ -485,7 +489,16 @@ fn manifest(
     } else {
         None
     };
-    scan(dir, "", prefix.as_deref(), excludes, true, 0, &mut entries)?;
+    let depth = usize::from(prefix.is_some());
+    scan(
+        dir,
+        "",
+        prefix.as_deref(),
+        excludes,
+        true,
+        depth,
+        &mut entries,
+    )?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((entries, prefix))
 }

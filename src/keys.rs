@@ -81,17 +81,19 @@ impl Scope {
 
 /// Whether `target` says, by its text, that it is beneath the scope's directory `root`: it
 /// starts with that directory's path (as the `clients` file has it, or resolved) and goes on
-/// with plain names, none of them `..`. Nothing of `target` is resolved: a symlink beneath
-/// `root` leads where it leads.
+/// with plain names, none of them `..` and none with a NUL in it. Nothing of `target` is
+/// resolved: a symlink beneath `root` leads where it leads.
 fn check_beneath(root: &Path, target: &Path) -> Result<()> {
     let root = expand_home(root)?;
     let base = root
         .canonicalize()
         .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
     let beneath = |dir: &Path| {
-        target
-            .strip_prefix(dir)
-            .is_ok_and(|rest| rest.components().all(|c| matches!(c, Component::Normal(_))))
+        target.strip_prefix(dir).is_ok_and(|rest| {
+            rest.components().all(
+                |c| matches!(c, Component::Normal(name) if !name.as_encoded_bytes().contains(&0)),
+            )
+        })
     };
     if beneath(&root) || beneath(&base) {
         Ok(())

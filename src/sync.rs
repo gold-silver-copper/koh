@@ -424,9 +424,16 @@ pub async fn receive_tree(
         fs::create_dir_all(dir)
             .map_err(|e| KohError::failed(format!("mkdir {}: {e}", dir.display())))
     };
-    // In a dry run nothing is made: a destination that is not there holds nothing.
-    if !dry_run {
-        mkdir(dst)?;
+    match found(dst, fs::metadata(dst))? {
+        Some(there) if !there.is_dir() => {
+            return Err(KohError::failed(format!(
+                "{} is not a directory",
+                dst.display()
+            )));
+        }
+        // In a dry run nothing is made: a destination that is not there holds nothing.
+        None if !dry_run => mkdir(dst)?,
+        _ => {}
     }
 
     for entry in &src_entries {
@@ -438,7 +445,7 @@ pub async fn receive_tree(
             }
             continue;
         }
-        match fs::metadata(&target).ok().filter(|m| m.is_file()) {
+        match found(&target, fs::metadata(&target))?.filter(|m| m.is_file()) {
             // (A file of another size differs, and need not be read to know.)
             Some(there) if there.len() == entry.size && hash_file(&target)? == entry.hash => {
                 summary.unchanged += 1;

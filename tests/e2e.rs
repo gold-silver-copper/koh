@@ -2332,3 +2332,33 @@ async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
         "while [ -d {name} ]; do cd {name}; done; while cd .. && rmdir {name} 2>/dev/null; do :; done"
     ));
 }
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_one_is_not_reported_as_copied_to() {
+    let (tmp, srv, client, allowed, _) = boot_scoped("bad-destination").await;
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), "sent").unwrap();
+    fs::write(allowed.join("file"), "a file").unwrap();
+    let push = |dst: String, dry_run: bool| {
+        let (client, src) = (&client, src.clone());
+        async move {
+            client
+                .cp_push(&src, dst, Vec::new(), false, false, dry_run)
+                .await
+        }
+    };
+    for dry_run in [true, false] {
+        // A file is no directory to copy into, and a dry run says so as the copy would.
+        let err = push(allowed.join("file").display().to_string(), dry_run).await;
+        assert_eq!(err.unwrap_err().code, Exit::FAILED, "dry run: {dry_run}");
+        // A name with a NUL in it names nothing: by its text it is not a path beneath DIR.
+        let err = push(format!("{}/bad\0name", allowed.display()), dry_run).await;
+        assert_eq!(err.unwrap_err().code, Exit::REFUSED, "dry run: {dry_run}");
+    }
+    assert_eq!(fs::read_to_string(allowed.join("file")).unwrap(), "a file");
+    assert_eq!(names_in(&allowed), ["file"]);
+
+    client.close().await;
+    srv.shutdown().await;
+}

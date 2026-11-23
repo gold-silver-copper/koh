@@ -1034,8 +1034,8 @@ async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where
     };
 
     // A path that says by its text that it is beneath DIR is taken, and the file system says
-    // where it is: a symlink on the way is a directory like any other, in the path the client
-    // names and in the tree that lands.
+    // where it is: a symlink on the way is followed, in the path the client names and in the
+    // tree that lands.
     symlink(&outside, allowed.join("link")).unwrap();
     let through = tmp.0.join("through");
     fs::create_dir_all(through.join("link")).unwrap();

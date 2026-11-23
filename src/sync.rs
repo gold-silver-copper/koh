@@ -109,7 +109,7 @@ struct Temp {
 impl Temp {
     /// A new file beside `target`, under a name nothing there has: a name that is taken (by
     /// anything: this process is not the only one that counts) is left as it is, and the next
-    /// one tried, a few times.
+    /// one tried: 17 names at most, the first and 16 more.
     fn create(target: &Path) -> Result<(File, Self)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut taken = 0;

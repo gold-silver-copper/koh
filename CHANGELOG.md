@@ -65,18 +65,22 @@ binary, its tests and the fuzz targets share code, and any release may change it
   where the copy would have removed it.
 - A tree that cannot be looked through fails the copy (exit 1) before anything is sent or
   removed: an entry whose stat fails is not taken for absent. `koh cp --dry-run` fails as the
-  copy would when its destination is there and is no directory.
+  copy would when its destination is there and is no directory (a symlink that leads nowhere
+  is one such).
 - `rustix` is no longer a dependency. A copy is `std::fs` on paths, and the lock on a server's
   key is opened with std. The directory of a key is no longer refused for being another user's
   (it is still refused if group or others may write to it). `koh cp -p` sets a file's
-  modification time and leaves its access time alone. With `XDG_RUNTIME_DIR` not set, the
-  number in the state directory's name (`TMPDIR/koh-UID`) is what `id -u` says.
+  modification time and leaves its access time alone.
 - `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
+  process group of a job, a- `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
   process group of a job, and of a `koh exec` command the server hangs up, is signalled with
   it. `koh kill` waits for it without holding up other requests, for 5 s at most, and fails
-  (exit 1) if a job that still runs was not signalled.
-- `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
-  this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
+  (exit 1) if a group that is still there was not signalled, whether or not the job's first
+  process has ended.
+- Where `XDG_RUNTIME_DIR` is not set, `koh serve` needs `id(1)` on its `PATH` too: the number
+  in the state directory's name (`TMPDIR/koh-UID`) is what `id -u` says, and a server that is
+  not told does not start (exit 1).
+ holds fuzz targets for what a peer sends; `cargo test` runs the same entry
   points under a fixed-seed mutation run.
 
 ## [0.17.2] — 2026-11-16

@@ -10,7 +10,8 @@ Keys & peers:
   koh clients [add NAME ID [--cp DIR | --exec DIR] | rm NAME | rename OLD NEW]
   koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
             [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
-            (needs kill(1) on its PATH: jobs are ended and commands hung up with it)
+            (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
+             and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...

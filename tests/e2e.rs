@@ -2032,12 +2032,20 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         .unwrap();
     assert_eq!(out, b"reached");
 
-    // It does not start elsewhere: not outside, and not in a directory that is beneath its own
-    // by name and somewhere else in fact (a symlink out of it).
-    for dir in [outside.clone(), allowed.join("out"), tmp.0.clone()] {
+    // It does not start elsewhere, and elsewhere is told by the text of the path: a directory
+    // that is beneath its own by name and somewhere else in fact (a symlink out of it) is
+    // beneath its own.
+    for dir in [outside.clone(), tmp.0.clone(), allowed.join("sub/../..")] {
         let err = pwd(dir.clone()).await.unwrap_err();
         assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
     }
+    let (code, out, _) = pwd(allowed.join("out")).await.unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        String::from_utf8_lossy(&out)
+            .trim_end()
+            .ends_with("/outside")
+    );
     let job = client
         .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
         .await

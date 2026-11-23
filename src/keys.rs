@@ -67,7 +67,7 @@ impl Scope {
     pub fn check_exec(&self, cwd: &Path) -> Result<()> {
         match self {
             Self::Full => Ok(()),
-            Self::Exec(root) => check_within(root, cwd),
+            Self::Exec(root) => check_beneath(root, cwd),
             Self::Cp(_) => Err(KohError::refused("key scope allows only cp")),
         }
     }
@@ -102,54 +102,6 @@ fn check_beneath(root: &Path, target: &Path) -> Result<()> {
             "path {} is outside allowed scope {}",
             target.display(),
             base.display()
-        )))
-    }
-}
-
-fn check_within(root: &Path, target: &Path) -> Result<()> {
-    let root = expand_home(root)?;
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
-    let target_abs = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        home_dir()?.join(target)
-    };
-    // Canonicalize the nearest existing ancestor so new files inside root are permitted.
-    let mut probe = target_abs.as_path();
-    let mut tail = Vec::new();
-    let base = loop {
-        if probe.exists() {
-            break probe.canonicalize().map_err(|e| {
-                KohError::refused(format!("cannot resolve {}: {e}", probe.display()))
-            })?;
-        }
-        let Some(name) = probe.file_name() else {
-            return Err(KohError::refused("path outside allowed scope"));
-        };
-        if name == ".." {
-            return Err(KohError::refused(
-                "parent traversal not allowed in scoped path",
-            ));
-        }
-        tail.push(name.to_os_string());
-        let Some(parent) = probe.parent() else {
-            return Err(KohError::refused("path outside allowed scope"));
-        };
-        probe = parent;
-    };
-    let mut resolved = base;
-    for part in tail.into_iter().rev() {
-        resolved.push(part);
-    }
-    if resolved == canon_root || resolved.starts_with(&canon_root) {
-        Ok(())
-    } else {
-        Err(KohError::refused(format!(
-            "path {} is outside allowed scope {}",
-            target.display(),
-            canon_root.display()
         )))
     }
 }

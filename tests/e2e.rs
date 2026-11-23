@@ -2299,29 +2299,29 @@ async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
 
 #[tokio::test]
 async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
-    // 129 directories, one in the next, each of a 40-character name: the path of the innermost
-    // is longer than a path may be, so they are made from inside (and a tree that deep is too
-    // deep to copy). `--delete` must find that out, or fail in the trying, before it removes
-    // anything: an entry it cannot look at is not an entry that is not there.
+    // 144 directories, one in the next, each of a 40-character name: the path of the innermost
+    // is longer than a path may be (and a tree that deep is too deep to copy). `--delete` must
+    // find that out, or fail in the trying, before it removes anything: an entry it cannot look
+    // at is not an entry that is not there.
     let (tmp, srv, client, _, _) = boot_pair("delete-unreadable").await;
     let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
     fs::create_dir_all(&src).unwrap();
     fs::create_dir_all(&dst).unwrap();
     fs::write(dst.join("stays"), "stays").unwrap();
+    // (No path can name them all, so they are made as nine chains of 16, which a path can
+    // name, and each chain is then moved to the bottom of the one before it.)
     let name = "d".repeat(40);
-    let sh = |script: String| {
-        let run = Command::new("sh")
-            .arg("-c")
-            .arg(script)
-            .current_dir(&dst)
-            .status();
-        run.unwrap().success()
-    };
-    assert!(sh(format!(
-        "i=0; while [ $i -lt 129 ]; do mkdir {name} && cd {name} || exit 1; i=$((i+1)); done"
-    )));
+    let chain = |nth: usize| dst.join(format!("chain{nth}"));
+    let bottom = |nth: usize| (0..16).fold(chain(nth), |at, _| at.join(&name));
+    for nth in 0..9 {
+        fs::create_dir_all(bottom(nth)).unwrap();
+    }
+    for nth in (1..9).rev() {
+        fs::rename(chain(nth).join(&name), bottom(nth - 1).join(&name)).unwrap();
+        fs::remove_dir(chain(nth)).unwrap();
+    }
 
-    let err = client
+    let pushed = client
         .cp_push(
             &src,
             dst.display().to_string(),
@@ -2330,18 +2330,12 @@ async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
             false,
             false,
         )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+        .await;
+    assert_eq!(pushed.map(|_| ()).unwrap_err().code, Exit::FAILED);
     assert_eq!(fs::read_to_string(dst.join("stays")).unwrap(), "stays");
 
     client.close().await;
     srv.shutdown().await;
-    // (What removes a tree by its path may not reach the end of this one: it is emptied from
-    // inside.)
-    sh(format!(
-        "while [ -d {name} ]; do cd {name}; done; while cd .. && rmdir {name} 2>/dev/null; do :; done"
-    ));
 }
 
 #[tokio::test]

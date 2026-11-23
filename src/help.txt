@@ -36,3 +36,4 @@ Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
             (`exec`, `wait`, and `logs -f` exit with the remote command's exit status.)
+            `koh serve` exits 75 when another `koh serve` already holds its key.

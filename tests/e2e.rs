@@ -1208,3 +1208,32 @@ async fn cp_receiver_bounds_the_manifest_and_takes_only_the_files_it_asked_for()
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
+    let tmp = TempDir::new("serve-lock");
+    let key = tmp.0.join("cfg/server.key");
+    fs::create_dir_all(tmp.0.join("cfg")).unwrap();
+    let serve = || {
+        start_server(ServeOptions {
+            key_file: Some(key.clone()),
+            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            allow: Vec::new(),
+            shell: None,
+            state_dir: Some(tmp.0.join("state")),
+            disable_relay: true,
+            quiet: true,
+        })
+    };
+    let first = serve().await.expect("the first server starts");
+    let refused = serve().await.err().expect("a second server on the key");
+    assert_eq!(refused.code, Exit::BUSY, "{refused:?}");
+    assert!(refused.message.contains("server.key"), "{refused:?}");
+
+    // The first stopped: the key is free, and what marks it held is a lock, not a file's being
+    // there (a server that was killed leaves the file, and nothing to clean up).
+    first.shutdown().await;
+    assert!(tmp.0.join("cfg/server.key.serving").exists());
+    let again = serve().await.expect("a server once the first stopped");
+    again.shutdown().await;
+}

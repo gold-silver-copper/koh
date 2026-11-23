@@ -2,7 +2,7 @@
 //! raw exec, headless jobs, delta sync, and fux-backed interactive sessions.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt as _;
@@ -16,7 +16,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::jobs::JobManager;
 use crate::keys::{
-    ClientEntry, Role, Scope, expand_home, home_dir, load_clients, load_or_create_key, render_qr,
+    ClientEntry, Role, Scope, expand_home, hold_for_serving, home_dir, load_clients,
+    load_or_create_key, render_qr,
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::pane::{AttachSpec, PaneSession, SessionManager};
@@ -63,6 +64,8 @@ pub struct RunningServer {
     pub direct_addr: Option<SocketAddr>,
     pub endpoint: iroh::Endpoint,
     task: tokio::task::JoinHandle<()>,
+    /// The lock that keeps a second server off this one's key, held until this is dropped.
+    _serving: fs::File,
 }
 
 impl RunningServer {
@@ -75,6 +78,7 @@ impl RunningServer {
 /// Starts a server in-process (used by both `koh serve` CLI and loopback integration tests).
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
+    let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
     let endpoint = bind_server(secret, opts.direct, opts.disable_relay).await?;
     let direct_addr = endpoint.bound_sockets().into_iter().next();
@@ -125,25 +129,16 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         direct_addr,
         endpoint,
         task,
+        _serving: serving,
     })
 }
 
 /// CLI entrypoint for `koh serve`.
 pub async fn run_serve(opts: ServeOptions) -> Result<()> {
     fuxix::own_children();
-    // Single-instance marker beside server.key (advisory file).
-    let marker = crate::keys::key_path(Role::Server, opts.key_file.as_deref())?
-        .with_file_name("server.key.serving");
-    let _lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&marker)
-        .ok();
     let running = start_server(opts).await?;
     let _ = tokio::signal::ctrl_c().await;
     running.shutdown().await;
-    let _ = fs::remove_file(&marker);
     Ok(())
 }
 

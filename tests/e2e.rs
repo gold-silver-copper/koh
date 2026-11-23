@@ -2432,7 +2432,8 @@ impl Served {
 }
 
 #[tokio::test]
-async fn koh_serve_needs_kill_and_says_so_when_a_job_was_not_signalled() {
+async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job_was_not_signalled()
+{
     use std::os::unix::fs::PermissionsExt as _;
     let tmp = TempDir::new("kill-helper");
     let key = new_key(&tmp, "client.key");
@@ -2445,6 +2446,17 @@ async fn koh_serve_needs_kill_and_says_so_when_a_job_was_not_signalled() {
     let said = none.says("listening:").unwrap_err();
     assert!(said.contains("kill"), "{said}");
     assert_eq!(none.server.wait().unwrap().code(), Some(1));
+
+    // With no runtime directory, its state is in the temporary directory under the number of
+    // the user who runs it (here, the owner of what this test made).
+    let all = std::env::var_os("PATH").unwrap();
+    let mut plain = Served::start(&tmp, std::path::Path::new(&all), key.public(), false);
+    let mine = fs::metadata(&tmp.0).unwrap().uid();
+    assert_eq!(
+        plain.says("sessions dir:").unwrap(),
+        format!("{}/koh-{mine}/sessions", tmp.0.display())
+    );
+    drop(plain);
 
     // A kill(1) that takes two seconds and then fails (it does answer `kill -0`).
     let slow = "#!/bin/sh\n[ \"$1\" = -0 ] && exit 0\n/bin/sleep 2\nexit 42\n";

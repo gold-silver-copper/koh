@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -158,7 +157,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
 
     let base = match opts.state_dir {
         Some(dir) => dir,
-        None => default_state_dir(&serving)?,
+        None => default_state_dir().await?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
     let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
@@ -243,18 +242,25 @@ pub async fn run_serve(opts: ServeOptions) -> Result<()> {
 }
 
 /// Where jobs and sessions are kept when no `--state-dir` says: in the user's runtime directory,
-/// or else in the temporary directory under the user's number. (std does not tell who runs
-/// this process; the owner of `serving`, the lock file this server made beside its key, does.)
-fn default_state_dir(serving: &fs::File) -> Result<PathBuf> {
+/// or else in the temporary directory under the user's number, as id(1) tells it. (std does not
+/// tell who runs this process, and no file that was already there is evidence of it.)
+async fn default_state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
         return Ok(PathBuf::from(dir).join("koh"));
     }
-    let uid = serving
-        .metadata()
-        .map_err(|e| KohError::failed(format!("stat the serve lock: {e}")))?
-        .uid();
+    let failed = |why: String| {
+        let what = "XDG_RUNTIME_DIR is not set, and `id -u` did not say whose state this is";
+        KohError::failed(format!("{what}: {why}"))
+    };
+    let mut id = tokio::process::Command::new("id");
+    let said = id.arg("-u").stdin(Stdio::null()).output().await;
+    let said = said.map_err(|e| failed(e.to_string()))?;
+    let uid: u32 = String::from_utf8_lossy(&said.stdout)
+        .trim()
+        .parse()
+        .map_err(|_| failed(format!("{}", said.status)))?;
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 

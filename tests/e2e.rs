@@ -11,7 +11,8 @@ use koh::Exit;
 use koh::client::Client;
 use koh::keys::{ClientEntry, Role, Route, Scope, load_or_create_key, save_clients};
 use koh::proto::{
-    ClientEvent, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Request, ScreenFrame, recv_msg, send_msg,
+    ClientEvent, MAX_CHUNK, MAX_CTRL, MAX_FRAME, PictureKind, Request, ScreenFrame, ServerEvent,
+    recv_msg, send_msg,
 };
 use koh::server::{ServeOptions, start_server};
 
@@ -293,7 +294,7 @@ async fn delta_cp_push_pull_exclude_delete_dry_run_and_preserve() {
 
 #[tokio::test]
 async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
-    let (tmp, srv, client, _, state_dir) = boot_pair("session").await;
+    let (tmp, srv, client, client_key, state_dir) = boot_pair("session").await;
 
     // Attach to a new interactive session running a script that emits OSC 133 marks.
     let (mut send, mut recv) = client
@@ -302,6 +303,8 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
             new: true,
             cols: 80,
             rows: 10,
+            cell_w: 10,
+            cell_h: 20,
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),
@@ -309,6 +312,8 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
                  printf '\\033]133;A\\007$ \\033]133;B\\007cmd1\\033]133;C\\007\\r\\nFIRST_OUT\\r\\n\\033]133;D;7\\007'; \
                  read line; \
                  printf '\\033]133;A\\007$ \\033]133;B\\007cmd2\\033]133;C\\007\\r\\nSECOND_OUT_%s\\r\\n\\033]133;D;42\\007' \"$line\"; \
+                 read line2; \
+                 printf 'AFTER_RECONNECT_%s\\r\\n' \"$line2\"; \
                  sleep 30"
                     .into(),
             ],
@@ -318,12 +323,23 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
         .unwrap();
 
     // Wait for first output frame pushed over QUIC (zero polling!).
-    let sid = loop {
-        let frame: ScreenFrame = recv_msg(&mut recv, MAX_FRAME).await.unwrap();
-        if frame.screen.contains("FIRST_OUT") && frame.marks.contains("end 7") {
-            break frame.session_id;
+    let mut current = ScreenFrame::default();
+    let sid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
+                ServerEvent::Full(frame) => current = frame,
+                ServerEvent::Delta(delta) => {
+                    let _ = current.apply_delta(delta);
+                }
+                ServerEvent::Picture(_) => {}
+            }
+            if current.screen.contains("FIRST_OUT") && current.marks.contains("end 7") {
+                break current.session_id;
+            }
         }
-    };
+    })
+    .await
+    .expect("timed out waiting for FIRST_OUT and OSC 133 end 7");
 
     // Verify genuine frozen v1 `fux` pane folder exists on the server!
     let pane_dir = state_dir.join("sessions").join(format!("s{sid}"));
@@ -350,8 +366,7 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
     // Verify `koh wait --session N` wakes on next OSC 133 MarkKind::End and returns exit 42!
     let wait_task = tokio::spawn({
         let (srv_id, addr) = (srv.endpoint_id, srv.direct_addr.unwrap());
-        let ckey =
-            load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg/client.key"))).unwrap();
+        let ckey = client_key.clone();
         async move {
             let c2 = Client::connect_direct(ckey, srv_id, Some(Route::Direct(addr)), true)
                 .await
@@ -383,15 +398,16 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
     drop(send);
     drop(recv);
 
-    // Verify local `fux` pane mirroring (`mount_local_pane`) writes valid v1 pane files + FIFOs.
+    // Verify local `fux` pane mirroring (`mount_local_pane`) writes valid v1 pane files + FIFOs
+    // AND automatically reconnects to the exact same session after a sudden QUIC link drop!
     let local_mirror = tmp.0.join("local_fux_pane");
     let mirror_dir = local_mirror.clone();
     let (srv_id, addr) = (srv.endpoint_id, srv.direct_addr.unwrap());
-    let ckey = load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg/client.key"))).unwrap();
+    let mut c3 = Client::connect_direct(client_key, srv_id, Some(Route::Direct(addr)), true)
+        .await
+        .unwrap();
+    let conn_handle = c3.connection();
     let mount_task = tokio::spawn(async move {
-        let c3 = Client::connect_direct(ckey, srv_id, Some(Route::Direct(addr)), true)
-            .await
-            .unwrap();
         let _ = c3.mount_local_pane(Some(sid), &mirror_dir, 80, 10).await;
         c3.close().await;
     });
@@ -410,11 +426,381 @@ async fn fux_backed_session_pane_folder_osc133_marks_and_local_mount() {
             .unwrap()
             .contains("SECOND_OUT_HELLO")
     );
+
+    // Simulate a sudden network drop (close the mounted client's QUIC connection)
+    // and write to `in` immediately — verifying BOTH FIFO input buffering during reconnect
+    // AND automatic redial/reattach to the exact same remote session!
+    conn_handle.close(0u32.into(), b"simulated-wifi-drop");
+    fs::write(local_mirror.join("in"), "SURVIVED\n").unwrap();
+    for _ in 0..160 {
+        if fs::read_to_string(local_mirror.join("shown/screen"))
+            .unwrap_or_default()
+            .contains("AFTER_RECONNECT_SURVIVED")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        fs::read_to_string(local_mirror.join("shown/screen"))
+            .unwrap()
+            .contains("AFTER_RECONNECT_SURVIVED"),
+        "expected mirrored pane to auto-reconnect and receive post-drop output"
+    );
+
     assert!(local_mirror.join("in").exists() && local_mirror.join("ctl").exists());
     // Writing `kill` to local `ctl` detaches the mirror cleanly.
     fs::write(local_mirror.join("ctl"), "kill\n").unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(3), mount_task).await;
+    tokio::time::timeout(Duration::from_secs(3), mount_task)
+        .await
+        .expect("mount_task did not detach within 3s")
+        .expect("mount_task panicked");
 
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_source_cp_push_and_pull_files_and_dirs() {
+    let (tmp, srv, client, _, _) = boot_pair("multicp").await;
+    let src_root = tmp.0.join("src");
+    let remote_dst = tmp.0.join("remote_dst");
+    let local_out = tmp.0.join("local_out");
+    fs::create_dir_all(src_root.join("d1")).unwrap();
+    fs::create_dir_all(src_root.join("d2")).unwrap();
+    fs::write(src_root.join("top.txt"), "top").unwrap();
+    fs::write(src_root.join("d1/one.txt"), "one").unwrap();
+    fs::write(src_root.join("d2/two.txt"), "two").unwrap();
+
+    // Multi-source push: 1 file + 2 directories into one remote destination dir.
+    let pushed = client
+        .cp_push_many(
+            &[
+                src_root.join("top.txt"),
+                src_root.join("d1"),
+                src_root.join("d2"),
+            ],
+            &remote_dst.display().to_string(),
+            &[],
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pushed.added.len(), 3);
+    assert_eq!(
+        fs::read_to_string(remote_dst.join("top.txt")).unwrap(),
+        "top"
+    );
+    assert_eq!(
+        fs::read_to_string(remote_dst.join("d1/one.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        fs::read_to_string(remote_dst.join("d2/two.txt")).unwrap(),
+        "two"
+    );
+
+    // --delete with multiple sources is refused with Usage error (push AND pull).
+    let del_err = client
+        .cp_push_many(
+            &[src_root.join("d1"), src_root.join("d2")],
+            &remote_dst.display().to_string(),
+            &[],
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(del_err.code, Exit::USAGE);
+
+    let pull_del_err = client
+        .cp_pull_many(
+            &[
+                remote_dst.join("d1").display().to_string(),
+                remote_dst.join("d2").display().to_string(),
+            ],
+            &local_out,
+            &[],
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(pull_del_err.code, Exit::USAGE);
+
+    // Multi-source --dry-run reports additions without creating local_out.
+    let dry_pull = client
+        .cp_pull_many(
+            &[
+                remote_dst.join("top.txt").display().to_string(),
+                remote_dst.join("d1").display().to_string(),
+            ],
+            &local_out,
+            &[],
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(dry_pull.dry_run);
+    assert_eq!(dry_pull.added.len(), 2);
+    assert!(!local_out.exists());
+
+    // Multi-source pull: 1 remote file + 2 remote dirs into one local dir.
+    let pulled = client
+        .cp_pull_many(
+            &[
+                remote_dst.join("top.txt").display().to_string(),
+                remote_dst.join("d1").display().to_string(),
+                remote_dst.join("d2").display().to_string(),
+            ],
+            &local_out,
+            &[],
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pulled.added.len(), 3);
+    assert_eq!(
+        fs::read_to_string(local_out.join("top.txt")).unwrap(),
+        "top"
+    );
+    assert_eq!(
+        fs::read_to_string(local_out.join("d1/one.txt")).unwrap(),
+        "one"
+    );
+    assert_eq!(
+        fs::read_to_string(local_out.join("d2/two.txt")).unwrap(),
+        "two"
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures() {
+    let (tmp, srv, client, client_key, state_dir) = boot_pair("rich-session").await;
+
+    // Tiny valid 1x1 red PNG encoded by fux-vt itself, base64-encoded for Kitty graphics APC!
+    let tiny_png = fux_vt::png::encode_rgba(1, 1, &[255, 0, 0, 255], 4096).unwrap();
+    let png_b64 = fux_vt::base64_encode(&tiny_png);
+
+    let script = format!(
+        "stty raw -echo; \
+         printf 'READY\\r\\n'; \
+         head -c 1 >/dev/null; \
+         printf '\\033]10;?\\033\\\\'; \
+         ans=$(dd bs=64 count=1 2>/dev/null | tr -cd '[:print:]'); \
+         printf 'COL=%s\\r\\n' \"$ans\"; \
+         printf '\\033]12;#445566\\007'; \
+         printf '\\033]52;c;aGVsbG8gY2xpcA==\\007'; \
+         printf '\\033]8;;https://koh.sh\\007click\\033]8;;\\007\\r\\n'; \
+         printf '\\033]9;build done\\007'; \
+         printf '\\033_Ga=T,f=100,t=d,q=2;{png_b64}\\033\\\\\\r\\n'; \
+         head -c 1 >/dev/null; \
+         printf 'ONE_LINE_EDIT\\r\\n'; \
+         head -c 1 >/dev/null; \
+         printf '\\033_Ga=d,d=A,q=2\\033\\\\DELETED_PIC\\r\\n'; \
+         sleep 30"
+    );
+
+    let (mut send, mut recv) = client
+        .request(&Request::Attach {
+            session: None,
+            new: true,
+            cols: 80,
+            rows: 12,
+            cell_w: 12,
+            cell_h: 24,
+            argv: vec!["/bin/sh".into(), "-c".into(), script],
+            cwd: Some(tmp.0.display().to_string()),
+        })
+        .await
+        .unwrap();
+
+    // Forward host colours right after attach.
+    send_msg(
+        &mut send,
+        &ClientEvent::Colours("foreground #aabbcc\nbackground #112233\n".into()),
+        MAX_CTRL,
+    )
+    .await
+    .unwrap();
+
+    let mut frame = ScreenFrame::default();
+    let sid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
+                ServerEvent::Full(f) => frame = f,
+                ServerEvent::Delta(d) => {
+                    let _ = frame.apply_delta(d);
+                }
+                ServerEvent::Picture(_) => {}
+            }
+            if frame.screen.contains("READY") {
+                break frame.session_id;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for READY frame");
+
+    // Give Colours event a moment to apply before triggering OSC 10;? query in step 1.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    send_msg(&mut send, &ClientEvent::Input(b"1".to_vec()), MAX_CHUNK)
+        .await
+        .unwrap();
+
+    let mut pic_blobs = 0usize;
+    let mut saw_clip = false;
+    let mut saw_notice = false;
+    let mut saw_link = false;
+    let mut saw_pic_ref = false;
+    let mut saw_colour = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !(saw_clip && saw_notice && saw_link && saw_pic_ref && saw_colour) {
+            match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
+                ServerEvent::Picture(blob) => {
+                    assert_eq!(blob.kind, PictureKind::Png);
+                    assert_eq!(blob.bytes, tiny_png);
+                    pic_blobs += 1;
+                }
+                ServerEvent::Full(f) => frame = f,
+                ServerEvent::Delta(d) => {
+                    let _ = frame.apply_delta(d);
+                }
+            }
+            if frame.screen.contains("rgb:aaaa/bbbb/cccc") {
+                saw_colour = true;
+            }
+            if frame.clipboard.as_deref() == Some(b"hello clip") {
+                saw_clip = true;
+            }
+            if frame.notice.as_deref() == Some("build done") {
+                saw_notice = true;
+            }
+            if frame.links.contains("https://koh.sh") {
+                saw_link = true;
+            }
+            if frame.pictures.contains("pic-1.png") {
+                saw_pic_ref = true;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for clipboard/notice/link/picture/colour events");
+    assert_eq!(pic_blobs, 1, "picture payload must be sent once per ID");
+
+    // Verify frozen v1 server pane folder also recorded clipboard, notice, links, cursor colour, and pic-1.png.
+    let pane_dir = state_dir.join("sessions").join(format!("s{sid}"));
+    assert_eq!(fs::read(pane_dir.join("clipboard")).unwrap(), b"hello clip");
+    assert!(
+        fs::read_to_string(pane_dir.join("cursor"))
+            .unwrap()
+            .contains("#445566"),
+        "expected OSC 12 cursor colour as 5th word in v1 cursor file"
+    );
+    assert!(
+        fs::read_to_string(pane_dir.join("notice"))
+            .unwrap()
+            .contains("build done")
+    );
+    assert!(
+        fs::read_to_string(pane_dir.join("shown/links"))
+            .unwrap()
+            .contains("https://koh.sh")
+    );
+    assert!(pane_dir.join("pic-1.png").is_file());
+
+    // Step 2: small 1-line edit MUST arrive as a compact Delta (NOT re-sending pic-1.png!).
+    send_msg(&mut send, &ClientEvent::Input(b"2".to_vec()), MAX_CHUNK)
+        .await
+        .unwrap();
+    let mut got_small_delta = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
+                ServerEvent::Picture(_) => panic!("picture must not be re-sent for unchanged ID"),
+                ServerEvent::Delta(d) => {
+                    if d.changed_rows.len() <= 2 {
+                        got_small_delta = true;
+                    }
+                    let _ = frame.apply_delta(d);
+                }
+                ServerEvent::Full(f) => frame = f,
+            }
+            if frame.screen.contains("ONE_LINE_EDIT") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for ONE_LINE_EDIT delta");
+    assert!(got_small_delta, "expected compact row-level FrameDelta");
+
+    // Mount the same session locally and verify pic-1.png + pictures mirror into local pane folder,
+    // and that deleting the picture removes pic-1.png on BOTH server and local mirror!
+    let local_mirror = tmp.0.join("mirror_pics");
+    let addr = srv.direct_addr.unwrap();
+    let mut mclient =
+        Client::connect_direct(client_key, srv.endpoint_id, Some(Route::Direct(addr)), true)
+            .await
+            .unwrap();
+    let mdir = local_mirror.clone();
+    let mtask = tokio::spawn(async move {
+        let r = mclient.mount_local_pane(Some(sid), &mdir, 80, 12).await;
+        mclient.close().await;
+        r
+    });
+    for _ in 0..80 {
+        if local_mirror.join("pic-1.png").is_file()
+            && fs::read_to_string(local_mirror.join("shown/pictures"))
+                .unwrap_or_default()
+                .contains("pic-1.png")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(local_mirror.join("pic-1.png").is_file());
+    assert!(
+        fs::read_to_string(local_mirror.join("cursor"))
+            .unwrap()
+            .contains("#445566")
+    );
+
+    // Step 3: delete the Kitty image and verify cleanup on both server and mirror.
+    send_msg(&mut send, &ClientEvent::Input(b"3".to_vec()), MAX_CHUNK)
+        .await
+        .unwrap();
+    for _ in 0..80 {
+        if !local_mirror.join("pic-1.png").exists()
+            && fs::read_to_string(local_mirror.join("shown/screen"))
+                .unwrap_or_default()
+                .contains("DELETED_PIC")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!local_mirror.join("pic-1.png").exists());
+    assert!(!pane_dir.join("pic-1.png").exists());
+
+    fs::write(local_mirror.join("ctl"), "kill\n").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), mtask)
+        .await
+        .expect("mount mirror task did not detach within 3s")
+        .expect("mount mirror task panicked")
+        .expect("mount mirror returned error");
+    let _ = send_msg(&mut send, &ClientEvent::Detach, MAX_CTRL).await;
     client.close().await;
     srv.shutdown().await;
 }
@@ -569,4 +955,26 @@ fn cli_help_keys_and_peer_lists() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stdout).contains("\"kind\":\"usage\""));
+
+    // Multi-source `cp --delete` MUST fail with usage (exit 2) BEFORE dialing any server.
+    let del_multi = Command::new(bin)
+        .env("KOH_CONFIG_DIR", &tmp.0)
+        .args(["cp", "--delete", "a", "b", "nosuch:dst", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(del_multi.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&del_multi.stdout).contains("\"kind\":\"usage\""));
+
+    // Mixing remote sources with remote destination or mismatched servers fails with exit 2.
+    let mixed = Command::new(bin)
+        .args(["cp", "box:a", "box:b", "box:dst"])
+        .output()
+        .unwrap();
+    assert_eq!(mixed.status.code(), Some(2));
+
+    let diff_srv = Command::new(bin)
+        .args(["cp", "box1:a", "box2:b", "."])
+        .output()
+        .unwrap();
+    assert_eq!(diff_srv.status.code(), Some(2));
 }

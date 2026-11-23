@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use koh::client::{Client, DialOptions, parse_signal, sync_before_command};
+use koh::client::{Client, ConnectOptions, DialOptions, parse_signal, sync_before_command};
 use koh::keys::{
     ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
     parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
@@ -752,11 +752,15 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
     let mut pos = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a == "--" {
+            pos.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            break;
+        }
         if parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
             "-r" | "-R" | "--recursive" => {}
             "--delete" => delete = true,
@@ -768,37 +772,76 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let (Some(src), Some(dst)) = (pos.first(), pos.get(1)) else {
+    if pos.len() < 2 {
         return Err(KohError::usage(
-            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC DST",
+            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
+        ));
+    }
+    let Some((dst, srcs)) = pos.split_last() else {
+        return Err(KohError::usage(
+            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
         ));
     };
+    if delete && srcs.len() > 1 {
+        return Err(KohError::usage("--delete requires a single source"));
+    }
     let summary = if let Some((server, rpath)) = split_remote(dst) {
+        if srcs.iter().any(|s| split_remote(s).is_some()) {
+            return Err(KohError::usage(
+                "cannot mix remote sources with a remote destination",
+            ));
+        }
         let client = Client::connect(server, &opts, false).await?;
         let rdst = if rpath.is_empty() {
             ".".to_string()
         } else {
             rpath.to_string()
         };
+        let local_srcs: Vec<PathBuf> = srcs.iter().map(PathBuf::from).collect();
         let s = client
-            .cp_push(Path::new(src), rdst, excludes, delete, preserve, dry_run)
-            .await?;
-        client.close().await;
-        s
-    } else if let Some((server, rpath)) = split_remote(src) {
-        let client = Client::connect(server, &opts, false).await?;
-        let rsrc = if rpath.is_empty() {
-            ".".to_string()
-        } else {
-            rpath.to_string()
-        };
-        let s = client
-            .cp_pull(rsrc, Path::new(dst), excludes, delete, preserve, dry_run)
+            .cp_push_many(&local_srcs, &rdst, &excludes, delete, preserve, dry_run)
             .await?;
         client.close().await;
         s
     } else {
-        return Err(KohError::usage("one of SRC or DST must be SERVER:PATH"));
+        let mut server_name: Option<&str> = None;
+        let mut remote_srcs = Vec::with_capacity(srcs.len());
+        for src in srcs {
+            let Some((srv, rpath)) = split_remote(src) else {
+                return Err(KohError::usage(
+                    "all sources must be SERVER:PATH when destination is local",
+                ));
+            };
+            match server_name {
+                None => server_name = Some(srv),
+                Some(prev) if prev != srv => {
+                    return Err(KohError::usage(
+                        "all remote sources in one `koh cp` must use the same server",
+                    ));
+                }
+                Some(_) => {}
+            }
+            remote_srcs.push(if rpath.is_empty() {
+                ".".to_string()
+            } else {
+                rpath.to_string()
+            });
+        }
+        let server =
+            server_name.ok_or_else(|| KohError::usage("one of SRC or DST must be SERVER:PATH"))?;
+        let client = Client::connect(server, &opts, false).await?;
+        let s = client
+            .cp_pull_many(
+                &remote_srcs,
+                Path::new(dst),
+                &excludes,
+                delete,
+                preserve,
+                dry_run,
+            )
+            .await?;
+        client.close().await;
+        s
     };
 
     if opts.json {
@@ -936,8 +979,13 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
         relay: None,
         json: false,
     };
-    let (mut server, mut session, mut new, mut cwd) =
-        (None::<String>, None::<u32>, false, None::<String>);
+    let (mut server, mut session, mut new, mut cwd, mut on_bell) = (
+        None::<String>,
+        None::<u32>,
+        false,
+        None::<String>,
+        None::<String>,
+    );
     let mut argv = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -960,6 +1008,7 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
                 )
             }
             "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
+            "--on-bell" => on_bell = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
             _ => {
                 return Err(KohError::usage(format!(
@@ -970,10 +1019,20 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
         i += 1;
     }
     let server = server.ok_or_else(|| {
-        KohError::usage("usage: koh connect SERVER [--new | --session N] [-- PROG...]")
+        KohError::usage(
+            "usage: koh connect SERVER [--new | --session N] [--on-bell CMD] [-- PROG...]",
+        )
     })?;
-    let client = Client::connect(&server, &opts, true).await?;
-    let code = client.connect_interactive(session, new, argv, cwd).await?;
+    let mut client = Client::connect(&server, &opts, true).await?;
+    let code = client
+        .connect_interactive(ConnectOptions {
+            session,
+            new,
+            argv,
+            cwd,
+            on_bell,
+        })
+        .await?;
     client.close().await;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
 }
@@ -1025,7 +1084,7 @@ async fn cmd_mount(args: &[String]) -> Result<Exit> {
             fux_dir.join("main").join(format!("koh-{server}"))
         }
     };
-    let client = Client::connect(&server, &opts, true).await?;
+    let mut client = Client::connect(&server, &opts, true).await?;
     let _ = writeln!(
         std::io::stderr(),
         "mirroring remote session at {}",

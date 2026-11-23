@@ -67,7 +67,9 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
 }
 
 /// Scans a local file or directory tree into a sorted blake3 manifest.
-pub fn scan_tree(root: &Path, excludes: &[String]) -> Result<Vec<SyncEntry>> {
+/// When `preserve_root` is true and `root` is a directory, every manifest path is prefixed with
+/// `root`'s basename so multiple directory sources can share one destination directory.
+pub fn scan_tree(root: &Path, excludes: &[String], preserve_root: bool) -> Result<Vec<SyncEntry>> {
     let meta = fs::metadata(root)
         .map_err(|e| KohError::failed(format!("stat {}: {e}", root.display())))?;
     let mut entries = Vec::new();
@@ -85,12 +87,44 @@ pub fn scan_tree(root: &Path, excludes: &[String]) -> Result<Vec<SyncEntry>> {
             root.display()
         )));
     }
-    walk(root, Path::new(""), excludes, &mut entries)?;
+    let prefix = if preserve_root {
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty() && *n != "." && *n != "..")
+            .ok_or_else(|| {
+                KohError::usage(format!("cannot determine name of {}", root.display()))
+            })?;
+        entries.push(SyncEntry {
+            path: name.to_string(),
+            size: 0,
+            mtime_secs: meta.mtime(),
+            mode: meta.permissions().mode() & 0o777,
+            hash: [0u8; 32],
+            is_dir: true,
+        });
+        Some(name.to_string())
+    } else {
+        None
+    };
+    walk(
+        root,
+        Path::new(""),
+        prefix.as_deref(),
+        excludes,
+        &mut entries,
+    )?;
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
 }
 
-fn walk(root: &Path, rel: &Path, excludes: &[String], out: &mut Vec<SyncEntry>) -> Result<()> {
+fn walk(
+    root: &Path,
+    rel: &Path,
+    prefix: Option<&str>,
+    excludes: &[String],
+    out: &mut Vec<SyncEntry>,
+) -> Result<()> {
     let dir = if rel.as_os_str().is_empty() {
         root.to_path_buf()
     } else {
@@ -117,6 +151,10 @@ fn walk(root: &Path, rel: &Path, excludes: &[String], out: &mut Vec<SyncEntry>) 
         if matches_exclude(&rel_str, excludes) {
             continue;
         }
+        let wire_path = match prefix {
+            Some(p) => format!("{p}/{rel_str}"),
+            None => rel_str,
+        };
         let full = root.join(&child_rel);
         let meta = match fs::symlink_metadata(&full) {
             Ok(m) => m,
@@ -130,16 +168,16 @@ fn walk(root: &Path, rel: &Path, excludes: &[String], out: &mut Vec<SyncEntry>) 
         }
         if meta.is_dir() {
             out.push(SyncEntry {
-                path: rel_str,
+                path: wire_path,
                 size: 0,
                 mtime_secs: meta.mtime(),
                 mode: meta.permissions().mode() & 0o777,
                 hash: [0u8; 32],
                 is_dir: true,
             });
-            walk(root, &child_rel, excludes, out)?;
+            walk(root, &child_rel, prefix, excludes, out)?;
         } else if meta.is_file() {
-            out.push(hash_file(&full, rel_str, &meta)?);
+            out.push(hash_file(&full, wire_path, &meta)?);
         }
     }
     Ok(())
@@ -194,11 +232,17 @@ pub fn safe_join(dst_root: &Path, rel: &str) -> Result<PathBuf> {
 pub async fn send_tree(
     root: &Path,
     excludes: &[String],
+    preserve_root: bool,
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<SyncSummary> {
     let single_file = fs::metadata(root).map(|m| m.is_file()).unwrap_or(false);
-    let manifest = scan_tree(root, excludes)?;
+    let root_prefix = if preserve_root && !single_file {
+        root.file_name().and_then(|n| n.to_str()).map(String::from)
+    } else {
+        None
+    };
+    let manifest = scan_tree(root, excludes, preserve_root)?;
     let by_path: BTreeMap<String, SyncEntry> = manifest
         .iter()
         .cloned()
@@ -216,6 +260,12 @@ pub async fn send_tree(
         };
         let full = if single_file {
             root.to_path_buf()
+        } else if let Some(prefix) = root_prefix.as_deref() {
+            let inner = rel
+                .strip_prefix(prefix)
+                .and_then(|s| s.strip_prefix('/'))
+                .ok_or_else(|| KohError::refused(format!("unexpected prefixed path {rel:?}")))?;
+            safe_join(root, inner)?
         } else {
             safe_join(root, &rel)?
         };
@@ -309,7 +359,7 @@ pub async fn receive_tree(
     }
 
     if delete && dst_root.is_dir() {
-        let local_entries = scan_tree(dst_root, excludes)?;
+        let local_entries = scan_tree(dst_root, excludes, false)?;
         for local in local_entries.into_iter().rev() {
             if !src_set.contains(&local.path) {
                 summary.deleted.push(local.path.clone());

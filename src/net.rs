@@ -17,7 +17,7 @@ const PROOF_LABEL: &[u8] = b"koh/18 client proof";
 
 fn transport_config(interactive: bool) -> QuicTransportConfig {
     let (idle_ms, keepalive) = if interactive {
-        (300_000, Duration::from_secs(5))
+        (30_000, Duration::from_secs(5))
     } else {
         (15_000, Duration::from_secs(2))
     };

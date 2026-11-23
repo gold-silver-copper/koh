@@ -11,37 +11,45 @@ use std::os::unix::fs::symlink;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fux_vt::{Mark, MarkKind, Term, files};
+use fux_vt::{Mark, MarkKind, Picture, Term, files};
 use fuxix::Winsize;
 use tokio::sync::watch;
 
-use crate::proto::{ScreenFrame, SessionInfo, WaitResult};
+use crate::proto::{PictureBlob, PictureKind, ScreenFrame, SessionInfo, WaitResult};
 use crate::{Exit, KohError, Result, atomic_write};
+
+const CLIPBOARD_MAX: usize = 1 << 20; // 1 MiB
 
 /// One live (or recently exited) interactive session backed by a real v1 `fux` pane folder.
 pub struct PaneSession {
     pub id: u32,
     pub dir: PathBuf,
     started: Instant,
-    attached: AtomicBool,
+    attached: AtomicUsize,
     pty_master: Mutex<Option<File>>,
     term: Mutex<Term>,
     history_lines: Mutex<String>,
+    pictures: Mutex<BTreeMap<u32, (PictureKind, Vec<u8>)>>,
+    clipboard: Mutex<(u64, Vec<u8>)>,
+    notice: Mutex<(u64, String)>,
     frame_tx: watch::Sender<ScreenFrame>,
     mark_tx: watch::Sender<usize>,
     generation: Mutex<u64>,
 }
 
 impl PaneSession {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: u32,
         dir: PathBuf,
         cols: u16,
         rows: u16,
+        cell_w: u16,
+        cell_h: u16,
         argv: &[String],
         cwd: &Path,
         default_shell: &str,
@@ -51,11 +59,12 @@ impl PaneSession {
             .map_err(|e| KohError::failed(format!("mkdir pane dir: {e}")))?;
 
         let (cols, rows) = (cols.clamp(1, 500), rows.clamp(1, 500));
+        let (cw, ch) = normalize_cell(cell_w, cell_h, (10, 20));
         let winsz = Winsize {
             rows,
             cols,
-            xpixel: cols.saturating_mul(10),
-            ypixel: rows.saturating_mul(20),
+            xpixel: cols.saturating_mul(cw),
+            ypixel: rows.saturating_mul(ch),
         };
         let (master, slave) =
             fuxix::pty(winsz).map_err(|e| KohError::failed(format!("openpty: {e}")))?;
@@ -109,7 +118,8 @@ impl PaneSession {
 
         let mut term = Term::new(usize::from(cols), usize::from(rows));
         term.told().name = format!("koh {}", env!("CARGO_PKG_VERSION"));
-        let init_frame = snapshot(&mut term, id, 2, "running", None);
+        term.told().cell = (usize::from(cw), usize::from(ch));
+        let init_frame = snapshot(&mut term, id, 2, "running", None, 0, 0);
         let (frame_tx, _) = watch::channel(init_frame);
         let (mark_tx, _) = watch::channel(0usize);
 
@@ -117,7 +127,7 @@ impl PaneSession {
             id,
             dir: dir.clone(),
             started: Instant::now(),
-            attached: AtomicBool::new(false),
+            attached: AtomicUsize::new(0),
             pty_master: Mutex::new(Some(
                 master
                     .try_clone()
@@ -125,6 +135,9 @@ impl PaneSession {
             )),
             term: Mutex::new(term),
             history_lines: Mutex::new(String::new()),
+            pictures: Mutex::new(BTreeMap::new()),
+            clipboard: Mutex::new((0, Vec::new())),
+            notice: Mutex::new((0, String::new())),
             frame_tx,
             mark_tx,
             generation: Mutex::new(0),
@@ -219,6 +232,28 @@ impl PaneSession {
             {
                 let _ = f.write_all(out.styled.as_bytes());
             }
+            if let Some(bytes) = out.clipboard
+                && bytes.len() <= CLIPBOARD_MAX
+            {
+                let _ = atomic_write(&self.dir.join("clipboard"), &bytes);
+                if let Ok(mut clip) = self.clipboard.lock() {
+                    clip.0 = clip.0.wrapping_add(1);
+                    clip.1 = bytes;
+                }
+            }
+            if let Some(msg) = out.notice {
+                let clean: String = msg.chars().filter(|c| !c.is_control()).take(200).collect();
+                if let Ok(mut notice) = self.notice.lock() {
+                    notice.0 = notice.0.wrapping_add(1);
+                    notice.1 = clean.clone();
+                    let line = if clean.is_empty() {
+                        format!("{}\n", notice.0)
+                    } else {
+                        format!("{} {clean}\n", notice.0)
+                    };
+                    let _ = atomic_write(&self.dir.join("notice"), line.as_bytes());
+                }
+            }
             let mark_count = term.marks().len();
             if *self.mark_tx.borrow() != mark_count {
                 let _ = self.mark_tx.send_replace(mark_count);
@@ -245,55 +280,50 @@ impl PaneSession {
             format!("{}\n", *generation).as_bytes(),
         );
 
-        // Write any new pictures beside the screen files.
-        for (pic_id, fmt, data) in term.new_pictures() {
-            let _ = fs::write(self.dir.join(format!("pic-{pic_id}.{}", fmt.ext())), data);
+        // Write any new pictures beside the screen files and cache them for attached clients.
+        let new_pics = term.new_pictures();
+        if let Ok(mut cache) = self.pictures.lock() {
+            for (pic_id, fmt, data) in new_pics {
+                let kind = PictureKind::from_vt(fmt);
+                let _ = fs::write(self.dir.join(format!("pic-{pic_id}.{}", kind.ext())), &data);
+                cache.insert(pic_id, (kind, data));
+            }
+            let stale: Vec<(u32, PictureKind)> = cache
+                .iter()
+                .filter(|(id, _)| !term.has_picture(**id))
+                .map(|(id, (kind, _))| (*id, *kind))
+                .collect();
+            for (pic_id, kind) in stale {
+                cache.remove(&pic_id);
+                let _ = fs::remove_file(self.dir.join(format!("pic-{pic_id}.{}", kind.ext())));
+            }
         }
 
+        let rows = term.shown().rows;
         if let Some(main_f) = files::render(&term, false) {
-            write_screen_dir(&self.dir.join("main"), &main_f);
+            write_screen_dir(&self.dir.join("main"), &main_f, rows);
         }
         if let Some(alt_f) = files::render(&term, true) {
             let _ = fs::create_dir_all(self.dir.join("alt"));
-            write_screen_dir(&self.dir.join("alt"), &alt_f);
+            write_screen_dir(&self.dir.join("alt"), &alt_f, rows);
             replace_shown_link(&self.dir, "alt");
         } else {
             replace_shown_link(&self.dir, "main");
             let _ = fs::remove_dir_all(self.dir.join("alt"));
         }
 
-        let frame = snapshot(&mut term, self.id, generation.wrapping_add(1), state, exit);
-        let shown_word = if frame.cursor_shown {
-            "shown"
-        } else {
-            "hidden"
-        };
-        let _ = atomic_write(
-            &self.dir.join("size"),
-            format!("{} {}\n", frame.cols, frame.rows).as_bytes(),
+        let clip_seq = self.clipboard.lock().map(|c| c.0).unwrap_or(0);
+        let notice_seq = self.notice.lock().map(|n| n.0).unwrap_or(0);
+        let frame = snapshot(
+            &mut term,
+            self.id,
+            generation.wrapping_add(1),
+            state,
+            exit,
+            clip_seq,
+            notice_seq,
         );
-        let _ = atomic_write(
-            &self.dir.join("cursor"),
-            format!(
-                "{} {} {shown_word} {}\n",
-                frame.cursor_row, frame.cursor_col, frame.cursor_shape
-            )
-            .as_bytes(),
-        );
-        let _ = atomic_write(
-            &self.dir.join("modes"),
-            format!("{}\n", frame.modes).as_bytes(),
-        );
-        let _ = atomic_write(&self.dir.join("marks"), frame.marks.as_bytes());
-        let _ = atomic_write(&self.dir.join("state"), format!("{state}\n").as_bytes());
-        if frame.title.is_empty() {
-            let _ = fs::remove_file(self.dir.join("title"));
-        } else {
-            let _ = atomic_write(
-                &self.dir.join("title"),
-                format!("{}\n", frame.title).as_bytes(),
-            );
-        }
+        write_v1_metadata(&self.dir, &frame);
 
         *generation = generation.wrapping_add(1);
         let _ = atomic_write(
@@ -327,28 +357,72 @@ impl PaneSession {
         Ok(())
     }
 
-    pub fn resize(&self, cols: u16, rows: u16) {
+    pub fn resize(&self, cols: u16, rows: u16, cell_w: u16, cell_h: u16) {
         let (cols, rows) = (cols.clamp(1, 500), rows.clamp(1, 500));
+        let (cw, ch) = if let Ok(mut term) = self.term.lock() {
+            let old = term.told().cell;
+            let fallback = (
+                u16::try_from(old.0).unwrap_or(10).clamp(1, 100),
+                u16::try_from(old.1).unwrap_or(20).clamp(1, 100),
+            );
+            let (cw, ch) = normalize_cell(cell_w, cell_h, fallback);
+            term.told().cell = (usize::from(cw), usize::from(ch));
+            term.resize(usize::from(cols), usize::from(rows));
+            (cw, ch)
+        } else {
+            normalize_cell(cell_w, cell_h, (10, 20))
+        };
         if let Ok(guard) = self.pty_master.lock()
             && let Some(master) = guard.as_ref()
         {
             let winsz = Winsize {
                 rows,
                 cols,
-                xpixel: cols.saturating_mul(10),
-                ypixel: rows.saturating_mul(20),
+                xpixel: cols.saturating_mul(cw),
+                ypixel: rows.saturating_mul(ch),
             };
             let _ = fuxix::set_winsize(master, winsz);
-        }
-        if let Ok(mut term) = self.term.lock() {
-            term.resize(usize::from(cols), usize::from(rows));
         }
         let cur = self.frame_tx.borrow().clone();
         self.publish(&cur.state, cur.exit);
     }
 
-    pub fn set_attached(&self, attached: bool) {
-        self.attached.store(attached, Ordering::Relaxed);
+    /// Updates host foreground/background/cursor/palette colours reported to OSC 4/10/11/12 queries.
+    pub fn set_colours(&self, text: &str) {
+        if let Ok(mut term) = self.term.lock() {
+            files::parse_colours(text, term.told());
+        }
+    }
+
+    pub fn picture_blob(&self, id: u32) -> Option<PictureBlob> {
+        let guard = self.pictures.lock().ok()?;
+        let (kind, bytes) = guard.get(&id)?;
+        Some(PictureBlob {
+            id,
+            kind: *kind,
+            bytes: bytes.clone(),
+        })
+    }
+
+    pub fn current_event_seqs(&self) -> (u64, u64) {
+        let c = self.clipboard.lock().map(|g| g.0).unwrap_or(0);
+        let n = self.notice.lock().map(|g| g.0).unwrap_or(0);
+        (c, n)
+    }
+
+    pub fn clipboard_since(&self, seen: u64) -> Option<(u64, Vec<u8>)> {
+        let guard = self.clipboard.lock().ok()?;
+        (guard.0 > seen).then(|| (guard.0, guard.1.clone()))
+    }
+
+    pub fn notice_since(&self, seen: u64) -> Option<(u64, String)> {
+        let guard = self.notice.lock().ok()?;
+        (guard.0 > seen).then(|| (guard.0, guard.1.clone()))
+    }
+
+    pub fn attach_guard(self: &Arc<Self>) -> AttachGuard {
+        self.attached.fetch_add(1, Ordering::Relaxed);
+        AttachGuard(self.clone())
     }
 
     pub fn subscribe(&self) -> watch::Receiver<ScreenFrame> {
@@ -361,7 +435,7 @@ impl PaneSession {
         let (running_command, last_exit) = marks_state(&marks);
         SessionInfo {
             id: self.id,
-            attached: self.attached.load(Ordering::Relaxed),
+            attached: self.attached.load(Ordering::Relaxed) > 0,
             state: frame.state,
             cols: frame.cols,
             rows: frame.rows,
@@ -456,6 +530,15 @@ impl PaneSession {
     }
 }
 
+/// RAII counter guard so overlapping reconnects never clobber `attached` state.
+pub struct AttachGuard(Arc<PaneSession>);
+
+impl Drop for AttachGuard {
+    fn drop(&mut self) {
+        self.0.attached.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Manages all interactive `fux`-backed sessions on the server.
 pub struct SessionManager {
     root: PathBuf,
@@ -469,6 +552,8 @@ pub struct AttachSpec<'a> {
     pub new: bool,
     pub cols: u16,
     pub rows: u16,
+    pub cell_w: u16,
+    pub cell_h: u16,
     pub argv: &'a [String],
     pub cwd: &'a Path,
     pub default_shell: &'a str,
@@ -486,13 +571,14 @@ impl SessionManager {
         })
     }
 
-    pub fn attach_or_create(&mut self, spec: AttachSpec<'_>) -> Result<Arc<PaneSession>> {
+    /// Attaches to an existing session or spawns a new one. Returns `(session, created_new)`.
+    pub fn attach_or_create(&mut self, spec: AttachSpec<'_>) -> Result<(Arc<PaneSession>, bool)> {
         if let Some(id) = spec.requested {
             let sess = self.sessions.get(&id).cloned().ok_or_else(|| {
                 KohError::new(Exit::NOT_FOUND, "not_found", format!("no session {id}"))
             })?;
             self.last_id = Some(id);
-            return Ok(sess);
+            return Ok((sess, false));
         }
         if !spec.new
             && spec.argv.is_empty()
@@ -500,7 +586,7 @@ impl SessionManager {
             && let Some(sess) = self.sessions.get(&last)
             && sess.info().state == "running"
         {
-            return Ok(sess.clone());
+            return Ok((sess.clone(), false));
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
@@ -510,13 +596,15 @@ impl SessionManager {
             dir,
             spec.cols,
             spec.rows,
+            spec.cell_w,
+            spec.cell_h,
             spec.argv,
             spec.cwd,
             spec.default_shell,
         )?;
         self.sessions.insert(id, sess.clone());
         self.last_id = Some(id);
-        Ok(sess)
+        Ok((sess, true))
     }
 
     pub fn get(&self, id: u32) -> Result<Arc<PaneSession>> {
@@ -531,46 +619,50 @@ impl SessionManager {
     }
 }
 
-fn snapshot(
-    term: &mut Term,
-    session_id: u32,
-    generation: u64,
-    state: &str,
-    exit: Option<i32>,
-) -> ScreenFrame {
-    let modes = files::modes(term);
-    let marks = files::marks(term);
-    let shown = term.shown();
-    let alt = shown.is_alt();
-    let rendered = files::render(term, alt).or_else(|| files::render(term, false));
-    let (screen, styled, lines, links) = rendered
-        .map(|f| (f.screen, f.styled, f.lines, f.links))
-        .unwrap_or_default();
-    ScreenFrame {
-        session_id,
-        generation,
-        cols: shown.cols,
-        rows: shown.rows,
-        alt,
-        screen,
-        styled,
-        lines,
-        links,
-        cursor_row: shown.cursor.row,
-        cursor_col: shown.cursor.col,
-        cursor_shown: shown.cursor_shown,
-        cursor_shape: shown.cursor_shape,
-        modes,
-        title: term.title().to_string(),
-        marks,
-        state: state.to_string(),
-        exit,
+fn normalize_cell(cell_w: u16, cell_h: u16, fallback: (u16, u16)) -> (u16, u16) {
+    if cell_w > 0 && cell_h > 0 {
+        (cell_w.clamp(1, 100), cell_h.clamp(1, 100))
+    } else {
+        fallback
     }
 }
 
-fn write_screen_dir(dir: &Path, f: &files::Files<'_>) {
+/// Writes frozen v1 `fux` pane metadata files (`size`, `cursor` incl. optional OSC 12 colour,
+/// `modes`, `marks`, `state`, and `title`). Shared by both `PaneSession` and `koh mount`.
+pub fn write_v1_metadata(dir: &Path, frame: &ScreenFrame) {
+    let shown_word = if frame.cursor_shown {
+        "shown"
+    } else {
+        "hidden"
+    };
+    let cursor_col_word = frame.cursor_colour.map_or(String::new(), |[r, g, b]| {
+        format!(" #{r:02x}{g:02x}{b:02x}")
+    });
+    let _ = atomic_write(
+        &dir.join("size"),
+        format!("{} {}\n", frame.cols, frame.rows).as_bytes(),
+    );
+    let _ = atomic_write(
+        &dir.join("cursor"),
+        format!(
+            "{} {} {shown_word} {}{cursor_col_word}\n",
+            frame.cursor_row, frame.cursor_col, frame.cursor_shape
+        )
+        .as_bytes(),
+    );
+    let _ = atomic_write(&dir.join("modes"), format!("{}\n", frame.modes).as_bytes());
+    let _ = atomic_write(&dir.join("marks"), frame.marks.as_bytes());
+    let _ = atomic_write(&dir.join("state"), format!("{}\n", frame.state).as_bytes());
+    if frame.title.is_empty() {
+        let _ = fs::remove_file(dir.join("title"));
+    } else {
+        let _ = atomic_write(&dir.join("title"), format!("{}\n", frame.title).as_bytes());
+    }
+}
+
+fn format_pictures(pics: &[Picture], rows: usize) -> String {
     let mut pictures = String::new();
-    for p in f.pictures {
+    for p in pics.iter().filter(|p| p.row < rows) {
         let row = if p.off > 0 {
             format!("-{}", p.off)
         } else {
@@ -587,6 +679,66 @@ fn write_screen_dir(dir: &Path, f: &files::Files<'_>) {
             p.cell.1
         ));
     }
+    pictures
+}
+
+fn snapshot(
+    term: &mut Term,
+    session_id: u32,
+    generation: u64,
+    state: &str,
+    exit: Option<i32>,
+    clipboard_seq: u64,
+    notice_seq: u64,
+) -> ScreenFrame {
+    let modes = files::modes(term);
+    let marks = files::marks(term);
+    let cursor_colour = term.cursor_colour();
+    let shown = term.shown();
+    let alt = shown.is_alt();
+    let shown_rows = shown.rows;
+    let rendered = files::render(term, alt).or_else(|| files::render(term, false));
+    let (screen, styled, lines, links, pictures) = rendered
+        .map(|f| {
+            (
+                f.screen,
+                f.styled,
+                f.lines,
+                f.links,
+                format_pictures(f.pictures, shown_rows),
+            )
+        })
+        .unwrap_or_default();
+    ScreenFrame {
+        session_id,
+        generation,
+        cols: shown.cols,
+        rows: shown.rows,
+        alt,
+        screen,
+        styled,
+        lines,
+        links,
+        pictures,
+        cursor_row: shown.cursor.row,
+        cursor_col: shown.cursor.col,
+        cursor_shown: shown.cursor_shown,
+        cursor_shape: shown.cursor_shape,
+        cursor_colour,
+        modes,
+        title: term.title().to_string(),
+        marks,
+        state: state.to_string(),
+        exit,
+        clipboard_seq,
+        clipboard: None,
+        notice_seq,
+        notice: None,
+    }
+}
+
+fn write_screen_dir(dir: &Path, f: &files::Files<'_>, rows: usize) {
+    let pictures = format_pictures(f.pictures, rows);
     let _ = atomic_write(&dir.join("lines"), f.lines.as_bytes());
     let _ = atomic_write(&dir.join("links"), f.links.as_bytes());
     let _ = atomic_write(&dir.join("pictures"), pictures.as_bytes());

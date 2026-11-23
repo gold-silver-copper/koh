@@ -1889,3 +1889,234 @@ async fn a_file_that_cannot_be_read_is_replaced_when_its_size_says_it_differs() 
     client.close().await;
     srv.shutdown().await;
 }
+
+/// The names in `dir`, in order.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_hostile_sender_lands_nothing_and_leaves_no_temporary_file() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("hostile-sender").await;
+    let dst = tmp.0.join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("there"), "before").unwrap();
+    let entry = |path: &str, size: u64| SyncEntry {
+        path: path.to_string(),
+        size,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let push = |delete| Request::CpPush {
+        dst: dst.display().to_string(),
+        excludes: Vec::new(),
+        delete,
+        preserve_mtime: false,
+        dry_run: false,
+    };
+    let refused = |answer: &SyncMsg| matches!(answer, SyncMsg::Failed(why) if why.code == 4);
+
+    // A path that is not plain names beneath the tree, in the manifest or at a file's start,
+    // with --delete or without: refused, and the destination is as it was (--delete has removed
+    // nothing: every path is looked at before anything goes).
+    for path in ["../x", "/x", "a//b", "a/./b", "a/../x", "", "a/"] {
+        for delete in [false, true] {
+            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
+            let manifest = SyncMsg::Manifest(vec![entry("ok", 1), entry(path, 1)]);
+            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(refused(&answer), "manifest {path:?} {delete}: {answer:?}");
+
+            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
+            let manifest = SyncMsg::Manifest(vec![entry("there", 9)]);
+            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+            let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(matches!(&need, SyncMsg::Need(asked) if asked == &["there".to_string()]));
+            let start = SyncMsg::FileStart {
+                path: path.to_string(),
+                size: 1,
+                mtime_secs: 0,
+                mode: 0o644,
+            };
+            send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(refused(&answer), "start {path:?} {delete}: {answer:?}");
+            assert_eq!(names_in(&dst), ["there"], "{path:?} {delete}");
+            assert_eq!(names_in(&tmp.0).iter().filter(|n| *n == "x").count(), 0);
+        }
+    }
+    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+
+    // A file that is longer or shorter than its sender said: the copy fails, the file that was
+    // there is as it was, and nothing is left beside it.
+    for sent in [&b"too long"[..], b"sh"] {
+        let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+        let manifest = SyncMsg::Manifest(vec![entry("there", 4)]);
+        send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+        let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+        let start = SyncMsg::FileStart {
+            path: "there".to_string(),
+            size: 4,
+            mtime_secs: 0,
+            mode: 0o644,
+        };
+        send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+        let _ = send_msg(&mut send, &SyncMsg::FileChunk(sent.to_vec()), MAX_CHUNK).await;
+        let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
+        let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+        assert!(
+            matches!(&answer, SyncMsg::Failed(why) if why.code == 1 && why.message.contains("size mismatch")),
+            "{answer:?}"
+        );
+        assert_eq!(names_in(&dst), ["there"]);
+        assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+    }
+
+    // A copy cut off in the middle of a file: while it runs, the bytes are in a file of another
+    // name beside where they land; once the sender is gone, that file is too.
+    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+    let manifest = SyncMsg::Manifest(vec![entry("there", 1 << 20)]);
+    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+    let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    let start = SyncMsg::FileStart {
+        path: "there".to_string(),
+        size: 1 << 20,
+        mtime_secs: 0,
+        mode: 0o644,
+    };
+    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+    let part = SyncMsg::FileChunk(vec![7; 4096]);
+    send_msg(&mut send, &part, MAX_CHUNK).await.unwrap();
+    let partial = |dst: &std::path::Path| names_in(dst).iter().any(|n| n.starts_with(".koh-"));
+    let until = |want: bool, dst: PathBuf| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while partial(&dst) != want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    };
+    until(true, dst.clone())
+        .await
+        .expect("its bytes were being written within 5 s");
+    drop((send, recv));
+    client.close().await;
+    until(false, dst.clone())
+        .await
+        .expect("the temporary file was gone within 5 s");
+    assert_eq!(names_in(&dst), ["there"]);
+    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_else() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new("exec-scope");
+    let (allowed, outside) = (tmp.0.join("allowed"), tmp.0.join("outside"));
+    fs::create_dir_all(allowed.join("sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, allowed.join("out")).unwrap();
+    let key = new_key(&tmp, "exec.key");
+    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
+    save_clients(
+        Some(&tmp.0.join("srv_cfg/server.key")),
+        &[ClientEntry {
+            name: "runner".into(),
+            id: key.public(),
+            scope: Scope::Exec(allowed.clone()),
+        }],
+    )
+    .unwrap();
+    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let client = Client::connect_direct(key, srv.endpoint_id, route, false)
+        .await
+        .unwrap();
+    let at = |dir: &std::path::Path| Some(dir.display().to_string());
+    let pwd = |dir: PathBuf| {
+        let client = &client;
+        async move {
+            client
+                .exec(vec!["pwd".into()], at(&dir), false, None, true)
+                .await
+        }
+    };
+
+    // A command starts in its directory, or in one beneath it, and is any command: this is no
+    // sandbox, and the command reaches what the server's user can.
+    let (code, out, _) = pwd(allowed.join("sub")).await.unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        String::from_utf8_lossy(&out)
+            .trim_end()
+            .ends_with("/allowed/sub")
+    );
+    let reach = format!("cat {}", outside.join("secret").display());
+    fs::write(outside.join("secret"), "reached").unwrap();
+    let (_, out, _) = client
+        .exec(vec![reach], at(&allowed), true, None, true)
+        .await
+        .unwrap();
+    assert_eq!(out, b"reached");
+
+    // It does not start elsewhere: not outside, and not in a directory that is beneath its own
+    // by name and somewhere else in fact (a symlink out of it).
+    for dir in [outside.clone(), allowed.join("out"), tmp.0.clone()] {
+        let err = pwd(dir.clone()).await.unwrap_err();
+        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
+    }
+    let job = client
+        .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
+        .await
+        .unwrap();
+    assert_eq!(job.name, "j");
+    let nowhere = client
+        .run_job(None, vec!["true".into()], at(&outside), false)
+        .await;
+    assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
+
+    // It copies beneath its directory as a `--cp` key does, through no symlink.
+    let file = tmp.0.join("payload");
+    fs::write(&file, "copied").unwrap();
+    let push = |dst: PathBuf| {
+        let (client, file) = (&client, file.clone());
+        async move {
+            let dst = dst.display().to_string();
+            client
+                .cp_push(&file, dst, Vec::new(), false, false, false)
+                .await
+        }
+    };
+    push(allowed.join("sub")).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(allowed.join("sub/payload")).unwrap(),
+        "copied"
+    );
+    for dst in [outside.clone(), allowed.join("out")] {
+        let err = push(dst.clone()).await.unwrap_err();
+        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dst.display());
+    }
+    assert!(!outside.join("payload").exists());
+
+    // And it asks for nothing else: no sessions, and no look at jobs, its own among them.
+    assert_eq!(client.sessions().await.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(client.jobs(None).await.unwrap_err().code, Exit::REFUSED);
+    let waited = client.wait_job("j".into(), None, 10, Some(1)).await;
+    assert_eq!(waited.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(
+        client.output(1, false).await.unwrap_err().code,
+        Exit::REFUSED
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}

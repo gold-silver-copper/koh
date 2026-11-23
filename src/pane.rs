@@ -394,6 +394,13 @@ impl PaneSession {
         }
     }
 
+    /// Updates Kitty keyboard protocol flags supported by the viewer's terminal.
+    pub fn set_keyboard(&self, flags: u8) {
+        if let Ok(mut term) = self.term.lock() {
+            term.told().keyboard = flags & fux_vt::KEYS;
+        }
+    }
+
     pub fn picture_blob(&self, id: u32) -> Option<PictureBlob> {
         let guard = self.pictures.lock().ok()?;
         let (kind, bytes) = guard.get(&id)?;

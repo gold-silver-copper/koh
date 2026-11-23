@@ -177,19 +177,6 @@ async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
         .unwrap();
     assert!(!killed.timed_out && killed.exit != 0);
 
-    // Wait for --file.
-    let marker = tmp.0.join("ready.flag");
-    let marker_bg = marker.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        let _ = fs::write(&marker_bg, "ok");
-    });
-    let wf = client
-        .wait_file(marker.display().to_string(), Some(5))
-        .await
-        .unwrap();
-    assert!(!wf.timed_out && wf.exit == 0);
-
     client.close().await;
     srv.shutdown().await;
 }
@@ -771,6 +758,11 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(local_mirror.join("pic-1.png").is_file());
+    assert!(
+        fs::read_to_string(local_mirror.join("status"))
+            .unwrap()
+            .starts_with("pid ")
+    );
     assert!(
         fs::read_to_string(local_mirror.join("cursor"))
             .unwrap()

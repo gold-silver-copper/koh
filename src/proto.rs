@@ -76,10 +76,6 @@ pub enum Request {
         tail: usize,
         timeout_secs: Option<u64>,
     },
-    WaitFile {
-        path: String,
-        timeout_secs: Option<u64>,
-    },
     CpPush {
         dst: String,
         excludes: Vec<String>,
@@ -197,7 +193,7 @@ pub enum LogMsg {
     },
 }
 
-/// Result of `WaitJob` / `WaitFile` / `WaitSession`.
+/// Result of `WaitJob` / `WaitSession`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitResult {
     pub timed_out: bool,
@@ -576,6 +572,7 @@ pub enum ClientEvent {
     },
     Colours(String),
     Detach,
+    Keyboard(u8),
 }
 
 /// Encode and write one length-prefixed postcard frame.

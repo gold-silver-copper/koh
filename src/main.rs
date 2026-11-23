@@ -663,8 +663,7 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         relay: None,
         json: false,
     };
-    let (mut server, mut job, mut text, mut file, mut session, mut tail, mut timeout) = (
-        None::<String>,
+    let (mut server, mut job, mut text, mut session, mut tail, mut timeout) = (
         None::<String>,
         None::<String>,
         None::<String>,
@@ -681,7 +680,6 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
             "--text" => text = Some(take_opt(args, &mut i, a)?),
-            "--file" => file = Some(take_opt(args, &mut i, a)?),
             "--session" => {
                 session = Some(
                     take_opt(args, &mut i, a)?
@@ -707,21 +705,16 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let server = server.ok_or_else(|| {
-        KohError::usage("usage: koh wait SERVER (JOB | --file PATH | --session N)")
-    })?;
+    let server =
+        server.ok_or_else(|| KohError::usage("usage: koh wait SERVER (JOB | --session N)"))?;
     let client = Client::connect(&server, &opts, true).await?;
     let res = if let Some(sid) = session {
         client.wait_session(sid, timeout).await?
-    } else if let Some(path) = file {
-        client.wait_file(path, timeout).await?
     } else if let Some(name) = job {
         client.wait_job(name, text, tail, timeout).await?
     } else {
         client.close().await;
-        return Err(KohError::usage(
-            "wait needs JOB, --file PATH, or --session N",
-        ));
+        return Err(KohError::usage("wait needs JOB or --session N"));
     };
     client.close().await;
 
@@ -979,13 +972,8 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
         relay: None,
         json: false,
     };
-    let (mut server, mut session, mut new, mut cwd, mut on_bell) = (
-        None::<String>,
-        None::<u32>,
-        false,
-        None::<String>,
-        None::<String>,
-    );
+    let (mut server, mut session, mut new, mut cwd) =
+        (None::<String>, None::<u32>, false, None::<String>);
     let mut argv = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1008,7 +996,6 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
                 )
             }
             "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
-            "--on-bell" => on_bell = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
             _ => {
                 return Err(KohError::usage(format!(
@@ -1019,21 +1006,17 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
         i += 1;
     }
     let server = server.ok_or_else(|| {
-        KohError::usage(
-            "usage: koh connect SERVER [--new | --session N] [--on-bell CMD] [-- PROG...]",
-        )
+        KohError::usage("usage: koh connect SERVER [--new | --session N] [-- PROG...]")
     })?;
-    let mut client = Client::connect(&server, &opts, true).await?;
+    let client = Client::connect(&server, &opts, true).await?;
     let code = client
         .connect_interactive(ConnectOptions {
             session,
             new,
             argv,
             cwd,
-            on_bell,
         })
         .await?;
-    client.close().await;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
 }
 

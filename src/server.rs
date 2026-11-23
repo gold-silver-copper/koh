@@ -348,13 +348,6 @@ async fn dispatch(
                     .await?;
             send_msg(send, &res, MAX_FRAME).await
         }
-        Request::WaitFile { path, timeout_secs } => {
-            let full = expand_home(Path::new(&path))?;
-            scope.check_cp(&full)?;
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let res = crate::jobs::wait_file(full, timeout_secs).await?;
-            send_msg(send, &res, MAX_CTRL).await
-        }
         Request::CpPush {
             dst,
             excludes,
@@ -523,6 +516,9 @@ async fn dispatch(
                             }
                             Some(Ok(ClientEvent::Colours(text))) => {
                                 sess.set_colours(&text);
+                            }
+                            Some(Ok(ClientEvent::Keyboard(flags))) => {
+                                sess.set_keyboard(flags);
                             }
                             Some(Ok(ClientEvent::Detach)) | Some(Err(_)) | None => break,
                         }

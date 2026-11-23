@@ -749,6 +749,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fux"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08cc7b023513499a7e077fa08a9998bdc47b27da8e7053ce56aa6163d881e0ee"
+dependencies = [
+ "fux-vt",
+ "fuxix",
+]
+
+[[package]]
 name = "fux-vt"
 version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,6 +1445,7 @@ version = "0.18.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "fux",
  "fux-vt",
  "fuxix",
  "iroh",

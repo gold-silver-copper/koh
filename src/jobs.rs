@@ -348,29 +348,3 @@ pub async fn wait_job(
         }
     }
 }
-
-/// Waits until `path` exists on the server filesystem, or until `timeout_secs` elapses.
-pub async fn wait_file(path: PathBuf, timeout_secs: Option<u64>) -> Result<WaitResult> {
-    let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
-    loop {
-        if path.exists() {
-            return Ok(WaitResult {
-                timed_out: false,
-                exit: 0,
-                tail: String::new(),
-                detail: "exists".into(),
-            });
-        }
-        if let Some(dl) = deadline
-            && Instant::now() >= dl
-        {
-            return Ok(WaitResult {
-                timed_out: true,
-                exit: i32::from(Exit::TIMEOUT.0),
-                tail: String::new(),
-                detail: "timed out".into(),
-            });
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}

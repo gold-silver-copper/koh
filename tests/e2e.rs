@@ -2285,3 +2285,50 @@ async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
+    // 129 directories, one in the next, each of a 40-character name: the path of the innermost
+    // is longer than a path may be, so they are made from inside (and a tree that deep is too
+    // deep to copy). `--delete` must find that out, or fail in the trying, before it removes
+    // anything: an entry it cannot look at is not an entry that is not there.
+    let (tmp, srv, client, _, _) = boot_pair("delete-unreadable").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("stays"), "stays").unwrap();
+    let name = "d".repeat(40);
+    let sh = |script: String| {
+        let run = Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .current_dir(&dst)
+            .status();
+        run.unwrap().success()
+    };
+    assert!(sh(format!(
+        "i=0; while [ $i -lt 129 ]; do mkdir {name} && cd {name} || exit 1; i=$((i+1)); done"
+    )));
+
+    let err = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert_eq!(fs::read_to_string(dst.join("stays")).unwrap(), "stays");
+
+    client.close().await;
+    srv.shutdown().await;
+    // (What removes a tree by its path may not reach the end of this one: it is emptied from
+    // inside.)
+    sh(format!(
+        "while [ -d {name} ]; do cd {name}; done; while cd .. && rmdir {name} 2>/dev/null; do :; done"
+    ));
+}

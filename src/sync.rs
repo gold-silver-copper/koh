@@ -163,6 +163,16 @@ fn entry(path: String, meta: &fs::Metadata, hash: [u8; 32]) -> SyncEntry {
     }
 }
 
+/// What a look at `path` found, or `None` if nothing is there. That it could not be looked at
+/// is a failure: what cannot be seen is not taken for absent.
+fn found(path: &Path, looked: io::Result<fs::Metadata>) -> Result<Option<fs::Metadata>> {
+    match looked {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KohError::failed(format!("stat {}: {e}", path.display()))),
+    }
+}
+
 fn open(path: &Path) -> Result<File> {
     File::open(path).map_err(|e| KohError::failed(format!("open {}: {e}", path.display())))
 }
@@ -218,7 +228,7 @@ fn scan(
             continue;
         }
         let full = root.join(&child);
-        let Ok(meta) = fs::symlink_metadata(&full) else {
+        let Some(meta) = found(&full, fs::symlink_metadata(&full))? else {
             continue;
         };
         if !meta.is_dir() && !meta.is_file() {

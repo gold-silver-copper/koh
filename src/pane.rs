@@ -427,7 +427,7 @@ impl PaneSession {
         (guard.0 > seen).then(|| (guard.0, guard.1.clone()))
     }
 
-    pub fn attach_guard(self: &Arc<Self>) -> AttachGuard {
+    fn attach_guard(self: &Arc<Self>) -> AttachGuard {
         self.attached.fetch_add(1, Ordering::Relaxed);
         AttachGuard(self.clone())
     }
@@ -603,14 +603,23 @@ impl SessionManager {
         })
     }
 
-    /// Attaches to an existing session or spawns a new one. Returns `(session, created_new)`.
-    pub fn attach_or_create(&mut self, spec: AttachSpec<'_>) -> Result<(Arc<PaneSession>, bool)> {
+    /// Attaches to an existing session or spawns a new one. Returns the session, whether it is
+    /// new, and the hold on it: it counts as attached from here on, while whoever asked still
+    /// holds the manager, so it cannot be forgotten for another before its client is told of it.
+    pub fn attach_or_create(
+        &mut self,
+        spec: AttachSpec<'_>,
+    ) -> Result<(Arc<PaneSession>, bool, AttachGuard)> {
+        let attached = |sess: Arc<PaneSession>, new| {
+            let hold = sess.attach_guard();
+            Ok((sess, new, hold))
+        };
         if let Some(id) = spec.requested {
             let sess = self.sessions.get(&id).cloned().ok_or_else(|| {
                 KohError::new(Exit::NOT_FOUND, "not_found", format!("no session {id}"))
             })?;
             self.last_id = Some(id);
-            return Ok((sess, false));
+            return attached(sess, false);
         }
         if !spec.new
             && spec.argv.is_empty()
@@ -618,7 +627,7 @@ impl SessionManager {
             && let Some(sess) = self.sessions.get(&last)
             && sess.info().state == "running"
         {
-            return Ok((sess.clone(), false));
+            return attached(sess.clone(), false);
         }
         let goes = self.goes_for_one_more()?;
         let id = self.next_id;
@@ -641,7 +650,7 @@ impl SessionManager {
         }
         self.sessions.insert(id, sess.clone());
         self.last_id = Some(id);
-        Ok((sess, true))
+        attached(sess, true)
     }
 
     pub fn get(&self, id: u32) -> Result<Arc<PaneSession>> {

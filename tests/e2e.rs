@@ -1805,3 +1805,53 @@ async fn a_session_that_cannot_start_takes_no_kept_session_with_it() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[test]
+fn a_session_is_attached_from_the_moment_it_is_handed_out() {
+    use koh::pane::{AttachSpec, SessionManager};
+    let tmp = TempDir::new("attach-guard");
+    let mut sessions = SessionManager::new(tmp.0.join("sessions"), 1).unwrap();
+    let words = |line: &str| vec!["/bin/sh".to_string(), "-c".into(), line.into()];
+    let spec = |requested: Option<u32>, argv: &'static [String]| AttachSpec {
+        requested,
+        new: requested.is_none(),
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv,
+        cwd: std::path::Path::new("/"),
+        default_shell: "/bin/sh",
+    };
+    let (exits, sleeps): (&'static [String], &'static [String]) =
+        (words("exit 0").leak(), words("sleep 30").leak());
+
+    // The server keeps one session; its program has ended and nobody is attached.
+    let first = sessions.attach_or_create(spec(None, exits)).unwrap();
+    let (id, dir) = (first.0.id, first.0.dir.clone());
+    drop(first);
+    let ended = |sessions: &SessionManager| sessions.list()[0].state != "running";
+    let began = std::time::Instant::now();
+    while !ended(&sessions) {
+        assert!(began.elapsed() < Duration::from_secs(5), "it did not end");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!sessions.list()[0].attached);
+
+    // A client is given that session to attach to. It is attached from then on, before the
+    // client has been answered: a new session that comes meanwhile finds no room, and the
+    // folder the client is about to read stays.
+    let again = sessions.attach_or_create(spec(Some(id), &[])).unwrap();
+    assert!(sessions.list()[0].attached, "handed out, and not attached");
+    let busy = sessions
+        .attach_or_create(spec(None, sleeps))
+        .err()
+        .expect("no room");
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    assert!(dir.is_dir());
+
+    // Once that client has let go, the ended session goes for a new one.
+    drop(again);
+    let new = sessions.attach_or_create(spec(None, sleeps)).unwrap();
+    assert!(new.0.id != id && !dir.exists());
+}

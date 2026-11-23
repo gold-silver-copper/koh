@@ -536,7 +536,7 @@ async fn dispatch(
         } => {
             scope.check_full()?;
             let dir = resolve_cwd(cwd.as_deref())?;
-            let (sess, created_new) = {
+            let (sess, created_new, _attached) = {
                 let mut guard = state
                     .sessions
                     .lock()
@@ -554,7 +554,6 @@ async fn dispatch(
                 })?
             };
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _attached = sess.attach_guard();
             // On reattach to an existing session, don't replay stale pre-existing bell/clipboard.
             let (mut last_clip_seq, mut last_notice_seq) = if created_new {
                 (0, 0)

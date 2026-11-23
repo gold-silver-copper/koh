@@ -18,14 +18,18 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ### Security
 
 - **A scoped key is not a confinement.** A `--cp DIR` or `--exec DIR` key is held to `DIR` by
-  the text of the path it names: the path begins with `DIR` and goes on with plain names (no
-  `..`), and so does every name a copy sends. Nothing is resolved, so a symlink beneath `DIR`
-  leads where it leads, in a copy and in a command's starting directory. 0.17.2 refused a
-  scoped key's path through a symlink; koh now has no anti-symlink mechanics and trusts the
-  machines it runs on (`SECURITY.md`, `docs/THREAT_MODEL.md`). A symlink in a tree that is read
-  is not sent, `--delete` leaves it, and a file that lands where one is replaces it.
-- A file is written under a name of its own beside where it lands (it was `.NAME.koh-tmp`,
-  which two copies of one file shared) and removed if the copy is cut short.
+  the text of the path it names: the path begins with `DIR` (as `clients` has it, or as that
+  resolves) and goes on with plain names (no `..`), and so does every name a copy sends. The
+  path a client names is not resolved, so a symlink beneath `DIR` leads where it leads, in a
+  copy and in a command's starting directory; and a `DIR` written as its resolved path refuses
+  a path that reaches it by another name (`/home/u/d` for `/var/home/u/d`). 0.17.2 refused a
+  scoped key's path through a symlink; koh now has no anti-symlink mechanics (a key file that
+  is a symlink is read as the file it leads to) and trusts the machines it runs on
+  (`SECURITY.md`, `docs/THREAT_MODEL.md`). A symlink in a tree that is read is not sent,
+  `--delete` leaves it, one in the tree a copy lands in is followed, and a file that lands
+  where one is replaces it.
+- A file is written under a new name of its own beside where it lands (it was `.NAME.koh-tmp`,
+  written over whatever had that name) and removed if the copy is cut short.
 - A copy's receiver refuses a manifest of more than 100,000 entries and a file it did not ask
   for, and stops at a file longer than its sender said.
 - What a peer says went wrong is never taken for success: its exit code is used only if it is
@@ -59,10 +63,14 @@ binary, its tests and the fuzz targets share code, and any release may change it
   tree says so before anything is sent or removed (exit 1). With `--delete` that holds for
   what the destination already has, so something deeper there fails the whole copy, even
   where the copy would have removed it.
+- A tree that cannot be looked through fails the copy (exit 1) before anything is sent or
+  removed: an entry whose stat fails is not taken for absent. `koh cp --dry-run` fails as the
+  copy would when its destination is there and is no directory.
 - `rustix` is no longer a dependency. A copy is `std::fs` on paths, and the lock on a server's
   key is opened with std. The directory of a key is no longer refused for being another user's
   (it is still refused if group or others may write to it). `koh cp -p` sets a file's
-  modification time and leaves its access time alone.
+  modification time and leaves its access time alone. With `XDG_RUNTIME_DIR` not set, the
+  number in the state directory's name (`TMPDIR/koh-UID`) is what `id -u` says.
 - `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
   process group of a job, and of a `koh exec` command the server hangs up, is signalled with
   it. `koh kill` waits for it without holding up other requests, for 5 s at most, and fails

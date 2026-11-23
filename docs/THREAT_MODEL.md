@@ -66,17 +66,22 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
 
 `koh clients add NAME ID --cp DIR` or `--exec DIR` (`src/keys.rs`, `Scope`).
 
-- **`--cp DIR`** copies to and from paths beneath `DIR`. The path it names must begin with
-  `DIR` and go on with plain names (no `..`); nothing of it is resolved (`src/keys.rs`,
-  `check_beneath`), and the names a copy then sends are held to plain names the same way
-  (`src/sync.rs`, `wire_names`). **That is the text of the path, and it is not a confinement:**
-  the server uses the path as the file system resolves it, so a symlink beneath `DIR` leads
-  where it leads, and a key that finds one leading out of `DIR` reads and writes there as the
-  server's user. The scope keeps a script or a slip of the hand in `DIR`; the operator trusts
-  his machines and what is on them. A copy makes no symlinks: one in a tree that is read is not
-  sent, `--delete` leaves it, and a file that lands where one is replaces it (a file is written
-  under a name of its own beside where it lands and renamed, with mode 0644 or 0755 and never
-  setuid). Every other request is refused (exit 4).
+- **`--cp DIR`** copies to and from paths that are beneath `DIR` by their text. The path a
+  client names must begin with `DIR` and go on with plain names (no `..`, no NUL). `DIR` is
+  resolved for this, each time, and the path may begin with it as `clients` has it or as it
+  resolves; the path itself is not resolved (`src/keys.rs`, `check_beneath`). The names a copy
+  then sends are held to plain names the same way (`src/sync.rs`, `wire_names`). **It is not a
+  confinement:** the server uses the path as the file system resolves it, so a symlink beneath
+  `DIR` leads where it leads, and a key that finds one leading out of `DIR` reads and writes
+  there as the server's user. The scope keeps a script or a slip of the hand in `DIR`; the
+  operator trusts his machines and what is on them. A copy makes no symlinks: one in a tree
+  that is read is not sent, `--delete` leaves it, one in the tree a copy lands in is followed,
+  and a file that lands where one is replaces it (a file is written under a new name of its
+  own beside where it lands and renamed, with mode 0644 or 0755 and never setuid). Every other
+  request is refused (exit 4).
+- A `DIR` written in `clients` as its resolved path refuses a path that reaches it by another
+  name (`/var/home/u` for `/home/u`, `/private/tmp` for `/tmp`): only `DIR` is resolved. That
+  refuses more, never less.
 - **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
   the same rule, and copies as above. **It is not a sandbox:** the command is any command,
   run as the server's user, and reaches whatever that user can. Every other request is refused:
@@ -90,10 +95,11 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
 
 A wrong endpoint id, or a host someone else now controls.
 
-- **A copy from it** (`koh cp SERVER:SRC DST`) lands beneath `DST`: every name it sends is a
-  plain name (no `..`, no `/`), so none takes a file outside. A symlink already in `DST` is
-  followed, as the user's own `cp` would. The client takes at most 100,000 entries, only the
-  files it asked for, and no file longer than the server said.
+- **A copy from it** (`koh cp SERVER:SRC DST`) lands beneath `DST` by the text of its names:
+  each is a plain name (no `..`, no `/`), and where they lead is the file system's to say, so
+  a symlink already in `DST` is followed, as the user's own `cp` would follow it. The client
+  takes at most 100,000 entries, only the files it asked for, and no file longer than the
+  server said.
 - **A session from it** (`koh connect`, `koh mount`) is mirrored into a pane folder on the
   client. The server chooses the contents of that folder's files (the screen, title, links,
   clipboard, notice, pictures), never their names. The viewer then draws them, so the server

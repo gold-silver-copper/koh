@@ -49,11 +49,14 @@ credit reporters who want it.
 
 - A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
   can read or write, and sessions.
-- A `--cp DIR` key copies to and from paths beneath `DIR` and nothing else. Beneath is told by
-  the text of the path: it begins with `DIR` and goes on with plain names (no `..`). **It is
-  not a confinement.** Nothing is resolved, so a symlink beneath `DIR` leads where it leads,
-  and a copy through it reads and writes there. The scope is a convenience and a guard against
-  mistakes; koh trusts the machines it runs on and what is on them.
+- A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
+  the path begins with `DIR` and goes on with plain names (no `..`). **It is not a
+  confinement.** `DIR` itself is resolved, and a path may begin with it as `clients` has it or
+  as it resolves; the path a client names is not resolved, so a symlink beneath `DIR` leads
+  where it leads, and a copy through it reads and writes there. The scope is a convenience and
+  a guard against mistakes; koh trusts the machines it runs on and what is on them. (A `DIR`
+  written as its resolved path refuses a path that reaches it by another name: `/var/home/u/d`
+  in `clients` refuses `/home/u/d/f`. Write `DIR` as its clients will name it.)
 - A `--exec DIR` key runs commands and starts jobs, which must start in a directory beneath
   `DIR` by the same rule, and copies as a `--cp DIR` key does. **It is not a sandbox**: only
   the starting directory's path is checked, and the command is any command, run as the

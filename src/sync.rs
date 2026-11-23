@@ -3,8 +3,8 @@
 //!
 //! A path a peer names is plain names beneath the tree: that is told by its text, and it is all
 //! that is told. The tree is what the file system says it is. A symlink in a tree that is read
-//! is not sent, and `--delete` leaves it; one in the tree a copy lands in is a directory like
-//! any other, and a file that lands where one is takes its place.
+//! is not sent, and `--delete` leaves it; one in the tree a copy lands in is followed, and a
+//! file that lands where one is takes its place.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};

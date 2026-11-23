@@ -2471,9 +2471,12 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
     );
     drop(plain);
 
-    // A kill(1) that takes two seconds and then fails (it does answer `kill -0`).
-    let slow = "#!/bin/sh\n[ \"$1\" = -0 ] && exit 0\n/bin/sleep 2\nexit 42\n";
-    fs::write(bin.join("kill"), slow).unwrap();
+    // A kill(1) that takes two seconds and then fails. (Asked whether a process or a group
+    // is there, `kill -0`, it is the real one.)
+    let fake = |then: &str| {
+        format!("#!/bin/sh\n[ \"$1\" = -0 ] && exec /bin/kill \"$@\"\n{then}exit 42\n")
+    };
+    fs::write(bin.join("kill"), fake("/bin/sleep 2\n")).unwrap();
     fs::set_permissions(bin.join("kill"), fs::Permissions::from_mode(0o755)).unwrap();
     let mut served = Served::start(&tmp, &bin, key.public(), true);
     let id: iroh::EndpointId = served.says("koh server id:").unwrap().parse().unwrap();
@@ -2502,6 +2505,38 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
     let err = killed.unwrap_err();
     assert_eq!(err.code, Exit::FAILED, "{err:?}");
     assert!(err.message.contains("kill"), "{err:?}");
+
+    // A job whose first process has ended and left another behind in its group: the job says
+    // it has ended, and the group is what `koh kill` is for. Not signalled, it is not reported
+    // as signalled; once it has gone, there is nothing to signal and nothing to report.
+    fs::write(bin.join("kill"), fake("")).unwrap();
+    let left = tmp.0.join("left.pid");
+    let line = format!("/bin/sleep 300 & echo $! > {}", left.display());
+    client
+        .run_job(Some("o".into()), vec![line], None, true)
+        .await
+        .unwrap();
+    let ended = client.wait_job("o".into(), None, 10, Some(10)).await;
+    assert!(!ended.unwrap().timed_out);
+    let pid = fs::read_to_string(&left).unwrap().trim().to_string();
+    served.started.push(pid.parse().unwrap());
+    let there = |pid: &str| {
+        let mut asked = Command::new("kill");
+        asked.args(["-0", pid]).stderr(std::process::Stdio::null());
+        asked.status().unwrap().success()
+    };
+    assert!(there(&pid));
+    let err = client.kill_job("o".into(), 15).await.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(there(&pid));
+    assert!(Command::new("kill").arg(&pid).status().unwrap().success());
+    for _ in 0..500 {
+        if !there(&pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(client.kill_job("o".into(), 15).await.unwrap().name, "o");
 
     client.close().await;
 }

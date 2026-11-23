@@ -188,8 +188,8 @@ impl JobManager {
 
     /// Signals the process group of job `name` (a number that is no signal's is SIGTERM's), and
     /// tells of the job as it then is. The lock is held only to find the job: kill(1) is waited
-    /// for with nothing held. That it failed is an error unless the job has ended: a group
-    /// that has gone is not there to signal.
+    /// for with nothing held. That it failed is an error unless the group has gone (all of it:
+    /// a job's first process may end and leave others), for then nothing is there to signal.
     pub async fn kill(mgr: &Arc<Mutex<Self>>, name: &str, sig: i32) -> Result<JobInfo> {
         let rec = {
             let guard = mgr
@@ -204,13 +204,10 @@ impl JobManager {
             })?
         };
         let signal = if (1..32).contains(&sig) { sig } else { 15 };
-        if let Err(err) = signal_group(rec.pid, signal).await {
-            // (A job's end is told a moment after its last process has gone.)
-            let mut state = rec.state_tx.subscribe();
-            let ended = state.wait_for(|(state, _)| state != "running");
-            if !matches!(tokio::time::timeout(ENDS_IN, ended).await, Ok(Ok(_))) {
-                return Err(err);
-            }
+        if let Err(err) = signal_group(rec.pid, signal).await
+            && group_is_there(rec.pid).await
+        {
+            return Err(err);
         }
         Ok(record_info(&rec))
     }
@@ -218,28 +215,37 @@ impl JobManager {
 
 /// How long a program koh runs for what it does or says (kill(1), id(1)) is given.
 const DONE_IN: Duration = Duration::from_secs(5);
-/// How long a job whose group could not be signalled is given to say that it has ended.
-const ENDS_IN: Duration = Duration::from_secs(1);
 
-/// Runs `program` with `args` and gives what it wrote. It is waited for, by the caller alone
-/// and for `DONE_IN` at most; that it could not be run, was not done in time or says it failed
-/// is an error, with what it said: what a program wrote before it failed is not its answer.
-pub(crate) async fn run(program: &str, args: &[String]) -> Result<Vec<u8>> {
-    let failed = |why: String| {
-        let what = format!("{program} {}", args.join(" "));
-        Err(KohError::failed(format!("{what}: {why}")))
-    };
+fn not_done(program: &str, args: &[String], why: impl std::fmt::Display) -> KohError {
+    KohError::failed(format!("{program} {}: {why}", args.join(" ")))
+}
+
+/// Runs `program` with `args` to its end, waited for by the caller alone and for `DONE_IN` at
+/// most. That it could not be run or was not done in time is an error; what it then says of
+/// itself, failure too, is the caller's to read.
+async fn ran(program: &str, args: &[String]) -> Result<std::process::Output> {
     let mut command = tokio::process::Command::new(program);
     command.args(args).stdin(Stdio::null()).kill_on_drop(true);
     match tokio::time::timeout(DONE_IN, command.output()).await {
-        Ok(Ok(done)) if done.status.success() => Ok(done.stdout),
-        Ok(Ok(done)) => {
-            let said = String::from_utf8_lossy(&done.stderr);
-            failed(format!("{} {}", done.status, said.trim()))
+        Ok(Ok(done)) => Ok(done),
+        Ok(Err(e)) => Err(not_done(program, args, e)),
+        Err(_) => {
+            let why = format!("not done in {} s", DONE_IN.as_secs());
+            Err(not_done(program, args, why))
         }
-        Ok(Err(e)) => failed(e.to_string()),
-        Err(_) => failed(format!("not done in {} s", DONE_IN.as_secs())),
     }
+}
+
+/// Runs `program` with `args` and gives what it wrote. That it says it failed is an error too,
+/// with what it said: what a program wrote before it failed is not its answer.
+pub(crate) async fn run(program: &str, args: &[String]) -> Result<Vec<u8>> {
+    let done = ran(program, args).await?;
+    if done.status.success() {
+        return Ok(done.stdout);
+    }
+    let said = String::from_utf8_lossy(&done.stderr);
+    let why = format!("{} {}", done.status, said.trim());
+    Err(not_done(program, args, why))
 }
 
 /// Runs kill(1) with `args`: std has no call that signals a process group, and the groups koh
@@ -259,6 +265,13 @@ pub(crate) async fn can_kill() -> Result<()> {
                 err.message
             ))
         })
+}
+
+/// Whether the process group `pgid` is there, as `kill -0` tells it. Only its saying no is a
+/// no: a kill(1) that could not be asked has told of nothing that went.
+async fn group_is_there(pgid: u32) -> bool {
+    let asked = ran("kill", &["-0".into(), "--".into(), format!("-{pgid}")]).await;
+    !asked.is_ok_and(|said| !said.status.success())
 }
 
 /// Sends `signal` to the process group `pgid`.

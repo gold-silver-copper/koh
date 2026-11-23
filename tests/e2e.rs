@@ -1652,3 +1652,31 @@ async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() 
     forward.abort();
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_client_refused_at_the_door_is_told_the_server_is_busy_too() {
+    let tmp = TempDir::new("refused-busy");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+
+    // One client has the place. A second is let connect to be told so, and has not asked yet: it
+    // holds the one place there is for that. A third is refused before it has connected at all,
+    // and that is the server being busy as much as the second's answer is: exit 75, not 3.
+    let first = dial().await.unwrap();
+    first.sessions().await.unwrap();
+    let second = dial().await.unwrap();
+    let third = dial().await.err().expect("a refusal");
+    assert_eq!(third.code, Exit::BUSY, "{third:?}");
+    assert!(third.message.contains("server busy"), "{third:?}");
+    let told = second.sessions().await.unwrap_err();
+    assert_eq!(told.code, Exit::BUSY, "{told:?}");
+
+    second.close().await;
+    first.close().await;
+    srv.shutdown().await;
+}

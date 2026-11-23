@@ -5,7 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use iroh::endpoint::{
-    BindOpts, Connection, IdleTimeout, QuicTransportConfig, RecvStream, SendStream, VarInt, presets,
+    BindOpts, ConnectError, ConnectingError, Connection, ConnectionError, IdleTimeout,
+    QuicTransportConfig, RecvStream, SendStream, TransportErrorCode, VarInt, presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 
@@ -91,8 +92,33 @@ pub async fn connect_server(
     let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN))
         .await
         .map_err(|_| KohError::unreachable("timed out dialing server"))?
-        .map_err(|e| KohError::unreachable(format!("cannot reach server: {e}")))?;
+        .map_err(|e| match refused(&e) {
+            true => busy(),
+            false => KohError::unreachable(format!("cannot reach server: {e}")),
+        })?;
     Ok((endpoint, conn))
+}
+
+/// Whether the server was reached and refused the connection before it began (QUIC's
+/// CONNECTION_REFUSED): a koh server does that when it has no place left, not even to say so.
+fn refused(err: &ConnectError) -> bool {
+    let closed = match err {
+        ConnectError::Connection { source, .. } => source,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => source,
+        _ => return false,
+    };
+    matches!(closed, ConnectionError::ConnectionClosed(close) if close.error_code == TransportErrorCode::CONNECTION_REFUSED)
+}
+
+fn busy() -> KohError {
+    KohError::new(
+        crate::Exit::BUSY,
+        "busy",
+        "server busy: too many connections at once",
+    )
 }
 
 fn proof_payload(conn: &Connection) -> Result<Vec<u8>> {
@@ -152,11 +178,7 @@ pub fn close_error(conn: &Connection) -> Option<KohError> {
     };
     match CloseCode::from_u64(close.error_code.into_inner()) {
         Some(CloseCode::Refused) => Some(KohError::refused("server refused this client key")),
-        Some(CloseCode::Busy) => Some(KohError::new(
-            crate::Exit::BUSY,
-            "busy",
-            "server busy: too many connections at once",
-        )),
+        Some(CloseCode::Busy) => Some(busy()),
         _ => None,
     }
 }

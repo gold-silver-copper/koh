@@ -1021,11 +1021,11 @@ async fn boot_scoped(
 }
 
 #[tokio::test]
-async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
+async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where_it_leads() {
     use std::os::unix::fs::symlink;
     let (tmp, srv, client, allowed, outside) = boot_scoped("symlink").await;
-    let push = |src: PathBuf, delete: bool| {
-        let (client, dst) = (&client, allowed.display().to_string());
+    let push = |src: PathBuf, dst: PathBuf, delete: bool| {
+        let (client, dst) = (&client, dst.display().to_string());
         async move {
             client
                 .cp_push(&src, dst, Vec::new(), delete, false, false)
@@ -1033,73 +1033,59 @@ async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
         }
     };
 
-    // A directory on the way that is a symlink out of DIR: refused, nothing written beyond it.
+    // A path that says by its text that it is beneath DIR is taken, and the file system says
+    // where it is: a symlink on the way is a directory like any other, in the path the client
+    // names and in the tree that lands.
     symlink(&outside, allowed.join("link")).unwrap();
     let through = tmp.0.join("through");
     fs::create_dir_all(through.join("link")).unwrap();
-    fs::write(through.join("link/x"), "escaped").unwrap();
-    let err = push(through.clone(), false).await.unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!outside.join("x").exists(), "wrote through DIR/link");
+    fs::write(through.join("link/x"), "through the tree").unwrap();
+    push(through, allowed.clone(), false).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(outside.join("x")).unwrap(),
+        "through the tree"
+    );
+    let file = tmp.0.join("y");
+    fs::write(&file, "through the path").unwrap();
+    push(file, allowed.join("link"), false).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(outside.join("y")).unwrap(),
+        "through the path"
+    );
 
-    // `--delete` removes nothing beyond it either.
-    fs::write(outside.join("victim"), "keep").unwrap();
-    let _ = push(through, true).await;
+    // `--delete` goes by what a tree that is read holds, and a symlink is not read: it stays,
+    // and so does what is beyond it.
     let empty = tmp.0.join("empty");
     fs::create_dir_all(&empty).unwrap();
-    push(empty, true).await.unwrap();
-    assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
-    fs::remove_file(allowed.join("link")).unwrap();
+    push(empty, allowed.clone(), true).await.unwrap();
+    assert!(allowed.join("link").is_symlink());
+    assert_eq!(names_in(&outside), ["x", "y"]);
 
-    // A symlink where the file lands is replaced, never read or written through: the same bytes
-    // are beyond it, and the copy must not find the file "unchanged" by hashing them.
-    fs::write(outside.join("target"), "same").unwrap();
+    // A file lands under a name of its own and is then renamed: a symlink where it lands is
+    // replaced by it, and the file the symlink led to is as it was.
+    fs::write(outside.join("target"), "old").unwrap();
     symlink(outside.join("target"), allowed.join("final")).unwrap();
     let onto = tmp.0.join("onto");
     fs::create_dir_all(&onto).unwrap();
-    fs::write(onto.join("final"), "same").unwrap();
-    let done = push(onto, false).await.unwrap();
-    assert_eq!(done.unchanged, 0, "hashed the file beyond DIR/final");
-    assert!(
-        fs::symlink_metadata(allowed.join("final"))
-            .unwrap()
-            .is_file()
-    );
-    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
+    fs::write(onto.join("final"), "new!").unwrap();
+    push(onto, allowed.clone(), false).await.unwrap();
+    assert!(!allowed.join("final").is_symlink());
+    assert_eq!(fs::read_to_string(allowed.join("final")).unwrap(), "new!");
+    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "old");
 
-    // A symlink planted at the name the file's bytes used to be written under first.
-    symlink(outside.join("planted"), allowed.join(".x.koh-tmp")).unwrap();
-    let file = tmp.0.join("x");
-    fs::write(&file, "payload").unwrap();
-    push(file, false).await.unwrap();
-    assert!(!outside.join("planted").exists(), "wrote through the temp");
-    assert!(fs::symlink_metadata(allowed.join("x")).unwrap().is_file());
-    assert_eq!(fs::read_to_string(allowed.join("x")).unwrap(), "payload");
-
-    // A tree with directories still lands, and no temporary file is left beside what landed.
+    // A tree with directories lands, and no temporary file is left beside what landed.
     let nested = tmp.0.join("nested");
     fs::create_dir_all(nested.join("a/b")).unwrap();
     fs::write(nested.join("a/b/c.txt"), "deep").unwrap();
-    let dst = allowed.join("sub/tree").display().to_string();
-    let landed = client
-        .cp_push(&nested, dst, Vec::new(), false, false, false)
-        .await
-        .unwrap();
+    let landed = push(nested, allowed.join("sub/tree"), false).await.unwrap();
     assert_eq!(landed.added, vec!["a/b/c.txt".to_string()]);
-    assert_eq!(
-        fs::read_to_string(allowed.join("sub/tree/a/b/c.txt")).unwrap(),
-        "deep"
-    );
-    let beside: Vec<_> = fs::read_dir(allowed.join("sub/tree/a/b"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(beside, vec![std::ffi::OsString::from("c.txt")]);
+    assert_eq!(names_in(&allowed.join("sub/tree/a/b")), ["c.txt"]);
 
-    // Reading is held to DIR the same way: a file beyond a symlink is refused when named, and
-    // not sent as part of the tree the symlink is in.
+    // Reading is the same: a symlink in a tree is not sent, as a file or as a directory, and a
+    // path that names a file through one reaches that file.
     fs::write(outside.join("secret"), "secret").unwrap();
     symlink(&outside, allowed.join("sub/tree/out")).unwrap();
+    symlink(outside.join("secret"), allowed.join("sub/tree/a/s")).unwrap();
     let pull = |src: PathBuf, to: &str| {
         let (client, to) = (&client, tmp.0.join(to));
         async move {
@@ -1107,47 +1093,25 @@ async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
             let done = client
                 .cp_pull(src, &to, Vec::new(), false, false, false)
                 .await;
-            (done, to)
+            (done.unwrap(), to)
         }
     };
-    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
-    assert_eq!(named.unwrap_err().code, Exit::REFUSED);
-    assert!(!to.join("secret").exists());
     let (whole, to) = pull(allowed.join("sub/tree"), "whole").await;
-    assert_eq!(whole.unwrap().added, vec!["a/b/c.txt".to_string()]);
-    assert!(!to.join("out").exists());
-    let (one, to) = pull(allowed.join("sub/tree/a/b/c.txt"), "one").await;
-    assert_eq!(one.unwrap().added, vec!["c.txt".to_string()]);
-    assert_eq!(fs::read_to_string(to.join("c.txt")).unwrap(), "deep");
+    assert_eq!(whole.added, vec!["a/b/c.txt".to_string()]);
+    assert_eq!(names_in(&to), ["a"]);
+    assert_eq!(names_in(&to.join("a")), ["b"]);
+    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
+    assert_eq!(named.added, vec!["secret".to_string()]);
+    assert_eq!(fs::read_to_string(to.join("secret")).unwrap(), "secret");
 
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn cp_pull_never_writes_through_a_symlink_in_the_local_destination() {
-    let (tmp, srv, client, _, _) = boot_pair("pull-symlink").await;
-    let tree = tmp.0.join("tree");
-    fs::create_dir_all(tree.join("link")).unwrap();
-    fs::write(tree.join("link/x"), "escaped").unwrap();
-    let (back, outside) = (tmp.0.join("back"), tmp.0.join("outside"));
-    fs::create_dir_all(&back).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-    std::os::unix::fs::symlink(&outside, back.join("link")).unwrap();
-
-    let err = client
-        .cp_pull(
-            tree.display().to_string(),
-            &back,
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
+    // The text is what holds: a path that does not begin with DIR is refused, though a symlink
+    // would have led it there.
+    symlink(&allowed, outside.join("in")).unwrap();
+    let file = tmp.0.join("z");
+    fs::write(&file, "z").unwrap();
+    let err = push(file, outside.join("in"), false).await.unwrap_err();
     assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!outside.join("x").exists(), "wrote through back/link");
+    assert!(!allowed.join("z").exists());
 
     client.close().await;
     srv.shutdown().await;
@@ -2084,7 +2048,7 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         .await;
     assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
 
-    // It copies beneath its directory as a `--cp` key does, through no symlink.
+    // It copies beneath its directory as a `--cp` key does.
     let file = tmp.0.join("payload");
     fs::write(&file, "copied").unwrap();
     let push = |dst: PathBuf| {
@@ -2101,10 +2065,8 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         fs::read_to_string(allowed.join("sub/payload")).unwrap(),
         "copied"
     );
-    for dst in [outside.clone(), allowed.join("out")] {
-        let err = push(dst.clone()).await.unwrap_err();
-        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dst.display());
-    }
+    let err = push(outside.clone()).await.unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
     assert!(!outside.join("payload").exists());
 
     // And it asks for nothing else: no sessions, and no look at jobs, its own among them.

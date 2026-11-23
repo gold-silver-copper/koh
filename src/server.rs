@@ -468,10 +468,11 @@ async fn dispatch(
             preserve_mtime,
             dry_run,
         } => {
-            let place = scope.place_cp(&expand_home(Path::new(&dst))?)?;
+            let dst = expand_home(Path::new(&dst))?;
+            scope.check_cp(&dst)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             let landed = receive_tree(
-                &place,
+                &dst,
                 &excludes,
                 delete,
                 preserve_mtime,
@@ -489,9 +490,10 @@ async fn dispatch(
             preserve_root,
             ..
         } => {
-            let place = scope.place_cp(&expand_home(Path::new(&src))?)?;
+            let src = expand_home(Path::new(&src))?;
+            scope.check_cp(&src)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let sent = send_tree(&place, &excludes, preserve_root, send, &mut recv).await;
+            let sent = send_tree(&src, &excludes, preserve_root, send, &mut recv).await;
             say_failure(send, sent).await;
             Ok(())
         }

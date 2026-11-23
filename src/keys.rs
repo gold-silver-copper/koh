@@ -12,7 +12,6 @@ use std::path::{Component, Path, PathBuf};
 use iroh::{EndpointId, RelayUrl, SecretKey};
 use qrcode::{QrCode, render::unicode};
 
-use crate::sync::Place;
 use crate::{Exit, KohError, Result, atomic_write, is_safe_name};
 
 const KEY_LEN: usize = 32;
@@ -56,13 +55,11 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Where a copy to or from `target` reaches under this scope, if it may: with no scope the
-    /// path as given; with one, the scope's directory and the names beneath it, of which a copy
-    /// follows no symlink.
-    pub fn place_cp(&self, target: &Path) -> Result<Place> {
+    /// Checks whether a path is allowed for copy operations under this scope.
+    pub fn check_cp(&self, target: &Path) -> Result<()> {
         match self {
-            Self::Full => Ok(Place::path(target)),
-            Self::Cp(root) | Self::Exec(root) => place_beneath(root, target),
+            Self::Full => Ok(()),
+            Self::Cp(root) | Self::Exec(root) => check_beneath(root, target),
         }
     }
 
@@ -84,35 +81,29 @@ impl Scope {
     }
 }
 
-/// `target` as names beneath the scope's directory `root`: it must say so itself, by starting
-/// with that directory's path (as the `clients` file has it, or resolved) and going on with
-/// plain names. Nothing of `target` is resolved here, so no symlink beneath `root` is trusted.
-fn place_beneath(root: &Path, target: &Path) -> Result<Place> {
+/// Whether `target` says, by its text, that it is beneath the scope's directory `root`: it
+/// starts with that directory's path (as the `clients` file has it, or resolved) and goes on
+/// with plain names, none of them `..`. Nothing of `target` is resolved: a symlink beneath
+/// `root` leads where it leads.
+fn check_beneath(root: &Path, target: &Path) -> Result<()> {
     let root = expand_home(root)?;
     let base = root
         .canonicalize()
         .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
-    let outside = || {
-        KohError::refused(format!(
+    let beneath = |dir: &Path| {
+        target
+            .strip_prefix(dir)
+            .is_ok_and(|rest| rest.components().all(|c| matches!(c, Component::Normal(_))))
+    };
+    if beneath(&root) || beneath(&base) {
+        Ok(())
+    } else {
+        Err(KohError::refused(format!(
             "path {} is outside allowed scope {}",
             target.display(),
             base.display()
-        ))
-    };
-    let target = expand_home(target)?;
-    let rest = target
-        .strip_prefix(&root)
-        .or_else(|_| target.strip_prefix(&base))
-        .map_err(|_| outside())?;
-    let mut beneath = Vec::new();
-    for part in rest.components() {
-        match part {
-            Component::Normal(name) => beneath.push(name.to_str().ok_or_else(outside)?.to_string()),
-            Component::CurDir => {}
-            _ => return Err(outside()),
-        }
+        )))
     }
-    Place::beneath(base, beneath)
 }
 
 fn check_within(root: &Path, target: &Path) -> Result<()> {

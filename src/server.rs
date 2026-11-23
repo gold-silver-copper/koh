@@ -16,6 +16,7 @@ use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
+use tokio::time::{Instant, timeout_at};
 
 use crate::jobs::JobManager;
 use crate::keys::{
@@ -43,11 +44,13 @@ pub struct ServeOptions {
     pub max_connections: usize,
     /// Most sessions kept at once, running or ended.
     pub max_sessions: usize,
-    /// How long a connection has to prove a key the server allows before it is closed.
+    /// How long a connection has, from its peer's first packet, to finish its handshake and prove
+    /// a key the server allows before it is closed.
     pub proof_timeout: Duration,
 }
 
-/// How long a connection turned away as busy is given to ask, and then to hear the answer.
+/// How long a connection turned away as busy has, from its first packet, to connect and ask: it is
+/// told as soon as it asks, and at the latest then.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 
 /// The CLI's default for `--max-connections`.
@@ -163,28 +166,32 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     }
 
     // A connection holds one of `max_connections` places from its peer's first packet, before
-    // anything is known of the peer, until it is gone. With none free, as many more are let
-    // finish connecting only to be told the server is busy; past those, a peer is refused unheard.
+    // anything is known of the peer, until it is gone; and it has `proof_timeout` from that packet
+    // to finish its handshake and prove a key the server allows, or its place is the next one's.
+    // With no place free, as many more are let connect, in `BUSY_WAIT` at most, only to be told
+    // the server is busy; past those, a peer is refused unheard.
     let places = Arc::new(Semaphore::new(max_connections));
     let turned_away = Arc::new(Semaphore::new(max_connections));
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
         while let Some(incoming) = ep_accept.accept().await {
+            let came = Instant::now();
             if let Ok(place) = places.clone().try_acquire_owned() {
-                let st = state.clone();
+                let (st, prove_by) = (state.clone(), came + state.proof_timeout);
                 tokio::spawn(async move {
-                    if let Ok(conn) = incoming.await {
-                        handle_connection(conn, st).await;
+                    // (A handshake that is dropped is gone: the transport closes it.)
+                    if let Ok(Ok(conn)) = timeout_at(prove_by, incoming.into_future()).await {
+                        handle_connection(conn, st, prove_by).await;
                     }
                     drop(place);
                 });
             } else if let Ok(place) = turned_away.clone().try_acquire_owned() {
                 tokio::spawn(async move {
-                    if let Ok(conn) = incoming.await {
+                    let told_by = came + BUSY_WAIT;
+                    if let Ok(Ok(conn)) = timeout_at(told_by, incoming.into_future()).await {
                         // (Once the client has connected and asks, so that it reads why.)
-                        let _ = tokio::time::timeout(BUSY_WAIT, conn.accept_bi()).await;
+                        let _ = timeout_at(told_by, conn.accept_bi()).await;
                         close_with(&conn, CloseCode::Busy);
-                        let _ = tokio::time::timeout(BUSY_WAIT, conn.closed()).await;
                     }
                     drop(place);
                 });
@@ -222,12 +229,12 @@ fn default_state_dir() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 
-/// Serves a connection's requests until it is gone. It is closed if, `proof_timeout` after it
-/// began, no request of it has proved a key the server allows: a peer that proves nothing does
-/// not keep its place.
-async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
+/// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
+/// its peer's first packet) no request of it has proved a key the server allows: a peer that
+/// proves nothing does not keep its place.
+async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: Instant) {
     let proven = Arc::new(AtomicBool::new(false));
-    let deadline = tokio::time::sleep(state.proof_timeout);
+    let deadline = tokio::time::sleep_until(prove_by);
     tokio::pin!(deadline);
     let mut unproven = true;
     loop {

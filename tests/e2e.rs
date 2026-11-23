@@ -1579,3 +1579,76 @@ async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
         assert!(said.contains(flag) && said.contains("1 to 65535"), "{said}");
     }
 }
+
+#[tokio::test]
+async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() {
+    let tmp = TempDir::new("handshake");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        proof_timeout: Duration::from_secs(2),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let server = srv.direct_addr.unwrap();
+
+    // A peer whose packets reach the server and to whom nothing comes back: a socket that passes
+    // on what it is sent and never reads the answers. Its handshake begins and cannot end, and it
+    // sends its first packet again and again, which keeps the transport from giving it up.
+    let front = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let back = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let front_addr = front.local_addr().unwrap();
+    let (passed, mut passed_on) = tokio::sync::watch::channel(0u32);
+    let forward = tokio::spawn(async move {
+        let mut packet = vec![0u8; 65_536];
+        while let Ok((len, _)) = front.recv_from(&mut packet).await {
+            let _ = back.send_to(&packet[..len], server).await;
+            passed.send_modify(|count| *count += 1);
+        }
+    });
+    let stalled = tokio::spawn(Client::connect_direct(
+        friend.clone(),
+        srv.endpoint_id,
+        Some(Route::Direct(front_addr)),
+        false,
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        passed_on.wait_for(|count| *count > 0),
+    )
+    .await
+    .expect("the stalled peer sent a packet within 5 s")
+    .unwrap();
+
+    // It has the server's one place: a client that comes now is told the server is busy.
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+    let early = dial().await.unwrap();
+    let busy = early.sessions().await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    early.close().await;
+
+    // The deadline is counted from that first packet, handshake and all: two seconds on, the
+    // place is the next client's, though the stalled peer is still sending.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let next = dial().await.unwrap();
+            let listed = next.sessions().await;
+            next.close().await;
+            if listed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the place came back within 8 s");
+    assert!(!stalled.is_finished(), "the stalled peer gave up by itself");
+
+    stalled.abort();
+    forward.abort();
+    srv.shutdown().await;
+}

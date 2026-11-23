@@ -141,7 +141,7 @@ impl Reply {
                 code,
                 kind,
                 message,
-            } => Err(KohError::new(Exit(code), kind_of(&kind), message)),
+            } => Err(KohError::new(exit_of(code), kind_of(&kind), message)),
         }
     }
 }
@@ -241,7 +241,27 @@ impl From<&KohError> for Failure {
 
 impl From<Failure> for KohError {
     fn from(said: Failure) -> Self {
-        Self::new(Exit(said.code), kind_of(&said.kind), said.message)
+        Self::new(exit_of(said.code), kind_of(&said.kind), said.message)
+    }
+}
+
+/// The exit code a peer gave for what went wrong, as one of koh's own for a failure: a peer cannot
+/// make a failure exit 0, or with a code koh does not have.
+fn exit_of(code: u8) -> Exit {
+    let known = [
+        Exit::USAGE,
+        Exit::UNREACHABLE,
+        Exit::REFUSED,
+        Exit::BUSY,
+        Exit::TIMEOUT,
+        Exit::CANNOT_START,
+        Exit::NOT_FOUND,
+        Exit::INTERNAL,
+    ];
+    if known.contains(&Exit(code)) {
+        Exit(code)
+    } else {
+        Exit::FAILED
     }
 }
 
@@ -823,5 +843,28 @@ mod tests {
             "took {:?}: each id was looked for among all before it",
             began.elapsed()
         );
+    }
+
+    #[test]
+    fn a_failure_a_peer_tells_of_is_one_of_kohs_and_never_success() {
+        // What a peer says went wrong becomes this process's exit code. It is one of the codes koh
+        // has for a failure; anything else a peer may say, 0 first of all, is a plain failure.
+        let told = [0, 1, 2, 3, 4, 5, 75, 124, 126, 127, 200, 255];
+        let taken = [1, 1, 2, 3, 4, 1, 75, 124, 126, 127, 1, 255];
+        for (said, code) in told.into_iter().zip(taken) {
+            let (kind, message) = ("failed".to_string(), "it stopped".to_string());
+            let answer = Reply::Err {
+                code: said,
+                kind: kind.clone(),
+                message: message.clone(),
+            };
+            assert_eq!(answer.into_result().unwrap_err().code, Exit(code), "{said}");
+            let failure = Failure {
+                code: said,
+                kind,
+                message,
+            };
+            assert_eq!(KohError::from(failure).code, Exit(code), "{said}");
+        }
     }
 }

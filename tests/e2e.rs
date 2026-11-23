@@ -970,3 +970,241 @@ fn cli_help_keys_and_peer_lists() {
         .unwrap();
     assert_eq!(diff_srv.status.code(), Some(2));
 }
+
+/// A server with one `--cp DIR` key, and that key's client.
+async fn boot_scoped(
+    tag: &str,
+) -> (
+    TempDir,
+    koh::server::RunningServer,
+    Client,
+    PathBuf,
+    PathBuf,
+) {
+    let tmp = TempDir::new(tag);
+    let srv_cfg = tmp.0.join("srv_cfg");
+    let cli_cfg = tmp.0.join("cli_cfg");
+    let allowed = tmp.0.join("allowed");
+    let outside = tmp.0.join("outside");
+    for dir in [&srv_cfg, &cli_cfg, &allowed, &outside] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
+    save_clients(
+        Some(&srv_cfg.join("server.key")),
+        &[ClientEntry {
+            name: "cpbot".into(),
+            id: key.public(),
+            scope: Scope::Cp(allowed.clone()),
+        }],
+    )
+    .unwrap();
+    let srv = start_server(ServeOptions {
+        key_file: Some(srv_cfg.join("server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow: Vec::new(),
+        shell: None,
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+    })
+    .await
+    .unwrap();
+    let addr = srv.direct_addr.unwrap();
+    let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+        .await
+        .unwrap();
+    (tmp, srv, client, allowed, outside)
+}
+
+#[tokio::test]
+async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let (tmp, srv, client, allowed, outside) = boot_scoped("symlink").await;
+    let push = |src: PathBuf, delete: bool| {
+        let (client, dst) = (&client, allowed.display().to_string());
+        async move {
+            client
+                .cp_push(&src, dst, Vec::new(), delete, false, false)
+                .await
+        }
+    };
+
+    // A directory on the way that is a symlink out of DIR: refused, nothing written beyond it.
+    symlink(&outside, allowed.join("link")).unwrap();
+    let through = tmp.0.join("through");
+    fs::create_dir_all(through.join("link")).unwrap();
+    fs::write(through.join("link/x"), "escaped").unwrap();
+    let err = push(through.clone(), false).await.unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+    assert!(!outside.join("x").exists(), "wrote through DIR/link");
+
+    // `--delete` removes nothing beyond it either.
+    fs::write(outside.join("victim"), "keep").unwrap();
+    let _ = push(through, true).await;
+    let empty = tmp.0.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    push(empty, true).await.unwrap();
+    assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    fs::remove_file(allowed.join("link")).unwrap();
+
+    // A symlink where the file lands is replaced, never read or written through: the same bytes
+    // are beyond it, and the copy must not find the file "unchanged" by hashing them.
+    fs::write(outside.join("target"), "same").unwrap();
+    symlink(outside.join("target"), allowed.join("final")).unwrap();
+    let onto = tmp.0.join("onto");
+    fs::create_dir_all(&onto).unwrap();
+    fs::write(onto.join("final"), "same").unwrap();
+    let done = push(onto, false).await.unwrap();
+    assert_eq!(done.unchanged, 0, "hashed the file beyond DIR/final");
+    assert!(
+        fs::symlink_metadata(allowed.join("final"))
+            .unwrap()
+            .is_file()
+    );
+    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
+
+    // A symlink planted at the name the file's bytes used to be written under first.
+    symlink(outside.join("planted"), allowed.join(".x.koh-tmp")).unwrap();
+    let file = tmp.0.join("x");
+    fs::write(&file, "payload").unwrap();
+    push(file, false).await.unwrap();
+    assert!(!outside.join("planted").exists(), "wrote through the temp");
+    assert!(fs::symlink_metadata(allowed.join("x")).unwrap().is_file());
+    assert_eq!(fs::read_to_string(allowed.join("x")).unwrap(), "payload");
+
+    // A tree with directories still lands, and no temporary file is left beside what landed.
+    let nested = tmp.0.join("nested");
+    fs::create_dir_all(nested.join("a/b")).unwrap();
+    fs::write(nested.join("a/b/c.txt"), "deep").unwrap();
+    let dst = allowed.join("sub/tree").display().to_string();
+    let landed = client
+        .cp_push(&nested, dst, Vec::new(), false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(landed.added, vec!["a/b/c.txt".to_string()]);
+    assert_eq!(
+        fs::read_to_string(allowed.join("sub/tree/a/b/c.txt")).unwrap(),
+        "deep"
+    );
+    let beside: Vec<_> = fs::read_dir(allowed.join("sub/tree/a/b"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(beside, vec![std::ffi::OsString::from("c.txt")]);
+
+    // Reading is held to DIR the same way: a file beyond a symlink is refused when named, and
+    // not sent as part of the tree the symlink is in.
+    fs::write(outside.join("secret"), "secret").unwrap();
+    symlink(&outside, allowed.join("sub/tree/out")).unwrap();
+    let pull = |src: PathBuf, to: &str| {
+        let (client, to) = (&client, tmp.0.join(to));
+        async move {
+            let src = src.display().to_string();
+            let done = client
+                .cp_pull(src, &to, Vec::new(), false, false, false)
+                .await;
+            (done, to)
+        }
+    };
+    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
+    assert_eq!(named.unwrap_err().code, Exit::REFUSED);
+    assert!(!to.join("secret").exists());
+    let (whole, to) = pull(allowed.join("sub/tree"), "whole").await;
+    assert_eq!(whole.unwrap().added, vec!["a/b/c.txt".to_string()]);
+    assert!(!to.join("out").exists());
+    let (one, to) = pull(allowed.join("sub/tree/a/b/c.txt"), "one").await;
+    assert_eq!(one.unwrap().added, vec!["c.txt".to_string()]);
+    assert_eq!(fs::read_to_string(to.join("c.txt")).unwrap(), "deep");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn cp_pull_never_writes_through_a_symlink_in_the_local_destination() {
+    let (tmp, srv, client, _, _) = boot_pair("pull-symlink").await;
+    let tree = tmp.0.join("tree");
+    fs::create_dir_all(tree.join("link")).unwrap();
+    fs::write(tree.join("link/x"), "escaped").unwrap();
+    let (back, outside) = (tmp.0.join("back"), tmp.0.join("outside"));
+    fs::create_dir_all(&back).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, back.join("link")).unwrap();
+
+    let err = client
+        .cp_pull(
+            tree.display().to_string(),
+            &back,
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+    assert!(!outside.join("x").exists(), "wrote through back/link");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn cp_receiver_bounds_the_manifest_and_takes_only_the_files_it_asked_for() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("cp-bounds").await;
+    let dst = tmp.0.join("dst");
+    let entry = |path: String| SyncEntry {
+        path,
+        size: 1,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let push = |dry_run| Request::CpPush {
+        dst: dst.display().to_string(),
+        excludes: Vec::new(),
+        delete: false,
+        preserve_mtime: false,
+        dry_run,
+    };
+
+    // One file more than a tree may hold.
+    let (mut send, mut recv) = client.request(&push(true)).await.unwrap();
+    let many = (0..=100_000).map(|n| entry(format!("f{n}"))).collect();
+    send_msg(&mut send, &SyncMsg::Manifest(many), MAX_CTRL * 8)
+        .await
+        .unwrap();
+    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(
+        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
+        "{answer:?}"
+    );
+
+    // A file the receiver did not ask for.
+    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+    let manifest = SyncMsg::Manifest(vec![entry("asked".into())]);
+    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(matches!(&need, SyncMsg::Need(n) if n == &["asked".to_string()]));
+    let start = SyncMsg::FileStart {
+        path: "unasked".into(),
+        size: 1,
+        mtime_secs: 0,
+        mode: 0o644,
+    };
+    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+    let _ = send_msg(&mut send, &SyncMsg::FileChunk(vec![b'!']), MAX_CHUNK).await;
+    let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
+    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(
+        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
+        "{answer:?}"
+    );
+    assert!(!dst.join("unasked").exists());
+
+    client.close().await;
+    srv.shutdown().await;
+}

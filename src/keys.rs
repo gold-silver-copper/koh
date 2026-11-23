@@ -7,11 +7,12 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
 use qrcode::{QrCode, render::unicode};
 
+use crate::sync::Place;
 use crate::{KohError, Result, atomic_write, is_safe_name};
 
 const KEY_LEN: usize = 32;
@@ -55,11 +56,13 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Checks whether a path is allowed for copy operations under this scope.
-    pub fn check_cp(&self, target: &Path) -> Result<()> {
+    /// Where a copy to or from `target` reaches under this scope, if it may: with no scope the
+    /// path as given; with one, the scope's directory and the names beneath it, of which a copy
+    /// follows no symlink.
+    pub fn place_cp(&self, target: &Path) -> Result<Place> {
         match self {
-            Self::Full => Ok(()),
-            Self::Cp(root) | Self::Exec(root) => check_within(root, target),
+            Self::Full => Ok(Place::path(target)),
+            Self::Cp(root) | Self::Exec(root) => place_beneath(root, target),
         }
     }
 
@@ -79,6 +82,37 @@ impl Scope {
             _ => Err(KohError::refused("key scope does not allow this operation")),
         }
     }
+}
+
+/// `target` as names beneath the scope's directory `root`: it must say so itself, by starting
+/// with that directory's path (as the `clients` file has it, or resolved) and going on with
+/// plain names. Nothing of `target` is resolved here, so no symlink beneath `root` is trusted.
+fn place_beneath(root: &Path, target: &Path) -> Result<Place> {
+    let root = expand_home(root)?;
+    let base = root
+        .canonicalize()
+        .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
+    let outside = || {
+        KohError::refused(format!(
+            "path {} is outside allowed scope {}",
+            target.display(),
+            base.display()
+        ))
+    };
+    let target = expand_home(target)?;
+    let rest = target
+        .strip_prefix(&root)
+        .or_else(|_| target.strip_prefix(&base))
+        .map_err(|_| outside())?;
+    let mut beneath = Vec::new();
+    for part in rest.components() {
+        match part {
+            Component::Normal(name) => beneath.push(name.to_str().ok_or_else(outside)?.to_string()),
+            Component::CurDir => {}
+            _ => return Err(outside()),
+        }
+    }
+    Ok(Place { base, beneath })
 }
 
 fn check_within(root: &Path, target: &Path) -> Result<()> {

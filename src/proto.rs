@@ -139,20 +139,7 @@ impl Reply {
                 code,
                 kind,
                 message,
-            } => {
-                let kind: &'static str = match kind.as_str() {
-                    "refused" => "refused",
-                    "usage" => "usage",
-                    "unreachable" => "unreachable",
-                    "timeout" => "timeout",
-                    "busy" => "busy",
-                    "not_found" => "not_found",
-                    "cannot_start" => "cannot_start",
-                    "failed" => "failed",
-                    _ => "remote",
-                };
-                Err(KohError::new(Exit(code), kind, message))
-            }
+            } => Err(KohError::new(Exit(code), kind_of(&kind), message)),
         }
     }
 }
@@ -227,6 +214,48 @@ pub enum SyncMsg {
     FileChunk(Vec<u8>),
     FileEnd,
     Summary(SyncSummary),
+    /// The end that could not go on says why.
+    Failed(Failure),
+}
+
+/// Why an end of a copy stopped, as its own caller would be told: the exit code, kind and words.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Failure {
+    pub code: u8,
+    pub kind: String,
+    pub message: String,
+}
+
+impl From<&KohError> for Failure {
+    fn from(err: &KohError) -> Self {
+        Self {
+            code: err.code.0,
+            kind: err.kind.to_string(),
+            // (A message quotes paths a peer sent: it stays well inside a control message.)
+            message: err.message.chars().take(4096).collect(),
+        }
+    }
+}
+
+impl From<Failure> for KohError {
+    fn from(said: Failure) -> Self {
+        Self::new(Exit(said.code), kind_of(&said.kind), said.message)
+    }
+}
+
+/// A kind a peer named, as one of ours: an error's kind is a fixed word.
+fn kind_of(kind: &str) -> &'static str {
+    match kind {
+        "refused" => "refused",
+        "usage" => "usage",
+        "unreachable" => "unreachable",
+        "timeout" => "timeout",
+        "busy" => "busy",
+        "not_found" => "not_found",
+        "cannot_start" => "cannot_start",
+        "failed" => "failed",
+        _ => "remote",
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

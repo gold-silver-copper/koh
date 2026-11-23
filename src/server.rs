@@ -22,7 +22,7 @@ use crate::net::{bind_server, close_with, verify_client};
 use crate::pane::{AttachSpec, PaneSession, SessionManager};
 use crate::proto::{
     ClientEvent, CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
-    Reply, Request, ScreenFrame, ServerEvent, recv_msg, send_msg, spawn_msg_reader,
+    Reply, Request, ScreenFrame, ServerEvent, SyncMsg, recv_msg, send_msg, spawn_msg_reader,
 };
 use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
@@ -355,11 +355,10 @@ async fn dispatch(
             preserve_mtime,
             dry_run,
         } => {
-            let target = expand_home(Path::new(&dst))?;
-            scope.check_cp(&target)?;
+            let place = scope.place_cp(&expand_home(Path::new(&dst))?)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _ = receive_tree(
-                &target,
+            let landed = receive_tree(
+                &place,
                 &excludes,
                 delete,
                 preserve_mtime,
@@ -367,7 +366,8 @@ async fn dispatch(
                 send,
                 &mut recv,
             )
-            .await?;
+            .await;
+            say_failure(send, landed).await;
             Ok(())
         }
         Request::CpPull {
@@ -376,10 +376,10 @@ async fn dispatch(
             preserve_root,
             ..
         } => {
-            let source = expand_home(Path::new(&src))?;
-            scope.check_cp(&source)?;
+            let place = scope.place_cp(&expand_home(Path::new(&src))?)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _ = send_tree(&source, &excludes, preserve_root, send, &mut recv).await?;
+            let sent = send_tree(&place, &excludes, preserve_root, send, &mut recv).await;
+            say_failure(send, sent).await;
             Ok(())
         }
         Request::Sessions => {
@@ -527,6 +527,14 @@ async fn dispatch(
             }
             Ok(())
         }
+    }
+}
+
+/// Tells the other end of a copy why this end stopped: the answer to its request was sent
+/// before the copy began, so the reason goes as a message of the copy.
+async fn say_failure<T>(send: &mut SendStream, done: Result<T>) {
+    if let Err(err) = done {
+        let _ = send_msg(send, &SyncMsg::Failed((&err).into()), MAX_CTRL).await;
     }
 }
 

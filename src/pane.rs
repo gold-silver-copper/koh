@@ -273,6 +273,16 @@ impl PaneSession {
         let Ok(mut generation) = self.generation.lock() else {
             return;
         };
+        // What its program's end made of the session is final. A round asked for with the state
+        // from just before (a resize that came as the program ended) tells of the end all the same.
+        let ended = {
+            let last = self.frame_tx.borrow();
+            (last.state != "running").then(|| (last.state.clone(), last.exit))
+        };
+        let (state, exit) = match &ended {
+            Some((state, exit)) => (state.as_str(), *exit),
+            None => (state, exit),
+        };
 
         *generation = generation.wrapping_add(1);
         let _ = atomic_write(
@@ -427,7 +437,7 @@ impl PaneSession {
         (guard.0 > seen).then(|| (guard.0, guard.1.clone()))
     }
 
-    pub fn attach_guard(self: &Arc<Self>) -> AttachGuard {
+    fn attach_guard(self: &Arc<Self>) -> AttachGuard {
         self.attached.fetch_add(1, Ordering::Relaxed);
         AttachGuard(self.clone())
     }
@@ -552,6 +562,8 @@ pub struct SessionManager {
     next_id: u32,
     last_id: Option<u32>,
     sessions: BTreeMap<u32, Arc<PaneSession>>,
+    /// Most sessions kept at once, running or ended.
+    max: usize,
 }
 
 pub struct AttachSpec<'a> {
@@ -567,7 +579,7 @@ pub struct AttachSpec<'a> {
 }
 
 impl SessionManager {
-    pub fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf, max: usize) -> Result<Self> {
         fs::create_dir_all(&root)
             .map_err(|e| KohError::failed(format!("mkdir {}: {e}", root.display())))?;
         Ok(Self {
@@ -575,17 +587,49 @@ impl SessionManager {
             next_id: 1,
             last_id: None,
             sessions: BTreeMap::new(),
+            max,
         })
     }
 
-    /// Attaches to an existing session or spawns a new one. Returns `(session, created_new)`.
-    pub fn attach_or_create(&mut self, spec: AttachSpec<'_>) -> Result<(Arc<PaneSession>, bool)> {
+    /// The session that goes for one more, if one must: with `max` kept, the oldest whose program
+    /// has ended and that no client is attached to. With none such, the server is busy.
+    fn goes_for_one_more(&self) -> Result<Option<u32>> {
+        if self.sessions.len() < self.max {
+            return Ok(None);
+        }
+        let ended = |s: &Arc<PaneSession>| {
+            s.frame_tx.borrow().state != "running" && s.attached.load(Ordering::Relaxed) == 0
+        };
+        let oldest = self.sessions.iter().find(|(_, s)| ended(s));
+        oldest.map(|(id, _)| Some(*id)).ok_or_else(|| {
+            let most = self.max;
+            KohError::new(
+                Exit::BUSY,
+                "busy",
+                format!(
+                    "server busy: it keeps at most {most} sessions (--max-sessions), and all are running or attached"
+                ),
+            )
+        })
+    }
+
+    /// Attaches to an existing session or spawns a new one. Returns the session, whether it is
+    /// new, and the hold on it: it counts as attached from here on, while whoever asked still
+    /// holds the manager, so it cannot be forgotten for another before its client is told of it.
+    pub fn attach_or_create(
+        &mut self,
+        spec: AttachSpec<'_>,
+    ) -> Result<(Arc<PaneSession>, bool, AttachGuard)> {
+        let attached = |sess: Arc<PaneSession>, new| {
+            let hold = sess.attach_guard();
+            Ok((sess, new, hold))
+        };
         if let Some(id) = spec.requested {
             let sess = self.sessions.get(&id).cloned().ok_or_else(|| {
                 KohError::new(Exit::NOT_FOUND, "not_found", format!("no session {id}"))
             })?;
             self.last_id = Some(id);
-            return Ok((sess, false));
+            return attached(sess, false);
         }
         if !spec.new
             && spec.argv.is_empty()
@@ -593,8 +637,9 @@ impl SessionManager {
             && let Some(sess) = self.sessions.get(&last)
             && sess.info().state == "running"
         {
-            return Ok((sess.clone(), false));
+            return attached(sess.clone(), false);
         }
+        let goes = self.goes_for_one_more()?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let dir = self.root.join(format!("s{id}"));
@@ -609,9 +654,13 @@ impl SessionManager {
             spec.cwd,
             spec.default_shell,
         )?;
+        // (Only now that the new one runs is the old one forgotten, and its pane folder with it.)
+        if let Some(gone) = goes.and_then(|id| self.sessions.remove(&id)) {
+            let _ = fs::remove_dir_all(&gone.dir);
+        }
         self.sessions.insert(id, sess.clone());
         self.last_id = Some(id);
-        Ok((sess, true))
+        attached(sess, true)
     }
 
     pub fn get(&self, id: u32) -> Result<Arc<PaneSession>> {

@@ -10,7 +10,7 @@ description = "Ultra-minimal peer-to-peer remote shell, jobs, delta sync, and fu
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "fux"]
 categories = ["command-line-utilities", "network-programming"]
-include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md"]
+include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md", "/docs/THREAT_MODEL.md"]
 
 [dependencies]
 anyhow = "1.0.104"

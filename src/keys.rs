@@ -7,12 +7,13 @@ use std::net::SocketAddr;
 use std::os::unix::fs::{
     DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
 };
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
 use qrcode::{QrCode, render::unicode};
 
-use crate::{KohError, Result, atomic_write, is_safe_name};
+use crate::sync::Place;
+use crate::{Exit, KohError, Result, atomic_write, is_safe_name};
 
 const KEY_LEN: usize = 32;
 
@@ -55,11 +56,13 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Checks whether a path is allowed for copy operations under this scope.
-    pub fn check_cp(&self, target: &Path) -> Result<()> {
+    /// Where a copy to or from `target` reaches under this scope, if it may: with no scope the
+    /// path as given; with one, the scope's directory and the names beneath it, of which a copy
+    /// follows no symlink.
+    pub fn place_cp(&self, target: &Path) -> Result<Place> {
         match self {
-            Self::Full => Ok(()),
-            Self::Cp(root) | Self::Exec(root) => check_within(root, target),
+            Self::Full => Ok(Place::path(target)),
+            Self::Cp(root) | Self::Exec(root) => place_beneath(root, target),
         }
     }
 
@@ -79,6 +82,37 @@ impl Scope {
             _ => Err(KohError::refused("key scope does not allow this operation")),
         }
     }
+}
+
+/// `target` as names beneath the scope's directory `root`: it must say so itself, by starting
+/// with that directory's path (as the `clients` file has it, or resolved) and going on with
+/// plain names. Nothing of `target` is resolved here, so no symlink beneath `root` is trusted.
+fn place_beneath(root: &Path, target: &Path) -> Result<Place> {
+    let root = expand_home(root)?;
+    let base = root
+        .canonicalize()
+        .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
+    let outside = || {
+        KohError::refused(format!(
+            "path {} is outside allowed scope {}",
+            target.display(),
+            base.display()
+        ))
+    };
+    let target = expand_home(target)?;
+    let rest = target
+        .strip_prefix(&root)
+        .or_else(|_| target.strip_prefix(&base))
+        .map_err(|_| outside())?;
+    let mut beneath = Vec::new();
+    for part in rest.components() {
+        match part {
+            Component::Normal(name) => beneath.push(name.to_str().ok_or_else(outside)?.to_string()),
+            Component::CurDir => {}
+            _ => return Err(outside()),
+        }
+    }
+    Place::beneath(base, beneath)
 }
 
 fn check_within(root: &Path, target: &Path) -> Result<()> {
@@ -265,6 +299,38 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
             Ok(key)
         }
         Err(e) => Err(KohError::failed(format!("open {}: {e}", path.display()))),
+    }
+}
+
+/// Holds the server key for one server, until the file this returns is dropped (or its process
+/// ends, however it ends). A second server on the key is refused: it would have the same
+/// endpoint id, and each client connection would reach one or the other, each with its own jobs
+/// and sessions. The lock is on a file beside the key, which stays: its being there says nothing.
+pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
+    use rustix::fs::{Mode, OFlags};
+    let key = key_path(Role::Server, explicit)?;
+    let name = key
+        .file_name()
+        .ok_or_else(|| KohError::usage("invalid key path"))?
+        .to_string_lossy();
+    let path = key.with_file_name(format!("{name}.serving"));
+    let failed = |e: std::io::Error| KohError::failed(format!("lock {}: {e}", path.display()));
+    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let lock: File = rustix::fs::open(&path, flags, Mode::from_raw_mode(0o600))
+        .map_err(|e| failed(e.into()))?
+        .into();
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(fs::TryLockError::WouldBlock) => Err(KohError::new(
+            Exit::BUSY,
+            "busy",
+            format!(
+                "another koh server is serving with the key {}: stop that one, or give this one \
+                 a key of its own (--key-file)",
+                key.display()
+            ),
+        )),
+        Err(fs::TryLockError::Error(e)) => Err(failed(e)),
     }
 }
 

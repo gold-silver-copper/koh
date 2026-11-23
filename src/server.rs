@@ -2,27 +2,32 @@
 //! raw exec, headless jobs, delta sync, and fux-backed interactive sessions.
 
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::Semaphore;
+use tokio::time::{Instant, timeout_at};
 
 use crate::jobs::JobManager;
 use crate::keys::{
-    ClientEntry, Role, Scope, expand_home, home_dir, load_clients, load_or_create_key, render_qr,
+    ClientEntry, Role, Scope, expand_home, hold_for_serving, home_dir, load_clients,
+    load_or_create_key, render_qr,
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::pane::{AttachSpec, PaneSession, SessionManager};
 use crate::proto::{
     ClientEvent, CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
-    Reply, Request, ScreenFrame, ServerEvent, recv_msg, send_msg, spawn_msg_reader,
+    Reply, Request, ScreenFrame, ServerEvent, SyncMsg, recv_msg, send_msg, spawn_msg_reader,
 };
 use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
@@ -35,6 +40,60 @@ pub struct ServeOptions {
     pub state_dir: Option<PathBuf>,
     pub disable_relay: bool,
     pub quiet: bool,
+    /// Most connections held at once, each counted from when the server takes it up, before it
+    /// proves a key.
+    pub max_connections: usize,
+    /// Most sessions kept at once, running or ended.
+    pub max_sessions: usize,
+    /// How long a connection has, from when the server takes it up, to finish its handshake and
+    /// prove a key the server allows before it is closed.
+    pub proof_timeout: Duration,
+}
+
+/// How long a connection turned away as busy has, from when the server takes it up, to connect
+/// and ask: it is told as soon as it asks, and at the latest then. One that has not connected by
+/// then is dropped without being told.
+const BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// The time `long` after `from`. More than thirty years is thirty years, the timer's own "never":
+/// a time the clock cannot say (`Duration::MAX` is one) would panic where it is added. (And were
+/// the clock itself that near its end, the time is `from`: a deadline that has come.)
+fn after(from: Instant, long: Duration) -> Instant {
+    const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
+    from.checked_add(long.min(NEVER)).unwrap_or(from)
+}
+
+/// The CLI's default for `--max-connections`.
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
+/// The CLI's default for `--max-sessions`.
+const DEFAULT_MAX_SESSIONS: usize = 64;
+
+/// `n` as a cap that `flag` may set: from 1 to 65535.
+pub fn cap(flag: &str, n: usize) -> Result<usize> {
+    if (1..=65_535).contains(&n) {
+        Ok(n)
+    } else {
+        Err(KohError::usage(format!(
+            "{flag} takes a number from 1 to 65535"
+        )))
+    }
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            key_file: None,
+            direct: None,
+            allow: Vec::new(),
+            shell: None,
+            state_dir: None,
+            disable_relay: false,
+            quiet: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            proof_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 struct ServerState {
@@ -43,6 +102,7 @@ struct ServerState {
     default_shell: String,
     jobs: Arc<Mutex<JobManager>>,
     sessions: Arc<Mutex<SessionManager>>,
+    proof_timeout: Duration,
 }
 
 impl ServerState {
@@ -62,19 +122,34 @@ pub struct RunningServer {
     pub endpoint_id: EndpointId,
     pub direct_addr: Option<SocketAddr>,
     pub endpoint: iroh::Endpoint,
+    /// What takes this server's connections. It holds the lock that keeps a second server off the
+    /// key, so the key is held exactly for as long as connections are taken.
     task: tokio::task::JoinHandle<()>,
 }
 
 impl RunningServer {
-    pub async fn shutdown(self) {
+    /// Stops taking connections, lets go of the key and closes the endpoint.
+    pub async fn shutdown(mut self) {
         self.task.abort();
+        // (Until what took connections is gone, and the lock with it: the key is free when this returns.)
+        let _ = (&mut self.task).await;
         self.endpoint.close().await;
+    }
+}
+
+/// A server that is dropped takes no more connections, and so lets go of its key.
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
 /// Starts a server in-process (used by both `koh serve` CLI and loopback integration tests).
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
+    let max_connections = cap("--max-connections", opts.max_connections)?;
+    let max_sessions = cap("--max-sessions", opts.max_sessions)?;
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
+    let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
     let endpoint = bind_server(secret, opts.direct, opts.disable_relay).await?;
     let direct_addr = endpoint.bound_sockets().into_iter().next();
@@ -84,7 +159,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         None => default_state_dir()?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
-    let sessions = Arc::new(Mutex::new(SessionManager::new(base.join("sessions"))?));
+    let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
+    let sessions = Arc::new(Mutex::new(sessions));
     let default_shell = opts
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
@@ -96,6 +172,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         default_shell,
         jobs,
         sessions,
+        proof_timeout: opts.proof_timeout,
     });
 
     if !opts.quiet {
@@ -108,15 +185,41 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         let _ = writeln!(err, "{}", render_qr(&endpoint_id));
     }
 
+    // A connection holds one of `max_connections` places from when it is taken up here, before
+    // anything is known of the peer, until it is gone; and it has `proof_timeout` from then to
+    // finish its handshake and prove a key the server allows, or its place is the next one's.
+    // (That is when this loop comes to it, after its first packet: the time the packet waited for
+    // the loop is not counted.) With no place free, as many more are let connect, in `BUSY_WAIT`
+    // at most, only to be told the server is busy; past those, a peer is refused unheard.
+    let places = Arc::new(Semaphore::new(max_connections));
+    let turned_away = Arc::new(Semaphore::new(max_connections));
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
+        let _serving = serving;
         while let Some(incoming) = ep_accept.accept().await {
-            let st = state.clone();
-            tokio::spawn(async move {
-                if let Ok(conn) = incoming.await {
-                    handle_connection(conn, st).await;
-                }
-            });
+            let came = Instant::now();
+            if let Ok(place) = places.clone().try_acquire_owned() {
+                let (st, prove_by) = (state.clone(), after(came, state.proof_timeout));
+                tokio::spawn(async move {
+                    // (A handshake that is dropped is gone: the transport closes it.)
+                    if let Ok(Ok(conn)) = timeout_at(prove_by, incoming.into_future()).await {
+                        handle_connection(conn, st, prove_by).await;
+                    }
+                    drop(place);
+                });
+            } else if let Ok(place) = turned_away.clone().try_acquire_owned() {
+                tokio::spawn(async move {
+                    let told_by = after(came, BUSY_WAIT);
+                    if let Ok(Ok(conn)) = timeout_at(told_by, incoming.into_future()).await {
+                        // (Once the client has connected and asks, so that it reads why.)
+                        let _ = timeout_at(told_by, conn.accept_bi()).await;
+                        close_with(&conn, CloseCode::Busy);
+                    }
+                    drop(place);
+                });
+            } else {
+                incoming.refuse();
+            }
         }
     });
 
@@ -131,19 +234,9 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
 /// CLI entrypoint for `koh serve`.
 pub async fn run_serve(opts: ServeOptions) -> Result<()> {
     fuxix::own_children();
-    // Single-instance marker beside server.key (advisory file).
-    let marker = crate::keys::key_path(Role::Server, opts.key_file.as_deref())?
-        .with_file_name("server.key.serving");
-    let _lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&marker)
-        .ok();
     let running = start_server(opts).await?;
     let _ = tokio::signal::ctrl_c().await;
     running.shutdown().await;
-    let _ = fs::remove_file(&marker);
     Ok(())
 }
 
@@ -157,13 +250,32 @@ fn default_state_dir() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 
-async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
+/// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
+/// the server took it up) no request of it has proved a key the server allows: a peer that
+/// proves nothing does not keep its place.
+async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: Instant) {
+    let proven = Arc::new(AtomicBool::new(false));
+    let deadline = tokio::time::sleep_until(prove_by);
+    tokio::pin!(deadline);
+    let mut unproven = true;
     loop {
-        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
-            break;
+        let (mut send, mut recv) = tokio::select! {
+            () = &mut deadline, if unproven => {
+                if !proven.load(Ordering::Relaxed) {
+                    close_with(&conn, CloseCode::Refused);
+                    break;
+                }
+                unproven = false;
+                continue;
+            }
+            accepted = conn.accept_bi() => match accepted {
+                Ok(streams) => streams,
+                Err(_) => break,
+            },
         };
         let conn_clone = conn.clone();
         let st = state.clone();
+        let proven = proven.clone();
         tokio::spawn(async move {
             let client_id = match verify_client(&conn_clone, &mut recv).await {
                 Ok(id) => id,
@@ -181,6 +293,7 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
                     return;
                 }
             };
+            proven.store(true, Ordering::Relaxed);
             let req: Request = match recv_msg(&mut recv, MAX_CTRL).await {
                 Ok(r) => r,
                 Err(_) => {
@@ -355,11 +468,10 @@ async fn dispatch(
             preserve_mtime,
             dry_run,
         } => {
-            let target = expand_home(Path::new(&dst))?;
-            scope.check_cp(&target)?;
+            let place = scope.place_cp(&expand_home(Path::new(&dst))?)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _ = receive_tree(
-                &target,
+            let landed = receive_tree(
+                &place,
                 &excludes,
                 delete,
                 preserve_mtime,
@@ -367,7 +479,8 @@ async fn dispatch(
                 send,
                 &mut recv,
             )
-            .await?;
+            .await;
+            say_failure(send, landed).await;
             Ok(())
         }
         Request::CpPull {
@@ -376,10 +489,10 @@ async fn dispatch(
             preserve_root,
             ..
         } => {
-            let source = expand_home(Path::new(&src))?;
-            scope.check_cp(&source)?;
+            let place = scope.place_cp(&expand_home(Path::new(&src))?)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _ = send_tree(&source, &excludes, preserve_root, send, &mut recv).await?;
+            let sent = send_tree(&place, &excludes, preserve_root, send, &mut recv).await;
+            say_failure(send, sent).await;
             Ok(())
         }
         Request::Sessions => {
@@ -434,7 +547,7 @@ async fn dispatch(
         } => {
             scope.check_full()?;
             let dir = resolve_cwd(cwd.as_deref())?;
-            let (sess, created_new) = {
+            let (sess, created_new, _attached) = {
                 let mut guard = state
                     .sessions
                     .lock()
@@ -452,7 +565,6 @@ async fn dispatch(
                 })?
             };
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let _attached = sess.attach_guard();
             // On reattach to an existing session, don't replay stale pre-existing bell/clipboard.
             let (mut last_clip_seq, mut last_notice_seq) = if created_new {
                 (0, 0)
@@ -467,6 +579,7 @@ async fn dispatch(
 
             // Send initial frame immediately.
             let initial = rx.borrow_and_update().clone();
+            let ended = initial.state != "running";
             send_frame_update(
                 &sess,
                 initial,
@@ -477,6 +590,11 @@ async fn dispatch(
                 send,
             )
             .await?;
+            // A session whose program has ended changes no more: its screen was the last there is
+            // to send. (Waiting for more would keep it attached for as long as its client stays.)
+            if ended {
+                return Ok(());
+            }
 
             // Bridge client events -> PTY and watch frames -> client (cancel-safe reader task).
             let mut client_rx = spawn_msg_reader::<ClientEvent>(recv, MAX_CHUNK);
@@ -527,6 +645,14 @@ async fn dispatch(
             }
             Ok(())
         }
+    }
+}
+
+/// Tells the other end of a copy why this end stopped: the answer to its request was sent
+/// before the copy began, so the reason goes as a message of the copy.
+async fn say_failure<T>(send: &mut SendStream, done: Result<T>) {
+    if let Err(err) = done {
+        let _ = send_msg(send, &SyncMsg::Failed((&err).into()), MAX_CTRL).await;
     }
 }
 

@@ -62,6 +62,7 @@ async fn boot_pair(
         state_dir: Some(state_dir.clone()),
         disable_relay: true,
         quiet: true,
+        ..ServeOptions::default()
     })
     .await
     .unwrap();
@@ -831,6 +832,7 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
         state_dir: Some(tmp.0.join("state")),
         disable_relay: true,
         quiet: true,
+        ..ServeOptions::default()
     })
     .await
     .unwrap();
@@ -969,4 +971,1306 @@ fn cli_help_keys_and_peer_lists() {
         .output()
         .unwrap();
     assert_eq!(diff_srv.status.code(), Some(2));
+}
+
+/// A server with one `--cp DIR` key, and that key's client.
+async fn boot_scoped(
+    tag: &str,
+) -> (
+    TempDir,
+    koh::server::RunningServer,
+    Client,
+    PathBuf,
+    PathBuf,
+) {
+    let tmp = TempDir::new(tag);
+    let srv_cfg = tmp.0.join("srv_cfg");
+    let cli_cfg = tmp.0.join("cli_cfg");
+    let allowed = tmp.0.join("allowed");
+    let outside = tmp.0.join("outside");
+    for dir in [&srv_cfg, &cli_cfg, &allowed, &outside] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
+    save_clients(
+        Some(&srv_cfg.join("server.key")),
+        &[ClientEntry {
+            name: "cpbot".into(),
+            id: key.public(),
+            scope: Scope::Cp(allowed.clone()),
+        }],
+    )
+    .unwrap();
+    let srv = start_server(ServeOptions {
+        key_file: Some(srv_cfg.join("server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow: Vec::new(),
+        shell: None,
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+    .unwrap();
+    let addr = srv.direct_addr.unwrap();
+    let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+        .await
+        .unwrap();
+    (tmp, srv, client, allowed, outside)
+}
+
+#[tokio::test]
+async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
+    use std::os::unix::fs::symlink;
+    let (tmp, srv, client, allowed, outside) = boot_scoped("symlink").await;
+    let push = |src: PathBuf, delete: bool| {
+        let (client, dst) = (&client, allowed.display().to_string());
+        async move {
+            client
+                .cp_push(&src, dst, Vec::new(), delete, false, false)
+                .await
+        }
+    };
+
+    // A directory on the way that is a symlink out of DIR: refused, nothing written beyond it.
+    symlink(&outside, allowed.join("link")).unwrap();
+    let through = tmp.0.join("through");
+    fs::create_dir_all(through.join("link")).unwrap();
+    fs::write(through.join("link/x"), "escaped").unwrap();
+    let err = push(through.clone(), false).await.unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+    assert!(!outside.join("x").exists(), "wrote through DIR/link");
+
+    // `--delete` removes nothing beyond it either.
+    fs::write(outside.join("victim"), "keep").unwrap();
+    let _ = push(through, true).await;
+    let empty = tmp.0.join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    push(empty, true).await.unwrap();
+    assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    fs::remove_file(allowed.join("link")).unwrap();
+
+    // A symlink where the file lands is replaced, never read or written through: the same bytes
+    // are beyond it, and the copy must not find the file "unchanged" by hashing them.
+    fs::write(outside.join("target"), "same").unwrap();
+    symlink(outside.join("target"), allowed.join("final")).unwrap();
+    let onto = tmp.0.join("onto");
+    fs::create_dir_all(&onto).unwrap();
+    fs::write(onto.join("final"), "same").unwrap();
+    let done = push(onto, false).await.unwrap();
+    assert_eq!(done.unchanged, 0, "hashed the file beyond DIR/final");
+    assert!(
+        fs::symlink_metadata(allowed.join("final"))
+            .unwrap()
+            .is_file()
+    );
+    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
+
+    // A symlink planted at the name the file's bytes used to be written under first.
+    symlink(outside.join("planted"), allowed.join(".x.koh-tmp")).unwrap();
+    let file = tmp.0.join("x");
+    fs::write(&file, "payload").unwrap();
+    push(file, false).await.unwrap();
+    assert!(!outside.join("planted").exists(), "wrote through the temp");
+    assert!(fs::symlink_metadata(allowed.join("x")).unwrap().is_file());
+    assert_eq!(fs::read_to_string(allowed.join("x")).unwrap(), "payload");
+
+    // A tree with directories still lands, and no temporary file is left beside what landed.
+    let nested = tmp.0.join("nested");
+    fs::create_dir_all(nested.join("a/b")).unwrap();
+    fs::write(nested.join("a/b/c.txt"), "deep").unwrap();
+    let dst = allowed.join("sub/tree").display().to_string();
+    let landed = client
+        .cp_push(&nested, dst, Vec::new(), false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(landed.added, vec!["a/b/c.txt".to_string()]);
+    assert_eq!(
+        fs::read_to_string(allowed.join("sub/tree/a/b/c.txt")).unwrap(),
+        "deep"
+    );
+    let beside: Vec<_> = fs::read_dir(allowed.join("sub/tree/a/b"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(beside, vec![std::ffi::OsString::from("c.txt")]);
+
+    // Reading is held to DIR the same way: a file beyond a symlink is refused when named, and
+    // not sent as part of the tree the symlink is in.
+    fs::write(outside.join("secret"), "secret").unwrap();
+    symlink(&outside, allowed.join("sub/tree/out")).unwrap();
+    let pull = |src: PathBuf, to: &str| {
+        let (client, to) = (&client, tmp.0.join(to));
+        async move {
+            let src = src.display().to_string();
+            let done = client
+                .cp_pull(src, &to, Vec::new(), false, false, false)
+                .await;
+            (done, to)
+        }
+    };
+    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
+    assert_eq!(named.unwrap_err().code, Exit::REFUSED);
+    assert!(!to.join("secret").exists());
+    let (whole, to) = pull(allowed.join("sub/tree"), "whole").await;
+    assert_eq!(whole.unwrap().added, vec!["a/b/c.txt".to_string()]);
+    assert!(!to.join("out").exists());
+    let (one, to) = pull(allowed.join("sub/tree/a/b/c.txt"), "one").await;
+    assert_eq!(one.unwrap().added, vec!["c.txt".to_string()]);
+    assert_eq!(fs::read_to_string(to.join("c.txt")).unwrap(), "deep");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn cp_pull_never_writes_through_a_symlink_in_the_local_destination() {
+    let (tmp, srv, client, _, _) = boot_pair("pull-symlink").await;
+    let tree = tmp.0.join("tree");
+    fs::create_dir_all(tree.join("link")).unwrap();
+    fs::write(tree.join("link/x"), "escaped").unwrap();
+    let (back, outside) = (tmp.0.join("back"), tmp.0.join("outside"));
+    fs::create_dir_all(&back).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, back.join("link")).unwrap();
+
+    let err = client
+        .cp_pull(
+            tree.display().to_string(),
+            &back,
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+    assert!(!outside.join("x").exists(), "wrote through back/link");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn cp_receiver_bounds_the_manifest_and_takes_only_the_files_it_asked_for() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("cp-bounds").await;
+    let dst = tmp.0.join("dst");
+    let entry = |path: String| SyncEntry {
+        path,
+        size: 1,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let push = |dry_run| Request::CpPush {
+        dst: dst.display().to_string(),
+        excludes: Vec::new(),
+        delete: false,
+        preserve_mtime: false,
+        dry_run,
+    };
+
+    // One file more than a tree may hold.
+    let (mut send, mut recv) = client.request(&push(true)).await.unwrap();
+    let many = (0..=100_000).map(|n| entry(format!("f{n}"))).collect();
+    send_msg(&mut send, &SyncMsg::Manifest(many), MAX_CTRL * 8)
+        .await
+        .unwrap();
+    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(
+        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
+        "{answer:?}"
+    );
+
+    // A file the receiver did not ask for.
+    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+    let manifest = SyncMsg::Manifest(vec![entry("asked".into())]);
+    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(matches!(&need, SyncMsg::Need(n) if n == &["asked".to_string()]));
+    let start = SyncMsg::FileStart {
+        path: "unasked".into(),
+        size: 1,
+        mtime_secs: 0,
+        mode: 0o644,
+    };
+    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+    let _ = send_msg(&mut send, &SyncMsg::FileChunk(vec![b'!']), MAX_CHUNK).await;
+    let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
+    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(
+        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
+        "{answer:?}"
+    );
+    assert!(!dst.join("unasked").exists());
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
+    let tmp = TempDir::new("serve-lock");
+    let key = tmp.0.join("cfg/server.key");
+    fs::create_dir_all(tmp.0.join("cfg")).unwrap();
+    let serve = || {
+        start_server(ServeOptions {
+            key_file: Some(key.clone()),
+            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            allow: Vec::new(),
+            shell: None,
+            state_dir: Some(tmp.0.join("state")),
+            disable_relay: true,
+            quiet: true,
+            ..ServeOptions::default()
+        })
+    };
+    let first = serve().await.expect("the first server starts");
+    let refused = serve().await.err().expect("a second server on the key");
+    assert_eq!(refused.code, Exit::BUSY, "{refused:?}");
+    assert!(refused.message.contains("server.key"), "{refused:?}");
+
+    // The first stopped: the key is free, and what marks it held is a lock, not a file's being
+    // there (a server that was killed leaves the file, and nothing to clean up).
+    first.shutdown().await;
+    assert!(tmp.0.join("cfg/server.key.serving").exists());
+    let again = serve().await.expect("a server once the first stopped");
+    again.shutdown().await;
+}
+
+/// A server that allows `allow`, with its other options from `more`.
+async fn boot_server(
+    tmp: &TempDir,
+    allow: Vec<iroh::EndpointId>,
+    more: ServeOptions,
+) -> (koh::server::RunningServer, Option<Route>) {
+    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
+    let srv = start_server(ServeOptions {
+        key_file: Some(tmp.0.join("srv_cfg/server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow,
+        shell: Some("/bin/sh".into()),
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..more
+    })
+    .await
+    .unwrap();
+    let route = Some(Route::Direct(srv.direct_addr.unwrap()));
+    (srv, route)
+}
+
+fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
+    fs::create_dir_all(tmp.0.join("cli_cfg")).unwrap();
+    load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg").join(name))).unwrap()
+}
+
+#[tokio::test]
+async fn connections_are_capped_before_auth_and_a_place_comes_back_when_one_ends() {
+    let tmp = TempDir::new("max-conn");
+    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
+    let more = ServeOptions {
+        max_connections: 2,
+        proof_timeout: Duration::from_secs(60),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = |key: &iroh::SecretKey| {
+        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false)
+    };
+
+    // Two peers the server does not know, which prove nothing, hold both places.
+    let (first, second) = (
+        dial(&stranger).await.unwrap(),
+        dial(&stranger).await.unwrap(),
+    );
+    let third = dial(&friend).await.unwrap();
+    let busy = third.sessions().await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    third.close().await;
+
+    // One of them goes: its place is the next client's.
+    first.close().await;
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let next = dial(&friend).await.unwrap();
+            let listed = next.sessions().await;
+            next.close().await;
+            match listed {
+                Ok(list) => break list,
+                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a place came back within 5 s");
+    assert!(served.is_empty());
+
+    second.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
+    let tmp = TempDir::new("proof-deadline");
+    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
+    let more = ServeOptions {
+        proof_timeout: Duration::from_secs(1),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = |key: &iroh::SecretKey| {
+        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), true)
+    };
+
+    let silent = dial(&stranger).await.unwrap();
+    let known = dial(&friend).await.unwrap();
+    known.sessions().await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), silent.connection().closed())
+        .await
+        .expect("the silent connection was closed within 5 s");
+    let refused = koh::proto::CloseCode::Refused as u64;
+    assert!(
+        matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == refused),
+        "{closed:?}"
+    );
+    // One that proved its key in time stays, past the deadline (it came a moment after the other).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    known.sessions().await.unwrap();
+
+    known.close().await;
+    silent.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn sessions_are_capped_and_an_ended_one_makes_room() {
+    let tmp = TempDir::new("max-sess");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_sessions: 2,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |line: &str| Request::Attach {
+        session: None,
+        new: true,
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: vec!["/bin/sh".into(), "-c".into(), line.into()],
+        cwd: Some(tmp.0.display().to_string()),
+    };
+
+    let (mut ends, _ends_recv) = client.request(&attach("read line")).await.unwrap();
+    let _stays = client.request(&attach("sleep 30")).await.unwrap();
+    let busy = client.request(&attach("sleep 30")).await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    assert_eq!(client.sessions().await.unwrap().len(), 2);
+
+    // The first one's program ends and its client detaches: the server forgets it for a new one.
+    send_msg(&mut ends, &ClientEvent::Input(b"go\n".to_vec()), MAX_CHUNK)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if list.iter().any(|s| s.state != "running" && !s.attached) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first session ended and was left within 5 s");
+    let _third = client.request(&attach("sleep 30")).await.unwrap();
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|s| s.state == "running"), "{list:?}");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn the_server_takes_no_stream_but_a_request() {
+    let (_tmp, srv, client, _, _) = boot_pair("no-uni").await;
+    // Nothing reads a unidirectional stream, so a peer is given none to fill.
+    let conn = client.connection();
+    let opened = tokio::time::timeout(Duration::from_millis(300), conn.open_uni()).await;
+    assert!(opened.is_err(), "a unidirectional stream was opened");
+    client.sessions().await.unwrap();
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_command_that_fails_gives_its_place_back_at_once() {
+    let tmp = TempDir::new("close-on-error");
+    let cfg = tmp.0.join("cli_cfg");
+    let friend = new_key(&tmp, "client.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, _) = boot_server(&tmp, vec![friend.public()], more).await;
+    let (id, addr) = (srv.endpoint_id.to_string(), srv.direct_addr.unwrap());
+    let koh = move |args: &'static [&'static str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_koh"));
+        command
+            .env("KOH_CONFIG_DIR", &cfg)
+            .arg(args[0])
+            .arg(&id)
+            .args(&args[1..])
+            .args(["--direct", &addr.to_string()]);
+        async move { command.output().await.unwrap() }
+    };
+
+    // No such job: the command fails after it connected. The server has one place, and the
+    // next command must find it free, not wait out the first one's connection.
+    let failed = koh(&["jobs", "no-such-job"]).await;
+    assert_eq!(failed.status.code(), Some(127), "{failed:?}");
+    let next = koh(&["jobs"]).await;
+    assert_eq!(next.status.code(), Some(0), "{next:?}");
+
+    srv.shutdown().await;
+}
+
+/// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.
+fn deep(root: &std::path::Path, dirs: usize) -> PathBuf {
+    let inner = (0..dirs).fold(root.to_path_buf(), |at, _| at.join("d"));
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(inner.join("f"), "deep").unwrap();
+    inner.join("f")
+}
+
+#[tokio::test]
+async fn a_tree_is_copied_to_128_directories_deep_on_both_ends_and_no_deeper() {
+    let (tmp, srv, client, _, _) = boot_pair("depth").await;
+    let dst = tmp.0.join("dst");
+    let push = |src: &[PathBuf], delete: bool| {
+        let (client, dst, src) = (&client, dst.display().to_string(), src.to_vec());
+        async move {
+            client
+                .cp_push_many(&src, &dst, &[], delete, false, false)
+                .await
+        }
+    };
+    // A file 128 directories beneath its tree is copied: that is the bound, on both ends.
+    let fits = tmp.0.join("fits");
+    let file = deep(&fits, 128);
+    let landed = push(std::slice::from_ref(&fits), false).await.unwrap();
+    assert_eq!(landed.added.len(), 1);
+    let there = dst.join(file.strip_prefix(&fits).unwrap());
+    assert_eq!(fs::read_to_string(there).unwrap(), "deep");
+
+    // One more is too deep. The end that reads it says so plainly (exit 1: nothing was refused,
+    // its own tree is too deep), before it sends anything.
+    let over = tmp.0.join("over");
+    deep(&over, 129);
+    let err = push(&[over], false).await.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+
+    // Sent beside another tree, a tree's own name is one of the 128.
+    let (keep, one, two) = (tmp.0.join("keep"), tmp.0.join("one"), tmp.0.join("two"));
+    fs::create_dir_all(&keep).unwrap();
+    fs::write(keep.join("keep"), "new").unwrap();
+    deep(&one, 127);
+    deep(&two, 128);
+    assert_eq!(
+        push(&[keep.clone(), one], false).await.unwrap().added.len(),
+        2
+    );
+    let err = push(&[keep.clone(), two], false).await.unwrap_err();
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+
+    // With --delete the receiving end reads its own tree too, by the same bound, before it
+    // removes anything: a destination that is too deep stops the copy, and nothing has gone.
+    let pruned = tmp.0.join("pruned");
+    deep(&pruned, 129);
+    fs::write(pruned.join("zzz"), "stays").unwrap();
+    let err = client
+        .cp_push(
+            &keep,
+            pruned.display().to_string(),
+            Vec::new(),
+            true,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(
+        err.message.contains("more than 128 directories deep"),
+        "{err:?}"
+    );
+    assert_eq!(fs::read_to_string(pruned.join("zzz")).unwrap(), "stays");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
+    let tmp = TempDir::new("cap-range");
+    for (max_connections, max_sessions, flag) in [
+        (usize::MAX, 64, "--max-connections"),
+        (0, 64, "--max-connections"),
+        (64, 65_536, "--max-sessions"),
+        (64, 0, "--max-sessions"),
+    ] {
+        let more = ServeOptions {
+            key_file: Some(tmp.0.join("srv_cfg/server.key")),
+            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            max_connections,
+            max_sessions,
+            quiet: true,
+            disable_relay: true,
+            ..ServeOptions::default()
+        };
+        let err = start_server(more).await.err().expect("a refusal");
+        assert_eq!(err.code, Exit::USAGE, "{err:?}");
+        assert!(
+            err.message.contains(flag) && err.message.contains("1 to 65535"),
+            "{err:?}"
+        );
+    }
+    // (Nothing was started for them: not even the key.)
+    assert!(!tmp.0.join("srv_cfg").exists());
+
+    let koh = |flag: &'static str, value: &'static str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_koh"))
+            .env("KOH_CONFIG_DIR", tmp.0.join("cli"))
+            .args(["serve", "--no-relay", flag, value])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for (flag, value) in [
+        ("--max-connections", "18446744073709551615"),
+        ("--max-sessions", "70000"),
+        ("--max-connections", "0"),
+        ("--max-sessions", "many"),
+    ] {
+        let (code, said) = koh(flag, value);
+        assert_eq!(code, Some(2), "{flag} {value}: {said}");
+        assert!(said.contains(flag) && said.contains("1 to 65535"), "{said}");
+    }
+}
+
+#[tokio::test]
+async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() {
+    let tmp = TempDir::new("handshake");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        proof_timeout: Duration::from_secs(2),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let server = srv.direct_addr.unwrap();
+
+    // A peer whose packets reach the server and to whom nothing comes back: a socket that passes
+    // on what it is sent and never reads the answers. Its handshake begins and cannot end, and it
+    // sends its first packet again and again, which keeps the transport from giving it up.
+    let front = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let back = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let front_addr = front.local_addr().unwrap();
+    let (passed, mut passed_on) = tokio::sync::watch::channel(0u32);
+    let forward = tokio::spawn(async move {
+        let mut packet = vec![0u8; 65_536];
+        while let Ok((len, _)) = front.recv_from(&mut packet).await {
+            let _ = back.send_to(&packet[..len], server).await;
+            passed.send_modify(|count| *count += 1);
+        }
+    });
+    let stalled = tokio::spawn(Client::connect_direct(
+        friend.clone(),
+        srv.endpoint_id,
+        Some(Route::Direct(front_addr)),
+        false,
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        passed_on.wait_for(|count| *count > 0),
+    )
+    .await
+    .expect("the stalled peer sent a packet within 5 s")
+    .unwrap();
+
+    // It has the server's one place: a client that comes now is told the server is busy.
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+    let early = dial().await.unwrap();
+    let busy = early.sessions().await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    early.close().await;
+
+    // The deadline is counted from when the server took that up, handshake and all: two seconds on, the
+    // place is the next client's, though the stalled peer is still sending.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let next = dial().await.unwrap();
+            let listed = next.sessions().await;
+            next.close().await;
+            if listed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the place came back within 8 s");
+    assert!(!stalled.is_finished(), "the stalled peer gave up by itself");
+
+    stalled.abort();
+    forward.abort();
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_client_refused_at_the_door_is_told_the_server_is_busy_too() {
+    let tmp = TempDir::new("refused-busy");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+
+    // One client has the place. A second is let connect to be told so, and has not asked yet: it
+    // holds the one place there is for that. A third is refused before it has connected at all,
+    // and that is the server being busy as much as the second's answer is: exit 75, not 3.
+    let first = dial().await.unwrap();
+    first.sessions().await.unwrap();
+    let second = dial().await.unwrap();
+    let third = dial().await.err().expect("a refusal");
+    assert_eq!(third.code, Exit::BUSY, "{third:?}");
+    assert!(third.message.contains("server busy"), "{third:?}");
+    let told = second.sessions().await.unwrap_err();
+    assert_eq!(told.code, Exit::BUSY, "{told:?}");
+
+    second.close().await;
+    first.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_that_is_dropped_stops_taking_connections_as_it_lets_go_of_its_key() {
+    let tmp = TempDir::new("drop-lock");
+    let friend = new_key(&tmp, "friend.key");
+    let (first, route) = boot_server(&tmp, vec![friend.public()], ServeOptions::default()).await;
+    let id = first.endpoint_id;
+    let dial = |route: Option<Route>| Client::connect_direct(friend.clone(), id, route, false);
+    let client = dial(route.clone()).await.unwrap();
+    client.sessions().await.unwrap();
+    client.close().await;
+
+    // Dropped, not shut down: the key is free for another server only once this one takes no
+    // more connections. So when a second server on the key has started, the first one's address
+    // serves nobody.
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match boot_server_on(&tmp, vec![friend.public()]).await {
+                Ok(server) => break server,
+                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the key was free within 5 s");
+    let old = tokio::time::timeout(Duration::from_secs(1), async {
+        let client = dial(route).await?;
+        client.sessions().await
+    })
+    .await;
+    assert!(
+        !matches!(old, Ok(Ok(_))),
+        "the dropped server served a client"
+    );
+
+    second.shutdown().await;
+}
+
+/// A server on the key `boot_server` uses, or why it could not start.
+async fn boot_server_on(
+    tmp: &TempDir,
+    allow: Vec<iroh::EndpointId>,
+) -> koh::Result<koh::server::RunningServer> {
+    start_server(ServeOptions {
+        key_file: Some(tmp.0.join("srv_cfg/server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow,
+        state_dir: Some(tmp.0.join("state2")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_session_that_cannot_start_takes_no_kept_session_with_it() {
+    let tmp = TempDir::new("failed-launch");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_sessions: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |argv: &[&str]| Request::Attach {
+        session: None,
+        new: true,
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: argv.iter().map(|word| word.to_string()).collect(),
+        cwd: Some(tmp.0.display().to_string()),
+    };
+
+    // The server keeps one session, and has one: its program has ended, and what it printed is
+    // there to read.
+    let _ended = client
+        .request(&attach(&["/bin/sh", "-c", "echo KEPT"]))
+        .await
+        .unwrap();
+    let kept = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if let [one] = &list[..]
+                && one.state != "running"
+                && !one.attached
+            {
+                break one.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session ended and was left within 5 s");
+
+    // A new session whose program is not there does not start, and the kept one is still kept.
+    let err = client
+        .request(&attach(&["/no/such/program"]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.iter().map(|s| s.id).collect::<Vec<_>>(), [kept]);
+    assert!(client.output(kept, false).await.unwrap().contains("KEPT"));
+
+    // One that starts takes its place.
+    let _new = client
+        .request(&attach(&["/bin/sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+    let list = client.sessions().await.unwrap();
+    assert!(
+        matches!(&list[..], [one] if one.id != kept && one.state == "running"),
+        "{list:?}"
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[test]
+fn a_session_is_attached_from_the_moment_it_is_handed_out() {
+    use koh::pane::{AttachSpec, SessionManager};
+    let tmp = TempDir::new("attach-guard");
+    let mut sessions = SessionManager::new(tmp.0.join("sessions"), 1).unwrap();
+    let words = |line: &str| vec!["/bin/sh".to_string(), "-c".into(), line.into()];
+    let spec = |requested: Option<u32>, argv: &'static [String]| AttachSpec {
+        requested,
+        new: requested.is_none(),
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv,
+        cwd: std::path::Path::new("/"),
+        default_shell: "/bin/sh",
+    };
+    let (exits, sleeps): (&'static [String], &'static [String]) =
+        (words("exit 0").leak(), words("sleep 30").leak());
+
+    // The server keeps one session; its program has ended and nobody is attached.
+    let first = sessions.attach_or_create(spec(None, exits)).unwrap();
+    let (id, dir) = (first.0.id, first.0.dir.clone());
+    drop(first);
+    let ended = |sessions: &SessionManager| sessions.list()[0].state != "running";
+    let began = std::time::Instant::now();
+    while !ended(&sessions) {
+        assert!(began.elapsed() < Duration::from_secs(5), "it did not end");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!sessions.list()[0].attached);
+
+    // A client is given that session to attach to. It is attached from then on, before the
+    // client has been answered: a new session that comes meanwhile finds no room, and the
+    // folder the client is about to read stays.
+    let again = sessions.attach_or_create(spec(Some(id), &[])).unwrap();
+    assert!(sessions.list()[0].attached, "handed out, and not attached");
+    let busy = sessions
+        .attach_or_create(spec(None, sleeps))
+        .err()
+        .expect("no room");
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    assert!(dir.is_dir());
+
+    // Once that client has let go, the ended session goes for a new one.
+    drop(again);
+    let new = sessions.attach_or_create(spec(None, sleeps)).unwrap();
+    assert!(new.0.id != id && !dir.exists());
+}
+
+#[tokio::test]
+async fn a_file_that_cannot_be_read_is_replaced_when_its_size_says_it_differs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (tmp, srv, client, _, _) = boot_pair("unreadable").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(src.join("f"), "the new contents").unwrap();
+    fs::write(dst.join("f"), "old").unwrap();
+    fs::set_permissions(dst.join("f"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // The file there is of another size, so it differs, and nobody needs to read it to know:
+    // it is replaced, as a file in a directory one may write to can be.
+    let done = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.updated, vec!["f".to_string()]);
+    assert_eq!(
+        fs::read_to_string(dst.join("f")).unwrap(),
+        "the new contents"
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+/// The names in `dir`, in order.
+fn names_in(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+async fn a_hostile_sender_lands_nothing_and_leaves_no_temporary_file() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("hostile-sender").await;
+    let dst = tmp.0.join("dst");
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("there"), "before").unwrap();
+    let entry = |path: &str, size: u64| SyncEntry {
+        path: path.to_string(),
+        size,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let push = |delete| Request::CpPush {
+        dst: dst.display().to_string(),
+        excludes: Vec::new(),
+        delete,
+        preserve_mtime: false,
+        dry_run: false,
+    };
+    let refused = |answer: &SyncMsg| matches!(answer, SyncMsg::Failed(why) if why.code == 4);
+
+    // A path that is not plain names beneath the tree, in the manifest or at a file's start,
+    // with --delete or without: refused, and the destination is as it was (--delete has removed
+    // nothing: every path is looked at before anything goes).
+    for path in ["../x", "/x", "a//b", "a/./b", "a/../x", "", "a/"] {
+        for delete in [false, true] {
+            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
+            let manifest = SyncMsg::Manifest(vec![entry("ok", 1), entry(path, 1)]);
+            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(refused(&answer), "manifest {path:?} {delete}: {answer:?}");
+
+            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
+            let manifest = SyncMsg::Manifest(vec![entry("there", 9)]);
+            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+            let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(matches!(&need, SyncMsg::Need(asked) if asked == &["there".to_string()]));
+            let start = SyncMsg::FileStart {
+                path: path.to_string(),
+                size: 1,
+                mtime_secs: 0,
+                mode: 0o644,
+            };
+            send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+            assert!(refused(&answer), "start {path:?} {delete}: {answer:?}");
+            assert_eq!(names_in(&dst), ["there"], "{path:?} {delete}");
+            assert_eq!(names_in(&tmp.0).iter().filter(|n| *n == "x").count(), 0);
+        }
+    }
+    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+
+    // A file that is longer or shorter than its sender said: the copy fails, the file that was
+    // there is as it was, and nothing is left beside it.
+    for sent in [&b"too long"[..], b"sh"] {
+        let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+        let manifest = SyncMsg::Manifest(vec![entry("there", 4)]);
+        send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+        let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+        let start = SyncMsg::FileStart {
+            path: "there".to_string(),
+            size: 4,
+            mtime_secs: 0,
+            mode: 0o644,
+        };
+        send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+        let _ = send_msg(&mut send, &SyncMsg::FileChunk(sent.to_vec()), MAX_CHUNK).await;
+        let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
+        let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+        assert!(
+            matches!(&answer, SyncMsg::Failed(why) if why.code == 1 && why.message.contains("size mismatch")),
+            "{answer:?}"
+        );
+        assert_eq!(names_in(&dst), ["there"]);
+        assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+    }
+
+    // A copy cut off in the middle of a file: while it runs, the bytes are in a file of another
+    // name beside where they land; once the sender is gone, that file is too.
+    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
+    let manifest = SyncMsg::Manifest(vec![entry("there", 1 << 20)]);
+    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
+    let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    let start = SyncMsg::FileStart {
+        path: "there".to_string(),
+        size: 1 << 20,
+        mtime_secs: 0,
+        mode: 0o644,
+    };
+    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
+    let part = SyncMsg::FileChunk(vec![7; 4096]);
+    send_msg(&mut send, &part, MAX_CHUNK).await.unwrap();
+    let partial = |dst: &std::path::Path| names_in(dst).iter().any(|n| n.starts_with(".koh-"));
+    let until = |want: bool, dst: PathBuf| async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while partial(&dst) != want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    };
+    until(true, dst.clone())
+        .await
+        .expect("its bytes were being written within 5 s");
+    drop((send, recv));
+    client.close().await;
+    until(false, dst.clone())
+        .await
+        .expect("the temporary file was gone within 5 s");
+    assert_eq!(names_in(&dst), ["there"]);
+    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
+
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_else() {
+    use std::os::unix::fs::symlink;
+    let tmp = TempDir::new("exec-scope");
+    let (allowed, outside) = (tmp.0.join("allowed"), tmp.0.join("outside"));
+    fs::create_dir_all(allowed.join("sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, allowed.join("out")).unwrap();
+    let key = new_key(&tmp, "exec.key");
+    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
+    save_clients(
+        Some(&tmp.0.join("srv_cfg/server.key")),
+        &[ClientEntry {
+            name: "runner".into(),
+            id: key.public(),
+            scope: Scope::Exec(allowed.clone()),
+        }],
+    )
+    .unwrap();
+    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let client = Client::connect_direct(key, srv.endpoint_id, route, false)
+        .await
+        .unwrap();
+    let at = |dir: &std::path::Path| Some(dir.display().to_string());
+    let pwd = |dir: PathBuf| {
+        let client = &client;
+        async move {
+            client
+                .exec(vec!["pwd".into()], at(&dir), false, None, true)
+                .await
+        }
+    };
+
+    // A command starts in its directory, or in one beneath it, and is any command: this is no
+    // sandbox, and the command reaches what the server's user can.
+    let (code, out, _) = pwd(allowed.join("sub")).await.unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        String::from_utf8_lossy(&out)
+            .trim_end()
+            .ends_with("/allowed/sub")
+    );
+    let reach = format!("cat {}", outside.join("secret").display());
+    fs::write(outside.join("secret"), "reached").unwrap();
+    let (_, out, _) = client
+        .exec(vec![reach], at(&allowed), true, None, true)
+        .await
+        .unwrap();
+    assert_eq!(out, b"reached");
+
+    // It does not start elsewhere: not outside, and not in a directory that is beneath its own
+    // by name and somewhere else in fact (a symlink out of it).
+    for dir in [outside.clone(), allowed.join("out"), tmp.0.clone()] {
+        let err = pwd(dir.clone()).await.unwrap_err();
+        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
+    }
+    let job = client
+        .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
+        .await
+        .unwrap();
+    assert_eq!(job.name, "j");
+    let nowhere = client
+        .run_job(None, vec!["true".into()], at(&outside), false)
+        .await;
+    assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
+
+    // It copies beneath its directory as a `--cp` key does, through no symlink.
+    let file = tmp.0.join("payload");
+    fs::write(&file, "copied").unwrap();
+    let push = |dst: PathBuf| {
+        let (client, file) = (&client, file.clone());
+        async move {
+            let dst = dst.display().to_string();
+            client
+                .cp_push(&file, dst, Vec::new(), false, false, false)
+                .await
+        }
+    };
+    push(allowed.join("sub")).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(allowed.join("sub/payload")).unwrap(),
+        "copied"
+    );
+    for dst in [outside.clone(), allowed.join("out")] {
+        let err = push(dst.clone()).await.unwrap_err();
+        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dst.display());
+    }
+    assert!(!outside.join("payload").exists());
+
+    // And it asks for nothing else: no sessions, and no look at jobs, its own among them.
+    assert_eq!(client.sessions().await.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(client.jobs(None).await.unwrap_err().code, Exit::REFUSED);
+    let waited = client.wait_job("j".into(), None, 10, Some(1)).await;
+    assert_eq!(waited.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(
+        client.output(1, false).await.unwrap_err().code,
+        Exit::REFUSED
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn attaching_to_a_session_that_has_ended_shows_it_and_lets_go() {
+    let tmp = TempDir::new("attach-ended");
+    let friend = new_key(&tmp, "friend.key");
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], ServeOptions::default()).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |session: Option<u32>| Request::Attach {
+        session,
+        new: session.is_none(),
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: if session.is_none() {
+            vec!["/bin/sh".into(), "-c".into(), "echo LAST".into()]
+        } else {
+            Vec::new()
+        },
+        cwd: None,
+    };
+    async fn left(client: &Client) -> u32 {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if let [one] = &list[..]
+                && one.state != "running"
+                && !one.attached
+            {
+                break one.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let first = client.request(&attach(None)).await.unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(5), left(&client)).await;
+    let id = id.expect("the session ended and was left within 5 s");
+
+    // A client that attaches now is shown the screen as the program left it, and that is all
+    // there will be: the server does not keep it attached to wait for more. (An ended session
+    // that stays attached can never make room for a new one.)
+    let (_send, mut recv) = client.request(&attach(Some(id))).await.unwrap();
+    let shown = recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap();
+    assert!(
+        matches!(&shown, ServerEvent::Full(frame) if frame.screen.contains("LAST") && frame.state != "running")
+    );
+    tokio::time::timeout(Duration::from_secs(5), left(&client))
+        .await
+        .expect("the ended session was let go within 5 s");
+    drop(first);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[test]
+fn a_session_whose_program_has_ended_never_says_it_runs_again() {
+    use koh::pane::PaneSession;
+    // A resize tells of the state the session is in. One that comes just as the program ends
+    // must not tell of the state from before: a session that says it runs after its program
+    // has gone is kept for ever, and counted against `--max-sessions`. Forty short programs, each
+    // resized as fast as can be while it ends.
+    let tmp = TempDir::new("ended-stays-ended");
+    let argv = ["/bin/sh".to_string(), "-c".into(), "exit 3".into()];
+    for round in 0..40u32 {
+        let dir = tmp.0.join(format!("s{round}"));
+        let session =
+            PaneSession::spawn(round, dir, 80, 10, 10, 20, &argv, &tmp.0, "/bin/sh").unwrap();
+        let began = std::time::Instant::now();
+        let mut cols = 80;
+        while session.info().state == "running" && began.elapsed() < Duration::from_millis(40) {
+            cols = if cols == 80 { 81 } else { 80 };
+            session.resize(cols, 10, 10, 20);
+            std::thread::yield_now();
+        }
+        // (Left alone, it has all the time it needs to say that its program ended.)
+        while session.info().state == "running" && began.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (0..5).for_each(|_| session.resize(80, 10, 10, 20));
+        assert_eq!(session.info().state, "exited 3", "round {round}");
+    }
+}
+
+#[tokio::test]
+async fn a_proof_deadline_too_far_off_for_the_clock_is_no_deadline_and_no_panic() {
+    // (`ServeOptions` is public: `Duration::MAX` added to the clock's time panicked in the task
+    // that takes connections, at the first peer to come, and no other was taken after it.)
+    let tmp = TempDir::new("proof-never");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        proof_timeout: Duration::MAX,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    for nth in 0..2 {
+        let dial = Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+        let client = tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .unwrap_or_else(|_| panic!("connection {nth} was not taken within 5 s"))
+            .unwrap();
+        client.sessions().await.unwrap();
+        client.close().await;
+    }
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
+    // The 128 directories are a bound on a path within a tree, as it goes over the wire. The way
+    // from a `--cp DIR` key's directory to the tree is not such a path: it may be any length.
+    let (tmp, srv, client, allowed, _) = boot_scoped("deep-root").await;
+    let root = deep(&allowed, 130).parent().unwrap().to_path_buf();
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), "pushed").unwrap();
+    client
+        .cp_push(
+            &src,
+            root.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(root.join("f")).unwrap(), "pushed");
+    let back = tmp.0.join("back");
+    client
+        .cp_pull(
+            root.display().to_string(),
+            &back,
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(back.join("f")).unwrap(), "pushed");
+
+    // Each name on that way is still one plain name: none of them may lead back out.
+    let out = format!("{}/d/../../outside", allowed.display());
+    let err = client
+        .cp_push(&src, out, Vec::new(), false, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+
+    client.close().await;
+    srv.shutdown().await;
 }

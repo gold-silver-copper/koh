@@ -20,14 +20,14 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::watch;
 
 use crate::keys::{Role, Route, load_or_create_key, resolve_server};
-use crate::net::{connect_server, map_conn_err, open_authed_stream};
+use crate::net::{close_error, connect_server, map_conn_err, open_authed_stream};
 use crate::pane::write_v1_metadata;
 use crate::proto::{
     ClientEvent, ExecClientMsg, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
     PictureKind, Reply, Request, ScreenFrame, ServerEvent, SessionInfo, SyncSummary, WaitResult,
     recv_msg, recv_msg_opt, send_msg, spawn_msg_reader,
 };
-use crate::sync::{receive_tree, send_tree};
+use crate::sync::{Place, receive_tree, send_tree};
 use crate::{Exit, KohError, Result, atomic_write};
 
 const PICTURE_CACHE_MAX_COUNT: usize = 16;
@@ -129,7 +129,9 @@ impl Client {
 
     pub async fn request(&self, req: &Request) -> Result<(SendStream, RecvStream)> {
         let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
-        send_msg(&mut send, req, MAX_CTRL).await?;
+        send_msg(&mut send, req, MAX_CTRL)
+            .await
+            .map_err(|e| close_error(&self.conn).unwrap_or(e))?;
         let reply: Reply = recv_msg(&mut recv, MAX_CTRL)
             .await
             .map_err(|e| map_conn_err(&self.conn, e.message))?;
@@ -364,7 +366,8 @@ impl Client {
                     dry_run,
                 })
                 .await?;
-            let part = send_tree(src, excludes, preserve_root, &mut send, &mut recv).await?;
+            let place = Place::path(src);
+            let part = send_tree(&place, excludes, preserve_root, &mut send, &mut recv).await?;
             total.merge(part);
         }
         Ok(total)
@@ -422,7 +425,7 @@ impl Client {
                 })
                 .await?;
             let part = receive_tree(
-                local_dst,
+                &Place::path(local_dst),
                 excludes,
                 delete,
                 preserve_mtime,

@@ -1,18 +1,32 @@
 //! Delta file sync using blake3 hashes: manifest diff, chunked transfer,
 //! `--delete`, `--exclude` globs, `-p` mtime preservation, and `--dry-run`.
+//!
+//! Every entry of a tree is reached from the directory above it, by that directory's descriptor
+//! and with `O_NOFOLLOW`: no name a peer sends and no symlink already in the tree takes a copy
+//! outside the tree. A symlink is never sent and never followed: where a directory is needed it
+//! is refused, where a file lands it is replaced as the link it is, and `--delete` leaves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
+use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use iroh::endpoint::{RecvStream, SendStream};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::io::Errno;
+use serde::Serialize;
 
 use crate::proto::{MAX_CHUNK, MAX_CTRL, SyncEntry, SyncMsg, SyncSummary, recv_msg, send_msg};
 use crate::{KohError, Result};
 
-const MAX_FILES: usize = 100_000;
+/// Most entries a tree may hold, on either end.
+pub const MAX_FILES: usize = 100_000;
+/// Most directories an entry may be beneath its tree: its path there has that many names and its own.
+/// (Both ends count the names of the path as it is sent, so they agree on what is too deep.)
+const MAX_DEPTH: usize = 128;
 const CHUNK_SIZE: usize = 64 << 10;
 
 /// Simple glob matcher supporting `*`, `?`, and `**` against relative paths and basenames.
@@ -66,132 +80,316 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
     p == pat.len()
 }
 
-/// Scans a local file or directory tree into a sorted blake3 manifest.
-/// When `preserve_root` is true and `root` is a directory, every manifest path is prefixed with
-/// `root`'s basename so multiple directory sources can share one destination directory.
-pub fn scan_tree(root: &Path, excludes: &[String], preserve_root: bool) -> Result<Vec<SyncEntry>> {
-    let meta = fs::metadata(root)
-        .map_err(|e| KohError::failed(format!("stat {}: {e}", root.display())))?;
-    let mut entries = Vec::new();
-    if meta.is_file() {
-        let name = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| KohError::usage("invalid filename"))?;
-        entries.push(hash_file(root, name.to_string(), &meta)?);
-        return Ok(entries);
-    }
-    if !meta.is_dir() {
-        return Err(KohError::usage(format!(
-            "{} is neither file nor directory",
-            root.display()
-        )));
-    }
-    let prefix = if preserve_root {
-        let name = root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty() && *n != "." && *n != "..")
-            .ok_or_else(|| {
-                KohError::usage(format!("cannot determine name of {}", root.display()))
-            })?;
-        entries.push(SyncEntry {
-            path: name.to_string(),
-            size: 0,
-            mtime_secs: meta.mtime(),
-            mode: meta.permissions().mode() & 0o777,
-            hash: [0u8; 32],
-            is_dir: true,
-        });
-        Some(name.to_string())
-    } else {
-        None
-    };
-    walk(
-        root,
-        Path::new(""),
-        prefix.as_deref(),
-        excludes,
-        &mut entries,
-    )?;
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(entries)
+/// A tree on this machine as a copy reaches it: `base` as the system finds it (the path its
+/// owner gave, symlinks followed), then `beneath` it one name at a time, never through a symlink.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    base: PathBuf,
+    beneath: Vec<String>,
 }
 
-fn walk(
-    root: &Path,
-    rel: &Path,
-    prefix: Option<&str>,
-    excludes: &[String],
-    out: &mut Vec<SyncEntry>,
-) -> Result<()> {
-    let dir = if rel.as_os_str().is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
-    };
-    let rd = fs::read_dir(&dir)
-        .map_err(|e| KohError::failed(format!("read_dir {}: {e}", dir.display())))?;
-    let mut names = Vec::new();
-    for item in rd {
-        let item = item.map_err(|e| KohError::failed(format!("dir entry: {e}")))?;
-        names.push(item.file_name());
+/// What a tree is read from: a directory, or one regular file.
+enum Source {
+    Dir(File),
+    File(File, fs::Metadata),
+}
+
+impl Place {
+    /// A path of the user's own, taken as given.
+    pub fn path(path: &Path) -> Self {
+        Self {
+            base: path.to_path_buf(),
+            beneath: Vec::new(),
+        }
     }
-    names.sort();
-    for name in names {
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        let child_rel = if rel.as_os_str().is_empty() {
-            PathBuf::from(name_str)
+
+    /// The names `beneath` the directory `base`, each one plain name: what a scoped key may reach.
+    /// (So that what walks a place can take every name of it for one name. There may be any number
+    /// of them: this is the way to a tree, and the 128 directories are a bound on a path within one.)
+    pub(crate) fn beneath(base: PathBuf, beneath: Vec<String>) -> Result<Self> {
+        if beneath.iter().all(|name| plain(name)) {
+            Ok(Self { base, beneath })
         } else {
-            rel.join(name_str)
-        };
-        let rel_str = child_rel.to_string_lossy().to_string();
-        if matches_exclude(&rel_str, excludes) {
-            continue;
-        }
-        let wire_path = match prefix {
-            Some(p) => format!("{p}/{rel_str}"),
-            None => rel_str,
-        };
-        let full = root.join(&child_rel);
-        let meta = match fs::symlink_metadata(&full) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.file_type().is_symlink() {
-            continue; // Never follow symlinks across sync boundaries.
-        }
-        if out.len() >= MAX_FILES {
-            return Err(KohError::failed("tree exceeds maximum file count (100000)"));
-        }
-        if meta.is_dir() {
-            out.push(SyncEntry {
-                path: wire_path,
-                size: 0,
-                mtime_secs: meta.mtime(),
-                mode: meta.permissions().mode() & 0o777,
-                hash: [0u8; 32],
-                is_dir: true,
-            });
-            walk(root, &child_rel, prefix, excludes, out)?;
-        } else if meta.is_file() {
-            out.push(hash_file(&full, wire_path, &meta)?);
+            Err(KohError::refused(format!(
+                "unsafe path beneath {}",
+                base.display()
+            )))
         }
     }
-    Ok(())
+
+    fn shown(&self) -> String {
+        let whole: PathBuf = std::iter::once(self.base.as_os_str())
+            .chain(self.beneath.iter().map(AsRef::as_ref))
+            .collect();
+        whole.display().to_string()
+    }
+
+    /// Its last name: what a tree's entries are sent under when several share a destination.
+    fn name(&self) -> Option<&str> {
+        let last = match self.beneath.last() {
+            Some(name) => Some(name.as_str()),
+            None => self.base.file_name().and_then(|n| n.to_str()),
+        };
+        last.filter(|n| !n.is_empty() && *n != "." && *n != "..")
+    }
+
+    fn open_base(&self, more: OFlags) -> io::Result<File> {
+        let flags = OFlags::RDONLY | OFlags::CLOEXEC | more;
+        Ok(rustix::fs::open(&self.base, flags, Mode::empty())?.into())
+    }
+
+    /// Its directory; made first (with those above it) if `make`, else `None` if it is not there.
+    fn open_dir(&self, make: bool) -> Result<Option<File>> {
+        let shown = self.shown();
+        if make && self.beneath.is_empty() {
+            fs::create_dir_all(&self.base)
+                .map_err(|e| KohError::failed(format!("create_dir_all {shown}: {e}")))?;
+        }
+        let mut at = match self.open_base(OFlags::DIRECTORY) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !make => return Ok(None),
+            Err(e) => return Err(KohError::failed(format!("open {shown}: {e}"))),
+        };
+        for name in &self.beneath {
+            let Some(next) = open_dir(&at, name, &shown, make)? else {
+                return Ok(None);
+            };
+            at = next;
+        }
+        Ok(Some(at))
+    }
+
+    /// The file or directory it names, to read.
+    fn open_source(&self) -> Result<Source> {
+        let shown = self.shown();
+        let missing = || KohError::failed(format!("stat {shown}: No such file or directory"));
+        let file = match self.beneath.split_last() {
+            None => self
+                .open_base(OFlags::NONBLOCK)
+                .map_err(|e| KohError::failed(format!("stat {shown}: {e}")))?,
+            Some((last, dirs)) => {
+                let mut at = self
+                    .open_base(OFlags::DIRECTORY)
+                    .map_err(|e| KohError::failed(format!("open {shown}: {e}")))?;
+                for name in dirs {
+                    at = open_dir(&at, name, &shown, false)?.ok_or_else(missing)?;
+                }
+                open_file(&at, last, &shown)?
+            }
+        };
+        let meta = file
+            .metadata()
+            .map_err(|e| KohError::failed(format!("stat {shown}: {e}")))?;
+        if meta.is_dir() {
+            Ok(Source::Dir(file))
+        } else if meta.is_file() {
+            Ok(Source::File(file, meta))
+        } else {
+            Err(KohError::usage(format!(
+                "{shown} is neither file nor directory"
+            )))
+        }
+    }
 }
 
-fn hash_file(path: &Path, rel: String, meta: &fs::Metadata) -> Result<SyncEntry> {
-    let mut f =
-        File::open(path).map_err(|e| KohError::failed(format!("open {}: {e}", path.display())))?;
+const fn nofollow(more: OFlags) -> OFlags {
+    OFlags::CLOEXEC.union(OFlags::NOFOLLOW).union(more)
+}
+
+/// What entry `name` of `dir` is, not followed; `None` if there is none.
+fn kind_at(dir: &File, name: &str) -> io::Result<Option<FileType>> {
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+/// Why `name` of `dir` could not be opened: a symlink there is refused, the rest failed.
+fn not_opened(dir: &File, name: &str, rel: &str, errno: Errno) -> KohError {
+    if matches!(kind_at(dir, name), Ok(Some(FileType::Symlink))) {
+        KohError::refused(format!(
+            "{rel}: {name:?} is a symlink, and a copy follows none"
+        ))
+    } else {
+        KohError::failed(format!("open {rel}: {}", io::Error::from(errno)))
+    }
+}
+
+/// Directory `name` of `dir`, never a symlink; made if `make` and not there, else `None` then.
+fn open_dir(dir: &File, name: &str, rel: &str, make: bool) -> Result<Option<File>> {
+    let flags = nofollow(OFlags::RDONLY.union(OFlags::DIRECTORY));
+    let open = || rustix::fs::openat(dir, name, flags, Mode::empty());
+    let found = match open() {
+        Err(Errno::NOENT) if make => {
+            match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o755)) {
+                Ok(()) | Err(Errno::EXIST) => open(),
+                Err(errno) => Err(errno),
+            }
+        }
+        found => found,
+    };
+    match found {
+        Ok(fd) => Ok(Some(fd.into())),
+        Err(Errno::NOENT) if !make => Ok(None),
+        Err(errno) => Err(not_opened(dir, name, rel, errno)),
+    }
+}
+
+/// File `name` of `dir` to read, never a symlink (and never waiting on a FIFO's writer).
+fn open_file(dir: &File, name: &str, rel: &str) -> Result<File> {
+    let flags = nofollow(OFlags::RDONLY.union(OFlags::NONBLOCK));
+    rustix::fs::openat(dir, name, flags, Mode::empty())
+        .map(File::from)
+        .map_err(|errno| not_opened(dir, name, rel, errno))
+}
+
+/// Whether `name` is one plain name: not empty, `.` or `..`, with no `/` or NUL.
+fn plain(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
+}
+
+/// The names of the wire path `rel`: a path beneath a tree, and nothing else. Each is one plain
+/// name, and there are at most 129: an entry's own, and those of the 128 directories it may be
+/// beneath.
+pub fn wire_names(rel: &str) -> Result<Vec<&str>> {
+    let names: Vec<&str> = rel.split('/').collect();
+    if names.len() > MAX_DEPTH + 1 || !names.iter().all(|name| plain(name)) {
+        return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
+    }
+    Ok(names)
+}
+
+/// File `rel` beneath `root` to read, each name opened from the one above it.
+fn open_beneath(root: &File, rel: &str) -> Result<File> {
+    let names = wire_names(rel)?;
+    let Some((last, dirs)) = names.split_last() else {
+        return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
+    };
+    let mut at = None::<File>;
+    for name in dirs {
+        let next = open_dir(at.as_ref().unwrap_or(root), name, rel, false)?;
+        at = Some(next.ok_or_else(|| KohError::failed(format!("open {rel}: no such directory")))?);
+    }
+    open_file(at.as_ref().unwrap_or(root), last, rel)
+}
+
+/// A tree a copy lands in: its root, and the directory last reached in it (a manifest goes
+/// directory by directory).
+struct Tree {
+    root: File,
+    last: Option<(String, File)>,
+}
+
+impl Tree {
+    /// The directory `rel` beneath the root (the root itself if empty), each name opened from
+    /// the one above it; made where missing if `make`, else `None` where missing.
+    fn dir(&mut self, rel: &str, make: bool) -> Result<Option<&File>> {
+        if rel.is_empty() {
+            return Ok(Some(&self.root));
+        }
+        if self.last.as_ref().is_none_or(|(at, _)| at != rel) {
+            self.last = None;
+            let mut at = None::<File>;
+            for name in wire_names(rel)? {
+                let above = at.as_ref().unwrap_or(&self.root);
+                let Some(next) = open_dir(above, name, rel, make)? else {
+                    return Ok(None);
+                };
+                at = Some(next);
+            }
+            self.last = at.map(|dir| (rel.to_string(), dir));
+        }
+        Ok(self.last.as_ref().map(|(_, dir)| dir))
+    }
+
+    /// The directory that holds `rel`'s last name, and that name.
+    fn parent<'a>(&'a mut self, rel: &'a str, make: bool) -> Result<Option<(&'a File, &'a str)>> {
+        wire_names(rel)?;
+        let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
+        Ok(self.dir(dir, make)?.map(|dir| (dir, name)))
+    }
+}
+
+/// A file written under a name of its own beside where it lands: removed unless it lands.
+struct Temp<'a> {
+    dir: &'a File,
+    name: String,
+    landed: bool,
+}
+
+impl<'a> Temp<'a> {
+    /// A new file in `dir` under a name nothing has: never one that is there, symlink or not.
+    fn create(dir: &'a File, rel: &str) -> Result<(File, Self)> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let flags = nofollow(OFlags::WRONLY.union(OFlags::CREATE).union(OFlags::EXCL));
+        let mut why = Errno::EXIST;
+        for _ in 0..16 {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let name = format!(
+                ".koh-{:x}-{:x}-{nanos:x}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            match rustix::fs::openat(dir, &name, flags, Mode::from_raw_mode(0o600)) {
+                Ok(fd) => {
+                    let temp = Self {
+                        dir,
+                        name,
+                        landed: false,
+                    };
+                    return Ok((fd.into(), temp));
+                }
+                Err(Errno::EXIST) => {}
+                Err(errno) => {
+                    why = errno;
+                    break;
+                }
+            }
+        }
+        Err(KohError::failed(format!(
+            "create a temporary file for {rel}: {}",
+            io::Error::from(why)
+        )))
+    }
+
+    /// Give it the name it lands under: whatever was there goes, a symlink as the link it is.
+    fn land(mut self, name: &str, rel: &str) -> Result<()> {
+        rustix::fs::renameat(self.dir, &self.name, self.dir, name)
+            .map_err(|e| KohError::failed(format!("rename {rel}: {}", io::Error::from(e))))?;
+        self.landed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Temp<'_> {
+    fn drop(&mut self) {
+        if !self.landed {
+            let _ = rustix::fs::unlinkat(self.dir, &self.name, AtFlags::empty());
+        }
+    }
+}
+
+fn entry(path: String, meta: &fs::Metadata, hash: [u8; 32]) -> SyncEntry {
+    SyncEntry {
+        path,
+        size: if meta.is_dir() { 0 } else { meta.len() },
+        mtime_secs: meta.mtime(),
+        mode: meta.permissions().mode() & 0o777,
+        hash,
+        is_dir: meta.is_dir(),
+    }
+}
+
+fn hash_file(mut file: &File, rel: &str) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; 32 << 10];
     loop {
-        let n = f
+        let n = file
             .read(&mut buf)
-            .map_err(|e| KohError::failed(format!("read {}: {e}", path.display())))?;
+            .map_err(|e| KohError::failed(format!("read {rel}: {e}")))?;
         if n == 0 {
             break;
         }
@@ -199,111 +397,263 @@ fn hash_file(path: &Path, rel: String, meta: &fs::Metadata) -> Result<SyncEntry>
             hasher.update(slice);
         }
     }
-    Ok(SyncEntry {
-        path: rel,
-        size: meta.len(),
-        mtime_secs: meta.mtime(),
-        mode: meta.permissions().mode() & 0o777,
-        hash: *hasher.finalize().as_bytes(),
-        is_dir: false,
-    })
+    Ok(*hasher.finalize().as_bytes())
 }
 
-/// Validates a relative wire path so it can never escape `dst_root`.
-pub fn safe_join(dst_root: &Path, rel: &str) -> Result<PathBuf> {
-    if rel.is_empty() || rel.starts_with('/') {
-        return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
-    }
-    let mut out = dst_root.to_path_buf();
-    for comp in Path::new(rel).components() {
-        match comp {
-            Component::Normal(part) => out.push(part),
-            _ => {
-                return Err(KohError::refused(format!(
-                    "unsafe path component in {rel:?}"
-                )));
-            }
+/// The directories and regular files beneath `dir`, into `out`: a symlink is not an entry and
+/// is not entered. With `hash`, each file's size, time, mode and blake3; without, its path alone.
+/// `depth` is how many names the path of `dir` has as it is sent: an entry in a directory that
+/// is itself as deep as an entry may be is too deep, and the tree is not read further.
+fn scan(
+    dir: &File,
+    rel: &str,
+    prefix: Option<&str>,
+    excludes: &[String],
+    hash: bool,
+    depth: usize,
+    out: &mut Vec<SyncEntry>,
+) -> Result<()> {
+    let failed = |e: io::Error| KohError::failed(format!("read_dir {rel:?}: {e}"));
+    let mut names = Vec::new();
+    for item in rustix::fs::Dir::read_from(dir).map_err(|e| failed(e.into()))? {
+        let item = item.map_err(|e| failed(e.into()))?;
+        if let Ok(name) = item.file_name().to_str()
+            && name != "."
+            && name != ".."
+        {
+            names.push(name.to_string());
         }
     }
-    Ok(out)
+    names.sort();
+    for name in names {
+        let child = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        if matches_exclude(&child, excludes) {
+            continue;
+        }
+        let is_dir = match kind_at(dir, &name) {
+            Ok(Some(FileType::Directory)) => true,
+            Ok(Some(FileType::RegularFile)) => false,
+            _ => continue,
+        };
+        if depth > MAX_DEPTH {
+            return Err(KohError::failed(format!(
+                "{child}: more than {MAX_DEPTH} directories deep"
+            )));
+        }
+        if out.len() >= MAX_FILES {
+            return Err(KohError::failed("tree exceeds maximum file count (100000)"));
+        }
+        let wire = match prefix {
+            Some(p) => format!("{p}/{child}"),
+            None => child.clone(),
+        };
+        let stat = |file: &File| {
+            file.metadata()
+                .map_err(|e| KohError::failed(format!("stat {child}: {e}")))
+        };
+        if is_dir {
+            let Some(sub) = open_dir(dir, &name, &child, false)? else {
+                continue;
+            };
+            out.push(entry(wire, &stat(&sub)?, [0u8; 32]));
+            scan(&sub, &child, prefix, excludes, hash, depth + 1, out)?;
+        } else if hash {
+            let file = open_file(dir, &name, &child)?;
+            let meta = stat(&file)?;
+            if meta.is_file() {
+                out.push(entry(wire, &meta, hash_file(&file, &child)?));
+            }
+        } else {
+            out.push(SyncEntry {
+                path: wire,
+                size: 0,
+                mtime_secs: 0,
+                mode: 0,
+                hash: [0u8; 32],
+                is_dir: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The sorted blake3 manifest of `source`, and the name its paths are prefixed with: with
+/// `preserve_root` a directory's own, so several directories can share one destination.
+fn manifest(
+    source: &Source,
+    name: Option<&str>,
+    excludes: &[String],
+    preserve_root: bool,
+) -> Result<(Vec<SyncEntry>, Option<String>)> {
+    let mut entries = Vec::new();
+    let dir = match source {
+        Source::File(file, meta) => {
+            let name = name.ok_or_else(|| KohError::usage("invalid filename"))?;
+            entries.push(entry(name.to_string(), meta, hash_file(file, name)?));
+            return Ok((entries, None));
+        }
+        Source::Dir(dir) => dir,
+    };
+    let prefix = if preserve_root {
+        let name = name.ok_or_else(|| KohError::usage("cannot determine the directory's name"))?;
+        let meta = dir
+            .metadata()
+            .map_err(|e| KohError::failed(format!("stat {name}: {e}")))?;
+        entries.push(entry(name.to_string(), &meta, [0u8; 32]));
+        Some(name.to_string())
+    } else {
+        None
+    };
+    let depth = usize::from(prefix.is_some());
+    scan(
+        dir,
+        "",
+        prefix.as_deref(),
+        excludes,
+        true,
+        depth,
+        &mut entries,
+    )?;
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok((entries, prefix))
+}
+
+/// What the peer said went wrong, if that is why sending to it failed.
+async fn peer_failure(recv: &mut RecvStream) -> Option<KohError> {
+    let said = recv_msg::<SyncMsg>(recv, MAX_CTRL * 4);
+    match tokio::time::timeout(Duration::from_secs(2), said).await {
+        Ok(Ok(SyncMsg::Failed(err))) => Some(err.into()),
+        _ => None,
+    }
+}
+
+async fn send_file_msg<T: Serialize>(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    msg: &T,
+    max: usize,
+) -> Result<()> {
+    match send_msg(send, msg, max).await {
+        Ok(()) => Ok(()),
+        Err(err) => Err(peer_failure(recv).await.unwrap_or(err)),
+    }
 }
 
 /// Sender half of delta sync: sends manifest, streams only requested files, receives summary.
 pub async fn send_tree(
-    root: &Path,
+    place: &Place,
     excludes: &[String],
     preserve_root: bool,
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<SyncSummary> {
-    let single_file = fs::metadata(root).map(|m| m.is_file()).unwrap_or(false);
-    let root_prefix = if preserve_root && !single_file {
-        root.file_name().and_then(|n| n.to_str()).map(String::from)
-    } else {
-        None
-    };
-    let manifest = scan_tree(root, excludes, preserve_root)?;
-    let by_path: BTreeMap<String, SyncEntry> = manifest
+    let source = place.open_source()?;
+    let (manifest, prefix) = manifest(&source, place.name(), excludes, preserve_root)?;
+    let files: BTreeMap<String, SyncEntry> = manifest
         .iter()
+        .filter(|e| !e.is_dir)
         .cloned()
         .map(|e| (e.path.clone(), e))
         .collect();
     send_msg(send, &SyncMsg::Manifest(manifest), MAX_CTRL * 8).await?;
 
-    let SyncMsg::Need(needed) = recv_msg(recv, MAX_CTRL * 4).await? else {
-        return Err(KohError::failed("expected Need message from receiver"));
+    let needed = match recv_msg(recv, MAX_CTRL * 4).await? {
+        SyncMsg::Need(needed) => needed,
+        SyncMsg::Failed(err) => return Err(err.into()),
+        _ => return Err(KohError::failed("expected Need message from receiver")),
     };
     let mut buf = vec![0u8; CHUNK_SIZE];
     for rel in needed {
-        let Some(entry) = by_path.get(&rel) else {
+        let Some(entry) = files.get(&rel) else {
             continue;
         };
-        let full = if single_file {
-            root.to_path_buf()
-        } else if let Some(prefix) = root_prefix.as_deref() {
-            let inner = rel
-                .strip_prefix(prefix)
-                .and_then(|s| s.strip_prefix('/'))
-                .ok_or_else(|| KohError::refused(format!("unexpected prefixed path {rel:?}")))?;
-            safe_join(root, inner)?
-        } else {
-            safe_join(root, &rel)?
+        let opened;
+        let mut file: &File = match &source {
+            Source::File(file, _) => file,
+            Source::Dir(root) => {
+                let inner = match prefix.as_deref() {
+                    Some(prefix) => rel
+                        .strip_prefix(prefix)
+                        .and_then(|s| s.strip_prefix('/'))
+                        .ok_or_else(|| {
+                            KohError::refused(format!("unexpected prefixed path {rel:?}"))
+                        })?,
+                    None => &rel,
+                };
+                opened = open_beneath(root, inner)?;
+                &opened
+            }
         };
-        send_msg(
-            send,
-            &SyncMsg::FileStart {
-                path: rel.clone(),
-                size: entry.size,
-                mtime_secs: entry.mtime_secs,
-                mode: entry.mode,
-            },
-            MAX_CTRL,
-        )
-        .await?;
-        let mut f = File::open(&full)
-            .map_err(|e| KohError::failed(format!("open {}: {e}", full.display())))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| KohError::failed(format!("seek {rel}: {e}")))?;
+        let start = SyncMsg::FileStart {
+            path: rel.clone(),
+            size: entry.size,
+            mtime_secs: entry.mtime_secs,
+            mode: entry.mode,
+        };
+        send_file_msg(send, recv, &start, MAX_CTRL).await?;
         loop {
-            let n = f
+            let n = file
                 .read(&mut buf)
-                .map_err(|e| KohError::failed(format!("read {}: {e}", full.display())))?;
+                .map_err(|e| KohError::failed(format!("read {rel}: {e}")))?;
             if n == 0 {
                 break;
             }
             if let Some(slice) = buf.get(..n) {
-                send_msg(send, &SyncMsg::FileChunk(slice.to_vec()), MAX_CHUNK).await?;
+                let chunk = SyncMsg::FileChunk(slice.to_vec());
+                send_file_msg(send, recv, &chunk, MAX_CHUNK).await?;
             }
         }
-        send_msg(send, &SyncMsg::FileEnd, MAX_CTRL).await?;
+        send_file_msg(send, recv, &SyncMsg::FileEnd, MAX_CTRL).await?;
     }
-    let SyncMsg::Summary(summary) = recv_msg(recv, MAX_CTRL * 4).await? else {
-        return Err(KohError::failed("expected Summary from receiver"));
-    };
-    Ok(summary)
+    match recv_msg(recv, MAX_CTRL * 4).await? {
+        SyncMsg::Summary(summary) => Ok(summary),
+        SyncMsg::Failed(err) => Err(err.into()),
+        _ => Err(KohError::failed("expected Summary from receiver")),
+    }
 }
 
-/// Receiver half of delta sync: diffs manifest against `dst_root`, requests changed files, applies updates.
+/// What is at `name` of `dir`, where a file of `size` bytes is to land.
+enum There {
+    /// No regular file (nothing, or something a file takes the place of: a symlink is not followed).
+    Nothing,
+    /// A regular file of another size: it differs, and need not be read to know.
+    Differs,
+    /// A regular file of that size, open: its hash says whether it is the same.
+    Same(File),
+}
+
+fn there(dir: &File, name: &str, rel: &str, size: u64) -> Result<There> {
+    let Ok(stat) = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return Ok(There::Nothing);
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Ok(There::Nothing);
+    }
+    if u64::try_from(stat.st_size).ok() != Some(size) {
+        return Ok(There::Differs);
+    }
+    // (Opened only now: a file that may not be read is replaced all the same if its size differs.)
+    let file = open_file(dir, name, rel)?;
+    let meta = file
+        .metadata()
+        .map_err(|e| KohError::failed(format!("stat {rel}: {e}")))?;
+    Ok(match (meta.is_file(), meta.len() == size) {
+        (true, true) => There::Same(file),
+        (true, false) => There::Differs,
+        (false, _) => There::Nothing,
+    })
+}
+
+/// Receiver half of delta sync: diffs manifest against the tree at `place`, requests changed
+/// files, applies updates.
 pub async fn receive_tree(
-    dst_root: &Path,
+    place: &Place,
     excludes: &[String],
     delete: bool,
     preserve_mtime: bool,
@@ -311,135 +661,137 @@ pub async fn receive_tree(
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<SyncSummary> {
-    let SyncMsg::Manifest(src_entries) = recv_msg(recv, MAX_CTRL * 8).await? else {
-        return Err(KohError::failed("expected Manifest from sender"));
+    let src_entries = match recv_msg(recv, MAX_CTRL * 8).await? {
+        SyncMsg::Manifest(entries) => entries,
+        SyncMsg::Failed(err) => return Err(err.into()),
+        _ => return Err(KohError::failed("expected Manifest from sender")),
     };
+    if src_entries.len() > MAX_FILES {
+        return Err(KohError::refused(format!(
+            "manifest exceeds maximum file count ({MAX_FILES})"
+        )));
+    }
     let mut summary = SyncSummary {
         dry_run,
         ..SyncSummary::default()
     };
     let mut needed = Vec::new();
     let mut src_set = BTreeSet::new();
-
-    if !dry_run {
-        fs::create_dir_all(dst_root)
-            .map_err(|e| KohError::failed(format!("create_dir_all {}: {e}", dst_root.display())))?;
-    }
+    // In a dry run nothing is made: a destination that is not there holds nothing.
+    let mut tree = place
+        .open_dir(!dry_run)?
+        .map(|root| Tree { root, last: None });
 
     for entry in &src_entries {
-        let target = safe_join(dst_root, &entry.path)?;
+        wire_names(&entry.path)?;
         src_set.insert(entry.path.clone());
-        if entry.is_dir {
-            if !dry_run {
-                fs::create_dir_all(&target)
-                    .map_err(|e| KohError::failed(format!("mkdir {}: {e}", target.display())))?;
+        let here = match (tree.as_mut(), entry.is_dir) {
+            (Some(tree), true) => {
+                tree.dir(&entry.path, !dry_run)?;
+                continue;
             }
-            continue;
+            (None, true) => continue,
+            (Some(tree), false) => match tree.parent(&entry.path, false)? {
+                Some((dir, name)) => there(dir, name, &entry.path, entry.size)?,
+                None => There::Nothing,
+            },
+            (None, false) => There::Nothing,
+        };
+        match here {
+            There::Same(file) if hash_file(&file, &entry.path)? == entry.hash => {
+                summary.unchanged += 1;
+                continue;
+            }
+            There::Same(_) | There::Differs => summary.updated.push(entry.path.clone()),
+            There::Nothing => summary.added.push(entry.path.clone()),
         }
-        let existing = fs::metadata(&target).ok().filter(|m| m.is_file());
-        match existing {
-            Some(meta) if meta.len() == entry.size => {
-                let local = hash_file(&target, entry.path.clone(), &meta)?;
-                if local.hash == entry.hash {
-                    summary.unchanged += 1;
-                    continue;
-                }
-                summary.updated.push(entry.path.clone());
-                needed.push(entry.path.clone());
+        needed.push(entry.path.clone());
+    }
+
+    if delete && let Some(tree) = tree.as_mut() {
+        let mut local = Vec::new();
+        scan(&tree.root, "", None, excludes, false, 0, &mut local)?;
+        local.sort_by(|a, b| a.path.cmp(&b.path));
+        for local in local.into_iter().rev() {
+            if src_set.contains(&local.path) {
+                continue;
             }
-            Some(_) => {
-                summary.updated.push(entry.path.clone());
-                needed.push(entry.path.clone());
+            if !dry_run && let Some((dir, name)) = tree.parent(&local.path, false)? {
+                let how = if local.is_dir {
+                    AtFlags::REMOVEDIR
+                } else {
+                    AtFlags::empty()
+                };
+                let _ = rustix::fs::unlinkat(dir, name, how);
             }
-            None => {
-                summary.added.push(entry.path.clone());
-                needed.push(entry.path.clone());
-            }
+            summary.deleted.push(local.path);
         }
     }
 
-    if delete && dst_root.is_dir() {
-        let local_entries = scan_tree(dst_root, excludes, false)?;
-        for local in local_entries.into_iter().rev() {
-            if !src_set.contains(&local.path) {
-                summary.deleted.push(local.path.clone());
-                if !dry_run {
-                    let target = safe_join(dst_root, &local.path)?;
-                    if local.is_dir {
-                        let _ = fs::remove_dir(&target);
-                    } else {
-                        let _ = fs::remove_file(&target);
-                    }
-                }
-            }
-        }
-    }
-
-    if dry_run {
+    let Some(tree) = tree.as_mut().filter(|_| !dry_run) else {
         send_msg(send, &SyncMsg::Need(Vec::new()), MAX_CTRL).await?;
         send_msg(send, &SyncMsg::Summary(summary.clone()), MAX_CTRL * 4).await?;
         return Ok(summary);
-    }
+    };
 
     send_msg(send, &SyncMsg::Need(needed.clone()), MAX_CTRL * 4).await?;
-    for _ in 0..needed.len() {
-        let SyncMsg::FileStart {
-            path,
-            size,
-            mtime_secs,
-            mode,
-        } = recv_msg(recv, MAX_CTRL).await?
-        else {
-            return Err(KohError::failed("expected FileStart"));
+    let mut wanted: BTreeSet<String> = needed.into_iter().collect();
+    while !wanted.is_empty() {
+        let (path, size, mtime_secs, mode) = match recv_msg(recv, MAX_CTRL).await? {
+            SyncMsg::FileStart {
+                path,
+                size,
+                mtime_secs,
+                mode,
+            } => (path, size, mtime_secs, mode),
+            SyncMsg::Failed(err) => return Err(err.into()),
+            _ => return Err(KohError::failed("expected FileStart")),
         };
-        let target = safe_join(dst_root, &path)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| KohError::failed(format!("mkdir {}: {e}", parent.display())))?;
+        if !wanted.remove(&path) {
+            return Err(KohError::refused(format!(
+                "{path:?} was sent but not asked for"
+            )));
         }
-        let fname = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-        let tmp = target.with_file_name(format!(".{fname}.koh-tmp"));
-        let mut out = File::create(&tmp)
-            .map_err(|e| KohError::failed(format!("create {}: {e}", tmp.display())))?;
+        let Some((dir, name)) = tree.parent(&path, true)? else {
+            return Err(KohError::failed(format!("open {path}: no such directory")));
+        };
+        let (mut out, temp) = Temp::create(dir, &path)?;
         let mut written = 0u64;
         loop {
             match recv_msg(recv, MAX_CHUNK).await? {
                 SyncMsg::FileChunk(bytes) => {
-                    out.write_all(&bytes)
-                        .map_err(|e| KohError::failed(format!("write {}: {e}", tmp.display())))?;
                     written += bytes.len() as u64;
+                    if written > size {
+                        break;
+                    }
+                    out.write_all(&bytes)
+                        .map_err(|e| KohError::failed(format!("write {path}: {e}")))?;
                 }
                 SyncMsg::FileEnd => break,
+                SyncMsg::Failed(err) => return Err(err.into()),
                 _ => return Err(KohError::failed("unexpected message during file transfer")),
             }
         }
-        drop(out);
         if written != size {
-            let _ = fs::remove_file(&tmp);
             return Err(KohError::failed(format!(
                 "size mismatch on {path} ({written} != {size})"
             )));
         }
         let perms = fs::Permissions::from_mode(if mode & 0o111 != 0 { 0o755 } else { 0o644 });
-        let _ = fs::set_permissions(&tmp, perms);
+        let _ = out.set_permissions(perms);
         if preserve_mtime {
-            let ts = rustix::fs::Timestamps {
-                last_access: rustix::fs::Timespec {
-                    tv_sec: mtime_secs,
-                    tv_nsec: 0,
-                },
-                last_modification: rustix::fs::Timespec {
-                    tv_sec: mtime_secs,
-                    tv_nsec: 0,
-                },
+            let at = rustix::fs::Timespec {
+                tv_sec: mtime_secs,
+                tv_nsec: 0,
             };
-            let _ = rustix::fs::utimensat(rustix::fs::CWD, &tmp, &ts, rustix::fs::AtFlags::empty());
+            let times = rustix::fs::Timestamps {
+                last_access: at,
+                last_modification: at,
+            };
+            let _ = rustix::fs::futimens(&out, &times);
         }
-        fs::rename(&tmp, &target)
-            .map_err(|e| KohError::failed(format!("rename {}: {e}", target.display())))?;
+        drop(out);
+        temp.land(name, &path)?;
         summary.bytes_transferred += written;
     }
 

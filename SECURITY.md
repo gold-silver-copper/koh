@@ -1,9 +1,9 @@
 # Security Policy
 
-koh is a young, largely single-maintainer project. It has had several internal security, quality, and
-architecture reviews, but **no external/professional audit** — please calibrate trust accordingly (see
-the [`THREAT_MODEL.md`](docs/THREAT_MODEL.md)). `forbid(unsafe)` and the forbidden panic lints shrink
-the surface that needs auditing, but they do not replace independent eyes.
+koh is a young, single-maintainer project. It was rewritten from scratch in 0.18.0, and that
+code has had internal reviews only: **no external or professional audit**. Please calibrate trust
+accordingly (see the [threat model](docs/THREAT_MODEL.md)). `forbid(unsafe_code)` and the denied
+panic lints shrink what needs auditing; they do not replace independent eyes.
 
 ## Reporting a vulnerability
 
@@ -22,34 +22,45 @@ credit reporters who want it.
 
 **In scope** (code koh authors):
 
-- On-disk identity-key handling and local-attacker hardening (`src/identity.rs`,
-  `src/identity/key_file.rs`): the key file is the raw 32-byte secret, protected by its
-  permissions (0600) like an SSH host key.
-- The connection accept gauntlet / client-key allowlist authorization (`src/server/cli.rs`),
-  and the proof of a client's key on each connection (`src/transport_iroh/mod.rs`, `prove` and
-  `proven`), and the session registry that attaches only allowed peers
-  (`src/server/session/sessions.rs`).
-- The untrusted wire decoders (`src/proto.rs`, `src/request.rs`, `src/sync/`) and the connection
-  cores (`src/server/attach.rs`, `src/client/mod.rs`).
-- The output filter both ends run (`src/stream.rs`): what of a server's output reaches the
-  user's terminal.
-- What a request may reach on the server: the scopes of client keys (`src/server/cli.rs`,
-  `src/server/place.rs`), and where a copy lands (`src/sync/receive.rs`, `src/sync/fsat.rs`).
+- The identity key on disk and its directory (`src/keys.rs`, `load_or_create_key`): the key file
+  is the raw 32-byte secret, protected by its permissions (0600) like an SSH host key; and the
+  lock that keeps two servers off one key (`hold_for_serving`).
+- The proof of a client's key on each request (`src/net.rs`, `open_authed_stream` and
+  `verify_client`), the allowlist and what each key may ask (`src/server.rs`, `authorize` and
+  `dispatch`; `src/keys.rs`, `Scope`), and what bounds a peer before and after that
+  (`src/server.rs`, `start_server` and `handle_connection`; `src/pane.rs`, `SessionManager`).
+- The wire decoders and their bounds (`src/proto.rs`), on both ends.
+- Where a copy reads and lands, on both ends (`src/sync.rs`), and what a scoped key's path may
+  name (`src/keys.rs`, `Scope::place_cp`).
+- Commands and jobs the server starts (`src/server.rs`, `handle_exec`; `src/jobs.rs`).
+- What a server can make a client write: a mirrored session's pane folder and the files of a
+  copy (`src/client.rs`, `mount_session` and `write_mirrored_pane`; `src/sync.rs`).
 
-**Out of scope — report upstream** (dependencies koh does not author):
+**Out of scope: report upstream** (dependencies koh does not author):
 
-- Transport crypto / QUIC / TLS: **iroh** and its QUIC backend, **rustls**, **ring**.
-- The terminal emulator **`fux-vt`**, which the server runs on its programs' output and the
-  client on what it writes to the user's terminal (a parse/logic bug belongs to the
-  [fux](https://github.com/gold-silver-copper/fux) project), and the system-call layer **`fuxix`** (PTYs, each session's `setsid` and
-  controlling terminal, signals; also fux's).
-- Known advisories in the dependency tree are tracked via `cargo deny check advisories` (CI) +
-  [`deny.toml`](deny.toml).
+- Transport crypto, QUIC and TLS: **iroh** and its QUIC backend, **rustls**, **ring**.
+- The terminal emulator **`fux-vt`** that the server runs on its programs' output, the viewer
+  **`fux`** that `koh connect` embeds to draw a mirrored session on the user's terminal, and the
+  system-call layer **`fuxix`** (PTYs, sessions, signals): a parse or drawing bug there belongs to
+  the [fux](https://github.com/gold-silver-copper/fux) project.
+
+## What a key can do
+
+- A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
+  can read or write, and sessions.
+- A `--cp DIR` key copies to and from paths beneath `DIR` and nothing else. No symlink beneath
+  `DIR` is followed, so it reaches nothing outside `DIR`.
+- A `--exec DIR` key runs commands and starts jobs, which must start in a directory beneath
+  `DIR`, and copies beneath `DIR`. **It is not a sandbox**: only the starting directory is
+  checked, and the command is any command, run as the server's user. Give it only to a peer you
+  would give a shell.
 
 ## Past audits
 
-koh's earlier security audits and reviews, and what fixed each finding, are in the git history
-(their PRs and commits). The tests that guard the fixes say so in their names and comments.
+The audits before 0.18.0 covered code the rewrite replaced; they are in the git history. An
+internal audit of the rewrite in November 2026 found a scoped key's copy writing through
+symlinks, a server lock that locked nothing and no bound on connections or sessions; the tests
+that guard those fixes are in `tests/e2e.rs`.
 
 ## Please do not
 

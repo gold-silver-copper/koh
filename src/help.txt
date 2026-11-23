@@ -8,7 +8,8 @@ Keys & peers:
   koh key reset [client|server] --yes            delete key; next use generates a new id
   koh servers [add NAME ID [--direct IP:PORT | --relay-url URL] | rm NAME | rename OLD NEW]
   koh clients [add NAME ID [--cp DIR | --exec DIR] | rm NAME | rename OLD NEW]
-  koh serve [--direct BIND] [--allow ID]... [--shell PROG]
+  koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
+            [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
 
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...
@@ -36,3 +37,4 @@ Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
             (`exec`, `wait`, and `logs -f` exit with the remote command's exit status.)
+            `koh serve` exits 75 when another `koh serve` already holds its key.

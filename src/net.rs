@@ -5,7 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use iroh::endpoint::{
-    BindOpts, Connection, IdleTimeout, QuicTransportConfig, RecvStream, SendStream, VarInt, presets,
+    BindOpts, ConnectError, ConnectingError, Connection, ConnectionError, IdleTimeout,
+    QuicTransportConfig, RecvStream, SendStream, TransportErrorCode, VarInt, presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 
@@ -25,7 +26,8 @@ fn transport_config(interactive: bool) -> QuicTransportConfig {
         .keep_alive_interval(keepalive)
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_ms))))
         .max_concurrent_bidi_streams(VarInt::from_u32(16))
-        .max_concurrent_uni_streams(VarInt::from_u32(4))
+        // (Nothing reads a unidirectional stream: a peer is given none to fill.)
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
         .build()
 }
 
@@ -90,8 +92,33 @@ pub async fn connect_server(
     let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN))
         .await
         .map_err(|_| KohError::unreachable("timed out dialing server"))?
-        .map_err(|e| KohError::unreachable(format!("cannot reach server: {e}")))?;
+        .map_err(|e| match refused(&e) {
+            true => busy(),
+            false => KohError::unreachable(format!("cannot reach server: {e}")),
+        })?;
     Ok((endpoint, conn))
+}
+
+/// Whether the server was reached and refused the connection before it began (QUIC's
+/// CONNECTION_REFUSED): a koh server does that when it has no place left, not even to say so.
+fn refused(err: &ConnectError) -> bool {
+    let closed = match err {
+        ConnectError::Connection { source, .. } => source,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError { source, .. },
+            ..
+        } => source,
+        _ => return false,
+    };
+    matches!(closed, ConnectionError::ConnectionClosed(close) if close.error_code == TransportErrorCode::CONNECTION_REFUSED)
+}
+
+fn busy() -> KohError {
+    KohError::new(
+        crate::Exit::BUSY,
+        "busy",
+        "server busy: too many connections at once",
+    )
 }
 
 fn proof_payload(conn: &Connection) -> Result<Vec<u8>> {
@@ -118,7 +145,9 @@ pub async fn open_authed_stream(
         key: *secret.public().as_bytes(),
         signature: sig.to_bytes().to_vec(),
     };
-    send_msg(&mut send, &proof, MAX_PROOF).await?;
+    send_msg(&mut send, &proof, MAX_PROOF)
+        .await
+        .map_err(|e| close_error(conn).unwrap_or(e))?;
     Ok((send, recv))
 }
 
@@ -141,15 +170,19 @@ pub fn close_with(conn: &Connection, code: CloseCode) {
     conn.close(VarInt::from_u32(code as u32), b"");
 }
 
-pub fn map_conn_err(conn: &Connection, fallback: String) -> KohError {
-    if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = conn.close_reason() {
-        match CloseCode::from_u64(close.error_code.into_inner()) {
-            Some(CloseCode::Refused) => return KohError::refused("server refused this client key"),
-            Some(CloseCode::Busy) => {
-                return KohError::new(crate::Exit::BUSY, "busy", "server is busy");
-            }
-            _ => {}
-        }
+/// Why the server closed the connection, if it did and said: refused, or busy.
+pub fn close_error(conn: &Connection) -> Option<KohError> {
+    let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = conn.close_reason()
+    else {
+        return None;
+    };
+    match CloseCode::from_u64(close.error_code.into_inner()) {
+        Some(CloseCode::Refused) => Some(KohError::refused("server refused this client key")),
+        Some(CloseCode::Busy) => Some(busy()),
+        _ => None,
     }
-    KohError::unreachable(fallback)
+}
+
+pub fn map_conn_err(conn: &Connection, fallback: String) -> KohError {
+    close_error(conn).unwrap_or_else(|| KohError::unreachable(fallback))
 }

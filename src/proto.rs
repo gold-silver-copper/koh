@@ -1,6 +1,8 @@
 //! Wire protocol for koh/18 over iroh QUIC bidirectional streams.
 //! Every message is length-prefixed (`u32` big-endian) postcard with strict byte bounds.
 
+use std::collections::BTreeSet;
+
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
@@ -139,20 +141,7 @@ impl Reply {
                 code,
                 kind,
                 message,
-            } => {
-                let kind: &'static str = match kind.as_str() {
-                    "refused" => "refused",
-                    "usage" => "usage",
-                    "unreachable" => "unreachable",
-                    "timeout" => "timeout",
-                    "busy" => "busy",
-                    "not_found" => "not_found",
-                    "cannot_start" => "cannot_start",
-                    "failed" => "failed",
-                    _ => "remote",
-                };
-                Err(KohError::new(Exit(code), kind, message))
-            }
+            } => Err(KohError::new(exit_of(code), kind_of(&kind), message)),
         }
     }
 }
@@ -227,6 +216,68 @@ pub enum SyncMsg {
     FileChunk(Vec<u8>),
     FileEnd,
     Summary(SyncSummary),
+    /// The end that could not go on says why.
+    Failed(Failure),
+}
+
+/// Why an end of a copy stopped, as its own caller would be told: the exit code, kind and words.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Failure {
+    pub code: u8,
+    pub kind: String,
+    pub message: String,
+}
+
+impl From<&KohError> for Failure {
+    fn from(err: &KohError) -> Self {
+        Self {
+            code: err.code.0,
+            kind: err.kind.to_string(),
+            // (A message quotes paths a peer sent: it stays well inside a control message.)
+            message: err.message.chars().take(4096).collect(),
+        }
+    }
+}
+
+impl From<Failure> for KohError {
+    fn from(said: Failure) -> Self {
+        Self::new(exit_of(said.code), kind_of(&said.kind), said.message)
+    }
+}
+
+/// The exit code a peer gave for what went wrong, as one of koh's own for a failure: a peer cannot
+/// make a failure exit 0, or with a code koh does not have.
+fn exit_of(code: u8) -> Exit {
+    let known = [
+        Exit::USAGE,
+        Exit::UNREACHABLE,
+        Exit::REFUSED,
+        Exit::BUSY,
+        Exit::TIMEOUT,
+        Exit::CANNOT_START,
+        Exit::NOT_FOUND,
+        Exit::INTERNAL,
+    ];
+    if known.contains(&Exit(code)) {
+        Exit(code)
+    } else {
+        Exit::FAILED
+    }
+}
+
+/// A kind a peer named, as one of ours: an error's kind is a fixed word.
+fn kind_of(kind: &str) -> &'static str {
+    match kind {
+        "refused" => "refused",
+        "usage" => "usage",
+        "unreachable" => "unreachable",
+        "timeout" => "timeout",
+        "busy" => "busy",
+        "not_found" => "not_found",
+        "cannot_start" => "cannot_start",
+        "failed" => "failed",
+        _ => "remote",
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -516,26 +567,18 @@ impl ScreenFrame {
         self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
     }
 
-    /// Parses all unique picture IDs referenced in the frozen v1 `pictures` listing.
+    /// The picture ids the frozen v1 `pictures` listing names, each once, in ascending order.
     pub fn referenced_picture_ids(&self) -> Vec<u32> {
-        let mut ids = Vec::new();
-        for line in self.pictures.lines() {
-            let Some(file) = line.split_whitespace().next() else {
-                continue;
-            };
-            let Some(rest) = file.strip_prefix("pic-") else {
-                continue;
-            };
-            let Some((num, _)) = rest.split_once('.') else {
-                continue;
-            };
-            if let Ok(id) = num.parse::<u32>()
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
-        }
-        ids
+        let ids: BTreeSet<u32> = self
+            .pictures
+            .lines()
+            .filter_map(|line| {
+                let file = line.split_whitespace().next()?;
+                let (number, _) = file.strip_prefix("pic-")?.split_once('.')?;
+                number.parse().ok()
+            })
+            .collect();
+        ids.into_iter().collect()
     }
 }
 
@@ -779,5 +822,49 @@ mod tests {
         assert_eq!(safe.screen, curr.screen);
         assert_eq!(safe.cursor_row, 4);
         assert_eq!(safe.cursor_col, 79);
+    }
+
+    #[test]
+    fn a_long_picture_listing_is_read_in_time_that_grows_with_its_length() {
+        // What a server can put in one frame: each line a picture nothing else names.
+        let listing: String = (0..100_000u32)
+            .map(|n| format!("pic-{n}.png 0 0 1 1 10 20\n"))
+            .chain(["pic-7.png 0 0 1 1 10 20\n".to_string()])
+            .collect();
+        let frame = ScreenFrame {
+            pictures: listing,
+            ..ScreenFrame::default()
+        };
+        let began = std::time::Instant::now();
+        let ids = frame.referenced_picture_ids();
+        assert_eq!(ids.len(), 100_000);
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}: each id was looked for among all before it",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_failure_a_peer_tells_of_is_one_of_kohs_and_never_success() {
+        // What a peer says went wrong becomes this process's exit code. It is one of the codes koh
+        // has for a failure; anything else a peer may say, 0 first of all, is a plain failure.
+        let told = [0, 1, 2, 3, 4, 5, 75, 124, 126, 127, 200, 255];
+        let taken = [1, 1, 2, 3, 4, 1, 75, 124, 126, 127, 1, 255];
+        for (said, code) in told.into_iter().zip(taken) {
+            let (kind, message) = ("failed".to_string(), "it stopped".to_string());
+            let answer = Reply::Err {
+                code: said,
+                kind: kind.clone(),
+                message: message.clone(),
+            };
+            assert_eq!(answer.into_result().unwrap_err().code, Exit(code), "{said}");
+            let failure = Failure {
+                code: said,
+                kind,
+                message,
+            };
+            assert_eq!(KohError::from(failure).code, Exit(code), "{said}");
+        }
     }
 }

@@ -25,7 +25,8 @@ fn transport_config(interactive: bool) -> QuicTransportConfig {
         .keep_alive_interval(keepalive)
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_ms))))
         .max_concurrent_bidi_streams(VarInt::from_u32(16))
-        .max_concurrent_uni_streams(VarInt::from_u32(4))
+        // (Nothing reads a unidirectional stream: a peer is given none to fill.)
+        .max_concurrent_uni_streams(VarInt::from_u32(0))
         .build()
 }
 

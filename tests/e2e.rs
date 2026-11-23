@@ -1402,3 +1402,15 @@ async fn sessions_are_capped_and_an_ended_one_makes_room() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn the_server_takes_no_stream_but_a_request() {
+    let (_tmp, srv, client, _, _) = boot_pair("no-uni").await;
+    // Nothing reads a unidirectional stream, so a peer is given none to fill.
+    let conn = client.connection();
+    let opened = tokio::time::timeout(Duration::from_millis(300), conn.open_uni()).await;
+    assert!(opened.is_err(), "a unidirectional stream was opened");
+    client.sessions().await.unwrap();
+    client.close().await;
+    srv.shutdown().await;
+}

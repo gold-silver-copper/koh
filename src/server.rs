@@ -1,0 +1,615 @@
+//! `koh serve`: QUIC listener, TLS-bound client auth, scoped authorization,
+//! raw exec, headless jobs, delta sync, and fux-backed interactive sessions.
+
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+
+use iroh::EndpointId;
+use iroh::endpoint::{Connection, RecvStream, SendStream};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+use crate::jobs::JobManager;
+use crate::keys::{
+    ClientEntry, Role, Scope, expand_home, home_dir, load_clients, load_or_create_key, render_qr,
+};
+use crate::net::{bind_server, close_with, verify_client};
+use crate::pane::{AttachSpec, SessionManager};
+use crate::proto::{
+    ClientEvent, CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
+    Reply, Request, recv_msg, recv_msg_opt, send_msg,
+};
+use crate::sync::{receive_tree, send_tree};
+use crate::{Exit, KohError, Result};
+
+pub struct ServeOptions {
+    pub key_file: Option<PathBuf>,
+    pub direct: Option<SocketAddr>,
+    pub allow: Vec<EndpointId>,
+    pub shell: Option<String>,
+    pub state_dir: Option<PathBuf>,
+    pub disable_relay: bool,
+    pub quiet: bool,
+}
+
+struct ServerState {
+    key_file: Option<PathBuf>,
+    extra_allow: Vec<EndpointId>,
+    default_shell: String,
+    jobs: Arc<Mutex<JobManager>>,
+    sessions: Arc<Mutex<SessionManager>>,
+}
+
+impl ServerState {
+    fn authorize(&self, id: EndpointId) -> Result<Scope> {
+        if self.extra_allow.contains(&id) {
+            return Ok(Scope::Full);
+        }
+        let clients: Vec<ClientEntry> = load_clients(self.key_file.as_deref())?;
+        if let Some(entry) = clients.into_iter().find(|c| c.id == id) {
+            return Ok(entry.scope);
+        }
+        Err(KohError::refused("client key is not in clients list"))
+    }
+}
+
+pub struct RunningServer {
+    pub endpoint_id: EndpointId,
+    pub direct_addr: Option<SocketAddr>,
+    pub endpoint: iroh::Endpoint,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RunningServer {
+    pub async fn shutdown(self) {
+        self.task.abort();
+        self.endpoint.close().await;
+    }
+}
+
+/// Starts a server in-process (used by both `koh serve` CLI and loopback integration tests).
+pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
+    let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
+    let endpoint_id = secret.public();
+    let endpoint = bind_server(secret, opts.direct, opts.disable_relay).await?;
+    let direct_addr = endpoint.bound_sockets().into_iter().next();
+
+    let base = match opts.state_dir {
+        Some(dir) => dir,
+        None => default_state_dir()?,
+    };
+    let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
+    let sessions = Arc::new(Mutex::new(SessionManager::new(base.join("sessions"))?));
+    let default_shell = opts
+        .shell
+        .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/bin/sh".to_string());
+
+    let state = Arc::new(ServerState {
+        key_file: opts.key_file,
+        extra_allow: opts.allow,
+        default_shell,
+        jobs,
+        sessions,
+    });
+
+    if !opts.quiet {
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "koh server id: {endpoint_id}");
+        if let Some(addr) = direct_addr {
+            let _ = writeln!(err, "listening:     {addr}");
+        }
+        let _ = writeln!(err, "sessions dir:  {}", base.join("sessions").display());
+        let _ = writeln!(err, "{}", render_qr(&endpoint_id));
+    }
+
+    let ep_accept = endpoint.clone();
+    let task = tokio::spawn(async move {
+        while let Some(incoming) = ep_accept.accept().await {
+            let st = state.clone();
+            tokio::spawn(async move {
+                if let Ok(conn) = incoming.await {
+                    handle_connection(conn, st).await;
+                }
+            });
+        }
+    });
+
+    Ok(RunningServer {
+        endpoint_id,
+        direct_addr,
+        endpoint,
+        task,
+    })
+}
+
+/// CLI entrypoint for `koh serve`.
+pub async fn run_serve(opts: ServeOptions) -> Result<()> {
+    fuxix::own_children();
+    // Single-instance marker beside server.key (advisory file).
+    let marker = crate::keys::key_path(Role::Server, opts.key_file.as_deref())?
+        .with_file_name("server.key.serving");
+    let _lock = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&marker)
+        .ok();
+    let running = start_server(opts).await?;
+    let _ = tokio::signal::ctrl_c().await;
+    running.shutdown().await;
+    let _ = fs::remove_file(&marker);
+    Ok(())
+}
+
+fn default_state_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir).join("koh"));
+    }
+    let uid = rustix::process::geteuid().as_raw();
+    Ok(std::env::temp_dir().join(format!("koh-{uid}")))
+}
+
+async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
+    loop {
+        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+            break;
+        };
+        let conn_clone = conn.clone();
+        let st = state.clone();
+        tokio::spawn(async move {
+            let client_id = match verify_client(&conn_clone, &mut recv).await {
+                Ok(id) => id,
+                Err(_) => {
+                    close_with(&conn_clone, CloseCode::Refused);
+                    return;
+                }
+            };
+            let scope = match st.authorize(client_id) {
+                Ok(scope) => scope,
+                Err(err) => {
+                    let _ = send_msg(&mut send, &Reply::from_err(&err), MAX_CTRL).await;
+                    let _ = send.finish();
+                    close_with(&conn_clone, CloseCode::Refused);
+                    return;
+                }
+            };
+            let req: Request = match recv_msg(&mut recv, MAX_CTRL).await {
+                Ok(r) => r,
+                Err(_) => {
+                    close_with(&conn_clone, CloseCode::Protocol);
+                    return;
+                }
+            };
+            if let Err(err) = dispatch(req, scope, &st, &mut send, &mut recv).await {
+                let _ = send_msg(&mut send, &Reply::from_err(&err), MAX_CTRL).await;
+            }
+            let _ = send.finish();
+        });
+    }
+}
+
+fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
+    match cwd {
+        Some(dir) => expand_home(Path::new(dir)),
+        None => home_dir(),
+    }
+}
+
+async fn dispatch(
+    req: Request,
+    scope: Scope,
+    state: &ServerState,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    match req {
+        Request::Exec { argv, cwd, shell } => {
+            let dir = resolve_cwd(cwd.as_deref())?;
+            scope.check_exec(&dir)?;
+            handle_exec(&argv, &dir, shell, send, recv).await
+        }
+        Request::Run {
+            name,
+            argv,
+            cwd,
+            shell,
+        } => {
+            let dir = resolve_cwd(cwd.as_deref())?;
+            scope.check_exec(&dir)?;
+            let info = JobManager::start(&state.jobs, name, &argv, &dir, shell)?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_msg(send, &info, MAX_CTRL).await
+        }
+        Request::Jobs { name } => {
+            scope.check_full()?;
+            let list = {
+                let guard = state
+                    .jobs
+                    .lock()
+                    .map_err(|_| KohError::internal("jobs lock"))?;
+                guard.list(name.as_deref())?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_msg(send, &list, MAX_CTRL).await
+        }
+        Request::Logs {
+            name,
+            tail,
+            all,
+            follow,
+        } => {
+            scope.check_full()?;
+            let handle = {
+                let guard = state
+                    .jobs
+                    .lock()
+                    .map_err(|_| KohError::internal("jobs lock"))?;
+                guard.get(&name)?
+            };
+            let (log_path, mut rx, started) = (handle.log_path, handle.state_rx, handle.started);
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let initial =
+                crate::jobs::read_log_tail(&log_path, if all { None } else { tail.or(Some(200)) })?;
+            let mut offset = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+            if !initial.is_empty() {
+                for chunk in initial.chunks(64 << 10) {
+                    send_msg(send, &LogMsg::Data(chunk.to_vec()), MAX_CHUNK).await?;
+                }
+            }
+            if follow {
+                loop {
+                    let meta_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(offset);
+                    if meta_len > offset
+                        && let Ok(mut f) = fs::File::open(&log_path)
+                    {
+                        use std::io::{Read as _, Seek as _, SeekFrom};
+                        if f.seek(SeekFrom::Start(offset)).is_ok() {
+                            let mut buf = vec![0u8; 64 << 10];
+                            while let Ok(n @ 1..) = f.read(&mut buf) {
+                                if let Some(slice) = buf.get(..n) {
+                                    send_msg(send, &LogMsg::Data(slice.to_vec()), MAX_CHUNK)
+                                        .await?;
+                                }
+                                offset += n as u64;
+                            }
+                        }
+                    }
+                    let (st, exit) = rx.borrow().clone();
+                    if st != "running" {
+                        send_msg(
+                            send,
+                            &LogMsg::Done {
+                                state: st,
+                                exit,
+                                age_secs: started.elapsed().as_secs(),
+                            },
+                            MAX_CTRL,
+                        )
+                        .await?;
+                        break;
+                    }
+                    tokio::select! {
+                        _ = rx.changed() => {}
+                        () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                    }
+                }
+            } else {
+                let (st, exit) = rx.borrow().clone();
+                send_msg(
+                    send,
+                    &LogMsg::Done {
+                        state: st,
+                        exit,
+                        age_secs: started.elapsed().as_secs(),
+                    },
+                    MAX_CTRL,
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        Request::Kill { name, signal } => {
+            scope.check_full()?;
+            let info = {
+                let guard = state
+                    .jobs
+                    .lock()
+                    .map_err(|_| KohError::internal("jobs lock"))?;
+                guard.kill(&name, signal)?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_msg(send, &info, MAX_CTRL).await
+        }
+        Request::WaitJob {
+            name,
+            text,
+            tail,
+            timeout_secs,
+        } => {
+            scope.check_full()?;
+            let handle = {
+                let guard = state
+                    .jobs
+                    .lock()
+                    .map_err(|_| KohError::internal("jobs lock"))?;
+                guard.get(&name)?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let res =
+                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs)
+                    .await?;
+            send_msg(send, &res, MAX_FRAME).await
+        }
+        Request::WaitFile { path, timeout_secs } => {
+            let full = expand_home(Path::new(&path))?;
+            scope.check_cp(&full)?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let res = crate::jobs::wait_file(full, timeout_secs).await?;
+            send_msg(send, &res, MAX_CTRL).await
+        }
+        Request::CpPush {
+            dst,
+            excludes,
+            delete,
+            preserve_mtime,
+            dry_run,
+        } => {
+            let target = expand_home(Path::new(&dst))?;
+            scope.check_cp(&target)?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let _ = receive_tree(
+                &target,
+                &excludes,
+                delete,
+                preserve_mtime,
+                dry_run,
+                send,
+                recv,
+            )
+            .await?;
+            Ok(())
+        }
+        Request::CpPull { src, excludes, .. } => {
+            let source = expand_home(Path::new(&src))?;
+            scope.check_cp(&source)?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let _ = send_tree(&source, &excludes, send, recv).await?;
+            Ok(())
+        }
+        Request::Sessions => {
+            scope.check_full()?;
+            let list = {
+                let guard = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| KohError::internal("sessions lock"))?;
+                guard.list()
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_msg(send, &list, MAX_CTRL).await
+        }
+        Request::Output { session, last } => {
+            scope.check_full()?;
+            let sess = {
+                let guard = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| KohError::internal("sessions lock"))?;
+                guard.get(session)?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_msg(send, &sess.output(last), MAX_FRAME).await
+        }
+        Request::WaitSession {
+            session,
+            timeout_secs,
+        } => {
+            scope.check_full()?;
+            let sess = {
+                let guard = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| KohError::internal("sessions lock"))?;
+                guard.get(session)?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            let res = sess.wait_command(timeout_secs).await?;
+            send_msg(send, &res, MAX_FRAME).await
+        }
+        Request::Attach {
+            session,
+            new,
+            cols,
+            rows,
+            argv,
+            cwd,
+        } => {
+            scope.check_full()?;
+            let dir = resolve_cwd(cwd.as_deref())?;
+            let sess = {
+                let mut guard = state
+                    .sessions
+                    .lock()
+                    .map_err(|_| KohError::internal("sessions lock"))?;
+                guard.attach_or_create(AttachSpec {
+                    requested: session,
+                    new,
+                    cols,
+                    rows,
+                    argv: &argv,
+                    cwd: &dir,
+                    default_shell: &state.default_shell,
+                })?
+            };
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            sess.set_attached(true);
+            sess.resize(cols, rows);
+            let mut rx = sess.subscribe();
+
+            // Send initial frame immediately.
+            let initial = rx.borrow_and_update().clone();
+            send_msg(send, &initial, MAX_FRAME).await?;
+
+            // Bridge client events -> PTY and watch frames -> client.
+            loop {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        let frame = rx.borrow_and_update().clone();
+                        let done = frame.state != "running";
+                        if send_msg(send, &frame, MAX_FRAME).await.is_err() {
+                            break;
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                    ev = recv_msg_opt::<ClientEvent>(recv, MAX_CHUNK) => {
+                        match ev {
+                            Ok(Some(ClientEvent::Input(bytes))) => {
+                                let _ = sess.write_input(&bytes);
+                            }
+                            Ok(Some(ClientEvent::Resize { cols, rows })) => {
+                                sess.resize(cols, rows);
+                            }
+                            Ok(Some(ClientEvent::Detach)) | Ok(None) | Err(_) => break,
+                        }
+                    }
+                }
+            }
+            sess.set_attached(false);
+            Ok(())
+        }
+    }
+}
+
+/// Raw non-PTY exec: separate stdout/stderr, binary-clean, stdin EOF, and SIGHUP on client drop.
+async fn handle_exec(
+    argv: &[String],
+    cwd: &Path,
+    shell: bool,
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+) -> Result<()> {
+    let mut std_cmd = crate::jobs::build_command(argv, cwd, shell)?;
+    fuxix::new_session(&mut std_cmd, false);
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::NotFound {
+            Exit::NOT_FOUND
+        } else {
+            Exit::CANNOT_START
+        };
+        KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
+    })?;
+    let pgid = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+
+    let mut child_stdin = child.stdin.take();
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ExecServerMsg>(32);
+
+    let tx1 = out_tx.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(mut out) = child_stdout.take() {
+            let mut buf = vec![0u8; 32 << 10];
+            while let Ok(n @ 1..) = out.read(&mut buf).await {
+                if let Some(slice) = buf.get(..n)
+                    && tx1
+                        .send(ExecServerMsg::Stdout(slice.to_vec()))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    let tx2 = out_tx.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(mut err) = child_stderr.take() {
+            let mut buf = vec![0u8; 32 << 10];
+            while let Ok(n @ 1..) = err.read(&mut buf).await {
+                if let Some(slice) = buf.get(..n)
+                    && tx2
+                        .send(ExecServerMsg::Stderr(slice.to_vec()))
+                        .await
+                        .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    drop(out_tx);
+
+    let mut disconnected = false;
+    let mut stdin_open = true;
+    loop {
+        tokio::select! {
+            msg = out_rx.recv() => {
+                match msg {
+                    Some(m) => {
+                        if send_msg(send, &m, MAX_CHUNK).await.is_err() {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            ev = recv_msg_opt::<ExecClientMsg>(recv, MAX_CHUNK), if stdin_open => {
+                match ev {
+                    Ok(Some(ExecClientMsg::Stdin(bytes))) => {
+                        if let Some(stdin) = child_stdin.as_mut() {
+                            let _ = stdin.write_all(&bytes).await;
+                        }
+                    }
+                    Ok(Some(ExecClientMsg::Eof)) => {
+                        stdin_open = false;
+                        drop(child_stdin.take());
+                    }
+                    Ok(None) | Err(_) => {
+                        disconnected = true;
+                        drop(child_stdin.take());
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    if disconnected && let Some(pid) = pgid {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+    }
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    let code = match child.wait().await {
+        Ok(status) => status
+            .code()
+            .or_else(|| status.signal().map(|s| 128 + s))
+            .unwrap_or(1),
+        Err(_) => 1,
+    };
+    if !disconnected {
+        let _ = send_msg(send, &ExecServerMsg::Exit(code), MAX_CTRL).await;
+    }
+    Ok(())
+}

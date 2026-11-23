@@ -2353,16 +2353,24 @@ async fn a_destination_that_cannot_be_one_is_not_reported_as_copied_to() {
                 .await
         }
     };
+    std::os::unix::fs::symlink(allowed.join("nowhere"), allowed.join("dangling")).unwrap();
     for dry_run in [true, false] {
-        // A file is no directory to copy into, and a dry run says so as the copy would.
-        let err = push(allowed.join("file").display().to_string(), dry_run).await;
-        assert_eq!(err.unwrap_err().code, Exit::FAILED, "dry run: {dry_run}");
+        // A file is no directory to copy into, and a dry run says so as the copy would. Nor is
+        // a symlink that leads nowhere: something is there, and it is not a directory.
+        for name in ["file", "dangling"] {
+            let err = push(allowed.join(name).display().to_string(), dry_run).await;
+            assert_eq!(
+                err.unwrap_err().code,
+                Exit::FAILED,
+                "{name}, dry: {dry_run}"
+            );
+        }
         // A name with a NUL in it names nothing: by its text it is not a path beneath DIR.
         let err = push(format!("{}/bad\0name", allowed.display()), dry_run).await;
         assert_eq!(err.unwrap_err().code, Exit::REFUSED, "dry run: {dry_run}");
     }
     assert_eq!(fs::read_to_string(allowed.join("file")).unwrap(), "a file");
-    assert_eq!(names_in(&allowed), ["file"]);
+    assert_eq!(names_in(&allowed), ["dangling", "file"]);
 
     client.close().await;
     srv.shutdown().await;

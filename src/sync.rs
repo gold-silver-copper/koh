@@ -426,16 +426,18 @@ pub async fn receive_tree(
         fs::create_dir_all(dir)
             .map_err(|e| KohError::failed(format!("mkdir {}: {e}", dir.display())))
     };
-    match found(dst, fs::metadata(dst))? {
-        Some(there) if !there.is_dir() => {
-            return Err(KohError::failed(format!(
-                "{} is not a directory",
-                dst.display()
-            )));
-        }
+    // What is at the destination itself is looked at first: a symlink that leads nowhere is
+    // there, and is no directory. Anything there must lead to one.
+    if found(dst, fs::symlink_metadata(dst))?.is_none() {
         // In a dry run nothing is made: a destination that is not there holds nothing.
-        None if !dry_run => mkdir(dst)?,
-        _ => {}
+        if !dry_run {
+            mkdir(dst)?;
+        }
+    } else if !fs::metadata(dst).is_ok_and(|there| there.is_dir()) {
+        return Err(KohError::failed(format!(
+            "{} is not a directory",
+            dst.display()
+        )));
     }
 
     for entry in &src_entries {

@@ -273,6 +273,16 @@ impl PaneSession {
         let Ok(mut generation) = self.generation.lock() else {
             return;
         };
+        // What its program's end made of the session is final. A round asked for with the state
+        // from just before (a resize that came as the program ended) tells of the end all the same.
+        let ended = {
+            let last = self.frame_tx.borrow();
+            (last.state != "running").then(|| (last.state.clone(), last.exit))
+        };
+        let (state, exit) = match &ended {
+            Some((state, exit)) => (state.as_str(), *exit),
+            None => (state, exit),
+        };
 
         *generation = generation.wrapping_add(1);
         let _ = atomic_write(

@@ -2175,3 +2175,32 @@ async fn attaching_to_a_session_that_has_ended_shows_it_and_lets_go() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[test]
+fn a_session_whose_program_has_ended_never_says_it_runs_again() {
+    use koh::pane::PaneSession;
+    // A resize tells of the state the session is in. One that comes just as the program ends
+    // must not tell of the state from before: a session that says it runs after its program
+    // has gone is kept for ever, and counted against `--max-sessions`. Forty short programs, each
+    // resized as fast as can be while it ends.
+    let tmp = TempDir::new("ended-stays-ended");
+    let argv = ["/bin/sh".to_string(), "-c".into(), "exit 3".into()];
+    for round in 0..40u32 {
+        let dir = tmp.0.join(format!("s{round}"));
+        let session =
+            PaneSession::spawn(round, dir, 80, 10, 10, 20, &argv, &tmp.0, "/bin/sh").unwrap();
+        let began = std::time::Instant::now();
+        let mut cols = 80;
+        while session.info().state == "running" && began.elapsed() < Duration::from_millis(40) {
+            cols = if cols == 80 { 81 } else { 80 };
+            session.resize(cols, 10, 10, 20);
+            std::thread::yield_now();
+        }
+        // (Left alone, it has all the time it needs to say that its program ended.)
+        while session.info().state == "running" && began.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (0..5).for_each(|_| session.resize(80, 10, 10, 20));
+        assert_eq!(session.info().state, "exited 3", "round {round}");
+    }
+}

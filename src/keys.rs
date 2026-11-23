@@ -250,7 +250,6 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
 /// endpoint id, and each client connection would reach one or the other, each with its own jobs
 /// and sessions. The lock is on a file beside the key, which stays: its being there says nothing.
 pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
-    use rustix::fs::{Mode, OFlags};
     let key = key_path(Role::Server, explicit)?;
     let name = key
         .file_name()
@@ -258,10 +257,14 @@ pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
         .to_string_lossy();
     let path = key.with_file_name(format!("{name}.serving"));
     let failed = |e: std::io::Error| KohError::failed(format!("lock {}: {e}", path.display()));
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let lock: File = rustix::fs::open(&path, flags, Mode::from_raw_mode(0o600))
-        .map_err(|e| failed(e.into()))?
-        .into();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(failed)?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
         Err(fs::TryLockError::WouldBlock) => Err(KohError::new(

@@ -552,6 +552,8 @@ pub struct SessionManager {
     next_id: u32,
     last_id: Option<u32>,
     sessions: BTreeMap<u32, Arc<PaneSession>>,
+    /// Most sessions kept at once, running or ended.
+    max: usize,
 }
 
 pub struct AttachSpec<'a> {
@@ -567,7 +569,7 @@ pub struct AttachSpec<'a> {
 }
 
 impl SessionManager {
-    pub fn new(root: PathBuf) -> Result<Self> {
+    pub fn new(root: PathBuf, max: usize) -> Result<Self> {
         fs::create_dir_all(&root)
             .map_err(|e| KohError::failed(format!("mkdir {}: {e}", root.display())))?;
         Ok(Self {
@@ -575,7 +577,38 @@ impl SessionManager {
             next_id: 1,
             last_id: None,
             sessions: BTreeMap::new(),
+            max,
         })
+    }
+
+    /// Room for one more session: with `max` kept, the oldest whose program has ended and that
+    /// no client is attached to is forgotten, its pane folder with it; with none such, busy.
+    fn make_room(&mut self) -> Result<()> {
+        if self.sessions.len() < self.max {
+            return Ok(());
+        }
+        let ended = |s: &Arc<PaneSession>| {
+            s.frame_tx.borrow().state != "running" && s.attached.load(Ordering::Relaxed) == 0
+        };
+        let oldest = self
+            .sessions
+            .iter()
+            .find(|(_, s)| ended(s))
+            .map(|(id, _)| *id);
+        match oldest.and_then(|id| self.sessions.remove(&id)) {
+            Some(gone) => {
+                let _ = fs::remove_dir_all(&gone.dir);
+                Ok(())
+            }
+            None => Err(KohError::new(
+                Exit::BUSY,
+                "busy",
+                format!(
+                    "server busy: it keeps at most {} sessions (--max-sessions), and all are running or attached",
+                    self.max
+                ),
+            )),
+        }
     }
 
     /// Attaches to an existing session or spawns a new one. Returns `(session, created_new)`.
@@ -595,6 +628,7 @@ impl SessionManager {
         {
             return Ok((sess.clone(), false));
         }
+        self.make_room()?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let dir = self.root.join(format!("s{id}"));

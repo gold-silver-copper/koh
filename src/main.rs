@@ -328,15 +328,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_serve(args: &[String]) -> Result<Exit> {
-    let mut opts = ServeOptions {
-        key_file: None,
-        direct: None,
-        allow: Vec::new(),
-        shell: None,
-        state_dir: None,
-        disable_relay: false,
-        quiet: false,
-    };
+    let mut opts = ServeOptions::default();
     let mut i = 0;
     while let Some(a) = args.get(i).map(String::as_str) {
         match a {
@@ -353,6 +345,18 @@ async fn cmd_serve(args: &[String]) -> Result<Exit> {
                 .push(parse_endpoint_id(&take_opt(args, &mut i, a)?)?),
             "--shell" => opts.shell = Some(take_opt(args, &mut i, a)?),
             "--no-relay" => opts.disable_relay = true,
+            "--max-connections" | "--max-sessions" => {
+                let most = take_opt(args, &mut i, a)?
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n >= 1)
+                    .ok_or_else(|| KohError::usage(format!("{a} takes a number, 1 or more")))?;
+                if a == "--max-connections" {
+                    opts.max_connections = most;
+                } else {
+                    opts.max_sessions = most;
+                }
+            }
             _ => return Err(KohError::usage(format!("unexpected serve flag {a:?}"))),
         }
         i += 1;

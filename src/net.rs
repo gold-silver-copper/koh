@@ -118,7 +118,9 @@ pub async fn open_authed_stream(
         key: *secret.public().as_bytes(),
         signature: sig.to_bytes().to_vec(),
     };
-    send_msg(&mut send, &proof, MAX_PROOF).await?;
+    send_msg(&mut send, &proof, MAX_PROOF)
+        .await
+        .map_err(|e| close_error(conn).unwrap_or(e))?;
     Ok((send, recv))
 }
 
@@ -141,15 +143,23 @@ pub fn close_with(conn: &Connection, code: CloseCode) {
     conn.close(VarInt::from_u32(code as u32), b"");
 }
 
-pub fn map_conn_err(conn: &Connection, fallback: String) -> KohError {
-    if let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = conn.close_reason() {
-        match CloseCode::from_u64(close.error_code.into_inner()) {
-            Some(CloseCode::Refused) => return KohError::refused("server refused this client key"),
-            Some(CloseCode::Busy) => {
-                return KohError::new(crate::Exit::BUSY, "busy", "server is busy");
-            }
-            _ => {}
-        }
+/// Why the server closed the connection, if it did and said: refused, or busy.
+pub fn close_error(conn: &Connection) -> Option<KohError> {
+    let Some(iroh::endpoint::ConnectionError::ApplicationClosed(close)) = conn.close_reason()
+    else {
+        return None;
+    };
+    match CloseCode::from_u64(close.error_code.into_inner()) {
+        Some(CloseCode::Refused) => Some(KohError::refused("server refused this client key")),
+        Some(CloseCode::Busy) => Some(KohError::new(
+            crate::Exit::BUSY,
+            "busy",
+            "server busy: too many connections at once",
+        )),
+        _ => None,
     }
-    KohError::unreachable(fallback)
+}
+
+pub fn map_conn_err(conn: &Connection, fallback: String) -> KohError {
+    close_error(conn).unwrap_or_else(|| KohError::unreachable(fallback))
 }

@@ -62,6 +62,7 @@ async fn boot_pair(
         state_dir: Some(state_dir.clone()),
         disable_relay: true,
         quiet: true,
+        ..ServeOptions::default()
     })
     .await
     .unwrap();
@@ -831,6 +832,7 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
         state_dir: Some(tmp.0.join("state")),
         disable_relay: true,
         quiet: true,
+        ..ServeOptions::default()
     })
     .await
     .unwrap();
@@ -1007,6 +1009,7 @@ async fn boot_scoped(
         state_dir: Some(tmp.0.join("state")),
         disable_relay: true,
         quiet: true,
+        ..ServeOptions::default()
     })
     .await
     .unwrap();
@@ -1223,6 +1226,7 @@ async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
             state_dir: Some(tmp.0.join("state")),
             disable_relay: true,
             quiet: true,
+            ..ServeOptions::default()
         })
     };
     let first = serve().await.expect("the first server starts");
@@ -1236,4 +1240,165 @@ async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
     assert!(tmp.0.join("cfg/server.key.serving").exists());
     let again = serve().await.expect("a server once the first stopped");
     again.shutdown().await;
+}
+
+/// A server that allows `allow`, with its other options from `more`.
+async fn boot_server(
+    tmp: &TempDir,
+    allow: Vec<iroh::EndpointId>,
+    more: ServeOptions,
+) -> (koh::server::RunningServer, Option<Route>) {
+    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
+    let srv = start_server(ServeOptions {
+        key_file: Some(tmp.0.join("srv_cfg/server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow,
+        shell: Some("/bin/sh".into()),
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..more
+    })
+    .await
+    .unwrap();
+    let route = Some(Route::Direct(srv.direct_addr.unwrap()));
+    (srv, route)
+}
+
+fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
+    fs::create_dir_all(tmp.0.join("cli_cfg")).unwrap();
+    load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg").join(name))).unwrap()
+}
+
+#[tokio::test]
+async fn connections_are_capped_before_auth_and_a_place_comes_back_when_one_ends() {
+    let tmp = TempDir::new("max-conn");
+    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
+    let more = ServeOptions {
+        max_connections: 2,
+        proof_timeout: Duration::from_secs(60),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = |key: &iroh::SecretKey| {
+        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false)
+    };
+
+    // Two peers the server does not know, which prove nothing, hold both places.
+    let (first, second) = (
+        dial(&stranger).await.unwrap(),
+        dial(&stranger).await.unwrap(),
+    );
+    let third = dial(&friend).await.unwrap();
+    let busy = third.sessions().await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    third.close().await;
+
+    // One of them goes: its place is the next client's.
+    first.close().await;
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let next = dial(&friend).await.unwrap();
+            let listed = next.sessions().await;
+            next.close().await;
+            match listed {
+                Ok(list) => break list,
+                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a place came back within 5 s");
+    assert!(served.is_empty());
+
+    second.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
+    let tmp = TempDir::new("proof-deadline");
+    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
+    let more = ServeOptions {
+        proof_timeout: Duration::from_millis(300),
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = |key: &iroh::SecretKey| {
+        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), true)
+    };
+
+    let silent = dial(&stranger).await.unwrap();
+    let known = dial(&friend).await.unwrap();
+    known.sessions().await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(5), silent.connection().closed())
+        .await
+        .expect("the silent connection was closed within 5 s");
+    let refused = koh::proto::CloseCode::Refused as u64;
+    assert!(
+        matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code.into_inner() == refused),
+        "{closed:?}"
+    );
+    // One that proved its key in time stays, past the deadline.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    known.sessions().await.unwrap();
+
+    known.close().await;
+    silent.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn sessions_are_capped_and_an_ended_one_makes_room() {
+    let tmp = TempDir::new("max-sess");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_sessions: 2,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |line: &str| Request::Attach {
+        session: None,
+        new: true,
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: vec!["/bin/sh".into(), "-c".into(), line.into()],
+        cwd: Some(tmp.0.display().to_string()),
+    };
+
+    let (mut ends, _ends_recv) = client.request(&attach("read line")).await.unwrap();
+    let _stays = client.request(&attach("sleep 30")).await.unwrap();
+    let busy = client.request(&attach("sleep 30")).await.unwrap_err();
+    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
+    assert_eq!(client.sessions().await.unwrap().len(), 2);
+
+    // The first one's program ends and its client detaches: the server forgets it for a new one.
+    send_msg(&mut ends, &ClientEvent::Input(b"go\n".to_vec()), MAX_CHUNK)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if list.iter().any(|s| s.state != "running" && !s.attached) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first session ended and was left within 5 s");
+    let _third = client.request(&attach("sleep 30")).await.unwrap();
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|s| s.state == "running"), "{list:?}");
+
+    client.close().await;
+    srv.shutdown().await;
 }

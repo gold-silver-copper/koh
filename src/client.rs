@@ -20,7 +20,7 @@ use tokio::io::AsyncReadExt as _;
 use tokio::sync::watch;
 
 use crate::keys::{Role, Route, load_or_create_key, resolve_server};
-use crate::net::{connect_server, map_conn_err, open_authed_stream};
+use crate::net::{close_error, connect_server, map_conn_err, open_authed_stream};
 use crate::pane::write_v1_metadata;
 use crate::proto::{
     ClientEvent, ExecClientMsg, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
@@ -129,7 +129,9 @@ impl Client {
 
     pub async fn request(&self, req: &Request) -> Result<(SendStream, RecvStream)> {
         let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
-        send_msg(&mut send, req, MAX_CTRL).await?;
+        send_msg(&mut send, req, MAX_CTRL)
+            .await
+            .map_err(|e| close_error(&self.conn).unwrap_or(e))?;
         let reply: Reply = recv_msg(&mut recv, MAX_CTRL)
             .await
             .map_err(|e| map_conn_err(&self.conn, e.message))?;

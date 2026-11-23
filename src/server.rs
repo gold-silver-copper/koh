@@ -8,11 +8,14 @@ use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::sync::Semaphore;
 
 use crate::jobs::JobManager;
 use crate::keys::{
@@ -36,6 +39,37 @@ pub struct ServeOptions {
     pub state_dir: Option<PathBuf>,
     pub disable_relay: bool,
     pub quiet: bool,
+    /// Most connections held at once, counted from a peer's first packet, before it proves a key.
+    pub max_connections: usize,
+    /// Most sessions kept at once, running or ended.
+    pub max_sessions: usize,
+    /// How long a connection has to prove a key the server allows before it is closed.
+    pub proof_timeout: Duration,
+}
+
+/// How long a connection turned away as busy is given to ask, and then to hear the answer.
+const BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// The CLI's default for `--max-connections`.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+/// The CLI's default for `--max-sessions`.
+pub const DEFAULT_MAX_SESSIONS: usize = 64;
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            key_file: None,
+            direct: None,
+            allow: Vec::new(),
+            shell: None,
+            state_dir: None,
+            disable_relay: false,
+            quiet: false,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            proof_timeout: Duration::from_secs(10),
+        }
+    }
 }
 
 struct ServerState {
@@ -44,6 +78,7 @@ struct ServerState {
     default_shell: String,
     jobs: Arc<Mutex<JobManager>>,
     sessions: Arc<Mutex<SessionManager>>,
+    proof_timeout: Duration,
 }
 
 impl ServerState {
@@ -88,7 +123,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         None => default_state_dir()?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
-    let sessions = Arc::new(Mutex::new(SessionManager::new(base.join("sessions"))?));
+    let sessions = SessionManager::new(base.join("sessions"), opts.max_sessions)?;
+    let sessions = Arc::new(Mutex::new(sessions));
     let default_shell = opts
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
@@ -100,6 +136,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         default_shell,
         jobs,
         sessions,
+        proof_timeout: opts.proof_timeout,
     });
 
     if !opts.quiet {
@@ -112,15 +149,35 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         let _ = writeln!(err, "{}", render_qr(&endpoint_id));
     }
 
+    // A connection holds one of `max_connections` places from its peer's first packet, before
+    // anything is known of the peer, until it is gone. With none free, as many more are let
+    // finish connecting only to be told the server is busy; past those, a peer is refused unheard.
+    let places = Arc::new(Semaphore::new(opts.max_connections));
+    let turned_away = Arc::new(Semaphore::new(opts.max_connections));
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
         while let Some(incoming) = ep_accept.accept().await {
-            let st = state.clone();
-            tokio::spawn(async move {
-                if let Ok(conn) = incoming.await {
-                    handle_connection(conn, st).await;
-                }
-            });
+            if let Ok(place) = places.clone().try_acquire_owned() {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        handle_connection(conn, st).await;
+                    }
+                    drop(place);
+                });
+            } else if let Ok(place) = turned_away.clone().try_acquire_owned() {
+                tokio::spawn(async move {
+                    if let Ok(conn) = incoming.await {
+                        // (Once the client has connected and asks, so that it reads why.)
+                        let _ = tokio::time::timeout(BUSY_WAIT, conn.accept_bi()).await;
+                        close_with(&conn, CloseCode::Busy);
+                        let _ = tokio::time::timeout(BUSY_WAIT, conn.closed()).await;
+                    }
+                    drop(place);
+                });
+            } else {
+                incoming.refuse();
+            }
         }
     });
 
@@ -152,13 +209,32 @@ fn default_state_dir() -> Result<PathBuf> {
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 
+/// Serves a connection's requests until it is gone. It is closed if, `proof_timeout` after it
+/// began, no request of it has proved a key the server allows: a peer that proves nothing does
+/// not keep its place.
 async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
+    let proven = Arc::new(AtomicBool::new(false));
+    let deadline = tokio::time::sleep(state.proof_timeout);
+    tokio::pin!(deadline);
+    let mut unproven = true;
     loop {
-        let Ok((mut send, mut recv)) = conn.accept_bi().await else {
-            break;
+        let (mut send, mut recv) = tokio::select! {
+            () = &mut deadline, if unproven => {
+                if !proven.load(Ordering::Relaxed) {
+                    close_with(&conn, CloseCode::Refused);
+                    break;
+                }
+                unproven = false;
+                continue;
+            }
+            accepted = conn.accept_bi() => match accepted {
+                Ok(streams) => streams,
+                Err(_) => break,
+            },
         };
         let conn_clone = conn.clone();
         let st = state.clone();
+        let proven = proven.clone();
         tokio::spawn(async move {
             let client_id = match verify_client(&conn_clone, &mut recv).await {
                 Ok(id) => id,
@@ -176,6 +252,7 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>) {
                     return;
                 }
             };
+            proven.store(true, Ordering::Relaxed);
             let req: Request = match recv_msg(&mut recv, MAX_CTRL).await {
                 Ok(r) => r,
                 Err(_) => {

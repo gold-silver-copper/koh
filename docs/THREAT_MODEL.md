@@ -111,7 +111,7 @@ A wrong endpoint id, or a host someone else now controls.
 
 Not defended against: koh trusts the machines it runs on. The key file is 0600 in a directory
 that koh makes 0700 and refuses if group or others may write to it; whose directory it is, koh
-does not check. The key is never read through a symlink (`src/keys.rs`). Sessions' pane folders
-and jobs' logs are kept in `$XDG_RUNTIME_DIR/koh`; where that is not set they are in the
-system's temporary directory under `koh-UID` (the owner of the server's lock file), which koh
-does not check the ownership of.
+does not check, and a key that is a symlink is read as the file it leads to (`src/keys.rs`).
+Sessions' pane folders and jobs' logs are kept in `$XDG_RUNTIME_DIR/koh`; where that is not set
+they are in the system's temporary directory under `koh-UID` (the number `id -u` gives), which
+koh does not check the ownership of.

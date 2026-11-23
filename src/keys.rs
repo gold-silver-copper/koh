@@ -189,7 +189,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Loads or creates a 32-byte Ed25519 identity key with `0600` permissions (refusing symlinks).
+/// Loads or creates a 32-byte Ed25519 identity key with `0600` permissions.
 pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretKey> {
     let path = key_path(role, explicit)?;
     let parent = path
@@ -198,7 +198,7 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
         .ok_or_else(|| KohError::usage("invalid key path"))?;
     ensure_private_dir(parent)?;
 
-    match open_nofollow(&path) {
+    match File::open(&path) {
         Ok(file) => {
             let meta = file
                 .metadata()
@@ -280,17 +280,6 @@ pub fn reset_key(role: Role, explicit: Option<&Path>) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(KohError::failed(format!("remove {}: {e}", path.display()))),
     }
-}
-
-fn open_nofollow(path: &Path) -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400_000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x0100;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
 }
 
 pub fn parse_endpoint_id(s: &str) -> Result<EndpointId> {

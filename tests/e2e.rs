@@ -2492,3 +2492,15 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
 
     client.close().await;
 }
+
+#[test]
+fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
+    // (koh has no anti-symlink mechanics. The one this replaced was a number written by hand
+    // for each system, and the wrong one on arm64 Linux, where it refused nothing.)
+    let tmp = TempDir::new("key-link");
+    let (real, link) = (tmp.0.join("real.key"), tmp.0.join("link.key"));
+    let made = load_or_create_key(Role::Client, Some(&real)).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let read = load_or_create_key(Role::Client, Some(&link)).unwrap();
+    assert_eq!(read.public(), made.public());
+}

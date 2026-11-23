@@ -30,13 +30,17 @@ binary, its tests and the fuzz targets share code, and any release may change it
   for, and stops at a file longer than its sender said.
 - What a peer says went wrong is never taken for success: its exit code is used only if it is
   one koh has for a failure, and is 1 otherwise. A server could make a failed `koh cp` exit 0.
-- `koh serve` takes at most `--max-connections` connections (64), counted from a peer's first
-  packet, and closes one that has not finished its handshake and proved an allowed key within
-  10 s of that packet; it keeps at most `--max-sessions` sessions (64), an ended one making
+- `koh serve` takes at most `--max-connections` connections (64), each counted from when the
+  server takes it up (after its first packet has arrived; the time that packet waited is not
+  counted), and closes one that has not finished its handshake and proved an allowed key
+  within 10 s of then; it keeps at most `--max-sessions` sessions (64), an ended one making
   room for a new one once that has started. Each takes 1 to 65535. Past either a client
-  exits 75, also when the server refuses it before it has connected. Nothing bounded these. A connection's place comes back when it is closed, or after
-  it has been silent for its idle timeout (15 s for a command or a copy); so a `koh` command
-  that fails now closes its connection as one that succeeds does.
+  exits 75, also when the server refuses it before it has connected. A connection let in only
+  to be told "busy" is told within 2 s of being taken up if it has connected by then, and is
+  dropped without being told if it has not. Nothing bounded these. A connection's place comes
+  back when it is closed, or after it has been silent for its idle timeout (15 s for a command
+  or a copy); so a `koh` command that fails now closes its connection as one that succeeds
+  does.
 - A connection is given no unidirectional streams (it had four, which nothing read).
 - A session's picture listing is read in time that grows with its length: a server could fill
   a frame with picture names and keep a client busy for minutes.
@@ -52,7 +56,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
 ### Changed
 
 - An entry more than 128 directories beneath its tree is not copied: the end that reads the
-  tree says so before anything is sent or removed (exit 1).
+  tree says so before anything is sent or removed (exit 1). With `--delete` that holds for
+  what the destination already has, so something deeper there fails the whole copy, even
+  where the copy would have removed it.
 - `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
   this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
   points under a fixed-seed mutation run.

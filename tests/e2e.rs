@@ -1631,7 +1631,7 @@ async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() 
     assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
     early.close().await;
 
-    // The deadline is counted from that first packet, handshake and all: two seconds on, the
+    // The deadline is counted from when the server took that up, handshake and all: two seconds on, the
     // place is the next client's, though the stalled peer is still sending.
     tokio::time::timeout(Duration::from_secs(8), async {
         loop {

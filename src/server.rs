@@ -40,17 +40,19 @@ pub struct ServeOptions {
     pub state_dir: Option<PathBuf>,
     pub disable_relay: bool,
     pub quiet: bool,
-    /// Most connections held at once, counted from a peer's first packet, before it proves a key.
+    /// Most connections held at once, each counted from when the server takes it up, before it
+    /// proves a key.
     pub max_connections: usize,
     /// Most sessions kept at once, running or ended.
     pub max_sessions: usize,
-    /// How long a connection has, from its peer's first packet, to finish its handshake and prove
-    /// a key the server allows before it is closed.
+    /// How long a connection has, from when the server takes it up, to finish its handshake and
+    /// prove a key the server allows before it is closed.
     pub proof_timeout: Duration,
 }
 
-/// How long a connection turned away as busy has, from its first packet, to connect and ask: it is
-/// told as soon as it asks, and at the latest then.
+/// How long a connection turned away as busy has, from when the server takes it up, to connect
+/// and ask: it is told as soon as it asks, and at the latest then. One that has not connected by
+/// then is dropped without being told.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 
 /// The time `long` after `from`. More than thirty years is thirty years, the timer's own "never":
@@ -183,11 +185,12 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         let _ = writeln!(err, "{}", render_qr(&endpoint_id));
     }
 
-    // A connection holds one of `max_connections` places from its peer's first packet, before
-    // anything is known of the peer, until it is gone; and it has `proof_timeout` from that packet
-    // to finish its handshake and prove a key the server allows, or its place is the next one's.
-    // With no place free, as many more are let connect, in `BUSY_WAIT` at most, only to be told
-    // the server is busy; past those, a peer is refused unheard.
+    // A connection holds one of `max_connections` places from when it is taken up here, before
+    // anything is known of the peer, until it is gone; and it has `proof_timeout` from then to
+    // finish its handshake and prove a key the server allows, or its place is the next one's.
+    // (That is when this loop comes to it, after its first packet: the time the packet waited for
+    // the loop is not counted.) With no place free, as many more are let connect, in `BUSY_WAIT`
+    // at most, only to be told the server is busy; past those, a peer is refused unheard.
     let places = Arc::new(Semaphore::new(max_connections));
     let turned_away = Arc::new(Semaphore::new(max_connections));
     let ep_accept = endpoint.clone();
@@ -248,7 +251,7 @@ fn default_state_dir() -> Result<PathBuf> {
 }
 
 /// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
-/// its peer's first packet) no request of it has proved a key the server allows: a peer that
+/// the server took it up) no request of it has proved a key the server allows: a peer that
 /// proves nothing does not keep its place.
 async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: Instant) {
     let proven = Arc::new(AtomicBool::new(false));

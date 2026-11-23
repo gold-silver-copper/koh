@@ -1680,3 +1680,59 @@ async fn a_client_refused_at_the_door_is_told_the_server_is_busy_too() {
     first.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_server_that_is_dropped_stops_taking_connections_as_it_lets_go_of_its_key() {
+    let tmp = TempDir::new("drop-lock");
+    let friend = new_key(&tmp, "friend.key");
+    let (first, route) = boot_server(&tmp, vec![friend.public()], ServeOptions::default()).await;
+    let id = first.endpoint_id;
+    let dial = |route: Option<Route>| Client::connect_direct(friend.clone(), id, route, false);
+    let client = dial(route.clone()).await.unwrap();
+    client.sessions().await.unwrap();
+    client.close().await;
+
+    // Dropped, not shut down: the key is free for another server only once this one takes no
+    // more connections. So when a second server on the key has started, the first one's address
+    // serves nobody.
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match boot_server_on(&tmp, vec![friend.public()]).await {
+                Ok(server) => break server,
+                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the key was free within 5 s");
+    let old = tokio::time::timeout(Duration::from_secs(1), async {
+        let client = dial(route).await?;
+        client.sessions().await
+    })
+    .await;
+    assert!(
+        !matches!(old, Ok(Ok(_))),
+        "the dropped server served a client"
+    );
+
+    second.shutdown().await;
+}
+
+/// A server on the key `boot_server` uses, or why it could not start.
+async fn boot_server_on(
+    tmp: &TempDir,
+    allow: Vec<iroh::EndpointId>,
+) -> koh::Result<koh::server::RunningServer> {
+    start_server(ServeOptions {
+        key_file: Some(tmp.0.join("srv_cfg/server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow,
+        state_dir: Some(tmp.0.join("state2")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+}

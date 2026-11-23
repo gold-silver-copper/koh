@@ -112,15 +112,25 @@ pub struct RunningServer {
     pub endpoint_id: EndpointId,
     pub direct_addr: Option<SocketAddr>,
     pub endpoint: iroh::Endpoint,
+    /// What takes this server's connections. It holds the lock that keeps a second server off the
+    /// key, so the key is held exactly for as long as connections are taken.
     task: tokio::task::JoinHandle<()>,
-    /// The lock that keeps a second server off this one's key, held until this is dropped.
-    _serving: fs::File,
 }
 
 impl RunningServer {
-    pub async fn shutdown(self) {
+    /// Stops taking connections, lets go of the key and closes the endpoint.
+    pub async fn shutdown(mut self) {
         self.task.abort();
+        // (Until what took connections is gone, and the lock with it: the key is free when this returns.)
+        let _ = (&mut self.task).await;
         self.endpoint.close().await;
+    }
+}
+
+/// A server that is dropped takes no more connections, and so lets go of its key.
+impl Drop for RunningServer {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -174,6 +184,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let turned_away = Arc::new(Semaphore::new(max_connections));
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
+        let _serving = serving;
         while let Some(incoming) = ep_accept.accept().await {
             let came = Instant::now();
             if let Ok(place) = places.clone().try_acquire_owned() {
@@ -206,7 +217,6 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         direct_addr,
         endpoint,
         task,
-        _serving: serving,
     })
 }
 

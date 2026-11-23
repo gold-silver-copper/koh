@@ -599,16 +599,36 @@ pub async fn send_tree(
     }
 }
 
-/// The regular file `name` of `dir`, open, if one is there: not a symlink to one.
-fn existing(dir: &File, name: &str, rel: &str) -> Result<Option<(File, fs::Metadata)>> {
-    if !matches!(kind_at(dir, name), Ok(Some(FileType::RegularFile))) {
-        return Ok(None);
+/// What is at `name` of `dir`, where a file of `size` bytes is to land.
+enum There {
+    /// No regular file (nothing, or something a file takes the place of: a symlink is not followed).
+    Nothing,
+    /// A regular file of another size: it differs, and need not be read to know.
+    Differs,
+    /// A regular file of that size, open: its hash says whether it is the same.
+    Same(File),
+}
+
+fn there(dir: &File, name: &str, rel: &str, size: u64) -> Result<There> {
+    let Ok(stat) = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return Ok(There::Nothing);
+    };
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Ok(There::Nothing);
     }
+    if u64::try_from(stat.st_size).ok() != Some(size) {
+        return Ok(There::Differs);
+    }
+    // (Opened only now: a file that may not be read is replaced all the same if its size differs.)
     let file = open_file(dir, name, rel)?;
     let meta = file
         .metadata()
         .map_err(|e| KohError::failed(format!("stat {rel}: {e}")))?;
-    Ok(meta.is_file().then_some((file, meta)))
+    Ok(match (meta.is_file(), meta.len() == size) {
+        (true, true) => There::Same(file),
+        (true, false) => There::Differs,
+        (false, _) => There::Nothing,
+    })
 }
 
 /// Receiver half of delta sync: diffs manifest against the tree at `place`, requests changed
@@ -653,21 +673,18 @@ pub async fn receive_tree(
             }
             (None, true) => continue,
             (Some(tree), false) => match tree.parent(&entry.path, false)? {
-                Some((dir, name)) => existing(dir, name, &entry.path)?,
-                None => None,
+                Some((dir, name)) => there(dir, name, &entry.path, entry.size)?,
+                None => There::Nothing,
             },
-            (None, false) => None,
+            (None, false) => There::Nothing,
         };
         match here {
-            Some((file, meta)) if meta.len() == entry.size => {
-                if hash_file(&file, &entry.path)? == entry.hash {
-                    summary.unchanged += 1;
-                    continue;
-                }
-                summary.updated.push(entry.path.clone());
+            There::Same(file) if hash_file(&file, &entry.path)? == entry.hash => {
+                summary.unchanged += 1;
+                continue;
             }
-            Some(_) => summary.updated.push(entry.path.clone()),
-            None => summary.added.push(entry.path.clone()),
+            There::Same(_) | There::Differs => summary.updated.push(entry.path.clone()),
+            There::Nothing => summary.added.push(entry.path.clone()),
         }
         needed.push(entry.path.clone());
     }

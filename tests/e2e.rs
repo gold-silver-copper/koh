@@ -1855,3 +1855,37 @@ fn a_session_is_attached_from_the_moment_it_is_handed_out() {
     let new = sessions.attach_or_create(spec(None, sleeps)).unwrap();
     assert!(new.0.id != id && !dir.exists());
 }
+
+#[tokio::test]
+async fn a_file_that_cannot_be_read_is_replaced_when_its_size_says_it_differs() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (tmp, srv, client, _, _) = boot_pair("unreadable").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(src.join("f"), "the new contents").unwrap();
+    fs::write(dst.join("f"), "old").unwrap();
+    fs::set_permissions(dst.join("f"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    // The file there is of another size, so it differs, and nobody needs to read it to know:
+    // it is replaced, as a file in a directory one may write to can be.
+    let done = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.updated, vec!["f".to_string()]);
+    assert_eq!(
+        fs::read_to_string(dst.join("f")).unwrap(),
+        "the new contents"
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}

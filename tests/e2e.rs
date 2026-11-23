@@ -1736,3 +1736,72 @@ async fn boot_server_on(
     })
     .await
 }
+
+#[tokio::test]
+async fn a_session_that_cannot_start_takes_no_kept_session_with_it() {
+    let tmp = TempDir::new("failed-launch");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_sessions: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |argv: &[&str]| Request::Attach {
+        session: None,
+        new: true,
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: argv.iter().map(|word| word.to_string()).collect(),
+        cwd: Some(tmp.0.display().to_string()),
+    };
+
+    // The server keeps one session, and has one: its program has ended, and what it printed is
+    // there to read.
+    let _ended = client
+        .request(&attach(&["/bin/sh", "-c", "echo KEPT"]))
+        .await
+        .unwrap();
+    let kept = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if let [one] = &list[..]
+                && one.state != "running"
+                && !one.attached
+            {
+                break one.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the session ended and was left within 5 s");
+
+    // A new session whose program is not there does not start, and the kept one is still kept.
+    let err = client
+        .request(&attach(&["/no/such/program"]))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.iter().map(|s| s.id).collect::<Vec<_>>(), [kept]);
+    assert!(client.output(kept, false).await.unwrap().contains("KEPT"));
+
+    // One that starts takes its place.
+    let _new = client
+        .request(&attach(&["/bin/sh", "-c", "sleep 30"]))
+        .await
+        .unwrap();
+    let list = client.sessions().await.unwrap();
+    assert!(
+        matches!(&list[..], [one] if one.id != kept && one.state == "running"),
+        "{list:?}"
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}

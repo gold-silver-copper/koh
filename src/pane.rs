@@ -581,34 +581,26 @@ impl SessionManager {
         })
     }
 
-    /// Room for one more session: with `max` kept, the oldest whose program has ended and that
-    /// no client is attached to is forgotten, its pane folder with it; with none such, busy.
-    fn make_room(&mut self) -> Result<()> {
+    /// The session that goes for one more, if one must: with `max` kept, the oldest whose program
+    /// has ended and that no client is attached to. With none such, the server is busy.
+    fn goes_for_one_more(&self) -> Result<Option<u32>> {
         if self.sessions.len() < self.max {
-            return Ok(());
+            return Ok(None);
         }
         let ended = |s: &Arc<PaneSession>| {
             s.frame_tx.borrow().state != "running" && s.attached.load(Ordering::Relaxed) == 0
         };
-        let oldest = self
-            .sessions
-            .iter()
-            .find(|(_, s)| ended(s))
-            .map(|(id, _)| *id);
-        match oldest.and_then(|id| self.sessions.remove(&id)) {
-            Some(gone) => {
-                let _ = fs::remove_dir_all(&gone.dir);
-                Ok(())
-            }
-            None => Err(KohError::new(
+        let oldest = self.sessions.iter().find(|(_, s)| ended(s));
+        oldest.map(|(id, _)| Some(*id)).ok_or_else(|| {
+            let most = self.max;
+            KohError::new(
                 Exit::BUSY,
                 "busy",
                 format!(
-                    "server busy: it keeps at most {} sessions (--max-sessions), and all are running or attached",
-                    self.max
+                    "server busy: it keeps at most {most} sessions (--max-sessions), and all are running or attached"
                 ),
-            )),
-        }
+            )
+        })
     }
 
     /// Attaches to an existing session or spawns a new one. Returns `(session, created_new)`.
@@ -628,7 +620,7 @@ impl SessionManager {
         {
             return Ok((sess.clone(), false));
         }
-        self.make_room()?;
+        let goes = self.goes_for_one_more()?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let dir = self.root.join(format!("s{id}"));
@@ -643,6 +635,10 @@ impl SessionManager {
             spec.cwd,
             spec.default_shell,
         )?;
+        // (Only now that the new one runs is the old one forgotten, and its pane folder with it.)
+        if let Some(gone) = goes.and_then(|id| self.sessions.remove(&id)) {
+            let _ = fs::remove_dir_all(&gone.dir);
+        }
         self.sessions.insert(id, sess.clone());
         self.last_id = Some(id);
         Ok((sess, true))

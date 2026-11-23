@@ -55,6 +55,17 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// The CLI's default for `--max-sessions`.
 pub const DEFAULT_MAX_SESSIONS: usize = 64;
 
+/// `n` as a cap that `flag` may set: from 1 to 65535.
+pub fn cap(flag: &str, n: usize) -> Result<usize> {
+    if (1..=65_535).contains(&n) {
+        Ok(n)
+    } else {
+        Err(KohError::usage(format!(
+            "{flag} takes a number from 1 to 65535"
+        )))
+    }
+}
+
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
@@ -112,6 +123,8 @@ impl RunningServer {
 
 /// Starts a server in-process (used by both `koh serve` CLI and loopback integration tests).
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
+    let max_connections = cap("--max-connections", opts.max_connections)?;
+    let max_sessions = cap("--max-sessions", opts.max_sessions)?;
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
     let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
@@ -123,7 +136,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         None => default_state_dir()?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
-    let sessions = SessionManager::new(base.join("sessions"), opts.max_sessions)?;
+    let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
     let sessions = Arc::new(Mutex::new(sessions));
     let default_shell = opts
         .shell
@@ -152,8 +165,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     // A connection holds one of `max_connections` places from its peer's first packet, before
     // anything is known of the peer, until it is gone. With none free, as many more are let
     // finish connecting only to be told the server is busy; past those, a peer is refused unheard.
-    let places = Arc::new(Semaphore::new(opts.max_connections));
-    let turned_away = Arc::new(Semaphore::new(opts.max_connections));
+    let places = Arc::new(Semaphore::new(max_connections));
+    let turned_away = Arc::new(Semaphore::new(max_connections));
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
         while let Some(incoming) = ep_accept.accept().await {

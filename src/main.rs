@@ -12,7 +12,7 @@ use koh::keys::{
     parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
     validate_peer_name,
 };
-use koh::server::{ServeOptions, run_serve};
+use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
 const HELP: &str = include_str!("help.txt");
@@ -346,11 +346,8 @@ async fn cmd_serve(args: &[String]) -> Result<Exit> {
             "--shell" => opts.shell = Some(take_opt(args, &mut i, a)?),
             "--no-relay" => opts.disable_relay = true,
             "--max-connections" | "--max-sessions" => {
-                let most = take_opt(args, &mut i, a)?
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| *n >= 1)
-                    .ok_or_else(|| KohError::usage(format!("{a} takes a number, 1 or more")))?;
+                // (A value that is no number is out of the range too, and is told the same.)
+                let most = cap(a, take_opt(args, &mut i, a)?.parse().unwrap_or(0))?;
                 if a == "--max-connections" {
                     opts.max_connections = most;
                 } else {

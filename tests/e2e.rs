@@ -1528,3 +1528,54 @@ async fn a_tree_is_copied_to_128_directories_deep_on_both_ends_and_no_deeper() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
+    let tmp = TempDir::new("cap-range");
+    for (max_connections, max_sessions, flag) in [
+        (usize::MAX, 64, "--max-connections"),
+        (0, 64, "--max-connections"),
+        (64, 65_536, "--max-sessions"),
+        (64, 0, "--max-sessions"),
+    ] {
+        let more = ServeOptions {
+            key_file: Some(tmp.0.join("srv_cfg/server.key")),
+            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            max_connections,
+            max_sessions,
+            quiet: true,
+            disable_relay: true,
+            ..ServeOptions::default()
+        };
+        let err = start_server(more).await.err().expect("a refusal");
+        assert_eq!(err.code, Exit::USAGE, "{err:?}");
+        assert!(
+            err.message.contains(flag) && err.message.contains("1 to 65535"),
+            "{err:?}"
+        );
+    }
+    // (Nothing was started for them: not even the key.)
+    assert!(!tmp.0.join("srv_cfg").exists());
+
+    let koh = |flag: &'static str, value: &'static str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_koh"))
+            .env("KOH_CONFIG_DIR", tmp.0.join("cli"))
+            .args(["serve", "--no-relay", flag, value])
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for (flag, value) in [
+        ("--max-connections", "18446744073709551615"),
+        ("--max-sessions", "70000"),
+        ("--max-connections", "0"),
+        ("--max-sessions", "many"),
+    ] {
+        let (code, said) = koh(flag, value);
+        assert_eq!(code, Some(2), "{flag} {value}: {said}");
+        assert!(said.contains(flag) && said.contains("1 to 65535"), "{said}");
+    }
+}

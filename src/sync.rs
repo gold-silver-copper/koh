@@ -445,7 +445,8 @@ pub async fn receive_tree(
             }
             continue;
         }
-        match found(&target, fs::metadata(&target))?.filter(|m| m.is_file()) {
+        // (What is there itself: a symlink is no file to compare with, and the file replaces it.)
+        match found(&target, fs::symlink_metadata(&target))?.filter(|m| m.is_file()) {
             // (A file of another size differs, and need not be read to know.)
             Some(there) if there.len() == entry.size && hash_file(&target)? == entry.hash => {
                 summary.unchanged += 1;

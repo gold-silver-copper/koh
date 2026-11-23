@@ -1062,16 +1062,19 @@ async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where
     assert_eq!(names_in(&outside), ["x", "y"]);
 
     // A file lands under a name of its own and is then renamed: a symlink where it lands is
-    // replaced by it, and the file the symlink led to is as it was.
-    fs::write(outside.join("target"), "old").unwrap();
+    // replaced by it, and the file the symlink led to is as it was. That file has the same
+    // bytes here, and the copy must not find the file "unchanged" for that: what is where a
+    // file lands is the symlink, and a symlink is not the file.
+    fs::write(outside.join("target"), "same").unwrap();
     symlink(outside.join("target"), allowed.join("final")).unwrap();
     let onto = tmp.0.join("onto");
     fs::create_dir_all(&onto).unwrap();
-    fs::write(onto.join("final"), "new!").unwrap();
-    push(onto, allowed.clone(), false).await.unwrap();
+    fs::write(onto.join("final"), "same").unwrap();
+    let done = push(onto, allowed.clone(), false).await.unwrap();
+    assert_eq!(done.unchanged, 0, "compared with the file beyond DIR/final");
     assert!(!allowed.join("final").is_symlink());
-    assert_eq!(fs::read_to_string(allowed.join("final")).unwrap(), "new!");
-    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "old");
+    assert_eq!(fs::read_to_string(allowed.join("final")).unwrap(), "same");
+    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
 
     // A tree with directories lands, and no temporary file is left beside what landed.
     let nested = tmp.0.join("nested");

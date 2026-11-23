@@ -15,6 +15,42 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Security
+
+- `koh cp` reaches every entry of a tree from the directory above it, by its descriptor and
+  never through a symlink, on both ends. A copy's receiver used to join the names its peer sent
+  onto the destination's path: a symlink already in the tree took the write, the comparison's
+  read and the temporary file outside the tree, and so outside a `--cp DIR` key's directory. A
+  symlink where a directory is needed is now refused (exit 4); one where a file lands is
+  replaced as the link it is. A scoped key's path must begin with its directory and go on with
+  plain names.
+- A file is written under a new name made with `O_EXCL` (it was `.NAME.koh-tmp`, opened through
+  whatever was there) and removed if the copy is cut short.
+- A copy's receiver refuses a manifest of more than 100,000 entries and a file it did not ask
+  for, and stops at a file longer than its sender said.
+- `koh serve` takes at most `--max-connections` connections (64), counted before a key is
+  proved, and closes one that has proved no allowed key within 10 s; it keeps at most
+  `--max-sessions` sessions (64), an ended one making room for a new one. Past either a client
+  exits 75. Nothing bounded these.
+- A connection is given no unidirectional streams (it had four, which nothing read).
+- A session's picture listing is read in time that grows with its length: a server could fill
+  a frame with picture names and keep a client busy for minutes.
+
+### Fixed
+
+- `koh serve` refuses to start on a key another `koh serve` holds, with exit 75. The marker
+  beside the key was never locked, so a second server started, and whichever stopped first
+  removed the other's marker.
+- A copy that its other end stops says why and exits with that reason (a refusal: 4); it was a
+  decode error, exit 1.
+
+### Changed
+
+- A tree deeper than 128 directories is not copied.
+- `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
+  this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
+  points under a fixed-seed mutation run.
+
 ## [0.17.2] — 2026-11-16
 
 A server that stayed busy until restarted, and a copy that never ended. The protocol is 0.17.1's.

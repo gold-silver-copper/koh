@@ -173,8 +173,10 @@ fn found(path: &Path, looked: io::Result<fs::Metadata>) -> Result<Option<fs::Met
     }
 }
 
+/// `path` to read, without waiting: something put there since it was seen to be a file (a FIFO
+/// with nobody writing to it) holds no copy up.
 fn open(path: &Path) -> Result<File> {
-    File::open(path).map_err(|e| KohError::failed(format!("open {}: {e}", path.display())))
+    fuxix::open(path, false).map_err(|e| KohError::failed(format!("open {}: {e}", path.display())))
 }
 
 fn hash_file(path: &Path) -> Result<[u8; 32]> {

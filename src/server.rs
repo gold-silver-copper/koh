@@ -54,9 +54,9 @@ pub struct ServeOptions {
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 
 /// The CLI's default for `--max-connections`.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 64;
+const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// The CLI's default for `--max-sessions`.
-pub const DEFAULT_MAX_SESSIONS: usize = 64;
+const DEFAULT_MAX_SESSIONS: usize = 64;
 
 /// `n` as a cap that `flag` may set: from 1 to 65535.
 pub fn cap(flag: &str, n: usize) -> Result<usize> {

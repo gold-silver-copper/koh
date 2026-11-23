@@ -83,8 +83,8 @@ fn glob_match(pat: &[u8], text: &[u8]) -> bool {
 /// owner gave, symlinks followed), then `beneath` it one name at a time, never through a symlink.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Place {
-    pub base: PathBuf,
-    pub beneath: Vec<String>,
+    base: PathBuf,
+    beneath: Vec<String>,
 }
 
 /// What a tree is read from: a directory, or one regular file.
@@ -99,6 +99,21 @@ impl Place {
         Self {
             base: path.to_path_buf(),
             beneath: Vec::new(),
+        }
+    }
+
+    /// The names `beneath` the directory `base`, each one plain name: what a scoped key may reach.
+    /// (So that what walks a place can take every name of it for one name.)
+    pub(crate) fn beneath(base: PathBuf, beneath: Vec<String>) -> Result<Self> {
+        if beneath.is_empty()
+            || wire_names(&beneath.join("/")).is_ok_and(|names| names.len() == beneath.len())
+        {
+            Ok(Self { base, beneath })
+        } else {
+            Err(KohError::refused(format!(
+                "unsafe path beneath {}",
+                base.display()
+            )))
         }
     }
 

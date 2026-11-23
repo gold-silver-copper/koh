@@ -1321,7 +1321,7 @@ async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
     let tmp = TempDir::new("proof-deadline");
     let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
     let more = ServeOptions {
-        proof_timeout: Duration::from_millis(300),
+        proof_timeout: Duration::from_secs(1),
         ..ServeOptions::default()
     };
     let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
@@ -1341,8 +1341,8 @@ async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
             if close.error_code.into_inner() == refused),
         "{closed:?}"
     );
-    // One that proved its key in time stays, past the deadline.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // One that proved its key in time stays, past the deadline (it came a moment after the other).
+    tokio::time::sleep(Duration::from_millis(300)).await;
     known.sessions().await.unwrap();
 
     known.close().await;

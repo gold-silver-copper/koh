@@ -112,7 +112,7 @@ fn place_beneath(root: &Path, target: &Path) -> Result<Place> {
             _ => return Err(outside()),
         }
     }
-    Ok(Place { base, beneath })
+    Place::beneath(base, beneath)
 }
 
 fn check_within(root: &Path, target: &Path) -> Result<()> {

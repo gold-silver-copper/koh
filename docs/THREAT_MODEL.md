@@ -21,9 +21,11 @@ a QUIC handshake: the transport does not know the allowlist.
 
 - **What it gets:** nothing. No request is read before a key the server allows is proved.
 - **What it can make the server hold:** a connection takes one of `--max-connections` places
-  (64) from its first packet. With none free, as many more are let connect only to be told
-  "busy" within about 2 s, and past those a peer is refused unheard. A connection that has not
-  proved an allowed key within 10 s is closed. On a connection, at most 16 streams are open at
+  (64) from its first packet until it is gone: closed by either end, or silent for its idle
+  timeout (15 s for a command or a copy, 30 s for a session; a client that is killed goes that
+  way). With none free, as many more are let connect only to be told "busy" within about 2 s,
+  and past those a peer is refused unheard. A connection that has not proved an allowed key
+  within 10 s is closed. On a connection, at most 16 streams are open at
   once; on each the server reads one proof of at most 512 bytes, checks one signature and reads
   the `clients` file once.
 - **Not defended:** peers that keep taking the places as they come free shut allowed clients

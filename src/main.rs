@@ -435,13 +435,17 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
     };
 
     let client = Client::connect(&server, &opts, false).await?;
-    if let Some(dir) = sync_dir {
-        let (remote_dir, _) =
-            sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
-        cwd = Some(remote_dir);
+    let done = async {
+        if let Some(dir) = sync_dir {
+            let (remote_dir, _) =
+                sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
+            cwd = Some(remote_dir);
+        }
+        client.exec(argv, cwd, shell, None, opts.json).await
     }
-    let (code, out, err) = client.exec(argv, cwd, shell, None, opts.json).await?;
+    .await;
     client.close().await;
+    let (code, out, err) = done?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -502,13 +506,17 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
         None => return Err(KohError::usage("missing command")),
     };
     let client = Client::connect(&server, &opts, false).await?;
-    if let Some(dir) = sync_dir {
-        let (remote_dir, _) =
-            sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
-        cwd = Some(remote_dir);
+    let done = async {
+        if let Some(dir) = sync_dir {
+            let (remote_dir, _) =
+                sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
+            cwd = Some(remote_dir);
+        }
+        client.run_job(name, argv, cwd, shell).await
     }
-    let info = client.run_job(name, argv, cwd, shell).await?;
+    .await;
     client.close().await;
+    let info = done?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -547,8 +555,9 @@ async fn cmd_jobs(args: &[String]) -> Result<Exit> {
     }
     let server = server.ok_or_else(|| KohError::usage("usage: koh jobs SERVER [NAME]"))?;
     let client = Client::connect(&server, &opts, false).await?;
-    let list = client.jobs(name).await?;
+    let list = client.jobs(name).await;
     client.close().await;
+    let list = list?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -608,8 +617,9 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
         ));
     };
     let client = Client::connect(&server, &opts, follow).await?;
-    let (bytes, state, exit, age) = client.logs(name, tail, all, follow).await?;
+    let done = client.logs(name, tail, all, follow).await;
     client.close().await;
+    let (bytes, state, exit, age) = done?;
     if !follow {
         let _ = std::io::stdout().write_all(&bytes);
     }
@@ -648,8 +658,9 @@ async fn cmd_kill(args: &[String]) -> Result<Exit> {
         return Err(KohError::usage("usage: koh kill SERVER JOB [--signal SIG]"));
     };
     let client = Client::connect(&server, &opts, false).await?;
-    let info = client.kill_job(name, sig).await?;
+    let info = client.kill_job(name, sig).await;
     client.close().await;
+    let info = info?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -713,14 +724,14 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         server.ok_or_else(|| KohError::usage("usage: koh wait SERVER (JOB | --session N)"))?;
     let client = Client::connect(&server, &opts, true).await?;
     let res = if let Some(sid) = session {
-        client.wait_session(sid, timeout).await?
+        client.wait_session(sid, timeout).await
     } else if let Some(name) = job {
-        client.wait_job(name, text, tail, timeout).await?
+        client.wait_job(name, text, tail, timeout).await
     } else {
-        client.close().await;
-        return Err(KohError::usage("wait needs JOB or --session N"));
+        Err(KohError::usage("wait needs JOB or --session N"))
     };
     client.close().await;
+    let res = res?;
 
     if opts.json {
         let _ = writeln!(
@@ -797,9 +808,9 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
         let local_srcs: Vec<PathBuf> = srcs.iter().map(PathBuf::from).collect();
         let s = client
             .cp_push_many(&local_srcs, &rdst, &excludes, delete, preserve, dry_run)
-            .await?;
+            .await;
         client.close().await;
-        s
+        s?
     } else {
         let mut server_name: Option<&str> = None;
         let mut remote_srcs = Vec::with_capacity(srcs.len());
@@ -836,9 +847,9 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
                 preserve,
                 dry_run,
             )
-            .await?;
+            .await;
         client.close().await;
-        s
+        s?
     };
 
     if opts.json {
@@ -893,8 +904,9 @@ async fn cmd_sessions(args: &[String]) -> Result<Exit> {
     }
     let server = server.ok_or_else(|| KohError::usage("usage: koh sessions SERVER [--json]"))?;
     let client = Client::connect(&server, &opts, false).await?;
-    let list = client.sessions().await?;
+    let list = client.sessions().await;
     client.close().await;
+    let list = list?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -955,8 +967,9 @@ async fn cmd_output(args: &[String]) -> Result<Exit> {
         ));
     };
     let client = Client::connect(&server, &opts, false).await?;
-    let text = client.output(session, last).await?;
+    let text = client.output(session, last).await;
     client.close().await;
+    let text = text?;
     if opts.json {
         let _ = writeln!(
             std::io::stdout(),
@@ -1077,7 +1090,8 @@ async fn cmd_mount(args: &[String]) -> Result<Exit> {
         "mirroring remote session at {}",
         dir.display()
     );
-    client.mount_local_pane(session, &dir, 80, 24).await?;
+    let mirrored = client.mount_local_pane(session, &dir, 80, 24).await;
     client.close().await;
+    mirrored?;
     Ok(Exit::OK)
 }

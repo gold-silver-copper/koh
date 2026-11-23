@@ -1414,3 +1414,35 @@ async fn the_server_takes_no_stream_but_a_request() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_command_that_fails_gives_its_place_back_at_once() {
+    let tmp = TempDir::new("close-on-error");
+    let cfg = tmp.0.join("cli_cfg");
+    let friend = new_key(&tmp, "client.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, _) = boot_server(&tmp, vec![friend.public()], more).await;
+    let (id, addr) = (srv.endpoint_id.to_string(), srv.direct_addr.unwrap());
+    let koh = move |args: &'static [&'static str]| {
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_koh"));
+        command
+            .env("KOH_CONFIG_DIR", &cfg)
+            .arg(args[0])
+            .arg(&id)
+            .args(&args[1..])
+            .args(["--direct", &addr.to_string()]);
+        async move { command.output().await.unwrap() }
+    };
+
+    // No such job: the command fails after it connected. The server has one place, and the
+    // next command must find it free, not wait out the first one's connection.
+    let failed = koh(&["jobs", "no-such-job"]).await;
+    assert_eq!(failed.status.code(), Some(127), "{failed:?}");
+    let next = koh(&["jobs"]).await;
+    assert_eq!(next.status.code(), Some(0), "{next:?}");
+
+    srv.shutdown().await;
+}

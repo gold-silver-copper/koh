@@ -31,7 +31,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - `koh serve` takes at most `--max-connections` connections (64), counted before a key is
   proved, and closes one that has proved no allowed key within 10 s; it keeps at most
   `--max-sessions` sessions (64), an ended one making room for a new one. Past either a client
-  exits 75. Nothing bounded these.
+  exits 75. Nothing bounded these. A connection's place comes back when it is closed, or after
+  it has been silent for its idle timeout (15 s for a command or a copy); so a `koh` command
+  that fails now closes its connection as one that succeeds does.
 - A connection is given no unidirectional streams (it had four, which nothing read).
 - A session's picture listing is read in time that grows with its length: a server could fill
   a frame with picture names and keep a client busy for minutes.

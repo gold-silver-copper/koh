@@ -1,6 +1,8 @@
 //! Wire protocol for koh/18 over iroh QUIC bidirectional streams.
 //! Every message is length-prefixed (`u32` big-endian) postcard with strict byte bounds.
 
+use std::collections::BTreeSet;
+
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 
@@ -545,26 +547,18 @@ impl ScreenFrame {
         self.cursor_col = self.cursor_col.min(self.cols.saturating_sub(1));
     }
 
-    /// Parses all unique picture IDs referenced in the frozen v1 `pictures` listing.
+    /// The picture ids the frozen v1 `pictures` listing names, each once, in ascending order.
     pub fn referenced_picture_ids(&self) -> Vec<u32> {
-        let mut ids = Vec::new();
-        for line in self.pictures.lines() {
-            let Some(file) = line.split_whitespace().next() else {
-                continue;
-            };
-            let Some(rest) = file.strip_prefix("pic-") else {
-                continue;
-            };
-            let Some((num, _)) = rest.split_once('.') else {
-                continue;
-            };
-            if let Ok(id) = num.parse::<u32>()
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
-        }
-        ids
+        let ids: BTreeSet<u32> = self
+            .pictures
+            .lines()
+            .filter_map(|line| {
+                let file = line.split_whitespace().next()?;
+                let (number, _) = file.strip_prefix("pic-")?.split_once('.')?;
+                number.parse().ok()
+            })
+            .collect();
+        ids.into_iter().collect()
     }
 }
 
@@ -808,5 +802,26 @@ mod tests {
         assert_eq!(safe.screen, curr.screen);
         assert_eq!(safe.cursor_row, 4);
         assert_eq!(safe.cursor_col, 79);
+    }
+
+    #[test]
+    fn a_long_picture_listing_is_read_in_time_that_grows_with_its_length() {
+        // What a server can put in one frame: each line a picture nothing else names.
+        let listing: String = (0..100_000u32)
+            .map(|n| format!("pic-{n}.png 0 0 1 1 10 20\n"))
+            .chain(["pic-7.png 0 0 1 1 10 20\n".to_string()])
+            .collect();
+        let frame = ScreenFrame {
+            pictures: listing,
+            ..ScreenFrame::default()
+        };
+        let began = std::time::Instant::now();
+        let ids = frame.referenced_picture_ids();
+        assert_eq!(ids.len(), 100_000);
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}: each id was looked for among all before it",
+            began.elapsed()
+        );
     }
 }

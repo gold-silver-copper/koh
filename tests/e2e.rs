@@ -2204,3 +2204,26 @@ fn a_session_whose_program_has_ended_never_says_it_runs_again() {
         assert_eq!(session.info().state, "exited 3", "round {round}");
     }
 }
+
+#[tokio::test]
+async fn a_proof_deadline_too_far_off_for_the_clock_is_no_deadline_and_no_panic() {
+    // (`ServeOptions` is public: `Duration::MAX` added to the clock's time panicked in the task
+    // that takes connections, at the first peer to come, and no other was taken after it.)
+    let tmp = TempDir::new("proof-never");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        proof_timeout: Duration::MAX,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    for nth in 0..2 {
+        let dial = Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+        let client = tokio::time::timeout(Duration::from_secs(5), dial)
+            .await
+            .unwrap_or_else(|_| panic!("connection {nth} was not taken within 5 s"))
+            .unwrap();
+        client.sessions().await.unwrap();
+        client.close().await;
+    }
+    srv.shutdown().await;
+}

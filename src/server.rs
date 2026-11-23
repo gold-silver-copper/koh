@@ -53,6 +53,14 @@ pub struct ServeOptions {
 /// told as soon as it asks, and at the latest then.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 
+/// The time `long` after `from`. More than thirty years is thirty years, the timer's own "never":
+/// a time the clock cannot say (`Duration::MAX` is one) would panic where it is added. (And were
+/// the clock itself that near its end, the time is `from`: a deadline that has come.)
+fn after(from: Instant, long: Duration) -> Instant {
+    const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
+    from.checked_add(long.min(NEVER)).unwrap_or(from)
+}
+
 /// The CLI's default for `--max-connections`.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// The CLI's default for `--max-sessions`.
@@ -188,7 +196,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         while let Some(incoming) = ep_accept.accept().await {
             let came = Instant::now();
             if let Ok(place) = places.clone().try_acquire_owned() {
-                let (st, prove_by) = (state.clone(), came + state.proof_timeout);
+                let (st, prove_by) = (state.clone(), after(came, state.proof_timeout));
                 tokio::spawn(async move {
                     // (A handshake that is dropped is gone: the transport closes it.)
                     if let Ok(Ok(conn)) = timeout_at(prove_by, incoming.into_future()).await {
@@ -198,7 +206,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
                 });
             } else if let Ok(place) = turned_away.clone().try_acquire_owned() {
                 tokio::spawn(async move {
-                    let told_by = came + BUSY_WAIT;
+                    let told_by = after(came, BUSY_WAIT);
                     if let Ok(Ok(conn)) = timeout_at(told_by, incoming.into_future()).await {
                         // (Once the client has connected and asks, so that it reads why.)
                         let _ = timeout_at(told_by, conn.accept_bi()).await;

@@ -228,8 +228,9 @@ fn open_file(dir: &File, name: &str, rel: &str) -> Result<File> {
         .map_err(|errno| not_opened(dir, name, rel, errno))
 }
 
-/// The names of the wire path `rel`: a path beneath a tree, and nothing else.
-fn names(rel: &str) -> Result<Vec<&str>> {
+/// The names of the wire path `rel`: a path beneath a tree, and nothing else. Each is one plain
+/// name (not empty, `.` or `..`, with no `/` or NUL), and there are at most 128.
+pub fn wire_names(rel: &str) -> Result<Vec<&str>> {
     let names: Vec<&str> = rel.split('/').collect();
     let plain = |n: &&str| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0');
     if names.len() > MAX_DEPTH || !names.iter().all(plain) {
@@ -240,7 +241,7 @@ fn names(rel: &str) -> Result<Vec<&str>> {
 
 /// File `rel` beneath `root` to read, each name opened from the one above it.
 fn open_beneath(root: &File, rel: &str) -> Result<File> {
-    let names = names(rel)?;
+    let names = wire_names(rel)?;
     let Some((last, dirs)) = names.split_last() else {
         return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
     };
@@ -269,7 +270,7 @@ impl Tree {
         if self.last.as_ref().is_none_or(|(at, _)| at != rel) {
             self.last = None;
             let mut at = None::<File>;
-            for name in names(rel)? {
+            for name in wire_names(rel)? {
                 let above = at.as_ref().unwrap_or(&self.root);
                 let Some(next) = open_dir(above, name, rel, make)? else {
                     return Ok(None);
@@ -283,7 +284,7 @@ impl Tree {
 
     /// The directory that holds `rel`'s last name, and that name.
     fn parent<'a>(&'a mut self, rel: &'a str, make: bool) -> Result<Option<(&'a File, &'a str)>> {
-        names(rel)?;
+        wire_names(rel)?;
         let (dir, name) = rel.rsplit_once('/').unwrap_or(("", rel));
         Ok(self.dir(dir, make)?.map(|dir| (dir, name)))
     }
@@ -630,7 +631,7 @@ pub async fn receive_tree(
         .map(|root| Tree { root, last: None });
 
     for entry in &src_entries {
-        names(&entry.path)?;
+        wire_names(&entry.path)?;
         src_set.insert(entry.path.clone());
         let here = match (tree.as_mut(), entry.is_dir) {
             (Some(tree), true) => {

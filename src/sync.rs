@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -107,23 +107,32 @@ struct Temp {
 }
 
 impl Temp {
-    /// A file beside `target`, under a name no other copy writes to.
+    /// A new file beside `target`, under a name nothing there has: a name that is taken (by
+    /// anything: this process is not the only one that counts) is left as it is, and the next
+    /// one tried, a few times.
     fn create(target: &Path) -> Result<(File, Self)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let nth = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path = target.with_file_name(format!(".koh-{:x}-{nth:x}.tmp", std::process::id()));
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| KohError::failed(format!("create {}: {e}", path.display())))?;
-        let temp = Self {
-            path,
-            landed: false,
-        };
-        Ok((file, temp))
+        let mut taken = 0;
+        loop {
+            let nth = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = target.with_file_name(format!(".koh-{:x}-{nth:x}.tmp", std::process::id()));
+            let made = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path);
+            match made {
+                Ok(file) => {
+                    let temp = Self {
+                        path,
+                        landed: false,
+                    };
+                    return Ok((file, temp));
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && taken < 16 => taken += 1,
+                Err(e) => return Err(KohError::failed(format!("create {}: {e}", path.display()))),
+            }
+        }
     }
 
     /// Give it the name it lands under: whatever was there goes.

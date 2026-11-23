@@ -1983,6 +1983,47 @@ async fn a_hostile_sender_lands_nothing_and_leaves_no_temporary_file() {
 }
 
 #[tokio::test]
+async fn a_file_that_has_a_staging_name_is_not_written_over() {
+    let (tmp, srv, client, _, _) = boot_pair("staging-name").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    // A file is written as `.koh-PID-N.tmp` beside where it lands, N counted up by the process
+    // that writes it (here this one). Three of every four such names are files of someone
+    // else's: wherever the count stands, eight files in a row meet some of them, and a free
+    // name is never more than four tries away.
+    let pid = std::process::id();
+    let theirs: Vec<PathBuf> = (0..4096u32)
+        .filter(|n| n % 4 != 3)
+        .map(|n| dst.join(format!(".koh-{pid:x}-{n:x}.tmp")))
+        .collect();
+    for path in &theirs {
+        fs::write(path, "theirs").unwrap();
+    }
+    for n in 0..8 {
+        fs::write(src.join(format!("f{n}")), "sent").unwrap();
+    }
+    let done = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.added.len(), 8);
+    assert_eq!(fs::read_to_string(dst.join("f7")).unwrap(), "sent");
+    let kept = |path: &PathBuf| fs::read_to_string(path).is_ok_and(|text| text == "theirs");
+    assert_eq!(theirs.iter().filter(|path| !kept(path)).count(), 0);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_else() {
     use std::os::unix::fs::symlink;
     let tmp = TempDir::new("exec-scope");

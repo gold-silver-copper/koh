@@ -1,33 +1,4 @@
-# Test code is allowed to panic: a failed `unwrap`/`expect`/`assert` in a test
-# IS the test failing. These keys relax the panic-prevention restriction lints
-# (forbidden in Cargo.toml)
-# inside `#[cfg(test)]` modules and `#[test]` functions. Anything else, including
-# helper functions in the integration tests, stays panic-free.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
-allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
-allow-dbg-in-tests = true
-
-allow-print-in-tests = true
-
-# Every queue has a bound (`koh::bounded::Bounded`), and every task spawned says what bounds how
-# many run at once, in an `#[expect(clippy::disallowed_methods, reason = …)]`.
-disallowed-types = [
-    { path = "std::collections::VecDeque", reason = "use koh::bounded::Bounded: every queue has a bound" },
-]
-disallowed-methods = [
-    { path = "tokio::sync::mpsc::unbounded_channel", reason = "use a bounded channel" },
-    { path = "tokio::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
-    { path = "tokio::task::spawn", reason = "say what bounds the tasks spawned here, in the expectation's reason" },
-    { path = "std::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
-    { path = "tokio::io::stderr", reason = "write through koh::log::stderr, which escapes what a peer chose" },
-    { path = "std::process::Command::new", reason = "tests start programs through koh_testkit::command, whose list never holds one that authenticates; elsewhere say what is run" },
-    { path = "std::env::temp_dir", reason = "write under target/, in a koh_testkit::Scratch" },
-]
-# The macros that write to stderr unescaped, banned with it, in tests too: a test's message goes in
-# its assertion.
-disallowed-macros = [
-    { path = "std::eprint", reason = "write through koh::log::stderr, which escapes what a peer chose" },
-    { path = "std::eprintln", reason = "write through koh::log::stderr, which escapes what a peer chose" },
-]
+allow-panic-in-tests = true

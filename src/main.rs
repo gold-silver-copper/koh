@@ -1,319 +1,1079 @@
-//! The `koh` binary: `serve` / `connect` / `sessions` / `exec` / `cp` / `id` / `key` / `servers` /
-//! `clients` dispatch, and the menu `koh` alone opens on a terminal.
+//! koh CLI entrypoint: zero-macro parser, unified help, strict exit codes, and `--json`.
+#![forbid(unsafe_code)]
 
-mod args;
+use std::io::Write as _;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
-use std::io::IsTerminal as _;
+use koh::client::{Client, ConnectOptions, DialOptions, parse_signal, sync_before_command};
+use koh::keys::{
+    ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
+    parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
+    validate_peer_name,
+};
+use koh::server::{ServeOptions, run_serve};
+use koh::{Exit, KohError, Result};
 
-use crate::args::{Cmd, ConnectArgs, RemoteArgs, ServerRef};
-use koh::names::{List, Places};
+const HELP: &str = include_str!("help.txt");
 
-// An explicit runtime instead of `#[tokio::main]`, whose expansion `allow`s `clippy::expect_used`.
-fn main() -> std::process::ExitCode {
-    let cmd = match args::command()
-        .try_get_matches()
-        .and_then(|matches| args::parse(&matches))
-    {
-        Ok(cmd) => cmd,
-        Err(e) => {
-            if let Some(bad) = args::bad_value(&e) {
-                koh::log::stderr(format_args!("koh: {bad}"));
-                return std::process::ExitCode::FAILURE;
-            }
-            e.exit()
-        }
-    };
-    if matches!(cmd, Cmd::Menu)
-        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
-    {
-        // As clap does for a missing subcommand: help, and the usage error's status.
-        let _ = args::command().print_help();
-        return std::process::ExitCode::from(2);
-    }
-    match tokio::runtime::Builder::new_multi_thread()
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let json = args.iter().any(|a| a == "--json");
+    let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => std::process::ExitCode::from(runtime.block_on(run(cmd))),
+        Ok(rt) => rt,
         Err(e) => {
-            koh::log::stderr(format_args!("koh: {e:#}"));
-            std::process::ExitCode::FAILURE
+            let err = KohError::internal(format!("tokio runtime: {e}"));
+            report_err(&err, json);
+            return ExitCode::from(err.code.0);
         }
-    }
-}
-
-/// Whether `cmd` asked for `--json`: its errors are said so too.
-const fn wants_json(cmd: &Cmd) -> bool {
-    match cmd {
-        Cmd::Sessions(_, json)
-        | Cmd::Jobs(_, _, json)
-        | Cmd::Output { json, .. }
-        | Cmd::Exec { json, .. }
-        | Cmd::Start { json, .. }
-        | Cmd::Kill { json, .. }
-        | Cmd::Wait { json, .. }
-        | Cmd::Copy { json, .. } => *json,
-        Cmd::Serve(_)
-        | Cmd::Connect(_)
-        | Cmd::Logs { .. }
-        | Cmd::Key(_)
-        | Cmd::Names { .. }
-        | Cmd::HelpAgents
-        | Cmd::Menu => false,
-    }
-}
-
-/// Whether `cmd` exits with a remote status, its own errors then 255, as ssh's.
-const fn passes_status(cmd: &Cmd) -> bool {
-    matches!(
-        cmd,
-        Cmd::Exec { .. } | Cmd::Wait { .. } | Cmd::Logs { follow: true, .. }
-    )
-}
-
-/// Run `cmd`; the status to exit with.
-async fn run(cmd: Cmd) -> u8 {
-    let (json, passes) = (wants_json(&cmd), passes_status(&cmd));
-    match dispatch(cmd).await {
-        Ok(Some(code)) => exit_status(code),
-        Ok(None) => 0,
-        Err(e) => {
-            if json {
-                use std::io::Write as _;
-                let _ = writeln!(std::io::stdout(), "{}", koh::client::cli::json_error(&e));
-            } else {
-                koh::log::stderr(format_args!("koh: {e:#}"));
-            }
-            if passes && !koh::client::cli::busy(&e) {
-                255
-            } else {
-                koh::client::cli::exit_code(&e)
-            }
-        }
-    }
-}
-
-/// Bring the tree `sync` names into line on `remote`, if asked, and say so on stderr unless the
-/// answer is `json`, whose value carries it.
-async fn synced(
-    remote: &koh::client::Remote,
-    sync: Option<koh::client::SyncTree>,
-    json: bool,
-) -> anyhow::Result<Option<koh::client::Synced>> {
-    let Some(sync) = sync else {
-        return Ok(None);
     };
-    let synced = koh::client::sync(remote, sync).await?;
-    if !json {
-        koh::log::stderr(format_args!("koh: {}", synced.line()));
+    match rt.block_on(run(args)) {
+        Ok(code) => ExitCode::from(code.0),
+        Err(err) => {
+            report_err(&err, json);
+            ExitCode::from(err.code.0)
+        }
     }
-    Ok(Some(synced))
 }
 
-async fn dispatch(cmd: Cmd) -> anyhow::Result<Option<u32>> {
-    use koh::client::cli::{self, Format};
-    let mut out = std::io::stdout();
-    let format = |json| Format { json };
+fn report_err(err: &KohError, json: bool) {
+    if json {
+        let _ = writeln!(std::io::stdout(), "{}", err.json_line());
+    } else {
+        let _ = writeln!(std::io::stderr(), "koh: {}", err.message);
+    }
+}
+
+fn take_opt(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
+    *i += 1;
+    args.get(*i)
+        .cloned()
+        .ok_or_else(|| KohError::usage(format!("{flag} requires a value")))
+}
+
+async fn run(args: Vec<String>) -> Result<Exit> {
+    let Some(cmd) = args.first().map(String::as_str) else {
+        let _ = std::io::stdout().write_all(HELP.as_bytes());
+        return Ok(Exit::OK);
+    };
+    if matches!(cmd, "-h" | "--help" | "help" | "help-agents") {
+        let _ = std::io::stdout().write_all(HELP.as_bytes());
+        return Ok(Exit::OK);
+    }
+    if matches!(cmd, "-V" | "--version" | "version") {
+        let _ = writeln!(std::io::stdout(), "koh {}", env!("CARGO_PKG_VERSION"));
+        return Ok(Exit::OK);
+    }
+
+    let rest = args.get(1..).unwrap_or_default();
     match cmd {
-        Cmd::Serve(config) => serve(config).await,
-        Cmd::Connect(args) => connect(args).await,
-        Cmd::Sessions(remote, json) => cli::sessions(&resolve(remote)?, format(json), &mut out)
-            .await
-            .map(|()| None),
-        Cmd::Output {
-            remote,
-            session,
-            last,
-            json,
-        } => cli::output(&resolve(remote)?, session, last, format(json), &mut out)
-            .await
-            .map(|()| None),
-        Cmd::Exec {
-            remote,
-            run,
-            sync,
-            json,
-        } => {
-            let remote = resolve(remote)?;
-            let synced = synced(&remote, sync, json).await?;
-            koh::client::exec(&remote, run, synced.as_ref(), format(json))
-                .await
-                .map(Some)
+        "id" => cmd_id(rest),
+        "key" => cmd_key(rest),
+        "servers" => cmd_servers(rest),
+        "clients" => cmd_clients(rest),
+        "serve" => cmd_serve(rest).await,
+        "exec" => cmd_exec(rest).await,
+        "run" => cmd_run(rest).await,
+        "jobs" => cmd_jobs(rest).await,
+        "logs" => cmd_logs(rest).await,
+        "kill" => cmd_kill(rest).await,
+        "wait" => cmd_wait(rest).await,
+        "cp" => cmd_cp(rest).await,
+        "sessions" => cmd_sessions(rest).await,
+        "output" => cmd_output(rest).await,
+        "connect" => cmd_connect(rest).await,
+        "mount" => cmd_mount(rest).await,
+        other => Err(KohError::usage(format!(
+            "unknown command {other:?} (try `koh --help`)"
+        ))),
+    }
+}
+
+fn parse_role(s: &str) -> Result<Role> {
+    match s {
+        "client" => Ok(Role::Client),
+        "server" => Ok(Role::Server),
+        _ => Err(KohError::usage(format!(
+            "role must be `client` or `server`, got {s:?}"
+        ))),
+    }
+}
+
+fn cmd_id(args: &[String]) -> Result<Exit> {
+    let (mut role, mut key_file, mut qr) = (Role::Client, None::<PathBuf>, false);
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        match a {
+            "--key-file" => key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            "--qr" => qr = true,
+            "client" | "server" => role = parse_role(a)?,
+            _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
         }
-        Cmd::Start {
-            remote,
-            name,
-            run,
-            sync,
-            json,
-        } => {
-            let remote = resolve(remote)?;
-            let synced = synced(&remote, sync, json).await?;
-            cli::run(&remote, name, run, synced.as_ref(), format(json), &mut out)
-                .await
-                .map(|()| None)
+        i += 1;
+    }
+    let key = load_or_create_key(role, key_file.as_deref())?;
+    let id = key.public();
+    let _ = writeln!(std::io::stdout(), "{id}");
+    if qr {
+        let _ = writeln!(std::io::stderr(), "{}", render_qr(&id));
+    }
+    Ok(Exit::OK)
+}
+
+fn cmd_key(args: &[String]) -> Result<Exit> {
+    if args.first().map(String::as_str) != Some("reset") {
+        return Err(KohError::usage(
+            "usage: koh key reset [client|server] --yes",
+        ));
+    }
+    let (mut role, mut yes, mut key_file) = (Role::Client, false, None::<PathBuf>);
+    let mut i = 1;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        match a {
+            "--yes" => yes = true,
+            "--key-file" => key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            "client" | "server" => role = parse_role(a)?,
+            _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
         }
-        Cmd::Jobs(remote, job, json) => cli::jobs(&resolve(remote)?, job, format(json), &mut out)
-            .await
-            .map(|()| None),
-        Cmd::Logs {
-            remote,
-            job,
-            follow,
-            tail,
-        } => {
-            let status = cli::logs(&resolve(remote)?, job, follow, tail).await?;
-            Ok(status.filter(|_| follow))
+        i += 1;
+    }
+    if !yes {
+        return Err(KohError::usage("refusing to delete key without --yes"));
+    }
+    reset_key(role, key_file.as_deref())?;
+    Ok(Exit::OK)
+}
+
+fn cmd_servers(args: &[String]) -> Result<Exit> {
+    let mut key_file = None::<PathBuf>;
+    let mut clean = Vec::new();
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        if a == "--key-file" {
+            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
+        } else {
+            clean.push(a.to_string());
         }
-        Cmd::Kill {
-            remote,
-            job,
-            signal,
-            json,
-        } => cli::kill(&resolve(remote)?, job, signal, format(json), &mut out)
-            .await
-            .map(|()| None),
-        Cmd::Wait {
-            remote,
-            wait,
-            tail,
-            timeout,
-            json,
-        } => cli::wait(
-            &resolve(remote)?,
-            wait,
-            timeout,
-            tail,
-            format(json),
-            &mut out,
-        )
-        .await
-        .map(Some),
-        Cmd::Copy {
-            remote,
-            job,
-            opts,
-            shown,
-            json,
-        } => {
-            let remote = resolve(remote)?;
-            koh::client::copy(&remote, (job, opts), &shown, format(json))
-                .await
-                .map(|()| None)
-        }
-        Cmd::HelpAgents => {
-            use std::io::Write as _;
-            out.write_all(args::HELP_AGENTS.as_bytes())?;
-            Ok(None)
-        }
-        Cmd::Key(config) => koh::keycmd::run(&config).map(|()| None),
-        Cmd::Names { list, op, key_file } => {
-            let places = match list {
-                List::Servers => Places::new(key_file, None)?,
-                List::Clients => Places::new(None, key_file)?,
-            };
-            koh::names::run(&places, list, op, &mut out).map(|()| None)
-        }
-        Cmd::Menu => {
-            let places = Places::new(None, None)?;
-            let choice = koh::menu::run(
-                &mut std::io::stdin().lock(),
-                &mut std::io::stdout(),
-                &places,
-            )?;
-            match choice {
-                koh::menu::Choice::Quit => Ok(None),
-                koh::menu::Choice::Connect(name) => connect(defaults_for_connect(&name)?).await,
-                koh::menu::Choice::Serve => serve(defaults_for_serve()?).await,
+        i += 1;
+    }
+    let mut list = load_servers(key_file.as_deref())?;
+    match clean.first().map(String::as_str) {
+        None => {
+            for e in &list {
+                let route = match &e.route {
+                    Some(Route::Direct(a)) => format!(" direct={a}"),
+                    Some(Route::Relay(u)) => format!(" relay={u}"),
+                    None => String::new(),
+                };
+                let _ = writeln!(std::io::stdout(), "{} {}{route}", e.name, e.id);
             }
         }
-    }
-}
-
-/// `koh serve`, allowing the clients saved beside the server key as well as any `--allow`.
-async fn serve(mut config: koh::server::ServeConfig) -> anyhow::Result<Option<u32>> {
-    config.saved_clients = Some(Places::new(None, config.key_file.clone())?);
-    koh::server::serve(config).await.map(|()| None)
-}
-
-/// `koh connect`, with a saved name turned into its id and route.
-async fn connect(args: ConnectArgs) -> anyhow::Result<Option<u32>> {
-    let (server, route) = saved_server(&args.remote)?;
-    koh::client::connect(args.into_config(server, route)).await
-}
-
-/// `remote`, with a saved name turned into its id and route.
-fn resolve(remote: RemoteArgs) -> anyhow::Result<koh::client::Remote> {
-    let (server, route) = saved_server(&remote)?;
-    Ok(remote.into_remote(server, route))
-}
-
-/// The id of `remote`'s server and the route it was saved with: as given (with no route), or
-/// saved under its name beside the client key.
-fn saved_server(
-    remote: &RemoteArgs,
-) -> anyhow::Result<(iroh::EndpointId, Option<koh::names::Route>)> {
-    match &remote.server {
-        ServerRef::Id(id) => Ok((*id, None)),
-        ServerRef::Name(name) => {
-            let places = Places::new(remote.key_file.clone(), None)?;
-            let saved = koh::names::load(&places, List::Servers)?;
-            if let Some(entry) = saved.get(name) {
-                Ok((entry.id, entry.route.clone()))
-            } else {
-                let known: Vec<&str> = saved.entries().map(|entry| entry.name.as_str()).collect();
-                anyhow::bail!(
-                    "{name:?} is neither an endpoint id nor a saved server name ({}); save it with \
-                     `koh servers add {name} <id>`",
-                    if known.is_empty() {
-                        "none are saved".to_owned()
-                    } else {
-                        format!("saved: {}", known.join(", "))
+        Some("add") => {
+            let name = clean.get(1).ok_or_else(|| {
+                KohError::usage("usage: koh servers add NAME ID [--direct IP:PORT]")
+            })?;
+            let id_s = clean.get(2).ok_or_else(|| {
+                KohError::usage("usage: koh servers add NAME ID [--direct IP:PORT]")
+            })?;
+            validate_peer_name(name)?;
+            let id = parse_endpoint_id(id_s)?;
+            let mut route = None;
+            let mut j = 3;
+            while let Some(a) = clean.get(j).map(String::as_str) {
+                match a {
+                    "--direct" => {
+                        let v = take_opt(&clean, &mut j, a)?;
+                        let addr: SocketAddr = v
+                            .parse()
+                            .map_err(|e| KohError::usage(format!("bad --direct: {e}")))?;
+                        route = Some(Route::Direct(addr));
                     }
+                    "--relay-url" => {
+                        let v = take_opt(&clean, &mut j, a)?;
+                        route = Some(Route::Relay(parse_relay_url(&v)?));
+                    }
+                    _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
+                }
+                j += 1;
+            }
+            list.retain(|e| e.name != *name);
+            list.push(ServerEntry {
+                name: name.clone(),
+                id,
+                route,
+            });
+            save_servers(key_file.as_deref(), &list)?;
+        }
+        Some("rm") => {
+            let name = clean
+                .get(1)
+                .ok_or_else(|| KohError::usage("usage: koh servers rm NAME"))?;
+            let before = list.len();
+            list.retain(|e| e.name != *name);
+            if list.len() == before {
+                return Err(KohError::failed(format!("no server named {name:?}")));
+            }
+            save_servers(key_file.as_deref(), &list)?;
+        }
+        Some("rename") => {
+            let old = clean
+                .get(1)
+                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
+            let new = clean
+                .get(2)
+                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
+            validate_peer_name(new)?;
+            let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
+                return Err(KohError::failed(format!("no server named {old:?}")));
+            };
+            entry.name = new.clone();
+            save_servers(key_file.as_deref(), &list)?;
+        }
+        Some(other) => {
+            return Err(KohError::usage(format!(
+                "unknown servers subcommand {other:?}"
+            )));
+        }
+    }
+    Ok(Exit::OK)
+}
+
+fn cmd_clients(args: &[String]) -> Result<Exit> {
+    let mut key_file = None::<PathBuf>;
+    let mut clean = Vec::new();
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        if a == "--key-file" {
+            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
+        } else {
+            clean.push(a.to_string());
+        }
+        i += 1;
+    }
+    let mut list = load_clients(key_file.as_deref())?;
+    match clean.first().map(String::as_str) {
+        None => {
+            for e in &list {
+                let scope = match &e.scope {
+                    Scope::Full => String::new(),
+                    Scope::Cp(d) => format!(" cp={}", d.display()),
+                    Scope::Exec(d) => format!(" exec={}", d.display()),
+                };
+                let _ = writeln!(std::io::stdout(), "{} {}{scope}", e.name, e.id);
+            }
+        }
+        Some("add") => {
+            let name = clean.get(1).ok_or_else(|| {
+                KohError::usage("usage: koh clients add NAME ID [--cp DIR | --exec DIR]")
+            })?;
+            let id_s = clean.get(2).ok_or_else(|| {
+                KohError::usage("usage: koh clients add NAME ID [--cp DIR | --exec DIR]")
+            })?;
+            validate_peer_name(name)?;
+            let id = parse_endpoint_id(id_s)?;
+            let mut scope = Scope::Full;
+            let mut j = 3;
+            while let Some(a) = clean.get(j).map(String::as_str) {
+                match a {
+                    "--cp" => scope = Scope::Cp(PathBuf::from(take_opt(&clean, &mut j, a)?)),
+                    "--exec" => scope = Scope::Exec(PathBuf::from(take_opt(&clean, &mut j, a)?)),
+                    _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
+                }
+                j += 1;
+            }
+            list.retain(|e| e.name != *name);
+            list.push(ClientEntry {
+                name: name.clone(),
+                id,
+                scope,
+            });
+            save_clients(key_file.as_deref(), &list)?;
+        }
+        Some("rm") => {
+            let name = clean
+                .get(1)
+                .ok_or_else(|| KohError::usage("usage: koh clients rm NAME"))?;
+            let before = list.len();
+            list.retain(|e| e.name != *name);
+            if list.len() == before {
+                return Err(KohError::failed(format!("no client named {name:?}")));
+            }
+            save_clients(key_file.as_deref(), &list)?;
+        }
+        Some("rename") => {
+            let old = clean
+                .get(1)
+                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
+            let new = clean
+                .get(2)
+                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
+            validate_peer_name(new)?;
+            let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
+                return Err(KohError::failed(format!("no client named {old:?}")));
+            };
+            entry.name = new.clone();
+            save_clients(key_file.as_deref(), &list)?;
+        }
+        Some(other) => {
+            return Err(KohError::usage(format!(
+                "unknown clients subcommand {other:?}"
+            )));
+        }
+    }
+    Ok(Exit::OK)
+}
+
+async fn cmd_serve(args: &[String]) -> Result<Exit> {
+    let mut opts = ServeOptions {
+        key_file: None,
+        direct: None,
+        allow: Vec::new(),
+        shell: None,
+        state_dir: None,
+        disable_relay: false,
+        quiet: false,
+    };
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        match a {
+            "--key-file" => opts.key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            "--direct" => {
+                let v = take_opt(args, &mut i, a)?;
+                opts.direct = Some(
+                    v.parse()
+                        .map_err(|e| KohError::usage(format!("bad --direct: {e}")))?,
                 );
             }
+            "--allow" => opts
+                .allow
+                .push(parse_endpoint_id(&take_opt(args, &mut i, a)?)?),
+            "--shell" => opts.shell = Some(take_opt(args, &mut i, a)?),
+            "--no-relay" => opts.disable_relay = true,
+            _ => return Err(KohError::usage(format!("unexpected serve flag {a:?}"))),
+        }
+        i += 1;
+    }
+    run_serve(opts).await?;
+    Ok(Exit::OK)
+}
+
+fn parse_common_dial(args: &[String], i: &mut usize, opts: &mut DialOptions) -> Result<bool> {
+    let Some(a) = args.get(*i).map(String::as_str) else {
+        return Ok(false);
+    };
+    match a {
+        "--key-file" => opts.key_file = Some(PathBuf::from(take_opt(args, i, a)?)),
+        "--direct" => {
+            let v = take_opt(args, i, a)?;
+            opts.direct = Some(
+                v.parse()
+                    .map_err(|e| KohError::usage(format!("bad --direct: {e}")))?,
+            );
+        }
+        "--relay-url" => opts.relay = Some(parse_relay_url(&take_opt(args, i, a)?)?),
+        "--json" => opts.json = true,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+async fn cmd_exec(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut cwd, mut sync_dir, mut sh_line) = (
+        None::<String>,
+        None::<String>,
+        None::<PathBuf>,
+        None::<String>,
+    );
+    let mut excludes = Vec::new();
+    let mut argv = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a == "--" {
+            argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            break;
+        }
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        match a {
+            "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
+            "--sync" => sync_dir = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
+            "--sh" => sh_line = Some(take_opt(args, &mut i, a)?),
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected exec argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let server = server.ok_or_else(|| {
+        KohError::usage("usage: koh exec SERVER [-C DIR] [--sync DIR] -- PROG ARG...")
+    })?;
+    let (argv, shell) = match sh_line {
+        Some(line) => (vec![line], true),
+        None if !argv.is_empty() => (argv, false),
+        None => {
+            return Err(KohError::usage(
+                "missing command (use `-- PROG ...` or `--sh 'LINE'`)",
+            ));
+        }
+    };
+
+    let client = Client::connect(&server, &opts, false).await?;
+    if let Some(dir) = sync_dir {
+        let (remote_dir, _) =
+            sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
+        cwd = Some(remote_dir);
+    }
+    let (code, out, err) = client.exec(argv, cwd, shell, None, opts.json).await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({
+                "exit": code,
+                "stdout": String::from_utf8_lossy(&out),
+                "stderr": String::from_utf8_lossy(&err),
+            })
+        );
+    }
+    Ok(Exit(u8::try_from(code).unwrap_or(1)))
+}
+
+async fn cmd_run(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut name, mut cwd, mut sync_dir, mut sh_line) = (
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<PathBuf>,
+        None::<String>,
+    );
+    let mut excludes = Vec::new();
+    let mut argv = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a == "--" {
+            argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            break;
+        }
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        match a {
+            "--name" => name = Some(take_opt(args, &mut i, a)?),
+            "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
+            "--sync" => sync_dir = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
+            "--sh" => sh_line = Some(take_opt(args, &mut i, a)?),
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected run argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let server =
+        server.ok_or_else(|| KohError::usage("usage: koh run SERVER [--name N] -- PROG ARG..."))?;
+    let (argv, shell) = match sh_line {
+        Some(line) => (vec![line], true),
+        None if !argv.is_empty() => (argv, false),
+        None => return Err(KohError::usage("missing command")),
+    };
+    let client = Client::connect(&server, &opts, false).await?;
+    if let Some(dir) = sync_dir {
+        let (remote_dir, _) =
+            sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
+        cwd = Some(remote_dir);
+    }
+    let info = client.run_job(name, argv, cwd, shell).await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&info).unwrap_or_default()
+        );
+    } else {
+        let _ = writeln!(std::io::stdout(), "{}", info.name);
+    }
+    Ok(Exit::OK)
+}
+
+async fn cmd_jobs(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut name) = (None::<String>, None::<String>);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if server.is_none() {
+            server = Some(a.to_string());
+        } else if name.is_none() {
+            name = Some(a.to_string());
+        } else {
+            return Err(KohError::usage(format!("unexpected argument {a:?}")));
+        }
+        i += 1;
+    }
+    let server = server.ok_or_else(|| KohError::usage("usage: koh jobs SERVER [NAME]"))?;
+    let client = Client::connect(&server, &opts, false).await?;
+    let list = client.jobs(name).await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&list).unwrap_or_default()
+        );
+    } else {
+        for j in &list {
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}\t{}\t{}s\t{}",
+                j.name,
+                j.state,
+                j.age_secs,
+                j.command
+            );
         }
     }
+    Ok(Exit::OK)
 }
 
-/// `koh connect <name>` with every option at its default.
-fn defaults_for_connect(name: &str) -> anyhow::Result<ConnectArgs> {
-    if let Cmd::Connect(args) =
-        args::parse(&args::command().try_get_matches_from(["koh", "connect", name])?)?
-    {
-        return Ok(args);
-    }
-    anyhow::bail!("internal error: `koh connect` parsed as another command")
-}
-
-/// `koh serve` with every option at its default.
-fn defaults_for_serve() -> anyhow::Result<koh::server::ServeConfig> {
-    if let Cmd::Serve(config) =
-        args::parse(&args::command().try_get_matches_from(["koh", "serve"])?)?
-    {
-        return Ok(config);
-    }
-    anyhow::bail!("internal error: `koh serve` parsed as another command")
-}
-
-/// The exit status for the remote `code`: 255 if it does not fit 8 bits, where truncating could
-/// turn a failure into 0.
-fn exit_status(code: u32) -> u8 {
-    u8::try_from(code).unwrap_or(u8::MAX)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::exit_status;
-
-    #[test]
-    fn exit_status_passes_8_bit_codes_and_never_turns_a_wider_one_into_success() {
-        for code in [0, 1, 42, 127, 128, 255] {
-            assert_eq!(u32::from(exit_status(code)), code);
+async fn cmd_logs(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut name, mut tail, mut all, mut follow) =
+        (None::<String>, None::<String>, None::<usize>, false, false);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
         }
-        // `code as u8` made 256 and 512 exit 0 and 257 exit 1.
-        for code in [256, 257, 512, 65_536, u32::MAX] {
-            assert_eq!(exit_status(code), u8::MAX, "code {code}");
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--tail" => {
+                tail = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --tail"))?,
+                )
+            }
+            "--all" => all = true,
+            "-f" | "--follow" => follow = true,
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ if name.is_none() && !a.starts_with('-') => name = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected logs argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let (Some(server), Some(name)) = (server, name) else {
+        return Err(KohError::usage(
+            "usage: koh logs SERVER JOB [--tail N | --all] [-f]",
+        ));
+    };
+    let client = Client::connect(&server, &opts, follow).await?;
+    let (bytes, state, exit, age) = client.logs(name, tail, all, follow).await?;
+    client.close().await;
+    if !follow {
+        let _ = std::io::stdout().write_all(&bytes);
+    }
+    let _ = writeln!(std::io::stderr(), "· {state} {age}s");
+    Ok(if follow {
+        Exit(u8::try_from(exit.unwrap_or(0)).unwrap_or(1))
+    } else {
+        Exit::OK
+    })
+}
+
+async fn cmd_kill(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut name, mut sig) = (None::<String>, None::<String>, 15i32);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--signal" | "-s" => sig = parse_signal(&take_opt(args, &mut i, a)?)?,
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ if name.is_none() && !a.starts_with('-') => name = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected kill argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let (Some(server), Some(name)) = (server, name) else {
+        return Err(KohError::usage("usage: koh kill SERVER JOB [--signal SIG]"));
+    };
+    let client = Client::connect(&server, &opts, false).await?;
+    let info = client.kill_job(name, sig).await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&info).unwrap_or_default()
+        );
+    }
+    Ok(Exit::OK)
+}
+
+async fn cmd_wait(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut job, mut text, mut session, mut tail, mut timeout) = (
+        None::<String>,
+        None::<String>,
+        None::<String>,
+        None::<u32>,
+        200usize,
+        None::<u64>,
+    );
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--text" => text = Some(take_opt(args, &mut i, a)?),
+            "--session" => {
+                session = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --session"))?,
+                )
+            }
+            "--tail" => {
+                tail = take_opt(args, &mut i, a)?
+                    .parse()
+                    .map_err(|_| KohError::usage("bad --tail"))?
+            }
+            "--timeout" => {
+                timeout = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --timeout"))?,
+                )
+            }
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ if job.is_none() && !a.starts_with('-') => job = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected wait argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let server =
+        server.ok_or_else(|| KohError::usage("usage: koh wait SERVER (JOB | --session N)"))?;
+    let client = Client::connect(&server, &opts, true).await?;
+    let res = if let Some(sid) = session {
+        client.wait_session(sid, timeout).await?
+    } else if let Some(name) = job {
+        client.wait_job(name, text, tail, timeout).await?
+    } else {
+        client.close().await;
+        return Err(KohError::usage("wait needs JOB or --session N"));
+    };
+    client.close().await;
+
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&res).unwrap_or_default()
+        );
+    } else {
+        if !res.tail.is_empty() {
+            let _ = std::io::stdout().write_all(res.tail.as_bytes());
+        }
+        let _ = writeln!(std::io::stderr(), "· {}", res.detail);
+    }
+    Ok(Exit(u8::try_from(res.exit).unwrap_or(1)))
+}
+
+async fn cmd_cp(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut delete, mut preserve, mut dry_run) = (false, false, false);
+    let mut excludes = Vec::new();
+    let mut pos = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a == "--" {
+            pos.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            break;
+        }
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        match a {
+            "-r" | "-R" | "--recursive" => {}
+            "--delete" => delete = true,
+            "-p" | "--preserve" => preserve = true,
+            "--dry-run" | "-n" => dry_run = true,
+            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
+            _ if !a.starts_with('-') => pos.push(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected cp flag {a:?}"))),
+        }
+        i += 1;
+    }
+    if pos.len() < 2 {
+        return Err(KohError::usage(
+            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
+        ));
+    }
+    let Some((dst, srcs)) = pos.split_last() else {
+        return Err(KohError::usage(
+            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
+        ));
+    };
+    if delete && srcs.len() > 1 {
+        return Err(KohError::usage("--delete requires a single source"));
+    }
+    let summary = if let Some((server, rpath)) = split_remote(dst) {
+        if srcs.iter().any(|s| split_remote(s).is_some()) {
+            return Err(KohError::usage(
+                "cannot mix remote sources with a remote destination",
+            ));
+        }
+        let client = Client::connect(server, &opts, false).await?;
+        let rdst = if rpath.is_empty() {
+            ".".to_string()
+        } else {
+            rpath.to_string()
+        };
+        let local_srcs: Vec<PathBuf> = srcs.iter().map(PathBuf::from).collect();
+        let s = client
+            .cp_push_many(&local_srcs, &rdst, &excludes, delete, preserve, dry_run)
+            .await?;
+        client.close().await;
+        s
+    } else {
+        let mut server_name: Option<&str> = None;
+        let mut remote_srcs = Vec::with_capacity(srcs.len());
+        for src in srcs {
+            let Some((srv, rpath)) = split_remote(src) else {
+                return Err(KohError::usage(
+                    "all sources must be SERVER:PATH when destination is local",
+                ));
+            };
+            match server_name {
+                None => server_name = Some(srv),
+                Some(prev) if prev != srv => {
+                    return Err(KohError::usage(
+                        "all remote sources in one `koh cp` must use the same server",
+                    ));
+                }
+                Some(_) => {}
+            }
+            remote_srcs.push(if rpath.is_empty() {
+                ".".to_string()
+            } else {
+                rpath.to_string()
+            });
+        }
+        let server =
+            server_name.ok_or_else(|| KohError::usage("one of SRC or DST must be SERVER:PATH"))?;
+        let client = Client::connect(server, &opts, false).await?;
+        let s = client
+            .cp_pull_many(
+                &remote_srcs,
+                Path::new(dst),
+                &excludes,
+                delete,
+                preserve,
+                dry_run,
+            )
+            .await?;
+        client.close().await;
+        s
+    };
+
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&summary).unwrap_or_default()
+        );
+    } else {
+        for p in &summary.added {
+            let _ = writeln!(std::io::stdout(), "+ {p}");
+        }
+        for p in &summary.updated {
+            let _ = writeln!(std::io::stdout(), "~ {p}");
+        }
+        for p in &summary.deleted {
+            let _ = writeln!(std::io::stdout(), "- {p}");
         }
     }
+    Ok(Exit::OK)
+}
+
+fn split_remote(s: &str) -> Option<(&str, &str)> {
+    let (host, path) = s.split_once(':')?;
+    if host.is_empty() || host.contains('/') {
+        return None;
+    }
+    Some((host, path))
+}
+
+async fn cmd_sessions(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let mut server = None::<String>;
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if server.is_none() {
+            server = Some(a.to_string());
+        } else {
+            return Err(KohError::usage(format!("unexpected argument {a:?}")));
+        }
+        i += 1;
+    }
+    let server = server.ok_or_else(|| KohError::usage("usage: koh sessions SERVER [--json]"))?;
+    let client = Client::connect(&server, &opts, false).await?;
+    let list = client.sessions().await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::to_string(&list).unwrap_or_default()
+        );
+    } else {
+        for s in &list {
+            let att = if s.attached { "attached" } else { "detached" };
+            let cmd_st = if s.running_command { "busy" } else { "idle" };
+            let last = s.last_exit.map_or("-".to_string(), |c| c.to_string());
+            let _ = writeln!(
+                std::io::stdout(),
+                "{}\t{att}\t{}\t{cmd_st}\texit={last}\t{}x{}\t{}",
+                s.id,
+                s.state,
+                s.cols,
+                s.rows,
+                s.title
+            );
+        }
+    }
+    Ok(Exit::OK)
+}
+
+async fn cmd_output(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut session, mut last) = (None::<String>, None::<u32>, false);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--session" => {
+                session = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --session"))?,
+                )
+            }
+            "--last" => last = true,
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected output argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let (Some(server), Some(session)) = (server, session) else {
+        return Err(KohError::usage(
+            "usage: koh output SERVER --session N [--last]",
+        ));
+    };
+    let client = Client::connect(&server, &opts, false).await?;
+    let text = client.output(session, last).await?;
+    client.close().await;
+    if opts.json {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            serde_json::json!({ "session": session, "output": text })
+        );
+    } else {
+        let _ = std::io::stdout().write_all(text.as_bytes());
+    }
+    Ok(Exit::OK)
+}
+
+async fn cmd_connect(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut session, mut new, mut cwd) =
+        (None::<String>, None::<u32>, false, None::<String>);
+    let mut argv = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a == "--" {
+            argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            break;
+        }
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        match a {
+            "--new" => new = true,
+            "--session" => {
+                session = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --session"))?,
+                )
+            }
+            "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ => {
+                return Err(KohError::usage(format!(
+                    "unexpected connect argument {a:?}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let server = server.ok_or_else(|| {
+        KohError::usage("usage: koh connect SERVER [--new | --session N] [-- PROG...]")
+    })?;
+    let client = Client::connect(&server, &opts, true).await?;
+    let code = client
+        .connect_interactive(ConnectOptions {
+            session,
+            new,
+            argv,
+            cwd,
+        })
+        .await?;
+    Ok(Exit(u8::try_from(code).unwrap_or(1)))
+}
+
+async fn cmd_mount(args: &[String]) -> Result<Exit> {
+    let mut opts = DialOptions {
+        key_file: None,
+        direct: None,
+        relay: None,
+        json: false,
+    };
+    let (mut server, mut session, mut local_dir) = (None::<String>, None::<u32>, None::<PathBuf>);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--session" => {
+                session = Some(
+                    take_opt(args, &mut i, a)?
+                        .parse()
+                        .map_err(|_| KohError::usage("bad --session"))?,
+                )
+            }
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ if local_dir.is_none() && !a.starts_with('-') => local_dir = Some(PathBuf::from(a)),
+            _ => return Err(KohError::usage(format!("unexpected mount argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let server = server
+        .ok_or_else(|| KohError::usage("usage: koh mount SERVER [--session N] [LOCAL_PANE_DIR]"))?;
+    let dir = match local_dir {
+        Some(d) => d,
+        None => {
+            let fux_dir = std::env::var("FUX_DIR")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var("XDG_RUNTIME_DIR")
+                        .ok()
+                        .map(|r| PathBuf::from(r).join("fux"))
+                })
+                .unwrap_or_else(|| std::env::temp_dir().join("fux"));
+            fux_dir.join("main").join(format!("koh-{server}"))
+        }
+    };
+    let mut client = Client::connect(&server, &opts, true).await?;
+    let _ = writeln!(
+        std::io::stderr(),
+        "mirroring remote session at {}",
+        dir.display()
+    );
+    client.mount_local_pane(session, &dir, 80, 24).await?;
+    client.close().await;
+    Ok(Exit::OK)
 }

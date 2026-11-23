@@ -1,164 +1,122 @@
-//! The library behind the `koh` remote shell: `koh serve` hosts PTYs for allowlisted peers and
-//! `koh connect` relays one to the user's terminal with predictive local echo, reconnecting
-//! transparently; `koh exec` runs a command there, `koh run` a job that outlives the connection,
-//! and `koh cp` brings files into line.
-//!
-//! [`transport_iroh`] sets up endpoints; [`identity`] loads the keys; [`keycmd`] is `koh id` and
-//! `koh key reset`; [`names`] names the servers and clients a machine knows. [`request`] is what a
-//! connection opens with, [`proto`] a shell's wire protocol, [`stream`] what of a program's output
-//! reaches the user's terminal, [`events`] the input it carries, [`sync`] a copy's; [`terminal`],
-//! [`predict`] and [`pty`] the server's emulator, the prediction and the PTY; [`server`] hosts
-//! sessions, commands and jobs and [`client`] drives them. [`bounded`] holds every queue.
-//!
-//! Production code is panic-free by construction: `Cargo.toml` forbids the panic lints, lossy casts
-//! and unchecked arithmetic, and a `forbid` cannot be lifted locally. Tests may panic.
-//!
-//! The library exists so the binary, tests and fuzz targets share code; all of it is internal.
+//! koh: ultra-minimal peer-to-peer remote shell, headless jobs, delta sync,
+//! and interactive fux sessions over iroh QUIC.
+#![forbid(unsafe_code)]
 
-pub mod bounded;
 pub mod client;
-pub mod events;
-pub mod identity;
-pub mod keycmd;
-pub mod log;
-pub mod menu;
-pub mod names;
-pub mod predict;
+pub mod jobs;
+pub mod keys;
+pub mod net;
+pub mod pane;
 pub mod proto;
-pub mod pty;
-pub mod request;
 pub mod server;
-pub mod stream;
 pub mod sync;
-pub mod terminal;
-pub mod transport_iroh;
 
-#[cfg(test)]
-mod test_runtime;
+use std::fmt;
 
-/// Cancel `token` on the first SIGTERM, SIGINT or SIGHUP, so `koh serve` drains and `koh connect`
-/// restores the terminal instead of the process dying where it stands; the token returned is
-/// cancelled on a later one ([`Shutdown`]), when waiting longer is not wanted. A SIGHUP ignored as
-/// the process started (`nohup`) stays ignored. Fails only if a handler cannot be installed.
-pub(crate) fn cancel_on_signals(
-    token: &tokio_util::sync::CancellationToken,
-) -> std::io::Result<tokio_util::sync::CancellationToken> {
-    use tokio::signal::unix::{signal, SignalKind};
-    // Read before the handler replaces it. The handler is installed even so: a program started
-    // later gets SIGHUP's default at its `exec`, as a hosted shell must to hang up with its session.
-    let nohup = ignored_at_start() & 1 == 1;
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    let mut hup = signal(SignalKind::hangup())?;
-    let (draining, forced) = (token.clone(), tokio_util::sync::CancellationToken::new());
-    let force = forced.clone();
-    #[expect(clippy::disallowed_methods, reason = "the one signal task")]
-    tokio::spawn(async move {
-        let mut shutdown = Shutdown::default();
-        loop {
-            let name = tokio::select! {
-                Some(()) = term.recv() => "SIGTERM",
-                Some(()) = int.recv() => "SIGINT",
-                Some(()) = hup.recv() => if nohup {
-                    tracing::info!("SIGHUP ignored, as it was when koh started (nohup)");
-                    continue;
-                } else {
-                    "SIGHUP"
-                },
-                else => return,
-            };
-            tracing::info!(signal = name, "shutting down");
-            let _ = STOPPED_BY.set(name);
-            match shutdown.signal(std::time::Instant::now()) {
-                Shutdown::Draining(_) => draining.cancel(),
-                Shutdown::Forced => force.cancel(),
-                Shutdown::Running => {}
+/// Strict CLI exit codes for scripts and agents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Exit(pub u8);
+
+impl Exit {
+    pub const OK: Self = Self(0);
+    pub const FAILED: Self = Self(1);
+    pub const USAGE: Self = Self(2);
+    pub const UNREACHABLE: Self = Self(3);
+    pub const REFUSED: Self = Self(4);
+    pub const BUSY: Self = Self(75);
+    pub const TIMEOUT: Self = Self(124);
+    pub const CANNOT_START: Self = Self(126);
+    pub const NOT_FOUND: Self = Self(127);
+    pub const INTERNAL: Self = Self(255);
+}
+
+/// Structured koh error carrying exit code and machine-readable kind for `--json`.
+#[derive(Debug)]
+pub struct KohError {
+    pub code: Exit,
+    pub kind: &'static str,
+    pub message: String,
+}
+
+impl KohError {
+    pub fn new(code: Exit, kind: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn usage(msg: impl Into<String>) -> Self {
+        Self::new(Exit::USAGE, "usage", msg)
+    }
+
+    pub fn unreachable(msg: impl Into<String>) -> Self {
+        Self::new(Exit::UNREACHABLE, "unreachable", msg)
+    }
+
+    pub fn refused(msg: impl Into<String>) -> Self {
+        Self::new(Exit::REFUSED, "refused", msg)
+    }
+
+    pub fn failed(msg: impl Into<String>) -> Self {
+        Self::new(Exit::FAILED, "failed", msg)
+    }
+
+    pub fn timeout(msg: impl Into<String>) -> Self {
+        Self::new(Exit::TIMEOUT, "timeout", msg)
+    }
+
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::new(Exit::INTERNAL, "internal", msg)
+    }
+
+    pub fn json_line(&self) -> String {
+        serde_json::json!({
+            "error": {
+                "kind": self.kind,
+                "message": self.message,
+                "code": self.code.0,
             }
-        }
-    });
-    Ok(forced)
+        })
+        .to_string()
+    }
 }
 
-/// The first signal [`cancel_on_signals`] took, by name.
-static STOPPED_BY: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
-
-/// The signal that stopped this process, by name, if one did ([`cancel_on_signals`]).
-pub(crate) fn stopped_by() -> Option<&'static str> {
-    STOPPED_BY.get().copied()
+impl fmt::Display for KohError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
-/// The signals this process was started ignoring, a bit each (signal `n` is bit `n - 1`): the
-/// `SigIgn` mask Linux and Android show; elsewhere none is known.
-fn ignored_at_start() -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let mask = status.lines().find_map(|line| line.strip_prefix("SigIgn:"));
-    mask.and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-        .unwrap_or(0)
-}
+impl std::error::Error for KohError {}
 
-/// Have the programs this process starts begin with every signal at its default, as from a login,
-/// though it was started ignoring some: a script's `&` ignores SIGINT and SIGQUIT, and an ignored
-/// signal stays ignored across `exec`, so a hosted shell's `Ctrl-\` would do nothing. Each is
-/// caught instead, by a handler that does nothing: this process goes on as if it ignored it, and
-/// `exec` gives a caught signal its default. Not SIGPIPE, which Rust ignores itself and gives its
-/// default back to what it starts, nor those [`cancel_on_signals`] catches, SIGHUP among them.
-/// Only where the mask is known ([`ignored_at_start`]).
-pub(crate) fn default_signals_for_children() {
-    use tokio::signal::unix::{signal, SignalKind};
-    const CAUGHT: [i32; 4] = [1, 2, 13, 15];
-    let ignored = ignored_at_start();
-    for (number, bit) in (1..=31_i32).zip(0..31_u32) {
-        if ignored.checked_shr(bit).unwrap_or(0) & 1 == 0 || CAUGHT.contains(&number) {
-            continue;
-        }
-        // Once installed, the handler stays when its stream is dropped.
-        if let Err(error) = signal(SignalKind::from_raw(number)) {
-            tracing::debug!(number, %error, "an ignored signal is left ignored");
+impl From<anyhow::Error> for KohError {
+    fn from(err: anyhow::Error) -> Self {
+        match err.downcast::<KohError>() {
+            Ok(ke) => ke,
+            Err(err) => Self::internal(format!("{err:#}")),
         }
     }
 }
 
-/// Where a process is in shutting down, by the signals it got. Counted apart from what they
-/// cancel: a drain the process began on its own (its endpoint closed) is not one a signal began.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum Shutdown {
-    #[default]
-    Running,
-    /// The first signal came, at this instant: drain.
-    Draining(std::time::Instant),
-    /// Another came, [`Shutdown::DEBOUNCE`] or more after the first: stop waiting.
-    Forced,
+pub type Result<T> = std::result::Result<T, KohError>;
+
+/// Valid single path component (no slashes, no `.` or `..`, printable ASCII/UTF-8 without controls).
+pub fn is_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-impl Shutdown {
-    /// Signals this close after the first are one event: a terminal closing sends its session a
-    /// SIGHUP, and its shell sends another, and that must not skip the drain.
-    const DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
-
-    /// A signal came at `now`: where that leaves the process.
-    fn signal(&mut self, now: std::time::Instant) -> Self {
-        *self = match *self {
-            Self::Running => Self::Draining(now),
-            Self::Draining(first) if now.saturating_duration_since(first) < Self::DEBOUNCE => {
-                Self::Draining(first)
-            }
-            Self::Draining(_) | Self::Forced => Self::Forced,
-        };
-        *self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Shutdown;
-
-    #[test]
-    fn a_double_sighup_still_drains_and_a_later_signal_forces() {
-        let t0 = std::time::Instant::now();
-        let mut s = Shutdown::default();
-        assert_eq!(s.signal(t0), Shutdown::Draining(t0));
-        let echo = t0 + std::time::Duration::from_millis(5);
-        assert_eq!(s.signal(echo), Shutdown::Draining(t0), "the same event");
-        assert_eq!(s.signal(t0 + Shutdown::DEBOUNCE), Shutdown::Forced);
-    }
+/// Atomically writes `data` to `path` via a sibling `.new` temp file + rename.
+pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.new"));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(tmp, path)
 }

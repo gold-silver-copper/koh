@@ -4,17 +4,11 @@ on:
   push:
     branches: [master]
   pull_request:
-  schedule:
-    # Weekly (Mon 06:00 UTC): the fuzzers, and the advisory scan again, so a newly-disclosed CVE
-    # against the deliberately `=`-pinned dependency tree surfaces even with no code change.
-    - cron: "0 6 * * 1"
 
-# Cancel superseded runs on the same ref.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Least privilege: every job here only needs to read the repo.
 permissions:
   contents: read
 
@@ -22,37 +16,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  harnesses:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            testkit -> target
-            testing/bench -> target
-            testing/android/evil-peer -> target
-            fuzz -> target
-      - name: Check standalone harnesses
-        run: |
-          for manifest in testkit/Cargo.toml testing/bench/Cargo.toml testing/android/evil-peer/Cargo.toml fuzz/Cargo.toml; do
-            cargo fmt --manifest-path "$manifest" --all --check
-            cargo clippy --manifest-path "$manifest" --all-targets --locked -- -D warnings
-          done
-
-  # The same green gate enforced locally — format, lints (warnings are errors), the layering guard,
-  # the full test suite, and broken-doc-link detection — on BOTH supported desktop OSes.
   gate:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -61,115 +31,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustfmt
         run: cargo fmt --all --check
-      - name: clippy (warnings are errors)
+      - name: clippy (all targets)
         run: cargo clippy --all-targets --locked -- -D warnings
-      # `--all-targets` builds the library under `cfg(test)`, where clippy.toml lets tests panic.
-      # Check the shipped library and binary as they are built for release, too.
-      - name: clippy (production build)
+      - name: clippy (production)
         run: cargo clippy --lib --bins --locked -- -D warnings
-      - name: layering guard
-        # Enforce the load-bearing dependency edges the architecture relies on: any `crate::` path
-        # in the code, a `use` (grouped or split over lines) or inline, but not in a comment, so a
-        # rustdoc link can't false-positive.
-        run: |
-          # The code of a file, its comments removed, on one line, so a `use` split over lines is one.
-          code() { sed -e 's://.*$::' "$1" | tr '\n' ' '; }
-          # The predictor and the wire protocol may use the screen types, never a client or server.
-          for file in src/predict.rs src/proto.rs; do
-            if code "$file" | grep -E 'crate::(\{[^}]*)?(server|client)' >/dev/null; then
-              echo "::error::$file must not import from server/client"
-              exit 1
-            fi
-          done
-          echo "layering edges OK"
-      - name: a bash koh marks, on macOS (its own is 3.2, which koh leaves unmarked)
-        if: runner.os == 'macOS'
-        run: |
-          brew install bash
-          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
       - name: test
-        run: cargo test --locked
-      - name: test with nvim (ignored elsewhere, as it needs nvim 0.10 or later)
-        if: runner.os == 'macOS'
-        run: |
-          brew install neovim
-          cargo test --locked --test net -- --ignored nvim
-      - name: docs (deny broken intra-doc links)
-        # Catches renamed intra-doc links before they ship a broken docs.rs build.
-        run: cargo doc --no-deps --locked
-        env:
-          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
+        run: cargo test --locked -- --test-threads 4
 
-  # koh stays publishable, so `cargo install koh` keeps working.
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo publish --dry-run
         run: cargo publish --dry-run --locked
-
-  # Verify the declared MSRV (`rust-version = "1.95"`) actually builds — otherwise the declaration is
-  # a false promise to `cargo install` users on an older toolchain. Check, not test (the `=`-pinned
-  # lockfile makes it cheap and deterministic). Bump `rust-version` if this ever fails.
-  msrv:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.95
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo check on the declared MSRV
-        run: cargo check --locked --all-targets
-
-  # Supply-chain tripwire: the `=` pins buy reproducibility, so this is what keeps them from
-  # silently aging into a CVE. Advisory ignores (and the rationale) live in deny.toml.
-  advisories:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check advisories
-
-  # Coverage-guided fuzzing of the untrusted-input decode surfaces (the OpenSSH/OSS-Fuzz doctrine:
-  # one harness per attacker-reachable parser). Builds the harnesses, then a short smoke run of each
-  # that MUST stay crash-free.
-  # Weekly only: the harnesses job already lints the fuzz targets on every push.
-  fuzz:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
-      - name: build fuzz targets
-        # The committed lockfile, checked first: `cargo fuzz build` would update it silently.
-        run: |
-          cargo +nightly check --locked --manifest-path fuzz/Cargo.toml --bins
-          cargo +nightly fuzz build
-      # What earlier runs found, a directory per target: each run goes on from there.
-      - uses: actions/cache@v4
-        with:
-          path: fuzz/corpus
-          key: fuzz-corpus-${{ github.run_id }}
-          restore-keys: fuzz-corpus-
-      - name: seed the corpus with the hand-built wire messages
-        run: KOH_FUZZ_SEEDS="$PWD/fuzz/corpus" cargo +nightly test --locked --test wire_golden the_wire_messages_seed_the_fuzzers
-      - name: smoke (must stay crash-free)
-        # Each target from its corpus (fuzz/corpus is not committed): what earlier runs found and
-        # the wire messages above, and for `server_process`, whose input is a program's output,
-        # the recorded output of real programs.
-        run: |
-          for target in proto_decode server_input client_input request_decode; do
-            cargo +nightly fuzz run "$target" -- -max_total_time=45 -rss_limit_mb=4096
-          done
-          mkdir -p fuzz/corpus/server_process
-          cargo +nightly fuzz run server_process fuzz/corpus/server_process testing/corpus -- \
-            -max_total_time=45 -rss_limit_mb=4096

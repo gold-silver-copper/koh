@@ -30,8 +30,9 @@ credit reporters who want it.
   `dispatch`; `src/keys.rs`, `Scope`), and what bounds a peer before and after that
   (`src/server.rs`, `start_server` and `handle_connection`; `src/pane.rs`, `SessionManager`).
 - The wire decoders and their bounds (`src/proto.rs`), on both ends.
-- Where a copy reads and lands, on both ends (`src/sync.rs`), and what a scoped key's path may
-  name (`src/keys.rs`, `Scope::place_cp`).
+- The paths a copy's peer may name, on both ends (`src/sync.rs`, `wire_names`), and the paths a
+  scoped key may name (`src/keys.rs`, `Scope`). Where a symlink leads is not in scope: see
+  below.
 - Commands and jobs the server starts (`src/server.rs`, `handle_exec`; `src/jobs.rs`).
 - What a server can make a client write: a mirrored session's pane folder and the files of a
   copy (`src/client.rs`, `mount_session` and `write_mirrored_pane`; `src/sync.rs`).
@@ -48,19 +49,24 @@ credit reporters who want it.
 
 - A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
   can read or write, and sessions.
-- A `--cp DIR` key copies to and from paths beneath `DIR` and nothing else. No symlink beneath
-  `DIR` is followed, so it reaches nothing outside `DIR`.
+- A `--cp DIR` key copies to and from paths beneath `DIR` and nothing else. Beneath is told by
+  the text of the path: it begins with `DIR` and goes on with plain names (no `..`). **It is
+  not a confinement.** Nothing is resolved, so a symlink beneath `DIR` leads where it leads,
+  and a copy through it reads and writes there. The scope is a convenience and a guard against
+  mistakes; koh trusts the machines it runs on and what is on them.
 - A `--exec DIR` key runs commands and starts jobs, which must start in a directory beneath
-  `DIR`, and copies beneath `DIR`. **It is not a sandbox**: only the starting directory is
-  checked, and the command is any command, run as the server's user. Give it only to a peer you
-  would give a shell.
+  `DIR` by the same rule, and copies as a `--cp DIR` key does. **It is not a sandbox**: only
+  the starting directory's path is checked, and the command is any command, run as the
+  server's user. Give it only to a peer you would give a shell.
 
 ## Past audits
 
 The audits before 0.18.0 covered code the rewrite replaced; they are in the git history. An
-internal audit of the rewrite in November 2026 found a scoped key's copy writing through
-symlinks, a server lock that locked nothing and no bound on connections or sessions; the tests
-that guard those fixes are in `tests/e2e.rs`.
+internal audit of the rewrite in November 2026 found a server lock that locked nothing and no
+bound on connections or sessions; the tests that guard those fixes are in `tests/e2e.rs`. It
+also found a scoped key's copy writing through symlinks. That one was fixed and then, by the
+maintainer's decision, undone: koh has no anti-symlink mechanics, and a scope is what the
+section above says it is.
 
 ## Please do not
 

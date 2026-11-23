@@ -67,15 +67,18 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
 `koh clients add NAME ID --cp DIR` or `--exec DIR` (`src/keys.rs`, `Scope`).
 
 - **`--cp DIR`** copies to and from paths beneath `DIR`. The path it names must begin with
-  `DIR` and go on with plain names (no `..`); nothing of it is resolved. The server opens `DIR`
-  and reaches each name from the directory above it with `openat` and `O_NOFOLLOW`
-  (`src/sync.rs`), so a symlink beneath `DIR`, whoever made it, is never followed: where a
-  directory is needed it is refused, where a file lands it is replaced as the link it is, and in
-  a tree being read or pruned (`--delete`) it is skipped. A file is written under a new name
-  made with `O_EXCL` and renamed into place, with mode 0644 or 0755 and never setuid. A copy
-  makes no symlinks. Every other request is refused (exit 4).
-- **`--exec DIR`** runs commands and starts jobs whose starting directory resolves beneath
-  `DIR`, and copies beneath `DIR` as above. **It is not a sandbox:** the command is any command,
+  `DIR` and go on with plain names (no `..`); nothing of it is resolved (`src/keys.rs`,
+  `check_beneath`), and the names a copy then sends are held to plain names the same way
+  (`src/sync.rs`, `wire_names`). **That is the text of the path, and it is not a confinement:**
+  the server uses the path as the file system resolves it, so a symlink beneath `DIR` leads
+  where it leads, and a key that finds one leading out of `DIR` reads and writes there as the
+  server's user. The scope keeps a script or a slip of the hand in `DIR`; the operator trusts
+  his machines and what is on them. A copy makes no symlinks: one in a tree that is read is not
+  sent, `--delete` leaves it, and a file that lands where one is replaces it (a file is written
+  under a name of its own beside where it lands and renamed, with mode 0644 or 0755 and never
+  setuid). Every other request is refused (exit 4).
+- **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
+  the same rule, and copies as above. **It is not a sandbox:** the command is any command,
   run as the server's user, and reaches whatever that user can. Every other request is refused:
   sessions (attaching, their list, their text, a wait for one) and everything about jobs but
   starting one (their list, their logs, a wait for one, killing one). Treat it as a full key
@@ -87,10 +90,10 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
 
 A wrong endpoint id, or a host someone else now controls.
 
-- **A copy from it** (`koh cp SERVER:SRC DST`) lands beneath `DST` and nowhere else, by the same
-  descriptor walk: no name it sends and no symlink in `DST` takes a file outside. The client
-  takes at most 100,000 entries, only the files it asked for, and no file longer than the
-  server said.
+- **A copy from it** (`koh cp SERVER:SRC DST`) lands beneath `DST`: every name it sends is a
+  plain name (no `..`, no `/`), so none takes a file outside. A symlink already in `DST` is
+  followed, as the user's own `cp` would. The client takes at most 100,000 entries, only the
+  files it asked for, and no file longer than the server said.
 - **A session from it** (`koh connect`, `koh mount`) is mirrored into a pane folder on the
   client. The server chooses the contents of that folder's files (the screen, title, links,
   clipboard, notice, pictures), never their names. The viewer then draws them, so the server
@@ -106,7 +109,9 @@ A wrong endpoint id, or a host someone else now controls.
 
 ## Local users of the server's machine
 
-The key file is 0600 in a directory that must be the user's own and not writable by others, and
-is never read through a symlink (`src/keys.rs`). Sessions' pane folders and jobs' logs are kept
-in `$XDG_RUNTIME_DIR/koh`; where that is not set they are in the system's temporary directory
-under `koh-UID`, which koh does not check the ownership of.
+Not defended against: koh trusts the machines it runs on. The key file is 0600 in a directory
+that koh makes 0700 and refuses if group or others may write to it; whose directory it is, koh
+does not check. The key is never read through a symlink (`src/keys.rs`). Sessions' pane folders
+and jobs' logs are kept in `$XDG_RUNTIME_DIR/koh`; where that is not set they are in the
+system's temporary directory under `koh-UID` (the owner of the server's lock file), which koh
+does not check the ownership of.

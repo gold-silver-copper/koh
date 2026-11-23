@@ -2227,3 +2227,50 @@ async fn a_proof_deadline_too_far_off_for_the_clock_is_no_deadline_and_no_panic(
     }
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
+    // The 128 directories are a bound on a path within a tree, as it goes over the wire. The way
+    // from a `--cp DIR` key's directory to the tree is not such a path: it may be any length.
+    let (tmp, srv, client, allowed, _) = boot_scoped("deep-root").await;
+    let root = deep(&allowed, 130).parent().unwrap().to_path_buf();
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), "pushed").unwrap();
+    client
+        .cp_push(
+            &src,
+            root.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(root.join("f")).unwrap(), "pushed");
+    let back = tmp.0.join("back");
+    client
+        .cp_pull(
+            root.display().to_string(),
+            &back,
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(back.join("f")).unwrap(), "pushed");
+
+    // Each name on that way is still one plain name: none of them may lead back out.
+    let out = format!("{}/d/../../outside", allowed.display());
+    let err = client
+        .cp_push(&src, out, Vec::new(), false, false, false)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
+
+    client.close().await;
+    srv.shutdown().await;
+}

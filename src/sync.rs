@@ -104,11 +104,10 @@ impl Place {
     }
 
     /// The names `beneath` the directory `base`, each one plain name: what a scoped key may reach.
-    /// (So that what walks a place can take every name of it for one name.)
+    /// (So that what walks a place can take every name of it for one name. There may be any number
+    /// of them: this is the way to a tree, and the 128 directories are a bound on a path within one.)
     pub(crate) fn beneath(base: PathBuf, beneath: Vec<String>) -> Result<Self> {
-        if beneath.is_empty()
-            || wire_names(&beneath.join("/")).is_ok_and(|names| names.len() == beneath.len())
-        {
+        if beneath.iter().all(|name| plain(name)) {
             Ok(Self { base, beneath })
         } else {
             Err(KohError::refused(format!(
@@ -245,13 +244,17 @@ fn open_file(dir: &File, name: &str, rel: &str) -> Result<File> {
         .map_err(|errno| not_opened(dir, name, rel, errno))
 }
 
+/// Whether `name` is one plain name: not empty, `.` or `..`, with no `/` or NUL.
+fn plain(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\0'])
+}
+
 /// The names of the wire path `rel`: a path beneath a tree, and nothing else. Each is one plain
-/// name (not empty, `.` or `..`, with no `/` or NUL), and there are at most 129: an entry's own,
-/// and those of the 128 directories it may be beneath.
+/// name, and there are at most 129: an entry's own, and those of the 128 directories it may be
+/// beneath.
 pub fn wire_names(rel: &str) -> Result<Vec<&str>> {
     let names: Vec<&str> = rel.split('/').collect();
-    let plain = |n: &&str| !n.is_empty() && *n != "." && *n != ".." && !n.contains('\0');
-    if names.len() > MAX_DEPTH + 1 || !names.iter().all(plain) {
+    if names.len() > MAX_DEPTH + 1 || !names.iter().all(|name| plain(name)) {
         return Err(KohError::refused(format!("unsafe relative path {rel:?}")));
     }
     Ok(names)

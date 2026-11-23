@@ -568,6 +568,7 @@ async fn dispatch(
 
             // Send initial frame immediately.
             let initial = rx.borrow_and_update().clone();
+            let ended = initial.state != "running";
             send_frame_update(
                 &sess,
                 initial,
@@ -578,6 +579,11 @@ async fn dispatch(
                 send,
             )
             .await?;
+            // A session whose program has ended changes no more: its screen was the last there is
+            // to send. (Waiting for more would keep it attached for as long as its client stays.)
+            if ended {
+                return Ok(());
+            }
 
             // Bridge client events -> PTY and watch frames -> client (cancel-safe reader task).
             let mut client_rx = spawn_msg_reader::<ClientEvent>(recv, MAX_CHUNK);

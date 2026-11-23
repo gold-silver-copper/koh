@@ -2120,3 +2120,58 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
     client.close().await;
     srv.shutdown().await;
 }
+
+#[tokio::test]
+async fn attaching_to_a_session_that_has_ended_shows_it_and_lets_go() {
+    let tmp = TempDir::new("attach-ended");
+    let friend = new_key(&tmp, "friend.key");
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], ServeOptions::default()).await;
+    let client = Client::connect_direct(friend, srv.endpoint_id, route, true)
+        .await
+        .unwrap();
+    let attach = |session: Option<u32>| Request::Attach {
+        session,
+        new: session.is_none(),
+        cols: 80,
+        rows: 10,
+        cell_w: 10,
+        cell_h: 20,
+        argv: if session.is_none() {
+            vec!["/bin/sh".into(), "-c".into(), "echo LAST".into()]
+        } else {
+            Vec::new()
+        },
+        cwd: None,
+    };
+    async fn left(client: &Client) -> u32 {
+        loop {
+            let list = client.sessions().await.unwrap();
+            if let [one] = &list[..]
+                && one.state != "running"
+                && !one.attached
+            {
+                break one.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let first = client.request(&attach(None)).await.unwrap();
+    let id = tokio::time::timeout(Duration::from_secs(5), left(&client)).await;
+    let id = id.expect("the session ended and was left within 5 s");
+
+    // A client that attaches now is shown the screen as the program left it, and that is all
+    // there will be: the server does not keep it attached to wait for more. (An ended session
+    // that stays attached can never make room for a new one.)
+    let (_send, mut recv) = client.request(&attach(Some(id))).await.unwrap();
+    let shown = recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap();
+    assert!(
+        matches!(&shown, ServerEvent::Full(frame) if frame.screen.contains("LAST") && frame.state != "running")
+    );
+    tokio::time::timeout(Duration::from_secs(5), left(&client))
+        .await
+        .expect("the ended session was let go within 5 s");
+    drop(first);
+
+    client.close().await;
+    srv.shutdown().await;
+}

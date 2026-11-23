@@ -149,6 +149,7 @@ impl Drop for RunningServer {
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let max_connections = cap("--max-connections", opts.max_connections)?;
     let max_sessions = cap("--max-sessions", opts.max_sessions)?;
+    crate::jobs::can_kill().await?;
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
     let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
@@ -438,13 +439,7 @@ async fn dispatch(
         }
         Request::Kill { name, signal } => {
             scope.check_full()?;
-            let info = {
-                let guard = state
-                    .jobs
-                    .lock()
-                    .map_err(|_| KohError::internal("jobs lock"))?;
-                guard.kill(&name, signal)?
-            };
+            let info = JobManager::kill(&state.jobs, &name, signal).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }
@@ -816,8 +811,14 @@ async fn handle_exec(
         }
     }
 
-    if disconnected && let Some(pid) = pgid {
-        let _ = crate::jobs::signal_group(pid, 1); // SIGHUP
+    // (Its client is gone, so that it could not be hung up is told to whoever reads what the
+    // server says.)
+    if disconnected
+        && let Some(pid) = pgid
+        && let Err(err) = crate::jobs::signal_group(pid, 1).await
+    {
+        let said = format!("koh: a command whose client went was not hung up: {err}");
+        let _ = writeln!(std::io::stderr(), "{said}");
     }
     let _ = stdout_task.await;
     let _ = stderr_task.await;

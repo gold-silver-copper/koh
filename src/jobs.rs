@@ -186,34 +186,82 @@ impl JobManager {
         })
     }
 
-    pub fn kill(&self, name: &str, sig: i32) -> Result<JobInfo> {
-        let rec = self.jobs.get(name).ok_or_else(|| {
-            KohError::new(
-                Exit::NOT_FOUND,
-                "not_found",
-                format!("no job named {name:?}"),
-            )
-        })?;
-        signal_group(rec.pid, if (1..32).contains(&sig) { sig } else { 15 })
-            .map_err(|e| KohError::failed(format!("kill: {e}")))?;
-        Ok(record_info(rec))
+    /// Signals the process group of job `name` (a number that is no signal's is SIGTERM's), and
+    /// tells of the job as it then is. The lock is held only to find the job: kill(1) is waited
+    /// for with nothing held. That it failed is an error unless the job has ended: a group
+    /// that has gone is not there to signal.
+    pub async fn kill(mgr: &Arc<Mutex<Self>>, name: &str, sig: i32) -> Result<JobInfo> {
+        let rec = {
+            let guard = mgr
+                .lock()
+                .map_err(|_| KohError::internal("job lock poisoned"))?;
+            guard.jobs.get(name).cloned().ok_or_else(|| {
+                KohError::new(
+                    Exit::NOT_FOUND,
+                    "not_found",
+                    format!("no job named {name:?}"),
+                )
+            })?
+        };
+        let signal = if (1..32).contains(&sig) { sig } else { 15 };
+        if let Err(err) = signal_group(rec.pid, signal).await {
+            // (A job's end is told a moment after its last process has gone.)
+            let mut state = rec.state_tx.subscribe();
+            let ended = state.wait_for(|(state, _)| state != "running");
+            if !matches!(tokio::time::timeout(ENDS_IN, ended).await, Ok(Ok(_))) {
+                return Err(err);
+            }
+        }
+        Ok(record_info(&rec))
     }
 }
 
-/// Sends `signal` to the process group `pgid` with kill(1), and waits for it (it is gone in a
-/// moment): std has no call that reaches a group, and the groups koh starts are its own to end.
-/// That the group is no longer there is no error.
-pub(crate) fn signal_group(pgid: u32, signal: i32) -> std::io::Result<()> {
-    if pgid < 2 {
-        return Err(std::io::ErrorKind::InvalidInput.into());
+/// How long kill(1) is given to do what it was asked.
+const KILL_IN: Duration = Duration::from_secs(5);
+/// How long a job whose group could not be signalled is given to say that it has ended.
+const ENDS_IN: Duration = Duration::from_secs(1);
+
+/// Runs kill(1) with `args`: std has no call that signals a process group, and the groups koh
+/// starts are its own to end, as anyone would end them. It is waited for, by the caller alone
+/// and for `KILL_IN` at most; that it could not be run, was not done in time or says it failed
+/// is an error, with what it said.
+async fn kill(args: &[String]) -> Result<()> {
+    let failed = |why: String| Err(KohError::failed(format!("kill {}: {why}", args.join(" "))));
+    let mut kill = tokio::process::Command::new("kill");
+    kill.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(KILL_IN, kill.output()).await {
+        Ok(Ok(done)) if done.status.success() => Ok(()),
+        Ok(Ok(done)) => {
+            let said = String::from_utf8_lossy(&done.stderr);
+            failed(format!("{} {}", done.status, said.trim()))
+        }
+        Ok(Err(e)) => failed(e.to_string()),
+        Err(_) => failed(format!("not done in {} s", KILL_IN.as_secs())),
     }
-    Command::new("kill")
-        .args([format!("-{signal}"), "--".into(), format!("-{pgid}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(drop)
+}
+
+/// Whether kill(1) can be run: a server that cannot run it ends no job and hangs up no command,
+/// and had better say so as it starts than do nothing when asked.
+pub(crate) async fn can_kill() -> Result<()> {
+    kill(&["-0".into(), std::process::id().to_string()])
+        .await
+        .map_err(|err| {
+            KohError::failed(format!(
+                "koh serve needs kill(1) on its PATH, to end jobs and commands ({})",
+                err.message
+            ))
+        })
+}
+
+/// Sends `signal` to the process group `pgid`.
+pub(crate) async fn signal_group(pgid: u32, signal: i32) -> Result<()> {
+    // (-0 is the caller's own group, and -1 every process there is.)
+    if pgid < 2 {
+        return Err(KohError::failed(format!(
+            "no process group {pgid} of a job"
+        )));
+    }
+    kill(&[format!("-{signal}"), "--".into(), format!("-{pgid}")]).await
 }
 
 fn record_info(rec: &JobRecord) -> JobInfo {

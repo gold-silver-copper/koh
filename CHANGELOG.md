@@ -59,11 +59,14 @@ binary, its tests and the fuzz targets share code, and any release may change it
   tree says so before anything is sent or removed (exit 1). With `--delete` that holds for
   what the destination already has, so something deeper there fails the whole copy, even
   where the copy would have removed it.
-- `rustix` is no longer a dependency. A copy is `std::fs` on paths; a job's process group, and
-  that of a `koh exec` whose client has gone, is signalled with `kill(1)`; the lock on a
-  server's key is opened with std. The directory of a key is no longer refused for being
-  another user's (it is still refused if group or others may write to it). `koh cp -p` sets a
-  file's modification time and leaves its access time alone.
+- `rustix` is no longer a dependency. A copy is `std::fs` on paths, and the lock on a server's
+  key is opened with std. The directory of a key is no longer refused for being another user's
+  (it is still refused if group or others may write to it). `koh cp -p` sets a file's
+  modification time and leaves its access time alone.
+- `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
+  process group of a job, and of a `koh exec` command the server hangs up, is signalled with
+  it. `koh kill` waits for it without holding up other requests, for 5 s at most, and fails
+  (exit 1) if a job that still runs was not signalled.
 - `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
   this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
   points under a fixed-seed mutation run.

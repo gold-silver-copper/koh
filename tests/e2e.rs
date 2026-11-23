@@ -2362,3 +2362,121 @@ async fn a_destination_that_cannot_be_one_is_not_reported_as_copied_to() {
     client.close().await;
     srv.shutdown().await;
 }
+
+/// `koh serve` as a process of its own, and processes it started: all ended when this is dropped.
+struct Served {
+    server: std::process::Child,
+    started: Vec<u32>,
+    // (Kept open: the server goes on writing to it.)
+    said: std::io::BufReader<std::process::ChildStderr>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.server.kill();
+        let _ = self.server.wait();
+        for pid in &self.started {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+}
+
+impl Served {
+    /// A server that allows `client`, with `path` for its PATH, a runtime directory or none,
+    /// and a temporary directory of its own.
+    fn start(
+        tmp: &TempDir,
+        path: &std::path::Path,
+        client: iroh::EndpointId,
+        runtime: bool,
+    ) -> Self {
+        let mut serve = Command::new(env!("CARGO_BIN_EXE_koh"));
+        serve
+            .args(["serve", "--direct", "127.0.0.1:0", "--no-relay", "--allow"])
+            .arg(client.to_string())
+            .env("PATH", path)
+            .env("KOH_CONFIG_DIR", tmp.0.join("served_cfg"))
+            .env("TMPDIR", &tmp.0)
+            .env_remove("XDG_RUNTIME_DIR")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if runtime {
+            serve.env("XDG_RUNTIME_DIR", tmp.0.join("run"));
+        }
+        let mut server = serve.spawn().unwrap();
+        let said = std::io::BufReader::new(server.stderr.take().unwrap());
+        Self {
+            server,
+            started: Vec::new(),
+            said,
+        }
+    }
+
+    /// What follows `label` on a line the server says as it starts; `Err` with all it said if
+    /// it ended without saying it.
+    fn says(&mut self, label: &str) -> Result<String, String> {
+        use std::io::BufRead as _;
+        let mut all = String::new();
+        loop {
+            let mut line = String::new();
+            if self.said.read_line(&mut line).unwrap() == 0 {
+                return Err(all);
+            }
+            if let Some(rest) = line.strip_prefix(label) {
+                return Ok(rest.trim().to_string());
+            }
+            all.push_str(&line);
+        }
+    }
+}
+
+#[tokio::test]
+async fn koh_serve_needs_kill_and_says_so_when_a_job_was_not_signalled() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new("kill-helper");
+    let key = new_key(&tmp, "client.key");
+    let bin = tmp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    // With no kill(1) to run, a server could end no job and hang up no command: it says so as
+    // it starts, and does not start.
+    let mut none = Served::start(&tmp, &bin, key.public(), true);
+    let said = none.says("listening:").unwrap_err();
+    assert!(said.contains("kill"), "{said}");
+    assert_eq!(none.server.wait().unwrap().code(), Some(1));
+
+    // A kill(1) that takes two seconds and then fails (it does answer `kill -0`).
+    let slow = "#!/bin/sh\n[ \"$1\" = -0 ] && exit 0\n/bin/sleep 2\nexit 42\n";
+    fs::write(bin.join("kill"), slow).unwrap();
+    fs::set_permissions(bin.join("kill"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut served = Served::start(&tmp, &bin, key.public(), true);
+    let id: iroh::EndpointId = served.says("koh server id:").unwrap().parse().unwrap();
+    let addr: SocketAddr = served.says("listening:").unwrap().parse().unwrap();
+    let client = Client::connect_direct(key, id, Some(Route::Direct(addr)), false)
+        .await
+        .unwrap();
+    let sleep = vec!["/bin/sleep".to_string(), "300".into()];
+    let job = client
+        .run_job(Some("j".into()), sleep, None, false)
+        .await
+        .unwrap();
+    served.started.push(job.pid);
+
+    // While it runs, the server answers others: nothing waits for kill(1) but who asked for it.
+    let others = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let asked = std::time::Instant::now();
+        let jobs = client.jobs(None).await.unwrap();
+        (jobs, asked.elapsed())
+    };
+    let (killed, (jobs, waited)) = tokio::join!(client.kill_job("j".into(), 15), others);
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    assert_eq!(jobs[0].state, "running");
+    // And a job that was not signalled is not reported as signalled.
+    let err = killed.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(err.message.contains("kill"), "{err:?}");
+
+    client.close().await;
+}

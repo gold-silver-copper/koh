@@ -9,7 +9,7 @@ Keys & peers:
   koh servers [add NAME ID [--direct IP:PORT | --relay-url URL] | rm NAME | rename OLD NEW]
   koh clients [add NAME ID [--cp DIR | --exec DIR] | rm NAME | rename OLD NEW]
   koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
-            [--max-connections N] [--max-sessions N]      (64 each; past them a client exits 75)
+            [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
 
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...

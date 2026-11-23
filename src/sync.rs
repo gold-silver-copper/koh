@@ -3,7 +3,8 @@
 //!
 //! Every entry of a tree is reached from the directory above it, by that directory's descriptor
 //! and with `O_NOFOLLOW`: no name a peer sends and no symlink already in the tree takes a copy
-//! outside the tree. Symlinks are neither sent, followed nor removed.
+//! outside the tree. A symlink is never sent and never followed: where a directory is needed it
+//! is refused, where a file lands it is replaced as the link it is, and `--delete` leaves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};

@@ -23,11 +23,14 @@ a QUIC handshake: the transport does not know the allowlist.
 - **What it can make the server hold:** a connection takes one of `--max-connections` places
   (64) from its first packet until it is gone: closed by either end, or silent for its idle
   timeout (15 s for a command or a copy, 30 s for a session; a client that is killed goes that
-  way). With none free, as many more are let connect only to be told "busy" within about 2 s,
-  and past those a peer is refused unheard. A connection that has not proved an allowed key
-  within 10 s is closed. On a connection, at most 16 streams are open at
-  once; on each the server reads one proof of at most 512 bytes, checks one signature and reads
-  the `clients` file once.
+  way). A connection has 10 s from its peer's first packet to finish its handshake and prove
+  a key the server allows: one that has not by then is closed and its place given back,
+  wherever it got to. With no place free, as many more are let connect only to be told
+  "busy", each within 2 s of its first packet; past those a peer is refused unheard (a koh
+  client takes that for "busy" too, and exits 75). On a connection, at most 16 streams are
+  open at once; on each the server reads one proof of at most 512 bytes, checks one signature
+  and, unless the key is one given by `--allow` or the proof is bad, reads the `clients` file
+  once.
 - **Not defended:** peers that keep taking the places as they come free shut allowed clients
   out for as long as they keep at it. Each stream may also hold unread data up to the
   transport's window (about 1.25 MB) until its connection is closed.
@@ -37,14 +40,21 @@ a QUIC handshake: the transport does not know the allowlist.
 It is the server's user: it runs any command (`koh exec`, `koh run`), reads and writes any file
 that user can (`koh cp`), and attaches to any session. There is nothing to escalate to.
 
-- **Bounds:** a message is at most 1 MiB (requests, answers), 256 KiB (a piece of a file, of
-  input or of output) or 8 MiB (a manifest, a screen), refused before it is read past its
-  length (`src/proto.rs`); a copy's tree is at most 100,000 entries and 128 directories deep; at
-  most `--max-sessions` sessions (64) are kept, an ended one that no client is attached to
-  making room for a new one.
+- **Bounds:** a message is refused before it is read past its length (`src/proto.rs`): 512
+  bytes for a proof; 1 MiB for a request, the answer that it was taken, and the short answers
+  (lists of jobs and sessions); 256 KiB for a piece of a file, of input or of output; 4 MiB for
+  what a copy says it needs and for its summary; 8 MiB for a copy's manifest, a screen, a
+  session's text and what a wait returns. A copy's tree is at most 100,000 entries, each at
+  most 128 directories beneath it; at most `--max-sessions` sessions (64) are kept, an ended
+  one that no client is attached to making room for a new one that has started.
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
   uses. A request that waits (`koh wait`, `koh logs -f`) is not stopped when its connection
   goes; it ends with what it waits for.
+- **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
+  itself may come as slowly as its sender likes, and a connection that has proved a key may
+  stay, asking nothing, for as long as it is kept alive. So a client with any allowed key, a
+  scoped one too, can hold places idle, up to all of them; a key taken out of `clients` keeps
+  the connections it has until they ask for something again.
 
 ## 3. A client with a scoped key
 
@@ -60,8 +70,10 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
   makes no symlinks. Every other request is refused (exit 4).
 - **`--exec DIR`** runs commands and starts jobs whose starting directory resolves beneath
   `DIR`, and copies beneath `DIR` as above. **It is not a sandbox:** the command is any command,
-  run as the server's user, and reaches whatever that user can. It may not attach to sessions or
-  list, read or kill jobs. Treat it as a full key that cannot open a terminal.
+  run as the server's user, and reaches whatever that user can. Every other request is refused:
+  sessions (attaching, their list, their text, a wait for one) and everything about jobs but
+  starting one (their list, their logs, a wait for one, killing one). Treat it as a full key
+  that cannot open a terminal.
 - A scope is read with each request, so narrowing or removing a key takes effect on its next
   request; what it already started goes on.
 

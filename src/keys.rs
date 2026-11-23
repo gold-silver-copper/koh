@@ -4,9 +4,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
 use std::net::SocketAddr;
-use std::os::unix::fs::{
-    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
@@ -180,13 +178,6 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
         .map_err(|e| KohError::failed(format!("cannot create {}: {e}", dir.display())))?;
     let meta =
         fs::metadata(dir).map_err(|e| KohError::failed(format!("stat {}: {e}", dir.display())))?;
-    let uid = rustix::process::geteuid().as_raw();
-    if meta.uid() != uid {
-        return Err(KohError::refused(format!(
-            "{} is owned by another user",
-            dir.display()
-        )));
-    }
     if meta.permissions().mode() & 0o022 != 0 {
         return Err(KohError::refused(format!(
             "{} is writable by group or others; run chmod 700",

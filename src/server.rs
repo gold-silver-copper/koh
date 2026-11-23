@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -156,7 +157,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
 
     let base = match opts.state_dir {
         Some(dir) => dir,
-        None => default_state_dir()?,
+        None => default_state_dir(&serving)?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
     let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
@@ -240,13 +241,19 @@ pub async fn run_serve(opts: ServeOptions) -> Result<()> {
     Ok(())
 }
 
-fn default_state_dir() -> Result<PathBuf> {
+/// Where jobs and sessions are kept when no `--state-dir` says: in the user's runtime directory,
+/// or else in the temporary directory under the user's number. (std does not tell who runs
+/// this process; the owner of `serving`, the lock file this server made beside its key, does.)
+fn default_state_dir(serving: &fs::File) -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
         return Ok(PathBuf::from(dir).join("koh"));
     }
-    let uid = rustix::process::geteuid().as_raw();
+    let uid = serving
+        .metadata()
+        .map_err(|e| KohError::failed(format!("stat the serve lock: {e}")))?
+        .uid();
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 

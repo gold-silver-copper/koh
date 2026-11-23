@@ -194,14 +194,26 @@ impl JobManager {
                 format!("no job named {name:?}"),
             )
         })?;
-        let pid_i32 = i32::try_from(rec.pid).map_err(|_| KohError::failed("invalid pid"))?;
-        if let Some(pid) = rustix::process::Pid::from_raw(pid_i32) {
-            let signal = rustix::process::Signal::from_named_raw(sig)
-                .unwrap_or(rustix::process::Signal::TERM);
-            let _ = rustix::process::kill_process_group(pid, signal);
-        }
+        signal_group(rec.pid, if (1..32).contains(&sig) { sig } else { 15 })
+            .map_err(|e| KohError::failed(format!("kill: {e}")))?;
         Ok(record_info(rec))
     }
+}
+
+/// Sends `signal` to the process group `pgid` with kill(1), and waits for it (it is gone in a
+/// moment): std has no call that reaches a group, and the groups koh starts are its own to end.
+/// That the group is no longer there is no error.
+pub(crate) fn signal_group(pgid: u32, signal: i32) -> std::io::Result<()> {
+    if pgid < 2 {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    Command::new("kill")
+        .args([format!("-{signal}"), "--".into(), format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(drop)
 }
 
 fn record_info(rec: &JobRecord) -> JobInfo {

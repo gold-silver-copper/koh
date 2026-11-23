@@ -730,10 +730,7 @@ async fn handle_exec(
         };
         KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
     })?;
-    let pgid = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(rustix::process::Pid::from_raw);
+    let pgid = child.id();
     send_msg(send, &Reply::Ok, MAX_CTRL).await?;
 
     let mut child_stdin = child.stdin.take();
@@ -813,7 +810,7 @@ async fn handle_exec(
     }
 
     if disconnected && let Some(pid) = pgid {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+        let _ = crate::jobs::signal_group(pid, 1); // SIGHUP
     }
     let _ = stdout_task.await;
     let _ = stderr_task.await;

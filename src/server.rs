@@ -254,13 +254,12 @@ async fn default_state_dir() -> Result<PathBuf> {
         let what = "XDG_RUNTIME_DIR is not set, and `id -u` did not say whose state this is";
         KohError::failed(format!("{what}: {why}"))
     };
-    let mut id = tokio::process::Command::new("id");
-    let said = id.arg("-u").stdin(Stdio::null()).output().await;
-    let said = said.map_err(|e| failed(e.to_string()))?;
-    let uid: u32 = String::from_utf8_lossy(&said.stdout)
+    let said = crate::jobs::run("id", &["-u".into()]).await;
+    let said = said.map_err(|err| failed(err.message))?;
+    let uid: u32 = String::from_utf8_lossy(&said)
         .trim()
         .parse()
-        .map_err(|_| failed(format!("{}", said.status)))?;
+        .map_err(|_| failed("it said no number".into()))?;
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 

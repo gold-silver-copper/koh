@@ -2509,3 +2509,24 @@ fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
     let read = load_or_create_key(Role::Client, Some(&link)).unwrap();
     assert_eq!(read.public(), made.public());
 }
+
+#[tokio::test]
+async fn koh_serve_does_not_take_its_user_from_an_id_that_failed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // With no runtime directory the server asks id(1) whose state it keeps. An id(1) that says
+    // a number and then that it failed has told nothing: the server says so and does not start.
+    let tmp = TempDir::new("id-failed");
+    let key = new_key(&tmp, "client.key");
+    let bin = tmp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("id"), "#!/bin/sh\necho 42424\nexit 42\n").unwrap();
+    fs::set_permissions(bin.join("id"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap());
+    let mut served = Served::start(&tmp, std::path::Path::new(&path), key.public(), false);
+    let said = served.says("sessions dir:").unwrap_err();
+    assert!(said.contains("id -u"), "{said}");
+    assert_eq!(served.server.wait().unwrap().code(), Some(1));
+    assert!(!tmp.0.join("koh-42424").exists());
+}

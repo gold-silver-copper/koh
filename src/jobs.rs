@@ -216,28 +216,36 @@ impl JobManager {
     }
 }
 
-/// How long kill(1) is given to do what it was asked.
-const KILL_IN: Duration = Duration::from_secs(5);
+/// How long a program koh runs for what it does or says (kill(1), id(1)) is given.
+const DONE_IN: Duration = Duration::from_secs(5);
 /// How long a job whose group could not be signalled is given to say that it has ended.
 const ENDS_IN: Duration = Duration::from_secs(1);
 
-/// Runs kill(1) with `args`: std has no call that signals a process group, and the groups koh
-/// starts are its own to end, as anyone would end them. It is waited for, by the caller alone
-/// and for `KILL_IN` at most; that it could not be run, was not done in time or says it failed
-/// is an error, with what it said.
-async fn kill(args: &[String]) -> Result<()> {
-    let failed = |why: String| Err(KohError::failed(format!("kill {}: {why}", args.join(" "))));
-    let mut kill = tokio::process::Command::new("kill");
-    kill.args(args).stdin(Stdio::null()).kill_on_drop(true);
-    match tokio::time::timeout(KILL_IN, kill.output()).await {
-        Ok(Ok(done)) if done.status.success() => Ok(()),
+/// Runs `program` with `args` and gives what it wrote. It is waited for, by the caller alone
+/// and for `DONE_IN` at most; that it could not be run, was not done in time or says it failed
+/// is an error, with what it said: what a program wrote before it failed is not its answer.
+pub(crate) async fn run(program: &str, args: &[String]) -> Result<Vec<u8>> {
+    let failed = |why: String| {
+        let what = format!("{program} {}", args.join(" "));
+        Err(KohError::failed(format!("{what}: {why}")))
+    };
+    let mut command = tokio::process::Command::new(program);
+    command.args(args).stdin(Stdio::null()).kill_on_drop(true);
+    match tokio::time::timeout(DONE_IN, command.output()).await {
+        Ok(Ok(done)) if done.status.success() => Ok(done.stdout),
         Ok(Ok(done)) => {
             let said = String::from_utf8_lossy(&done.stderr);
             failed(format!("{} {}", done.status, said.trim()))
         }
         Ok(Err(e)) => failed(e.to_string()),
-        Err(_) => failed(format!("not done in {} s", KILL_IN.as_secs())),
+        Err(_) => failed(format!("not done in {} s", DONE_IN.as_secs())),
     }
+}
+
+/// Runs kill(1) with `args`: std has no call that signals a process group, and the groups koh
+/// starts are its own to end, as anyone would end them.
+async fn kill(args: &[String]) -> Result<()> {
+    run("kill", args).await.map(drop)
 }
 
 /// Whether kill(1) can be run: a server that cannot run it ends no job and hangs up no command,

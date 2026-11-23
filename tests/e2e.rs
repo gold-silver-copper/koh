@@ -1103,6 +1103,14 @@ async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where
     assert_eq!(whole.added, vec!["a/b/c.txt".to_string()]);
     assert_eq!(names_in(&to), ["a"]);
     assert_eq!(names_in(&to.join("a")), ["b"]);
+    // The client's own destination is as its file system has it too: a symlink there is
+    // followed.
+    let (local, beyond) = (tmp.0.join("local"), tmp.0.join("beyond"));
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&beyond).unwrap();
+    symlink(&beyond, local.join("a")).unwrap();
+    pull(allowed.join("sub/tree"), "local").await;
+    assert_eq!(fs::read_to_string(beyond.join("b/c.txt")).unwrap(), "deep");
     let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
     assert_eq!(named.added, vec!["secret".to_string()]);
     assert_eq!(fs::read_to_string(to.join("secret")).unwrap(), "secret");

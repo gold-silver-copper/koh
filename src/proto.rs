@@ -736,8 +736,9 @@ pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usi
     Ok(())
 }
 
-/// Read and decode one length-prefixed postcard frame, returning `Ok(None)` on clean EOF.
-pub async fn recv_msg_opt<T: for<'de> Deserialize<'de>>(
+/// Read and decode one length-prefixed postcard frame, returning `Ok(None)` on clean EOF. The
+/// frame is all of one message: bytes after it are no message.
+pub async fn recv_msg_opt<T: DeserializeOwned>(
     stream: &mut RecvStream,
     max: usize,
 ) -> Result<Option<T>> {
@@ -769,16 +770,11 @@ pub async fn recv_msg_opt<T: for<'de> Deserialize<'de>>(
         .read_exact(&mut buf)
         .await
         .map_err(|e| KohError::unreachable(format!("read body: {e}")))?;
-    let val =
-        postcard::from_bytes(&buf).map_err(|e| KohError::failed(format!("decode message: {e}")))?;
-    Ok(Some(val))
+    decode(&buf, max).map(Some)
 }
 
 /// Read and decode one required frame.
-pub async fn recv_msg<T: for<'de> Deserialize<'de>>(
-    stream: &mut RecvStream,
-    max: usize,
-) -> Result<T> {
+pub async fn recv_msg<T: DeserializeOwned>(stream: &mut RecvStream, max: usize) -> Result<T> {
     recv_msg_opt(stream, max)
         .await?
         .ok_or_else(|| KohError::unreachable("connection closed before response"))
@@ -792,7 +788,7 @@ pub fn spawn_msg_reader<T>(
     max: usize,
 ) -> tokio::sync::mpsc::Receiver<Result<T>>
 where
-    T: for<'de> Deserialize<'de> + Send + 'static,
+    T: DeserializeOwned + Send + 'static,
 {
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     tokio::spawn(async move {

@@ -2840,3 +2840,22 @@ fn koh_fux_is_fux_and_a_holder_has_no_runtime() {
     assert_eq!(code, Some(1));
     assert!(said.starts_with("fux: usage:"), "{said}");
 }
+
+#[tokio::test]
+async fn a_message_with_more_after_it_is_no_message() {
+    let (_tmp, srv, client, key, _) = boot_pair("more-after").await;
+    // A request as it is sent, and one byte more inside its frame.
+    let conn = client.connection();
+    let (mut send, mut recv) = koh::net::open_authed_stream(&conn, &key).await.unwrap();
+    let mut body = postcard::to_allocvec(&Request::Jobs { name: None }).unwrap();
+    body.push(0);
+    send.write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    send.write_all(&body).await.unwrap();
+    // The server reads no request in it, and answers none: it closes the connection.
+    let answer = recv_msg::<koh::proto::Reply>(&mut recv, MAX_CTRL).await;
+    assert!(answer.is_err(), "{answer:?}");
+    client.close().await;
+    srv.shutdown().await;
+}

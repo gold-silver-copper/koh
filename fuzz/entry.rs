@@ -139,7 +139,8 @@ fn held(dir: &Path, prefix: &str, found: &mut BTreeMap<String, Vec<u8>>) {
 /// Any messages a server sends, one after the other, into a mirror made for them. After each
 /// that is not taken, and when no more come, the mirror is what the last whole round left; and
 /// what a whole round leaves is a mirror: its number in `generation`, every link to a folder of
-/// its own, no `command`, nothing staged. Nothing is ever beside it.
+/// its own, no `command` and no `status`, no name in two spellings, nothing staged. Nothing is
+/// ever beside it.
 pub fn carry_sequence(data: &[u8]) {
     static RUNS: AtomicU64 = AtomicU64::new(0);
     let Some(messages) = decode::<Vec<ToMirror>>(data) else {
@@ -171,8 +172,8 @@ pub fn carry_sequence(data: &[u8]) {
                     is("mirror/generation", &format!("file {number}\n"))
                         && is("mirror/.koh", "folder")
                 );
-                for (name, what) in &whole {
-                    let name = name.strip_prefix("mirror/").unwrap_or(name);
+                for (full, what) in &whole {
+                    let name = full.strip_prefix("mirror/").unwrap_or(full);
                     let led = what
                         .strip_prefix(b"-> ")
                         .map(|to| format!("mirror/{}", String::from_utf8_lossy(to)));
@@ -180,9 +181,16 @@ pub fn carry_sequence(data: &[u8]) {
                         led.is_none_or(|to| !name.contains('/') && is(&to, "folder")),
                         "{name}"
                     );
+                    let never = |never: &str| name.eq_ignore_ascii_case(never);
                     assert!(
-                        !name.eq_ignore_ascii_case("command") && !name.starts_with(".koh/"),
+                        !never("command") && !never("status") && !name.starts_with(".koh/"),
                         "{name}"
+                    );
+                    let other = |other: &&String| other.eq_ignore_ascii_case(full);
+                    assert_eq!(
+                        whole.keys().filter(other).count(),
+                        1,
+                        "{name} in two spellings"
                     );
                 }
             }

@@ -431,7 +431,7 @@ fn rounds(rng: &mut Rng) -> Vec<u8> {
         ".koh/1",
         "generation",
         "COMMAND",
-        "a/b/c",
+        "status",
     ];
     // (The first ten are names a mirror may have: most messages are of those.)
     let name = |rng: &mut Rng| {

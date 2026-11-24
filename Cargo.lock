@@ -750,9 +750,9 @@ dependencies = [
 
 [[package]]
 name = "fux"
-version = "0.42.0"
+version = "0.43.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08cc7b023513499a7e077fa08a9998bdc47b27da8e7053ce56aa6163d881e0ee"
+checksum = "1a31fa49208cef67a46afcd1c5d3e214cba829ba8132c34eb8f43b27bcc713e0"
 dependencies = [
  "fux-vt",
  "fuxix",
@@ -760,15 +760,15 @@ dependencies = [
 
 [[package]]
 name = "fux-vt"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae15658e57fc7202645d31fb8ff77d1b20f28c7f92a35e01d5237a91e458bd9"
+checksum = "54ed4dcd6ebe909017c86b2bc94f2f167f5b115e13ba873e21d8fa9e8b9d533a"
 
 [[package]]
 name = "fuxix"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c08348729b4b7c0732cd252978d073f607504175be837cc26f7a603afe78a6e"
+checksum = "0bc19863bf0d72bbebc627d1dcecba0126511f1828588f541bb6c282435637e8"
 
 [[package]]
 name = "generator"

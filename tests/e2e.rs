@@ -574,14 +574,12 @@ async fn multi_source_cp_push_and_pull_files_and_dirs() {
 }
 
 #[tokio::test]
-async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures() {
+async fn session_forwards_clipboard_links_colours_bell_deltas_and_sixel_pictures() {
     let (tmp, srv, client, client_key, state_dir) = boot_pair("rich-session").await;
 
-    // Tiny valid 1x1 red PNG encoded by fux-vt itself, base64-encoded for Kitty graphics APC!
-    let tiny_png = fux_vt::png::encode_rgba(1, 1, &[255, 0, 0, 255], 4096).unwrap();
-    let png_b64 = fux_vt::base64_encode(&tiny_png);
-
-    let script = format!(
+    // A sixel picture, one red column six pixels high: the one picture format fux has. It goes
+    // when what it lies on is erased.
+    let script = String::from(
         "stty raw -echo; \
          printf 'READY\\r\\n'; \
          head -c 1 >/dev/null; \
@@ -592,12 +590,12 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
          printf '\\033]52;c;aGVsbG8gY2xpcA==\\007'; \
          printf '\\033]8;;https://koh.sh\\007click\\033]8;;\\007\\r\\n'; \
          printf '\\033]9;build done\\007'; \
-         printf '\\033_Ga=T,f=100,t=d,q=2;{png_b64}\\033\\\\\\r\\n'; \
+         printf '\\033Pq#0;2;100;0;0#0~\\033\\\\\\r\\n'; \
          head -c 1 >/dev/null; \
          printf 'ONE_LINE_EDIT\\r\\n'; \
          head -c 1 >/dev/null; \
-         printf '\\033_Ga=d,d=A,q=2\\033\\\\DELETED_PIC\\r\\n'; \
-         sleep 30"
+         printf '\\033[H\\033[2JDELETED_PIC\\r\\n'; \
+         sleep 30",
     );
 
     let (mut send, mut recv) = client
@@ -647,7 +645,7 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         .await
         .unwrap();
 
-    let mut pic_blobs = 0usize;
+    let mut pic_blobs = Vec::new();
     let mut saw_clip = false;
     let mut saw_notice = false;
     let mut saw_link = false;
@@ -657,9 +655,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         while !(saw_clip && saw_notice && saw_link && saw_pic_ref && saw_colour) {
             match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
                 ServerEvent::Picture(blob) => {
-                    assert_eq!(blob.kind, PictureKind::Png);
-                    assert_eq!(blob.bytes, tiny_png);
-                    pic_blobs += 1;
+                    assert_eq!(blob.kind, PictureKind::Sixel);
+                    pic_blobs.push(blob.bytes);
                 }
                 ServerEvent::Full(f) => frame = f,
                 ServerEvent::Delta(d) => {
@@ -678,16 +675,20 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
             if frame.links.contains("https://koh.sh") {
                 saw_link = true;
             }
-            if frame.pictures.contains("pic-1.png") {
+            if frame.pictures.contains("pic-1.sixel") {
                 saw_pic_ref = true;
             }
         }
     })
     .await
     .expect("timed out waiting for clipboard/notice/link/picture/colour events");
-    assert_eq!(pic_blobs, 1, "picture payload must be sent once per ID");
+    assert_eq!(
+        pic_blobs.len(),
+        1,
+        "picture payload must be sent once per ID"
+    );
 
-    // Verify frozen v1 server pane folder also recorded clipboard, notice, links, cursor colour, and pic-1.png.
+    // Verify frozen v1 server pane folder also recorded clipboard, notice, links, cursor colour, and pic-1.sixel.
     let pane_dir = state_dir.join("sessions").join(format!("s{sid}"));
     assert_eq!(fs::read(pane_dir.join("clipboard")).unwrap(), b"hello clip");
     assert!(
@@ -706,9 +707,11 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
             .unwrap()
             .contains("https://koh.sh")
     );
-    assert!(pane_dir.join("pic-1.png").is_file());
+    let sixel = fs::read(pane_dir.join("pic-1.sixel")).unwrap();
+    assert_eq!(sixel, b"\x1bPq#0;2;100;0;0#0~\x1b\\");
+    assert_eq!(pic_blobs.concat(), sixel);
 
-    // Step 2: small 1-line edit MUST arrive as a compact Delta (NOT re-sending pic-1.png!).
+    // Step 2: small 1-line edit MUST arrive as a compact Delta (NOT re-sending pic-1.sixel!).
     send_msg(&mut send, &ClientEvent::Input(b"2".to_vec()), MAX_CHUNK)
         .await
         .unwrap();
@@ -734,8 +737,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
     .expect("timed out waiting for ONE_LINE_EDIT delta");
     assert!(got_small_delta, "expected compact row-level FrameDelta");
 
-    // Mount the same session locally and verify pic-1.png + pictures mirror into local pane folder,
-    // and that deleting the picture removes pic-1.png on BOTH server and local mirror!
+    // Mount the same session locally and verify pic-1.sixel + pictures mirror into local pane folder,
+    // and that erasing the picture removes pic-1.sixel on BOTH server and local mirror!
     let local_mirror = tmp.0.join("mirror_pics");
     let addr = srv.direct_addr.unwrap();
     let mut mclient =
@@ -749,16 +752,16 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         r
     });
     for _ in 0..80 {
-        if local_mirror.join("pic-1.png").is_file()
+        if local_mirror.join("pic-1.sixel").is_file()
             && fs::read_to_string(local_mirror.join("shown/pictures"))
                 .unwrap_or_default()
-                .contains("pic-1.png")
+                .contains("pic-1.sixel")
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(local_mirror.join("pic-1.png").is_file());
+    assert_eq!(fs::read(local_mirror.join("pic-1.sixel")).unwrap(), sixel);
     assert!(
         fs::read_to_string(local_mirror.join("status"))
             .unwrap()
@@ -770,12 +773,12 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
             .contains("#445566")
     );
 
-    // Step 3: delete the Kitty image and verify cleanup on both server and mirror.
+    // Step 3: erase the picture and verify cleanup on both server and mirror.
     send_msg(&mut send, &ClientEvent::Input(b"3".to_vec()), MAX_CHUNK)
         .await
         .unwrap();
     for _ in 0..80 {
-        if !local_mirror.join("pic-1.png").exists()
+        if !local_mirror.join("pic-1.sixel").exists()
             && fs::read_to_string(local_mirror.join("shown/screen"))
                 .unwrap_or_default()
                 .contains("DELETED_PIC")
@@ -784,8 +787,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(!local_mirror.join("pic-1.png").exists());
-    assert!(!pane_dir.join("pic-1.png").exists());
+    assert!(!local_mirror.join("pic-1.sixel").exists());
+    assert!(!pane_dir.join("pic-1.sixel").exists());
 
     fs::write(local_mirror.join("ctl"), "kill\n").unwrap();
     tokio::time::timeout(Duration::from_secs(3), mtask)

@@ -1,4 +1,4 @@
-//! Interactive sessions backed directly by new `fux` (`fux-vt` 0.19 + `fuxix` 0.11):
+//! Interactive sessions backed directly by new `fux` (`fux-vt` 0.20 + `fuxix` 0.12):
 //! every remote session writes a genuine frozen v1 `fux` pane folder on disk AND
 //! pushes frames immediately over a `tokio::sync::watch` channel (zero double-polling).
 //! OSC 133 `marks` (`Term::marks()`) replace old koh's brittle `--reading` PTY hack.
@@ -293,8 +293,8 @@ impl PaneSession {
         // Write any new pictures beside the screen files and cache them for attached clients.
         let new_pics = term.new_pictures();
         if let Ok(mut cache) = self.pictures.lock() {
-            for (pic_id, fmt, data) in new_pics {
-                let kind = PictureKind::from_vt(fmt);
+            for (pic_id, data) in new_pics {
+                let kind = PictureKind::Sixel;
                 let _ = fs::write(self.dir.join(format!("pic-{pic_id}.{}", kind.ext())), &data);
                 cache.insert(pic_id, (kind, data));
             }
@@ -725,9 +725,8 @@ fn format_pictures(pics: &[Picture], rows: usize) -> String {
             p.row.to_string()
         };
         pictures.push_str(&format!(
-            "pic-{}.{} {row} {} {} {} {} {}\n",
+            "pic-{}.sixel {row} {} {} {} {} {}\n",
             p.id,
-            p.format.ext(),
             p.col,
             p.cols,
             p.rows + p.off,

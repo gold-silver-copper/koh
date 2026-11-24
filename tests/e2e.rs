@@ -202,6 +202,44 @@ async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
 }
 
 #[tokio::test]
+async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_does() {
+    let (tmp, srv, client, _, _) = boot_pair("left").await;
+    let cwd = Some(tmp.0.display().to_string());
+    let script = vec!["sleep 60".to_string()];
+    client
+        .run_job(Some("long".into()), script, cwd, true)
+        .await
+        .unwrap();
+    let name = || "long".to_string();
+    let (wait, follow) = (
+        Request::WaitJob {
+            name: name(),
+            text: Some("NEVER_APPEARS".into()),
+            tail: 10,
+            timeout_secs: None,
+        },
+        Request::Logs {
+            name: name(),
+            tail: None,
+            all: false,
+            follow: true,
+        },
+    );
+    for request in [wait, follow] {
+        // The client lets go of what it reads, on a connection that lives: the server lets go
+        // of the request, which is seen here as its end of what the client sends being let go.
+        let (send, recv) = client.request(&request).await.unwrap();
+        drop(recv);
+        let ended = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        assert!(ended.is_ok(), "still served after 5 s: {request:?}");
+    }
+
+    client.kill_job(name(), 9).await.unwrap();
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn delta_cp_push_pull_exclude_delete_dry_run_and_preserve() {
     let (tmp, srv, client, _, _) = boot_pair("cp").await;
     let src = tmp.0.join("src");

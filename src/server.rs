@@ -413,6 +413,8 @@ async fn dispatch(
                     }
                     tokio::select! {
                         _ = rx.changed() => {}
+                        // (A client that has left is followed for no longer.)
+                        _ = send.stopped() => return Ok(()),
                         () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
                     }
                 }
@@ -452,9 +454,13 @@ async fn dispatch(
                 guard.get(&name)?
             };
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let res =
-                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs)
-                    .await?;
+            let waited =
+                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs);
+            // (A client that has left is waited for no longer.)
+            let res = tokio::select! {
+                res = waited => res?,
+                _ = send.stopped() => return Ok(()),
+            };
             send_msg(send, &res, MAX_FRAME).await
         }
         Request::CpPush {

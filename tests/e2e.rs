@@ -4106,6 +4106,39 @@ async fn an_open_round_that_stands_still_is_a_broken_link() {
     assert_eq!(names_in(&mount.dir.join(".koh")), [""; 0]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_on_a_new_connection_has_five_seconds_to_be_answered_too() {
+    let host = Host::start("unanswered", &[]);
+    let hostile = Hostile::start(&host).await;
+    let mount = host.mount("a", Some(&hostile.at), &[], &[]);
+    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
+    // A first link, with a whole round; then its connection goes.
+    let (mut send, mut recv, _) = Hostile::asked(&conn).await;
+    let attached = Attached {
+        name: "1".into(),
+        run: RUNS[0],
+    };
+    send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
+    let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
+    for message in [
+        ToMirror::Round(2),
+        ToMirror::Fifo("in".into()),
+        ToMirror::Done,
+    ] {
+        send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
+    }
+    until("the mirror has its FIFO", || mount.dir.join("in").exists());
+    conn.close(0u32.into(), b"");
+    // The client dials anew and asks, and is not answered: the connection lives, and its
+    // request is read no further.
+    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
+    let _unanswered = conn.accept_bi().await.unwrap();
+    // It does not wait for that answer for ever: it asks again, on the connection it has.
+    let again = tokio::time::timeout(Duration::from_secs(15), Hostile::asked(&conn)).await;
+    let (_send, _recv, asks) = again.expect("the client did not ask again");
+    assert_eq!(asks.run, Some(RUNS[0]));
+}
+
 #[test]
 fn an_ended_session_with_a_client_is_not_removed_and_a_start_that_fails_removes_none() {
     let host = Host::start("kept", &["--max-sessions", "1"]);

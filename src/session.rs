@@ -374,7 +374,7 @@ impl Sessions {
     /// one, always if `new` or a program was given. A new one is one more folder: with `max`
     /// there, the oldest that has ended and has no client goes for it, once it has started.
     async fn find(&self, asked: &Attach, cwd: &Path) -> Result<PathBuf> {
-        let _one = self.starting.lock().await;
+        let one = self.starting.lock().await;
         let folders = self.folders();
         let wanted = asked.name.as_ref().map(|name| self.dir.join(name));
         let newest = || {
@@ -410,8 +410,10 @@ impl Sessions {
         };
         let started = self.start(asked, cwd).await?;
         // (Only now that the new one runs does the old one go; and what it held is removed
-        // with nothing held, where no other request waits for it.)
+        // with nothing held, where no other request waits for it: the next start does not
+        // either, for the folder has no session's name any more.)
         if let Some(gone) = goes.and_then(|gone| self.goes(&gone)) {
+            drop(one);
             let _ = pooled(move || drop(gone)).await;
         }
         Ok(started)

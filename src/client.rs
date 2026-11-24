@@ -547,7 +547,10 @@ impl Client {
             }
         };
 
-        let view_ctl = session_dir.join(format!(".view.{}", std::process::id()));
+        // (The viewer's FIFO, in the folder it makes for itself in the session.)
+        let view_ctl = session_dir
+            .join(format!(".view.{}", std::process::id()))
+            .join("ctl");
         let view_exited = Arc::new(AtomicBool::new(false));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mount_pane = pane_dir.clone();

@@ -1,11 +1,12 @@
 //! End-to-end integration tests over real loopback iroh QUIC connections.
 
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koh::Exit;
 use koh::client::Client;
@@ -797,6 +798,127 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_sixel_pictures
         .expect("mount mirror task panicked")
         .expect("mount mirror returned error");
     let _ = send_msg(&mut send, &ClientEvent::Detach, MAX_CTRL).await;
+    client.close().await;
+    srv.shutdown().await;
+}
+
+/// `koh connect` as a person runs it, in a terminal of the test's own (a pty): what it drew there
+/// and how it ended. It is killed when the test lets go of it, however the test ends.
+struct InTerminal {
+    koh: std::process::Child,
+    tty: fs::File,
+    drawn: Vec<u8>,
+}
+
+impl Drop for InTerminal {
+    fn drop(&mut self) {
+        let _ = self.koh.kill();
+        let _ = self.koh.wait();
+    }
+}
+
+impl InTerminal {
+    fn connect(config: &Path, runtime: &Path, args: &[&str]) -> Self {
+        let size = fuxix::Winsize {
+            rows: 24,
+            cols: 80,
+            xpixel: 800,
+            ypixel: 480,
+        };
+        let (tty, theirs) = fuxix::pty(size).unwrap();
+        let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
+        koh.env("KOH_CONFIG_DIR", config)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .arg("connect")
+            .args(args)
+            .stdin(theirs.try_clone().unwrap())
+            .stdout(theirs.try_clone().unwrap())
+            .stderr(theirs);
+        fuxix::new_session(&mut koh, true);
+        Self {
+            koh: koh.spawn().unwrap(),
+            tty,
+            drawn: Vec::new(),
+        }
+    }
+
+    /// Waits until `done` says so, reading meanwhile what koh draws (a terminal nobody reads
+    /// holds its program up). Twenty seconds is the most any of it may take.
+    async fn until(&mut self, what: &str, mut done: impl AsyncFnMut(&mut Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut some = [0u8; 4096];
+            while let Ok(n @ 1..) = (&self.tty).read(&mut some) {
+                self.drawn.extend_from_slice(&some[..n]);
+            }
+            if done(self).await {
+                return;
+            }
+            let last = self.drawn.len().saturating_sub(400);
+            let drawn = String::from_utf8_lossy(&self.drawn[last..]);
+            assert!(
+                Instant::now() < deadline,
+                "{what}: not in 20 s. The last it drew: {drawn:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn shows(&mut self, text: &str) {
+        let has = async |me: &mut Self| me.drawn.windows(text.len()).any(|w| w == text.as_bytes());
+        self.until(&format!("the terminal shows {text:?}"), has)
+            .await;
+    }
+
+    fn types(&mut self, keys: &[u8]) {
+        (&self.tty).write_all(keys).unwrap();
+    }
+
+    /// The exit code koh ended with.
+    async fn ends(&mut self) -> Option<i32> {
+        let mut code = None;
+        let ended = async |me: &mut Self| {
+            code = me.koh.try_wait().unwrap().map(|status| status.code());
+            code.is_some()
+        };
+        self.until("koh connect ends", ended).await;
+        code.flatten()
+    }
+}
+
+#[tokio::test]
+async fn koh_connect_in_a_terminal_leaves_at_its_detach_key_and_ends_when_the_program_does() {
+    let (tmp, srv, client, _, _) = boot_pair("connect-tty").await;
+    let (config, runtime) = (tmp.0.join("cli_cfg"), tmp.0.join("run"));
+    fs::create_dir_all(&runtime).unwrap();
+    let (id, addr) = (
+        srv.endpoint_id.to_string(),
+        srv.direct_addr.unwrap().to_string(),
+    );
+    let program = "stty -icanon -echo; echo READY; head -c 1 >/dev/null; exit 7";
+
+    // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
+    let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
+    let mut first = InTerminal::connect(&config, &runtime, &started);
+    first.shows("READY").await;
+    first.types(b"\x1d.");
+    assert_eq!(first.ends().await, Some(0));
+    let sessions = client.sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].state, "running");
+
+    // The program's end is the end of `koh connect`, with the program's status: nobody has to
+    // type the detach key at a session that is over.
+    let session = sessions[0].id.to_string();
+    let again = ["--direct", &addr, &id, "--session", &session];
+    let mut second = InTerminal::connect(&config, &runtime, &again);
+    second.shows("READY").await;
+    second.types(b"x");
+    assert_eq!(second.ends().await, Some(7));
+
+    // What koh made for its viewer is gone with it.
+    assert_eq!(names_in(&runtime), [""; 0]);
+
     client.close().await;
     srv.shutdown().await;
 }

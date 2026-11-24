@@ -2639,6 +2639,10 @@ fn a_session_is_a_fux_pane_kept_by_koh_hold() {
 #[test]
 fn the_mirror_is_the_pane() {
     let host = Host::start("mirror", &[]);
+    // (Where a viewer would say what its terminal is like there is a FIFO nobody writes to:
+    // koh reads a file there when one changes, and waits at nothing else.)
+    fs::create_dir_all(host.tmp.0.join("a")).unwrap();
+    drop(fuxix::fifo(host.tmp.0.join("a/colours")).unwrap());
     let mut mount = host.mount("a", None, &[], &[]);
     let pane = host.pane("1");
     agrees(&pane, &mount.dir);

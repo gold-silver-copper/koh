@@ -1072,17 +1072,22 @@ async fn linked(
             _ = tick.tick() => for (name, seen) in ["colours", "keyboard"].into_iter().zip(&mut seen) {
                 let Some(file) = told.map(|session| session.join(name)) else { continue };
                 let stamp = fs::metadata(&file).ok().filter(|file| file.is_file()).map(fux::stamp);
-                let mut bytes = Vec::new();
-                let read = File::open(&file).map(|file| file.take(MAX_TYPED as u64 + 1).read_to_end(&mut bytes));
-                if stamp.is_some() && stamp != *seen && matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_TYPED {
-                    waits.push_back(FromMirror::Told { name: name.into(), bytes });
+                // (Read when it is a file and another than was read, as fux's holder reads
+                // it: without waiting, and no more than a message holds.)
+                if stamp.is_some() && stamp != *seen {
+                    let mut bytes = Vec::new();
+                    let read = fuxix::open(&file, false).map(|file| file.take(MAX_TYPED as u64 + 1).read_to_end(&mut bytes));
+                    if matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_TYPED {
+                        waits.push_back(FromMirror::Told { name: name.into(), bytes });
+                    }
                 }
                 *seen = stamp;
             },
         }
     };
-    // Every way out takes what the writer says the stream took before any of it is offered
-    // to another link: what a stream took is never sent again.
+    // Every way out to another link takes what the writer says the stream took before any of
+    // it is offered again: what a stream took is never sent again. (The one way out that
+    // takes nothing, a mirror whose work could not be done, ends the client.)
     while let Ok(message) = took.try_recv() {
         typed.taken(message);
     }

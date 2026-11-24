@@ -11,13 +11,13 @@ use std::net::SocketAddr;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
 use tokio::io::AsyncReadExt as _;
-use tokio::net::unix::pipe;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -707,58 +707,84 @@ fn default_mount(server: &str, session: &str) -> Result<PathBuf> {
 }
 
 /// What was written to a mirror's two FIFOs and no link has taken whole yet.
-#[derive(Default)]
 struct Typed {
-    /// Typed bytes, in their order: `MAX_HELD` at most, and past that `in` is read no more.
+    /// Typed bytes, in their order.
     bytes: Vec<u8>,
     /// The last line of `ctl` that asked for a size.
     asked: Option<Vec<u8>>,
     /// A line of `ctl` that has not ended yet.
     line: Vec<u8>,
+    /// What the thread that reads the two FIFOs hands over: bytes of `in` (false) or of `ctl`.
+    read: mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
+    /// How many typed bytes were read and no stream has taken: with `MAX_HELD` of them `in` is
+    /// read no more, its pipe fills, and whoever writes to it waits.
+    held: Arc<AtomicUsize>,
 }
 
 /// A line of `ctl` is 1,280 bytes at most, as fux has it: a longer one is dropped.
 const CTL_LINE: usize = 1280;
 
-/// The mirror's two FIFOs, `in` and `ctl`, to read what is written to them: those it has now.
-fn fifos_of(mirror: &Mutex<Mirror>) -> [Option<pipe::Receiver>; 2] {
-    let mirror = mirror.lock().unwrap_or_else(PoisonError::into_inner);
-    ["in", "ctl"].map(|name| {
-        let fifo = mirror.fifo(name).and_then(|fifo| fifo.try_clone().ok());
-        fifo.and_then(|fifo| pipe::Receiver::from_file(fifo).ok())
-    })
-}
-
-/// Waits until something is written to one of the mirror's FIFOs and reads it: typed bytes are
-/// kept, as long as fewer than `MAX_HELD` are; the lines of `ctl` that ended are given.
-async fn typing(typed: &mut Typed, fifos: &[Option<pipe::Receiver>; 2]) -> Vec<Vec<u8>> {
-    let [input, ctl] = fifos;
-    let readable = async |fifo: &Option<pipe::Receiver>, wanted: bool| match fifo {
-        Some(fifo) if wanted => _ = fifo.readable().await,
-        _ => std::future::pending().await,
-    };
-    let room = MAX_HELD.saturating_sub(typed.bytes.len());
-    let mut buffer = [0u8; 4096];
-    let (read, lined) = tokio::select! {
-        () = readable(input, room > 0) => (input, false),
-        () = readable(ctl, true) => (ctl, true),
-    };
-    let most = if lined {
-        buffer.len()
-    } else {
-        room.min(buffer.len())
-    };
-    let into = buffer.get_mut(..most).unwrap_or_default();
-    let n = read.as_ref().and_then(|fifo| fifo.try_read(into).ok());
-    let bytes = buffer.get(..n.unwrap_or(0)).unwrap_or_default();
-    if !lined {
-        typed.bytes.extend_from_slice(bytes);
-        return Vec::new();
+impl Typed {
+    /// Starts the one thread that reads the mirror's two FIFOs, link or no link, for as long
+    /// as what it reads is taken from it. It waits on them as fux does on a pane's (`poll`).
+    fn of(mirror: Arc<Mutex<Mirror>>) -> Typed {
+        let (read, taken) = mpsc::unbounded_channel();
+        let held = Arc::new(AtomicUsize::new(0));
+        let counted = held.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while !read.is_closed() {
+                // (The FIFOs the mirror has now: a round makes them, and a round removes them.)
+                let [input, ctl] = {
+                    let mirror = mirror.lock().unwrap_or_else(PoisonError::into_inner);
+                    ["in", "ctl"]
+                        .map(|name| mirror.fifo(name).and_then(|fifo| fifo.try_clone().ok()))
+                };
+                let room = MAX_HELD.saturating_sub(counted.load(Ordering::Relaxed));
+                let wanted = [input.as_ref().filter(|_| room > 0), ctl.as_ref()];
+                let fifos = wanted.map(|fifo| (fifo.map(|fifo| fifo.as_fd()), fuxix::POLLIN));
+                // (With no room it looks again soon: a stream may have taken some.)
+                let Ok(ready) = fuxix::wait(fifos, if room > 0 { 50 } else { 5 }) else {
+                    break;
+                };
+                for ((fifo, lined), ready) in wanted.into_iter().zip([false, true]).zip(ready) {
+                    let most = if lined {
+                        buffer.len()
+                    } else {
+                        room.min(buffer.len())
+                    };
+                    let into = buffer.get_mut(..most).unwrap_or_default();
+                    let got = fifo.filter(|_| ready != 0).map(|mut fifo| fifo.read(into));
+                    if let Some(Ok(n @ 1..)) = got {
+                        counted.fetch_add(if lined { 0 } else { n }, Ordering::Relaxed);
+                        let _ = read.send((lined, buffer.get(..n).unwrap_or_default().to_vec()));
+                    }
+                }
+            }
+        });
+        Typed {
+            bytes: Vec::new(),
+            asked: None,
+            line: Vec::new(),
+            read: taken,
+            held,
+        }
     }
-    let lines = fux::lines(&mut typed.line, bytes, CTL_LINE)
-        .into_iter()
-        .flatten();
-    lines.map(|line| format!("{line}\n").into_bytes()).collect()
+
+    /// Waits for what was written to one of the mirror's FIFOs: typed bytes are kept; the
+    /// lines of `ctl` that ended are given.
+    async fn typing(&mut self) -> Vec<Vec<u8>> {
+        match self.read.recv().await {
+            Some((false, bytes)) => self.bytes.extend(bytes),
+            Some((true, bytes)) => {
+                let lines = fux::lines(&mut self.line, &bytes, CTL_LINE);
+                let lines = lines.into_iter().flatten();
+                return lines.map(|line| format!("{line}\n").into_bytes()).collect();
+            }
+            None => std::future::pending().await,
+        }
+        Vec::new()
+    }
 }
 
 /// Something done to the mirror, on the blocking pool: its files are read and written there.
@@ -811,11 +837,11 @@ async fn carry(
     mut stop: watch::Receiver<bool>,
 ) -> Result<i32> {
     let (mirror, corner) = (Arc::new(Mutex::new(mirror)), corner.as_deref());
-    let (mut typed, mut link) = (Typed::default(), Some(first));
+    let (mut typed, mut link) = (Typed::of(mirror.clone()), Some(first));
     loop {
         let (send, recv) = match link.take() {
             Some(link) => link,
-            None => match away(client, &asks, &mirror, &mut typed, corner, &mut stop).await? {
+            None => match away(client, &asks, &mut typed, corner, &mut stop).await? {
                 Some(link) => link,
                 None => return Ok(0),
             },
@@ -855,12 +881,11 @@ async fn carry(
 async fn away(
     client: &mut Client,
     asks: &Attach,
-    mirror: &Arc<Mutex<Mirror>>,
     typed: &mut Typed,
     corner: Option<&Path>,
     stop: &mut watch::Receiver<bool>,
 ) -> Result<Option<(SendStream, RecvStream)>> {
-    let (since, fifos) = (Instant::now(), fifos_of(mirror));
+    let since = Instant::now();
     // (Said again each second: a viewer's corner is cleared by the next key.)
     let mut said = tokio::time::interval(Duration::from_secs(1));
     for tries in 0u32.. {
@@ -880,7 +905,7 @@ async fn away(
                         secs => say(corner, &format!("no link for {secs} s: {held}")),
                     }
                 }
-                lines = typing(typed, &fifos) => for line in lines {
+                lines = typed.typing() => for line in lines {
                     match line.starts_with(b"resize ") {
                         true => typed.asked = Some(line),
                         false => say(corner, "no link: a line written to ctl was dropped"),
@@ -951,7 +976,6 @@ async fn linked(
     // How many of the typed bytes the writer has been handed; when the open round is thrown
     // away; and what the viewer here last wrote of its terminal.
     let (mut offered, mut due, mut seen) = (0, None::<Instant>, [None, None]);
-    let mut fifos = fifos_of(mirror);
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         let more = !waits.is_empty() || offered < typed.bytes.len();
@@ -971,6 +995,7 @@ async fn linked(
             Some(message) = took.recv() => match message {
                 FromMirror::Write { name, bytes } if name == "in" => {
                     typed.bytes.drain(..bytes.len().min(typed.bytes.len()));
+                    typed.held.fetch_sub(bytes.len(), Ordering::Relaxed);
                     offered = offered.saturating_sub(bytes.len());
                 }
                 FromMirror::Write { bytes, .. } if typed.asked.as_ref() == Some(&bytes) => typed.asked = None,
@@ -990,10 +1015,7 @@ async fn linked(
                 due = until;
                 match taken {
                     Ok(true) => return Ok(Link::Ended),
-                    Ok(false) if done => {
-                        fifos = fifos_of(mirror);
-                        let _ = ready.take().map(|ready| ready.send(()));
-                    }
+                    Ok(false) if done => _ = ready.take().map(|ready| ready.send(())),
                     Ok(false) => {}
                     Err(Fault::Refused(what)) => return Err(refused(&what)),
                     Err(Fault::Failed(what)) => {
@@ -1002,7 +1024,7 @@ async fn linked(
                     }
                 }
             }
-            lines = typing(typed, &fifos) => for line in lines {
+            lines = typed.typing() => for line in lines {
                 if line.starts_with(b"resize ") {
                     typed.asked = Some(line.clone());
                 }

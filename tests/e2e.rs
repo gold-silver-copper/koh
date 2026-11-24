@@ -2847,7 +2847,8 @@ fn a_paste_larger_than_the_pipe_waits_and_is_not_cut() {
         let of = paste.len();
         assert!(
             began.elapsed() < Duration::from_secs(120),
-            "the program read {read} of {of} bytes in two minutes"
+            "the program read {read} of {of} bytes in two minutes; koh said: {}",
+            mount.said()
         );
     }
     writer.join().unwrap();

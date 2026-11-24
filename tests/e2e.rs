@@ -4967,12 +4967,28 @@ impl Stepped {
     /// Has the next step done, and gives the pane's `marks` after it.
     fn step(&mut self) -> String {
         self.1 += 1;
-        fs::write(self.0.join("in"), "\n").unwrap();
-        let title = format!("done-{}\n", self.1);
-        let said = || fs::read_to_string(self.0.join("title")).unwrap_or_default();
-        until(&title, || said() == title);
-        fs::read_to_string(self.0.join("marks")).unwrap()
+        stepped(&self.0, self.1)
     }
+}
+
+/// Has a session of `marks_by_steps` do its next step, the `done`th, and gives the pane's
+/// `marks` once its title says so: the two as one round of the holder's left them, read
+/// between two looks at the same even `generation`. (A round writes `title` before `marks`:
+/// read one after the other and no more, the marks may be those of the round before, which
+/// under load is one from the middle of the step.)
+fn stepped(pane: &Path, done: u32) -> String {
+    fs::write(pane.join("in"), "\n").unwrap();
+    let title = format!("done-{done}\n");
+    let read = |name: &str| fs::read_to_string(pane.join(name)).unwrap_or_default();
+    let mut marks = String::new();
+    until(&title, || {
+        let number = read("generation");
+        let even = number.trim().parse::<u64>().is_ok_and(|n| n % 2 == 0);
+        let said = read("title");
+        marks = read("marks");
+        even && said == title && read("generation") == number
+    });
+    marks
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4989,12 +5005,7 @@ async fn a_wait_is_not_ended_by_marks_that_only_moved() {
     let mut done = 0;
     let mut step = || {
         done += 1;
-        fs::write(pane.join("in"), "\n").unwrap();
-        let title = format!("done-{done}\n");
-        until(&title, || {
-            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
-        });
-        fs::read_to_string(pane.join("marks")).unwrap()
+        stepped(&pane, done)
     };
     let client = host.client().await;
     // A command has ended with 7; a wait is asked at the prompt after it. The marks are few, and
@@ -5198,23 +5209,33 @@ async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed
     session.step();
     let client = host.client().await;
     let wait = waits(&client, "s").await;
+    // The server looks ten times a second, and the holder writes the burst in as many rounds
+    // as it reads it in. So that all of it is between two looks, the server stands still
+    // from the look the wait was asked with until the pane has the whole burst: a look in the
+    // middle would find the first command, or the oldest of that moment.
+    let server = host.served.as_ref().unwrap().server.id().to_string();
+    let state = || {
+        let ps = Command::new("ps")
+            .args(["-o", "state=", "-p", &server])
+            .output();
+        String::from_utf8_lossy(&ps.unwrap().stdout).into_owned()
+    };
+    signal(&server, "-STOP");
+    until("the server is stopped", || state().contains('T'));
     let marks = session.step();
+    signal(&server, "-CONT");
     assert_eq!(marks.lines().count(), 1000);
     let (code, text, said) = told(wait).await;
     // The first that ended is not there any more. The wait gives the oldest that is, and says
-    // that it is not known to be the first; or, had it looked in the middle of the write,
-    // the first itself.
+    // that it is not known to be the first.
     let kept = marks.lines().filter(|mark| mark.contains(" end")).count();
     let oldest = 300 - kept;
-    if said.contains("unread") {
-        assert_eq!(
-            (code, text),
-            ((oldest % 100) as i32, format!("burst-{oldest}\n")),
-            "{said}"
-        );
-    } else {
-        assert_eq!((code, text), (0, "burst-0\n".to_string()), "{said}");
-    }
+    assert!(said.contains("marks came and went unread"), "{said}");
+    assert_eq!(
+        (code, text),
+        ((oldest % 100) as i32, format!("burst-{oldest}\n")),
+        "{said}"
+    );
     client.close().await;
 }
 

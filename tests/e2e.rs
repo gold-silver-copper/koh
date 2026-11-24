@@ -1200,6 +1200,76 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_tree_that_takes_long_to_hash_holds_up_nothing_else_the_server_serves() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("cp-beside").await;
+    // As much of nothing as takes about half a second to hash here (8 MiB to 2 GiB): long to
+    // hash, and nothing to make.
+    let began = Instant::now();
+    blake3::hash(&vec![0u8; 8 << 20]);
+    let eighth = began.elapsed().as_micros().max(1) as u64;
+    let (size, tree) = (
+        (8u64 << 20) * (500_000 / eighth).clamp(1, 256),
+        tmp.0.join("tree"),
+    );
+    fs::create_dir_all(&tree).unwrap();
+    let big = fs::File::create(tree.join("big")).unwrap();
+    big.set_len(size).unwrap();
+    // The server is in this process, and one thread serves all its requests: what else that
+    // thread serves stands in for another client's link. It wakes every two milliseconds.
+    let woken = Arc::new(AtomicUsize::new(0));
+    let wakes = woken.clone();
+    let beside = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            wakes.fetch_add(1, SeqCst);
+        }
+    });
+    // It went on waking while the server hashed: for a quarter of that time at the least.
+    // (Held up, it wakes a few times in all: the hashing is nearly all the time there is.)
+    let went_on = |what: &str, began: Instant, woke: usize| {
+        let took = began.elapsed();
+        let awake = Duration::from_millis(2) * (woken.load(SeqCst) - woke) as u32;
+        assert!(awake >= took / 4, "{what}: awake for {awake:?} of {took:?}");
+    };
+
+    // A pull: the server hashes the tree before it sends its list. (Nothing is made here.)
+    let (began, woke) = (Instant::now(), woken.load(SeqCst));
+    let (from, to) = (tree.display().to_string(), tmp.0.join("back"));
+    let pulled = client.cp_pull(from.clone(), &to, vec![], false, false, true);
+    assert_eq!(pulled.await.unwrap().added, ["big"]);
+    went_on("a pull", began, woke);
+
+    // A push of a file as long as the one that is there: the server hashes its own to compare.
+    let push = Request::CpPush {
+        dst: from,
+        excludes: Vec::new(),
+        delete: false,
+        preserve_mtime: false,
+        dry_run: true,
+    };
+    let (mut send, mut recv) = client.request(&push).await.unwrap();
+    let entry = SyncEntry {
+        path: "big".into(),
+        size,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let (began, woke) = (Instant::now(), woken.load(SeqCst));
+    let list = SyncMsg::Manifest(vec![entry]);
+    send_msg(&mut send, &list, MAX_CTRL).await.unwrap();
+    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(matches!(need, SyncMsg::Need(..)), "{need:?}");
+    went_on("a push", began, woke);
+
+    beside.abort();
+    client.close().await;
+    srv.shutdown().await;
+}
+
 /// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.
 fn deep(root: &std::path::Path, dirs: usize) -> PathBuf {
     let inner = (0..dirs).fold(root.to_path_buf(), |at, _| at.join("d"));

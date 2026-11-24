@@ -4,15 +4,12 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
 use std::net::SocketAddr;
-use std::os::unix::fs::{
-    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
 use qrcode::{QrCode, render::unicode};
 
-use crate::sync::Place;
 use crate::{Exit, KohError, Result, atomic_write, is_safe_name};
 
 const KEY_LEN: usize = 32;
@@ -56,13 +53,11 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Where a copy to or from `target` reaches under this scope, if it may: with no scope the
-    /// path as given; with one, the scope's directory and the names beneath it, of which a copy
-    /// follows no symlink.
-    pub fn place_cp(&self, target: &Path) -> Result<Place> {
+    /// Checks whether a path is allowed for copy operations under this scope.
+    pub fn check_cp(&self, target: &Path) -> Result<()> {
         match self {
-            Self::Full => Ok(Place::path(target)),
-            Self::Cp(root) | Self::Exec(root) => place_beneath(root, target),
+            Self::Full => Ok(()),
+            Self::Cp(root) | Self::Exec(root) => check_beneath(root, target),
         }
     }
 
@@ -70,7 +65,7 @@ impl Scope {
     pub fn check_exec(&self, cwd: &Path) -> Result<()> {
         match self {
             Self::Full => Ok(()),
-            Self::Exec(root) => check_within(root, cwd),
+            Self::Exec(root) => check_beneath(root, cwd),
             Self::Cp(_) => Err(KohError::refused("key scope allows only cp")),
         }
     }
@@ -84,81 +79,29 @@ impl Scope {
     }
 }
 
-/// `target` as names beneath the scope's directory `root`: it must say so itself, by starting
-/// with that directory's path (as the `clients` file has it, or resolved) and going on with
-/// plain names. Nothing of `target` is resolved here, so no symlink beneath `root` is trusted.
-fn place_beneath(root: &Path, target: &Path) -> Result<Place> {
+/// Whether `target` says, by its text, that it is beneath the scope's directory `root`: it
+/// starts with that directory's path (as the `clients` file has it, or resolved) and goes on
+/// with plain names, none of them `..` and none with a NUL in it. Nothing of `target` is
+/// resolved: a symlink beneath `root` leads where it leads.
+fn check_beneath(root: &Path, target: &Path) -> Result<()> {
     let root = expand_home(root)?;
     let base = root
         .canonicalize()
         .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
-    let outside = || {
-        KohError::refused(format!(
-            "path {} is outside allowed scope {}",
-            target.display(),
-            base.display()
-        ))
+    let beneath = |dir: &Path| {
+        target.strip_prefix(dir).is_ok_and(|rest| {
+            rest.components().all(
+                |c| matches!(c, Component::Normal(name) if !name.as_encoded_bytes().contains(&0)),
+            )
+        })
     };
-    let target = expand_home(target)?;
-    let rest = target
-        .strip_prefix(&root)
-        .or_else(|_| target.strip_prefix(&base))
-        .map_err(|_| outside())?;
-    let mut beneath = Vec::new();
-    for part in rest.components() {
-        match part {
-            Component::Normal(name) => beneath.push(name.to_str().ok_or_else(outside)?.to_string()),
-            Component::CurDir => {}
-            _ => return Err(outside()),
-        }
-    }
-    Place::beneath(base, beneath)
-}
-
-fn check_within(root: &Path, target: &Path) -> Result<()> {
-    let root = expand_home(root)?;
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
-    let target_abs = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        home_dir()?.join(target)
-    };
-    // Canonicalize the nearest existing ancestor so new files inside root are permitted.
-    let mut probe = target_abs.as_path();
-    let mut tail = Vec::new();
-    let base = loop {
-        if probe.exists() {
-            break probe.canonicalize().map_err(|e| {
-                KohError::refused(format!("cannot resolve {}: {e}", probe.display()))
-            })?;
-        }
-        let Some(name) = probe.file_name() else {
-            return Err(KohError::refused("path outside allowed scope"));
-        };
-        if name == ".." {
-            return Err(KohError::refused(
-                "parent traversal not allowed in scoped path",
-            ));
-        }
-        tail.push(name.to_os_string());
-        let Some(parent) = probe.parent() else {
-            return Err(KohError::refused("path outside allowed scope"));
-        };
-        probe = parent;
-    };
-    let mut resolved = base;
-    for part in tail.into_iter().rev() {
-        resolved.push(part);
-    }
-    if resolved == canon_root || resolved.starts_with(&canon_root) {
+    if beneath(&root) || beneath(&base) {
         Ok(())
     } else {
         Err(KohError::refused(format!(
             "path {} is outside allowed scope {}",
             target.display(),
-            canon_root.display()
+            base.display()
         )))
     }
 }
@@ -237,13 +180,6 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
         .map_err(|e| KohError::failed(format!("cannot create {}: {e}", dir.display())))?;
     let meta =
         fs::metadata(dir).map_err(|e| KohError::failed(format!("stat {}: {e}", dir.display())))?;
-    let uid = rustix::process::geteuid().as_raw();
-    if meta.uid() != uid {
-        return Err(KohError::refused(format!(
-            "{} is owned by another user",
-            dir.display()
-        )));
-    }
     if meta.permissions().mode() & 0o022 != 0 {
         return Err(KohError::refused(format!(
             "{} is writable by group or others; run chmod 700",
@@ -253,7 +189,7 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Loads or creates a 32-byte Ed25519 identity key with `0600` permissions (refusing symlinks).
+/// Loads or creates a 32-byte Ed25519 identity key with `0600` permissions.
 pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretKey> {
     let path = key_path(role, explicit)?;
     let parent = path
@@ -262,7 +198,7 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
         .ok_or_else(|| KohError::usage("invalid key path"))?;
     ensure_private_dir(parent)?;
 
-    match open_nofollow(&path) {
+    match File::open(&path) {
         Ok(file) => {
             let meta = file
                 .metadata()
@@ -307,7 +243,6 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
 /// endpoint id, and each client connection would reach one or the other, each with its own jobs
 /// and sessions. The lock is on a file beside the key, which stays: its being there says nothing.
 pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
-    use rustix::fs::{Mode, OFlags};
     let key = key_path(Role::Server, explicit)?;
     let name = key
         .file_name()
@@ -315,10 +250,14 @@ pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
         .to_string_lossy();
     let path = key.with_file_name(format!("{name}.serving"));
     let failed = |e: std::io::Error| KohError::failed(format!("lock {}: {e}", path.display()));
-    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let lock: File = rustix::fs::open(&path, flags, Mode::from_raw_mode(0o600))
-        .map_err(|e| failed(e.into()))?
-        .into();
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(failed)?;
     match lock.try_lock() {
         Ok(()) => Ok(lock),
         Err(fs::TryLockError::WouldBlock) => Err(KohError::new(
@@ -341,17 +280,6 @@ pub fn reset_key(role: Role, explicit: Option<&Path>) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(KohError::failed(format!("remove {}: {e}", path.display()))),
     }
-}
-
-fn open_nofollow(path: &Path) -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400_000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x0100;
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
 }
 
 pub fn parse_endpoint_id(s: &str) -> Result<EndpointId> {

@@ -148,6 +148,7 @@ impl Drop for RunningServer {
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let max_connections = cap("--max-connections", opts.max_connections)?;
     let max_sessions = cap("--max-sessions", opts.max_sessions)?;
+    crate::jobs::can_kill().await?;
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
     let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
@@ -156,7 +157,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
 
     let base = match opts.state_dir {
         Some(dir) => dir,
-        None => default_state_dir()?,
+        None => default_state_dir().await?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
     let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
@@ -240,13 +241,25 @@ pub async fn run_serve(opts: ServeOptions) -> Result<()> {
     Ok(())
 }
 
-fn default_state_dir() -> Result<PathBuf> {
+/// Where jobs and sessions are kept when no `--state-dir` says: in the user's runtime directory,
+/// or else in the temporary directory under the user's number, as id(1) tells it. (std does not
+/// tell who runs this process, and no file that was already there is evidence of it.)
+async fn default_state_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
         return Ok(PathBuf::from(dir).join("koh"));
     }
-    let uid = rustix::process::geteuid().as_raw();
+    let failed = |why: String| {
+        let what = "XDG_RUNTIME_DIR is not set, and `id -u` did not say whose state this is";
+        KohError::failed(format!("{what}: {why}"))
+    };
+    let said = crate::jobs::run("id", &["-u".into()]).await;
+    let said = said.map_err(|err| failed(err.message))?;
+    let uid: u32 = String::from_utf8_lossy(&said)
+        .trim()
+        .parse()
+        .map_err(|_| failed("it said no number".into()))?;
     Ok(std::env::temp_dir().join(format!("koh-{uid}")))
 }
 
@@ -431,13 +444,7 @@ async fn dispatch(
         }
         Request::Kill { name, signal } => {
             scope.check_full()?;
-            let info = {
-                let guard = state
-                    .jobs
-                    .lock()
-                    .map_err(|_| KohError::internal("jobs lock"))?;
-                guard.kill(&name, signal)?
-            };
+            let info = JobManager::kill(&state.jobs, &name, signal).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }
@@ -468,10 +475,11 @@ async fn dispatch(
             preserve_mtime,
             dry_run,
         } => {
-            let place = scope.place_cp(&expand_home(Path::new(&dst))?)?;
+            let dst = expand_home(Path::new(&dst))?;
+            scope.check_cp(&dst)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             let landed = receive_tree(
-                &place,
+                &dst,
                 &excludes,
                 delete,
                 preserve_mtime,
@@ -489,9 +497,10 @@ async fn dispatch(
             preserve_root,
             ..
         } => {
-            let place = scope.place_cp(&expand_home(Path::new(&src))?)?;
+            let src = expand_home(Path::new(&src))?;
+            scope.check_cp(&src)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let sent = send_tree(&place, &excludes, preserve_root, send, &mut recv).await;
+            let sent = send_tree(&src, &excludes, preserve_root, send, &mut recv).await;
             say_failure(send, sent).await;
             Ok(())
         }
@@ -728,10 +737,7 @@ async fn handle_exec(
         };
         KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
     })?;
-    let pgid = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(rustix::process::Pid::from_raw);
+    let pgid = child.id();
     send_msg(send, &Reply::Ok, MAX_CTRL).await?;
 
     let mut child_stdin = child.stdin.take();
@@ -810,8 +816,14 @@ async fn handle_exec(
         }
     }
 
-    if disconnected && let Some(pid) = pgid {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::HUP);
+    // (Its client is gone, so that it could not be hung up is told to whoever reads what the
+    // server says.)
+    if disconnected
+        && let Some(pid) = pgid
+        && let Err(err) = crate::jobs::signal_group(pid, 1).await
+    {
+        let said = format!("koh: a command whose client went was not hung up: {err}");
+        let _ = writeln!(std::io::stderr(), "{said}");
     }
     let _ = stdout_task.await;
     let _ = stderr_task.await;

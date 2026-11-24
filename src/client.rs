@@ -27,7 +27,7 @@ use crate::proto::{
     PictureKind, Reply, Request, ScreenFrame, ServerEvent, SessionInfo, SyncSummary, WaitResult,
     recv_msg, recv_msg_opt, send_msg, spawn_msg_reader,
 };
-use crate::sync::{Place, receive_tree, send_tree};
+use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result, atomic_write};
 
 const PICTURE_CACHE_MAX_COUNT: usize = 16;
@@ -366,8 +366,7 @@ impl Client {
                     dry_run,
                 })
                 .await?;
-            let place = Place::path(src);
-            let part = send_tree(&place, excludes, preserve_root, &mut send, &mut recv).await?;
+            let part = send_tree(src, excludes, preserve_root, &mut send, &mut recv).await?;
             total.merge(part);
         }
         Ok(total)
@@ -425,7 +424,7 @@ impl Client {
                 })
                 .await?;
             let part = receive_tree(
-                &Place::path(local_dst),
+                local_dst,
                 excludes,
                 delete,
                 preserve_mtime,

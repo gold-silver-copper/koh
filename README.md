@@ -11,7 +11,8 @@ Rewritten from scratch on `fux` 0.42, `fux-vt` 0.19, and `fuxix` 0.11 (~5,800 li
 - **Layer 2 — Raw Streams & Delta Sync (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, SIGHUP on disconnect.
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
-    log files (no 80-column wrapping, no screen truncation).
+    log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
+    which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
   - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete`, `--exclude`,
     `-p`, `--dry-run`).
 - **Layer 3 — Interactive Sessions Backed Directly by `fux`:**

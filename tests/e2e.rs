@@ -1021,11 +1021,11 @@ async fn boot_scoped(
 }
 
 #[tokio::test]
-async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
+async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where_it_leads() {
     use std::os::unix::fs::symlink;
     let (tmp, srv, client, allowed, outside) = boot_scoped("symlink").await;
-    let push = |src: PathBuf, delete: bool| {
-        let (client, dst) = (&client, allowed.display().to_string());
+    let push = |src: PathBuf, dst: PathBuf, delete: bool| {
+        let (client, dst) = (&client, dst.display().to_string());
         async move {
             client
                 .cp_push(&src, dst, Vec::new(), delete, false, false)
@@ -1033,73 +1033,62 @@ async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
         }
     };
 
-    // A directory on the way that is a symlink out of DIR: refused, nothing written beyond it.
+    // A path that says by its text that it is beneath DIR is taken, and the file system says
+    // where it is: a symlink on the way is followed, in the path the client names and in the
+    // tree that lands.
     symlink(&outside, allowed.join("link")).unwrap();
     let through = tmp.0.join("through");
     fs::create_dir_all(through.join("link")).unwrap();
-    fs::write(through.join("link/x"), "escaped").unwrap();
-    let err = push(through.clone(), false).await.unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!outside.join("x").exists(), "wrote through DIR/link");
+    fs::write(through.join("link/x"), "through the tree").unwrap();
+    push(through, allowed.clone(), false).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(outside.join("x")).unwrap(),
+        "through the tree"
+    );
+    let file = tmp.0.join("y");
+    fs::write(&file, "through the path").unwrap();
+    push(file, allowed.join("link"), false).await.unwrap();
+    assert_eq!(
+        fs::read_to_string(outside.join("y")).unwrap(),
+        "through the path"
+    );
 
-    // `--delete` removes nothing beyond it either.
-    fs::write(outside.join("victim"), "keep").unwrap();
-    let _ = push(through, true).await;
+    // `--delete` goes by what a tree that is read holds, and a symlink is not read: it stays,
+    // and so does what is beyond it.
     let empty = tmp.0.join("empty");
     fs::create_dir_all(&empty).unwrap();
-    push(empty, true).await.unwrap();
-    assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
-    fs::remove_file(allowed.join("link")).unwrap();
+    push(empty, allowed.clone(), true).await.unwrap();
+    assert!(allowed.join("link").is_symlink());
+    assert_eq!(names_in(&outside), ["x", "y"]);
 
-    // A symlink where the file lands is replaced, never read or written through: the same bytes
-    // are beyond it, and the copy must not find the file "unchanged" by hashing them.
+    // A file lands under a name of its own and is then renamed: a symlink where it lands is
+    // replaced by it, and the file the symlink led to is as it was. That file has the same
+    // bytes here, and the copy must not find the file "unchanged" for that: what is where a
+    // file lands is the symlink, and a symlink is not the file.
     fs::write(outside.join("target"), "same").unwrap();
     symlink(outside.join("target"), allowed.join("final")).unwrap();
     let onto = tmp.0.join("onto");
     fs::create_dir_all(&onto).unwrap();
     fs::write(onto.join("final"), "same").unwrap();
-    let done = push(onto, false).await.unwrap();
-    assert_eq!(done.unchanged, 0, "hashed the file beyond DIR/final");
-    assert!(
-        fs::symlink_metadata(allowed.join("final"))
-            .unwrap()
-            .is_file()
-    );
+    let done = push(onto, allowed.clone(), false).await.unwrap();
+    assert_eq!(done.unchanged, 0, "compared with the file beyond DIR/final");
+    assert!(!allowed.join("final").is_symlink());
+    assert_eq!(fs::read_to_string(allowed.join("final")).unwrap(), "same");
     assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
 
-    // A symlink planted at the name the file's bytes used to be written under first.
-    symlink(outside.join("planted"), allowed.join(".x.koh-tmp")).unwrap();
-    let file = tmp.0.join("x");
-    fs::write(&file, "payload").unwrap();
-    push(file, false).await.unwrap();
-    assert!(!outside.join("planted").exists(), "wrote through the temp");
-    assert!(fs::symlink_metadata(allowed.join("x")).unwrap().is_file());
-    assert_eq!(fs::read_to_string(allowed.join("x")).unwrap(), "payload");
-
-    // A tree with directories still lands, and no temporary file is left beside what landed.
+    // A tree with directories lands, and no temporary file is left beside what landed.
     let nested = tmp.0.join("nested");
     fs::create_dir_all(nested.join("a/b")).unwrap();
     fs::write(nested.join("a/b/c.txt"), "deep").unwrap();
-    let dst = allowed.join("sub/tree").display().to_string();
-    let landed = client
-        .cp_push(&nested, dst, Vec::new(), false, false, false)
-        .await
-        .unwrap();
+    let landed = push(nested, allowed.join("sub/tree"), false).await.unwrap();
     assert_eq!(landed.added, vec!["a/b/c.txt".to_string()]);
-    assert_eq!(
-        fs::read_to_string(allowed.join("sub/tree/a/b/c.txt")).unwrap(),
-        "deep"
-    );
-    let beside: Vec<_> = fs::read_dir(allowed.join("sub/tree/a/b"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(beside, vec![std::ffi::OsString::from("c.txt")]);
+    assert_eq!(names_in(&allowed.join("sub/tree/a/b")), ["c.txt"]);
 
-    // Reading is held to DIR the same way: a file beyond a symlink is refused when named, and
-    // not sent as part of the tree the symlink is in.
+    // Reading is the same: a symlink in a tree is not sent, as a file or as a directory, and a
+    // path that names a file through one reaches that file.
     fs::write(outside.join("secret"), "secret").unwrap();
     symlink(&outside, allowed.join("sub/tree/out")).unwrap();
+    symlink(outside.join("secret"), allowed.join("sub/tree/a/s")).unwrap();
     let pull = |src: PathBuf, to: &str| {
         let (client, to) = (&client, tmp.0.join(to));
         async move {
@@ -1107,47 +1096,33 @@ async fn scoped_cp_never_writes_reads_or_deletes_through_a_symlink() {
             let done = client
                 .cp_pull(src, &to, Vec::new(), false, false, false)
                 .await;
-            (done, to)
+            (done.unwrap(), to)
         }
     };
-    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
-    assert_eq!(named.unwrap_err().code, Exit::REFUSED);
-    assert!(!to.join("secret").exists());
     let (whole, to) = pull(allowed.join("sub/tree"), "whole").await;
-    assert_eq!(whole.unwrap().added, vec!["a/b/c.txt".to_string()]);
-    assert!(!to.join("out").exists());
-    let (one, to) = pull(allowed.join("sub/tree/a/b/c.txt"), "one").await;
-    assert_eq!(one.unwrap().added, vec!["c.txt".to_string()]);
-    assert_eq!(fs::read_to_string(to.join("c.txt")).unwrap(), "deep");
+    assert_eq!(whole.added, vec!["a/b/c.txt".to_string()]);
+    assert_eq!(names_in(&to), ["a"]);
+    assert_eq!(names_in(&to.join("a")), ["b"]);
+    // The client's own destination is as its file system has it too: a symlink there is
+    // followed.
+    let (local, beyond) = (tmp.0.join("local"), tmp.0.join("beyond"));
+    fs::create_dir_all(&local).unwrap();
+    fs::create_dir_all(&beyond).unwrap();
+    symlink(&beyond, local.join("a")).unwrap();
+    pull(allowed.join("sub/tree"), "local").await;
+    assert_eq!(fs::read_to_string(beyond.join("b/c.txt")).unwrap(), "deep");
+    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
+    assert_eq!(named.added, vec!["secret".to_string()]);
+    assert_eq!(fs::read_to_string(to.join("secret")).unwrap(), "secret");
 
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn cp_pull_never_writes_through_a_symlink_in_the_local_destination() {
-    let (tmp, srv, client, _, _) = boot_pair("pull-symlink").await;
-    let tree = tmp.0.join("tree");
-    fs::create_dir_all(tree.join("link")).unwrap();
-    fs::write(tree.join("link/x"), "escaped").unwrap();
-    let (back, outside) = (tmp.0.join("back"), tmp.0.join("outside"));
-    fs::create_dir_all(&back).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-    std::os::unix::fs::symlink(&outside, back.join("link")).unwrap();
-
-    let err = client
-        .cp_pull(
-            tree.display().to_string(),
-            &back,
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
+    // The text is what holds: a path that does not begin with DIR is refused, though a symlink
+    // would have led it there.
+    symlink(&allowed, outside.join("in")).unwrap();
+    let file = tmp.0.join("z");
+    fs::write(&file, "z").unwrap();
+    let err = push(file, outside.join("in"), false).await.unwrap_err();
     assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!outside.join("x").exists(), "wrote through back/link");
+    assert!(!allowed.join("z").exists());
 
     client.close().await;
     srv.shutdown().await;
@@ -2019,6 +1994,47 @@ async fn a_hostile_sender_lands_nothing_and_leaves_no_temporary_file() {
 }
 
 #[tokio::test]
+async fn a_file_that_has_a_staging_name_is_not_written_over() {
+    let (tmp, srv, client, _, _) = boot_pair("staging-name").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    // A file is written as `.koh-PID-N.tmp` beside where it lands, N counted up by the process
+    // that writes it (here this one). Three of every four such names are files of someone
+    // else's: wherever the count stands, eight files in a row meet some of them, and a free
+    // name is never more than four tries away.
+    let pid = std::process::id();
+    let theirs: Vec<PathBuf> = (0..4096u32)
+        .filter(|n| n % 4 != 3)
+        .map(|n| dst.join(format!(".koh-{pid:x}-{n:x}.tmp")))
+        .collect();
+    for path in &theirs {
+        fs::write(path, "theirs").unwrap();
+    }
+    for n in 0..8 {
+        fs::write(src.join(format!("f{n}")), "sent").unwrap();
+    }
+    let done = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.added.len(), 8);
+    assert_eq!(fs::read_to_string(dst.join("f7")).unwrap(), "sent");
+    let kept = |path: &PathBuf| fs::read_to_string(path).is_ok_and(|text| text == "theirs");
+    assert_eq!(theirs.iter().filter(|path| !kept(path)).count(), 0);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_else() {
     use std::os::unix::fs::symlink;
     let tmp = TempDir::new("exec-scope");
@@ -2068,12 +2084,20 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         .unwrap();
     assert_eq!(out, b"reached");
 
-    // It does not start elsewhere: not outside, and not in a directory that is beneath its own
-    // by name and somewhere else in fact (a symlink out of it).
-    for dir in [outside.clone(), allowed.join("out"), tmp.0.clone()] {
+    // It does not start elsewhere, and elsewhere is told by the text of the path: a directory
+    // that is beneath its own by name and somewhere else in fact (a symlink out of it) is
+    // beneath its own.
+    for dir in [outside.clone(), tmp.0.clone(), allowed.join("sub/../..")] {
         let err = pwd(dir.clone()).await.unwrap_err();
         assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
     }
+    let (code, out, _) = pwd(allowed.join("out")).await.unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        String::from_utf8_lossy(&out)
+            .trim_end()
+            .ends_with("/outside")
+    );
     let job = client
         .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
         .await
@@ -2084,7 +2108,7 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         .await;
     assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
 
-    // It copies beneath its directory as a `--cp` key does, through no symlink.
+    // It copies beneath its directory as a `--cp` key does.
     let file = tmp.0.join("payload");
     fs::write(&file, "copied").unwrap();
     let push = |dst: PathBuf| {
@@ -2101,10 +2125,8 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         fs::read_to_string(allowed.join("sub/payload")).unwrap(),
         "copied"
     );
-    for dst in [outside.clone(), allowed.join("out")] {
-        let err = push(dst.clone()).await.unwrap_err();
-        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dst.display());
-    }
+    let err = push(outside.clone()).await.unwrap_err();
+    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
     assert!(!outside.join("payload").exists());
 
     // And it asks for nothing else: no sessions, and no look at jobs, its own among them.
@@ -2273,4 +2295,281 @@ async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
 
     client.close().await;
     srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
+    // 144 directories, one in the next, each of a 40-character name: the path of the innermost
+    // is longer than a path may be (and a tree that deep is too deep to copy). `--delete` must
+    // find that out, or fail in the trying, before it removes anything: an entry it cannot look
+    // at is not an entry that is not there.
+    let (tmp, srv, client, _, _) = boot_pair("delete-unreadable").await;
+    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(dst.join("stays"), "stays").unwrap();
+    // (No path can name them all, so they are made as nine chains of 16, which a path can
+    // name, and each chain is then moved to the bottom of the one before it.)
+    let name = "d".repeat(40);
+    let chain = |nth: usize| dst.join(format!("chain{nth}"));
+    let bottom = |nth: usize| (0..16).fold(chain(nth), |at, _| at.join(&name));
+    for nth in 0..9 {
+        fs::create_dir_all(bottom(nth)).unwrap();
+    }
+    for nth in (1..9).rev() {
+        fs::rename(chain(nth).join(&name), bottom(nth - 1).join(&name)).unwrap();
+        fs::remove_dir(chain(nth)).unwrap();
+    }
+
+    let pushed = client
+        .cp_push(
+            &src,
+            dst.display().to_string(),
+            Vec::new(),
+            true,
+            false,
+            false,
+        )
+        .await;
+    assert_eq!(pushed.map(|_| ()).unwrap_err().code, Exit::FAILED);
+    assert_eq!(fs::read_to_string(dst.join("stays")).unwrap(), "stays");
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_one_is_not_reported_as_copied_to() {
+    let (tmp, srv, client, allowed, _) = boot_scoped("bad-destination").await;
+    let src = tmp.0.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), "sent").unwrap();
+    fs::write(allowed.join("file"), "a file").unwrap();
+    let push = |dst: String, dry_run: bool| {
+        let (client, src) = (&client, src.clone());
+        async move {
+            client
+                .cp_push(&src, dst, Vec::new(), false, false, dry_run)
+                .await
+        }
+    };
+    std::os::unix::fs::symlink(allowed.join("nowhere"), allowed.join("dangling")).unwrap();
+    for dry_run in [true, false] {
+        // A file is no directory to copy into, and a dry run says so as the copy would. Nor is
+        // a symlink that leads nowhere: something is there, and it is not a directory.
+        for name in ["file", "dangling"] {
+            let err = push(allowed.join(name).display().to_string(), dry_run).await;
+            assert_eq!(
+                err.unwrap_err().code,
+                Exit::FAILED,
+                "{name}, dry: {dry_run}"
+            );
+        }
+        // A name with a NUL in it names nothing: by its text it is not a path beneath DIR.
+        let err = push(format!("{}/bad\0name", allowed.display()), dry_run).await;
+        assert_eq!(err.unwrap_err().code, Exit::REFUSED, "dry run: {dry_run}");
+    }
+    assert_eq!(fs::read_to_string(allowed.join("file")).unwrap(), "a file");
+    assert_eq!(names_in(&allowed), ["dangling", "file"]);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+/// `koh serve` as a process of its own, and processes it started: all ended when this is dropped.
+struct Served {
+    server: std::process::Child,
+    started: Vec<u32>,
+    // (Kept open: the server goes on writing to it.)
+    said: std::io::BufReader<std::process::ChildStderr>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let _ = self.server.kill();
+        let _ = self.server.wait();
+        for pid in &self.started {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+}
+
+impl Served {
+    /// A server that allows `client`, with `path` for its PATH, a runtime directory or none,
+    /// and a temporary directory of its own.
+    fn start(
+        tmp: &TempDir,
+        path: &std::path::Path,
+        client: iroh::EndpointId,
+        runtime: bool,
+    ) -> Self {
+        let mut serve = Command::new(env!("CARGO_BIN_EXE_koh"));
+        serve
+            .args(["serve", "--direct", "127.0.0.1:0", "--no-relay", "--allow"])
+            .arg(client.to_string())
+            .env("PATH", path)
+            .env("KOH_CONFIG_DIR", tmp.0.join("served_cfg"))
+            .env("TMPDIR", &tmp.0)
+            .env_remove("XDG_RUNTIME_DIR")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if runtime {
+            serve.env("XDG_RUNTIME_DIR", tmp.0.join("run"));
+        }
+        let mut server = serve.spawn().unwrap();
+        let said = std::io::BufReader::new(server.stderr.take().unwrap());
+        Self {
+            server,
+            started: Vec::new(),
+            said,
+        }
+    }
+
+    /// What follows `label` on a line the server says as it starts; `Err` with all it said if
+    /// it ended without saying it.
+    fn says(&mut self, label: &str) -> Result<String, String> {
+        use std::io::BufRead as _;
+        let mut all = String::new();
+        loop {
+            let mut line = String::new();
+            if self.said.read_line(&mut line).unwrap() == 0 {
+                return Err(all);
+            }
+            if let Some(rest) = line.strip_prefix(label) {
+                return Ok(rest.trim().to_string());
+            }
+            all.push_str(&line);
+        }
+    }
+}
+
+#[tokio::test]
+async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job_was_not_signalled()
+{
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new("kill-helper");
+    let key = new_key(&tmp, "client.key");
+    let bin = tmp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+
+    // With no kill(1) to run, a server could end no job and hang up no command: it says so as
+    // it starts, and does not start.
+    let mut none = Served::start(&tmp, &bin, key.public(), true);
+    let said = none.says("listening:").unwrap_err();
+    assert!(said.contains("kill"), "{said}");
+    assert_eq!(none.server.wait().unwrap().code(), Some(1));
+
+    // With no runtime directory, its state is in the temporary directory under the number of
+    // the user who runs it (here, the owner of what this test made).
+    let all = std::env::var_os("PATH").unwrap();
+    let mut plain = Served::start(&tmp, std::path::Path::new(&all), key.public(), false);
+    let mine = fs::metadata(&tmp.0).unwrap().uid();
+    assert_eq!(
+        plain.says("sessions dir:").unwrap(),
+        format!("{}/koh-{mine}/sessions", tmp.0.display())
+    );
+    drop(plain);
+
+    // A kill(1) that takes two seconds and then fails. (Asked whether a process or a group
+    // is there, `kill -0`, it is the real one.)
+    let fake = |then: &str| {
+        format!("#!/bin/sh\n[ \"$1\" = -0 ] && exec /bin/kill \"$@\"\n{then}exit 42\n")
+    };
+    fs::write(bin.join("kill"), fake("/bin/sleep 2\n")).unwrap();
+    fs::set_permissions(bin.join("kill"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut served = Served::start(&tmp, &bin, key.public(), true);
+    let id: iroh::EndpointId = served.says("koh server id:").unwrap().parse().unwrap();
+    let addr: SocketAddr = served.says("listening:").unwrap().parse().unwrap();
+    let client = Client::connect_direct(key, id, Some(Route::Direct(addr)), false)
+        .await
+        .unwrap();
+    let sleep = vec!["/bin/sleep".to_string(), "300".into()];
+    let job = client
+        .run_job(Some("j".into()), sleep, None, false)
+        .await
+        .unwrap();
+    served.started.push(job.pid);
+
+    // While it runs, the server answers others: nothing waits for kill(1) but who asked for it.
+    let others = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let asked = std::time::Instant::now();
+        let jobs = client.jobs(None).await.unwrap();
+        (jobs, asked.elapsed())
+    };
+    let (killed, (jobs, waited)) = tokio::join!(client.kill_job("j".into(), 15), others);
+    assert!(waited < Duration::from_secs(1), "{waited:?}");
+    assert_eq!(jobs[0].state, "running");
+    // And a job that was not signalled is not reported as signalled.
+    let err = killed.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(err.message.contains("kill"), "{err:?}");
+
+    // A job whose first process has ended and left another behind in its group: the job says
+    // it has ended, and the group is what `koh kill` is for. Not signalled, it is not reported
+    // as signalled; once it has gone, there is nothing to signal and nothing to report.
+    fs::write(bin.join("kill"), fake("")).unwrap();
+    let left = tmp.0.join("left.pid");
+    let line = format!("/bin/sleep 300 & echo $! > {}", left.display());
+    client
+        .run_job(Some("o".into()), vec![line], None, true)
+        .await
+        .unwrap();
+    let ended = client.wait_job("o".into(), None, 10, Some(10)).await;
+    assert!(!ended.unwrap().timed_out);
+    let pid = fs::read_to_string(&left).unwrap().trim().to_string();
+    served.started.push(pid.parse().unwrap());
+    let there = |pid: &str| {
+        let mut asked = Command::new("kill");
+        asked.args(["-0", pid]).stderr(std::process::Stdio::null());
+        asked.status().unwrap().success()
+    };
+    assert!(there(&pid));
+    let err = client.kill_job("o".into(), 15).await.unwrap_err();
+    assert_eq!(err.code, Exit::FAILED, "{err:?}");
+    assert!(there(&pid));
+    assert!(Command::new("kill").arg(&pid).status().unwrap().success());
+    for _ in 0..500 {
+        if !there(&pid) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(client.kill_job("o".into(), 15).await.unwrap().name, "o");
+
+    client.close().await;
+}
+
+#[test]
+fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
+    // (koh has no anti-symlink mechanics. The one this replaced was a number written by hand
+    // for each system, and the wrong one on arm64 Linux, where it refused nothing.)
+    let tmp = TempDir::new("key-link");
+    let (real, link) = (tmp.0.join("real.key"), tmp.0.join("link.key"));
+    let made = load_or_create_key(Role::Client, Some(&real)).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let read = load_or_create_key(Role::Client, Some(&link)).unwrap();
+    assert_eq!(read.public(), made.public());
+}
+
+#[tokio::test]
+async fn koh_serve_does_not_take_its_user_from_an_id_that_failed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // With no runtime directory the server asks id(1) whose state it keeps. An id(1) that says
+    // a number and then that it failed has told nothing: the server says so and does not start.
+    let tmp = TempDir::new("id-failed");
+    let key = new_key(&tmp, "client.key");
+    let bin = tmp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(bin.join("id"), "#!/bin/sh\necho 42424\nexit 42\n").unwrap();
+    fs::set_permissions(bin.join("id"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut path = bin.into_os_string();
+    path.push(":");
+    path.push(std::env::var_os("PATH").unwrap());
+    let mut served = Served::start(&tmp, std::path::Path::new(&path), key.public(), false);
+    let said = served.says("sessions dir:").unwrap_err();
+    assert!(said.contains("id -u"), "{said}");
+    assert_eq!(served.server.wait().unwrap().code(), Some(1));
+    assert!(!tmp.0.join("koh-42424").exists());
 }

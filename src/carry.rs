@@ -906,10 +906,12 @@ impl Round {
     }
 
     /// A folder, a FIFO or a link: at the mirror's root (a FIFO is `in` or `ctl`), and never
-    /// where a thing of another kind is. (A link may be turned.)
+    /// where a thing of another kind is. A link may be turned; it leads to a folder the round
+    /// has so far, so none is ever made, even for a moment, that leads anywhere else.
     fn make(&mut self, name: String, thing: Thing) -> Result<(), Fault> {
-        let fits = match thing {
+        let fits = match &thing {
             Thing::Fifo => name == "in" || name == "ctl",
+            Thing::Link(to) if self.will.get(to) != Some(&Thing::Folder) => false,
             _ => plain(&name) && !name.contains('/') && self.alone(&name),
         };
         let kind = discriminant(&thing);

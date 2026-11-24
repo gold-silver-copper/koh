@@ -309,6 +309,22 @@ fn a_round_a_server_must_not_send_changes_nothing() {
             vec![],
             vec![put("x", b"x\n"), put("X", b"X\n")],
         ),
+        // A link is checked when it comes: one that is gone again by `Done` is never made.
+        (
+            "a link to no folder, removed again",
+            vec![],
+            vec![link("way", "missing"), remove("way")],
+        ),
+        (
+            "a link that leads out, removed again",
+            vec![],
+            vec![link("way", "../.."), remove("way")],
+        ),
+        (
+            "a link before its folder",
+            vec![],
+            vec![link("way", "alt"), folder("alt")],
+        ),
         // (The first has no `Round` before it; the last one's link ends before its `Done`.)
         ("a message outside a round", vec![], vec![]),
         ("an odd round", vec![], vec![]),

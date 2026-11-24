@@ -4590,3 +4590,137 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
         "s\tended\texited 3\t80x24\tidle\t9\t\n"
     );
 }
+
+/// A program for a session that marks as a shell does (OSC 133), by itself: a prompt, and then,
+/// each time a line is entered, the next of `steps` (sh, with `prompt` and `ran TEXT CODE` for a
+/// command that printed and ended); after each the pane's title says how many are done.
+fn marks_by_steps(steps: &[&str]) -> Vec<String> {
+    let script = r#"stty -echo
+m() { printf '\033]133;%s\007' "$1"; }
+prompt() { m A; printf '$ '; m B; }
+ran() { printf '\r\n'; m C; printf '%s\r\n' "$1"; m "D;$2"; prompt; }
+n=0; prompt; printf '\033]2;done-0\007'
+for step in "$@"; do read line; eval "$step"; n=$((n + 1)); printf '\033]2;done-%s\007' "$n"; done
+read line"#;
+    let mut program = sh(script);
+    program.push("sh".into());
+    program.extend(steps.iter().map(|step| step.to_string()));
+    program
+}
+
+/// The four ways a screen moves its marks without a command's end: a line inserted above the
+/// prompt, a scroll down, a clear with the prompt drawn anew, the prompt drawn again in its place.
+const MOVES: [&str; 4] = [
+    r"printf '\0337\033[1;1H\033[L\0338\033[B'",
+    r"printf '\033[T\033[B'",
+    r"printf '\033[H\033[2J'; prompt",
+    r"printf '\r'; prompt",
+];
+
+/// A wait asked of the server by the client in this process: the stream, once the server has
+/// taken the request.
+async fn waits(client: &Client, session: &str) -> RecvStream {
+    let asked = Request::WaitSession {
+        session: session.into(),
+        timeout_secs: Some(60),
+    };
+    client.request(&asked).await.unwrap().1
+}
+
+/// What a wait was answered: its exit code and its text.
+async fn waited(mut wait: RecvStream) -> (i32, String) {
+    let ended: koh::proto::WaitResult = recv_msg(&mut wait, MAX_CTRL).await.unwrap();
+    (ended.exit, koh::proto::recv_text(&mut wait).await.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_is_not_ended_by_marks_that_only_moved() {
+    let host = Host::start("moved", &[]);
+    let fill = "i=0; while [ $i -lt 260 ]; do ran fill 0; i=$((i + 1)); done";
+    let cleared = r"printf '\r\n'; m C; printf '\033[H\033[2Jfour\r\n'; m 'D;4'; prompt";
+    let mut steps = vec!["ran one 7"];
+    steps.extend(MOVES);
+    steps.extend(["ran two 9", fill]);
+    steps.extend(MOVES);
+    steps.push(cleared);
+    let pane = host.session("s", &marks_by_steps(&steps), "$");
+    let mut done = 0;
+    let mut step = || {
+        done += 1;
+        fs::write(pane.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
+        });
+        fs::read_to_string(pane.join("marks")).unwrap()
+    };
+    let client = host.client().await;
+    // A command has ended with 7; a wait is asked at the prompt after it. The marks are few, and
+    // all on the screen.
+    let before = step();
+    let mut wait = waits(&client, "s").await;
+    // Whatever moves the screen moves its marks, and is no command's end: the wait says nothing.
+    for moved in [
+        "a line inserted",
+        "a scroll down",
+        "a clear",
+        "the prompt again",
+    ] {
+        let marks = step();
+        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
+        assert!(
+            said.is_err(),
+            "after {moved} the wait ended: {before:?} became {marks:?}"
+        );
+    }
+    // A command's end is one.
+    step();
+    assert_eq!(waited(wait).await, (9, "two\n".to_string()));
+    // The same in a pane whose `marks` is full: it keeps a thousand, and drops one for each it takes.
+    let full = step();
+    assert_eq!(full.lines().count(), 1000);
+    let mut wait = waits(&client, "s").await;
+    for moved in [
+        "a line inserted",
+        "a scroll down",
+        "a clear",
+        "the prompt again",
+    ] {
+        let marks = step();
+        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
+        assert!(
+            said.is_err(),
+            "full, after {moved} the wait ended: {marks:?}"
+        );
+    }
+    // There a command that clears the screen and ends no further down than the last has ended too.
+    let marks = step();
+    assert_eq!(marks.lines().count(), 1000);
+    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_gives_the_first_command_that_ended_since_it_was_asked() {
+    let host = Host::start("first", &[]);
+    // Two commands end before the wait looks again: one typed while the other ran.
+    let pane = host.session(
+        "s",
+        &marks_by_steps(&["ran one 7", "ran two 0; ran three 5"]),
+        "$",
+    );
+    let step = |done: u32| {
+        fs::write(pane.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
+        });
+    };
+    step(1);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    step(2);
+    // It is the first of them that the wait was for: its code, and what it printed.
+    assert_eq!(waited(wait).await, (0, "two\n".to_string()));
+    client.close().await;
+}

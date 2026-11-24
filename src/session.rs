@@ -12,7 +12,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use iroh::endpoint::{RecvStream, SendStream};
@@ -113,8 +113,8 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
         cols: size.next().unwrap_or(0),
         rows: size.next().unwrap_or(0),
         title: title.unwrap_or_default(),
-        running_command: alive && marks.busy,
-        last_exit: marks.code(),
+        running_command: alive && marks.busy(),
+        last_exit: marks.command(usize::MAX).0,
         age_secs: written.elapsed().map_or(0, |age| age.as_secs()),
         pane_dir: dir.display().to_string(),
     }
@@ -124,9 +124,34 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
 /// shows where its shell has marked no command that ended.
 fn text(dir: &Path, last: bool) -> Vec<u8> {
     let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)));
-    printed
-        .flatten()
-        .unwrap_or_else(|| fs::read(dir.join("shown/screen")).unwrap_or_default())
+    printed.flatten().unwrap_or_else(|| screen(dir))
+}
+
+/// The screen a session shows.
+fn screen(dir: &Path) -> Vec<u8> {
+    pane::read(dir, "shown/screen").unwrap_or_default()
+}
+
+/// What a wait finds when it looks: nothing while the session runs on and no command of its
+/// shell has ended since `was` was read; else the exit code, how it ended, and the text. The
+/// first command that ended, its code and what it printed read as one; or, of a session that
+/// ended, what `state` says and its last screen. A folder that is gone or another run's by
+/// then has ended, and nothing of it is given.
+fn looked(dir: &Path, run: Run, was: &Marks) -> Option<(i32, String, Vec<u8>)> {
+    // (The marks alone first, a file: the pane's text is read only once they say so.)
+    let ended = was.first_since(&Marks::read(dir)).is_some();
+    let ended = ended.then(|| pane::together(dir, lives, || pane::ended_since(was, dir)));
+    let (ended, alive) = (ended.flatten(), lives(dir));
+    if run_of(dir) != Some(run) {
+        return Some((1, "ended".into(), Vec::new()));
+    }
+    if let Some((code, printed)) = ended {
+        let said = "command ended (OSC 133)".to_string();
+        let printed = printed.unwrap_or_else(|| screen(dir));
+        return Some((code.map_or(0, i32::from), said, printed));
+    }
+    let state = (!alive).then(|| state_of(dir, false))?;
+    Some((pane::code(&state).unwrap_or(1), state, screen(dir)))
 }
 
 /// File work of the three commands, on the blocking pool: it reads megabytes of history, and
@@ -206,13 +231,13 @@ impl Sessions {
             .collect()
     }
 
-    /// The folder of the session `name`: a pane's, or there is no such session.
-    fn named(&self, name: &str) -> Result<PathBuf> {
-        let dir = self.dir.join(name);
-        match session_name(name) && run_of(&dir).is_some() {
-            true => Ok(dir),
-            false => Err(not_found(format!("no session {name}"))),
-        }
+    /// The folder of the session `name` and its run: a pane's, or there is no such session.
+    /// (A name that is none is no path.)
+    fn named(&self, name: &str) -> Result<(PathBuf, Run)> {
+        let dir = session_name(name).then(|| self.dir.join(name));
+        let pane = dir.and_then(|dir| Some((run_of(&dir)?, dir)));
+        let pane = pane.map(|(run, dir)| (dir, run));
+        pane.ok_or_else(|| not_found(format!("no session {name}")))
     }
 
     /// `koh sessions`: every session as its folder says it is, the oldest first, and whether
@@ -232,59 +257,53 @@ impl Sessions {
     /// `koh output`: what the session `name` shows, or with `last` what its last command
     /// printed.
     pub async fn output(&self, name: &str, last: bool) -> Result<Vec<u8>> {
-        let dir = self.named(name)?;
+        let (dir, _) = self.named(name)?;
         pooled(move || text(&dir, last)).await
     }
 
-    /// `koh wait --session`: until the session has ended, one more command of its shell has
-    /// than when this was asked (`Ok` is sent once its marks were read), or `seconds` have
-    /// gone by; answered with how it ended and, in pieces, what that command printed or what
-    /// the session shows. A client that has left is waited for no longer.
+    /// `koh wait --session`: until a command of the session's shell has ended since this was
+    /// asked (`Ok` is sent once its marks were read), the session has ended, or `seconds` have
+    /// gone by; answered with how it ended and, in pieces, with what the first such command
+    /// printed, or what the session shows. It is the run that was asked about that is waited
+    /// for. A client that has left is waited for no longer: that is seen between two looks.
     pub async fn wait(
         &self,
         name: &str,
         seconds: Option<u64>,
         send: &mut SendStream,
     ) -> Result<()> {
-        let dir = self.named(name)?;
-        let look = || {
-            let dir = dir.clone();
-            pooled(move || (Marks::read(&dir), lives(&dir)))
-        };
-        let (was, _) = look().await?;
+        let (dir, run) = self.named(name)?;
+        let read = dir.clone();
+        let was = Arc::new(pooled(move || Marks::read(&read)).await?);
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         // (A time too far off for the clock is no time.)
         let until = seconds.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
-        let waited = |exit: i32, detail: &str, timed_out: bool| WaitResult {
-            timed_out,
-            exit,
-            tail: String::new(),
-            detail: detail.to_string(),
-        };
-        // (Life first: of a folder that is gone nothing is read, and no mark says anything.)
-        let (waited, last) = loop {
-            let (now, alive) = look().await?;
-            if !alive {
-                let state = state_of(&dir, false);
-                break (
-                    waited(pane::code(&state).unwrap_or(1), &state, false),
-                    false,
-                );
-            }
-            if was.ended_by(&now) {
-                let code = now.code().map_or(0, i32::from);
-                break (waited(code, "command ended (OSC 133)", false), true);
+        let (timed_out, (exit, detail, text)) = loop {
+            let (look, was) = (dir.clone(), was.clone());
+            if let Some(ended) = pooled(move || looked(&look, run, &was)).await? {
+                break (false, ended);
             }
             if until.is_some_and(|until| Instant::now() >= until) {
-                break (waited(i32::from(Exit::TIMEOUT.0), "timed out", true), false);
+                let shown = dir.clone();
+                let shown = pooled(move || screen(&shown)).await?;
+                break (
+                    true,
+                    (i32::from(Exit::TIMEOUT.0), "timed out".into(), shown),
+                );
             }
             tokio::select! {
                 _ = send.stopped() => return Ok(()),
                 () = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         };
+        let waited = WaitResult {
+            timed_out,
+            exit,
+            tail: String::new(),
+            detail,
+        };
         send_msg(send, &waited, MAX_CTRL).await?;
-        send_text(send, &pooled(move || text(&dir, last)).await?).await
+        send_text(send, &text).await
     }
 
     /// Starts a pane with this binary as fux, `koh fux start SESSIONS/NAME -- PROGRAM` (no
@@ -769,6 +788,44 @@ mod tests {
         assert!(held(&dir, Some(named)).is_none());
         fs::remove_dir_all(&dir).unwrap();
         assert!(held(&dir, Some(named)).is_none() && held(&dir, None).is_none());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_wait_is_for_the_run_it_was_asked_about() {
+        let tmp = scratch("looked");
+        let (dir, aside) = (tmp.join("s"), tmp.join("aside"));
+        let lock = |dir: &Path| {
+            let held = File::open(dir).unwrap();
+            held.try_lock().unwrap();
+            held
+        };
+        // A session that runs (the test holds its lock), and has marked no command.
+        let (_fifos, holder) = (pane(&dir, 7), lock(&dir));
+        let (run, was) = (run_of(&dir).unwrap(), Marks::read(&dir));
+        assert_eq!(looked(&dir, run, &was), None);
+        // Between two looks it ends, and another run has its name, whose shell has marked a
+        // command's end with 7: that is not what was waited for. The session has ended.
+        drop(holder);
+        fs::rename(&dir, &aside).unwrap();
+        let (_others, _holder) = (pane(&dir, 8), lock(&dir));
+        fs::write(dir.join("marks"), "0 0 output\n1 0 end 7\n").unwrap();
+        assert_eq!(
+            looked(&dir, run, &was),
+            Some((1, "ended".to_string(), Vec::new()))
+        );
+        // The folder gone is the same; and the run itself, ended, says how.
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            looked(&dir, run, &was),
+            Some((1, "ended".to_string(), Vec::new()))
+        );
+        fs::rename(&aside, &dir).unwrap();
+        fs::write(dir.join("state"), "exited 3\n").unwrap();
+        assert_eq!(
+            looked(&dir, run, &was),
+            Some((3, "exited 3".to_string(), Vec::new()))
+        );
         let _ = fs::remove_dir_all(tmp);
     }
 

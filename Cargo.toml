@@ -24,6 +24,16 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["full"] }
 
+[dev-dependencies]
+# The fault link (`tests/link/net.rs`): a network below QUIC, for the tests alone. It is iroh's
+# custom-transport interface, and the three crates whose types that interface's traits name
+# and iroh gives no name of its own for. All are in the lockfile through iroh already, and
+# none is in a release build: a dev-dependency's features are not the package's.
+iroh = { version = "=1.3.0", features = ["unstable-custom-transports"] }
+iroh-base = "=1.3.0"
+n0-watcher = "=1.0.0"
+noq-udp = { version = "=1.3.0", default-features = false }
+
 # What proving a file costs the reader of a pane's folder: prints, and is no test.
 [[bench]]
 name = "carry"

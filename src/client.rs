@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -426,14 +426,23 @@ impl Client {
             (last, closed.unwrap_or(e))
         })?;
         reply.into_result().map_err(|e| (true, e))?;
-        let attached: Attached = recv_msg(&mut recv, MAX_CTRL)
-            .await
-            .map_err(|e| (false, e))?;
-        // (The server chose the name, and a mirror's default place is made of it: a name it
-        // is, and no path.)
-        match session_name(&attached.name) {
-            true => Ok((send, recv, attached)),
-            false => Err((true, refused("a session's name that is none"))),
+        // (An answer that is over its bound or is none is refused, as a message of a round
+        // is; the transport's end is not. The server chose the name, and a mirror's default
+        // place is made of it: a name it is, and no path. And a client that comes again is
+        // given the run it named, or types nothing.)
+        let attached: Attached = match recv_msg(&mut recv, MAX_CTRL).await {
+            Ok(attached) => attached,
+            Err(e) if e.code == Exit::FAILED => return Err((true, refused(&e.message))),
+            Err(e) => return Err((false, e)),
+        };
+        let name = &attached.name;
+        match (
+            session_name(name),
+            asks.run.is_none_or(|run| run == attached.run),
+        ) {
+            (true, true) => Ok((send, recv, attached)),
+            (true, false) => Err((true, another_run(name))),
+            (false, _) => Err((true, refused("a session's name that is none"))),
         }
     }
 
@@ -448,7 +457,11 @@ impl Client {
                 Ok(answered) => return answered,
             }
         }
-        self.redial().await.map_err(|e| (false, e))?;
+        // (A dial is given five seconds: one begun while there was no path sends again ever
+        // more seldom, and would be found waiting long after the path is back.)
+        let dialled = tokio::time::timeout(Duration::from_secs(5), self.redial()).await;
+        let timed_out = |_| (false, KohError::unreachable("timed out dialing server"));
+        dialled.map_err(timed_out)?.map_err(|e| (false, e))?;
         self.attach(asks).await
     }
 
@@ -506,6 +519,15 @@ impl Client {
         let (stop, stopped) = watch::channel(false);
         let (ready, first) = oneshot::channel();
         let says = Some(corner.clone());
+        // Told to end (its terminal closed, as a rule), koh leaves as if its user had: the
+        // viewer is told to go, and the private folder goes with it.
+        let left = Arc::new(AtomicBool::new(false));
+        let (leaves, viewer) = (left.clone(), corner.clone());
+        let signals = tokio::spawn(async move {
+            told_to_end().await;
+            leaves.store(true, Ordering::Relaxed);
+            quit_viewer(&viewer).await;
+        });
         let mut carried = tokio::spawn(async move {
             let mut client = self;
             let carried = carry(
@@ -559,6 +581,10 @@ impl Client {
             },
         };
         drop(temp);
+        signals.abort();
+        if left.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
         match (viewed, ended) {
             (Ok(Err(why)), _) => Err(KohError::failed(why)),
             (Err(e), _) => Err(KohError::internal(format!("fux view thread: {e}"))),
@@ -569,7 +595,8 @@ impl Client {
 
     /// `koh mount`: a mirror of a session in `place`, or with none in koh's own fux session on
     /// this machine (`K/fux/koh-mounts/SERVER.NAME`), for any `fux view`, `cat` or script to
-    /// look at and write to, until the session ends or koh is stopped (SIGINT, SIGTERM). koh
+    /// look at and write to, until the session ends or koh is stopped (SIGINT, SIGTERM, or
+    /// SIGHUP as from a terminal that is closed). koh
     /// makes the folder (one that is there is not taken) and removes it when the mount ends.
     pub async fn mount(
         self,
@@ -613,23 +640,13 @@ impl Client {
         );
         let (stop, stopped) = watch::channel(false);
         let signals = tokio::spawn(async move {
-            let mut term = signal(SignalKind::terminate()).ok();
-            let term = async {
-                match term.as_mut() {
-                    Some(term) => _ = term.recv().await,
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                () = term => {}
-            }
+            told_to_end().await;
             let _ = stop.send(true);
         });
         let mut client = self;
         let carried = carry(&mut client, &dir, mirror, asks, link, None, None, stopped).await;
         signals.abort();
-        client.close().await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
         let _ = fs::remove_dir_all(&dir);
         carried
     }
@@ -698,12 +715,14 @@ fn default_mount(server: &str, session: &str) -> Result<PathBuf> {
             '_'
         }
     };
-    let server: String = server
-        .chars()
-        .map(letters)
-        .take(63usize.saturating_sub(session.len()))
-        .collect();
-    Ok(mounts.join(format!("{server}.{session}")))
+    // (A pane's name is 64 characters at most: the server's part is cut to fit, and with no
+    // room for any of it the name is the session's own.)
+    let room = 63usize.saturating_sub(session.len());
+    let server: String = server.chars().map(letters).take(room).collect();
+    Ok(mounts.join(match server.is_empty() {
+        true => session.to_string(),
+        false => format!("{server}.{session}"),
+    }))
 }
 
 /// What was written to a mirror's two FIFOs and no link has taken whole yet.
@@ -768,6 +787,24 @@ impl Typed {
             line: Vec::new(),
             read: taken,
             held,
+        }
+    }
+
+    /// A message the stream has taken whole: what it carried is held no more. Says how many
+    /// typed bytes those were.
+    fn taken(&mut self, message: FromMirror) -> usize {
+        match message {
+            FromMirror::Write { name, bytes } if name == "in" => {
+                let typed = bytes.len().min(self.bytes.len());
+                self.bytes.drain(..typed);
+                self.held.fetch_sub(typed, Ordering::Relaxed);
+                typed
+            }
+            FromMirror::Write { bytes, .. } => {
+                self.asked.take_if(|asked| *asked == bytes);
+                0
+            }
+            _ => 0,
         }
     }
 
@@ -977,13 +1014,13 @@ async fn linked(
     // away; and what the viewer here last wrote of its terminal.
     let (mut offered, mut due, mut seen) = (0, None::<Instant>, [None, None]);
     let mut tick = tokio::time::interval(Duration::from_millis(50));
-    loop {
+    let link = loop {
         let more = !waits.is_empty() || offered < typed.bytes.len();
         tokio::select! {
-            _ = stop.changed() => return Ok(Link::Stopped),
-            () = &mut writer => return Ok(Link::Broken),
+            _ = stop.changed() => break Ok(Link::Stopped),
+            () = &mut writer => break Ok(Link::Broken),
             permit = out.reserve(), if more => {
-                let Ok(permit) = permit else { return Ok(Link::Broken) };
+                let Ok(permit) = permit else { break Ok(Link::Broken) };
                 let message = waits.pop_front().unwrap_or_else(|| {
                     let piece = typed.bytes.get(offered..).unwrap_or_default();
                     let piece = piece.get(..piece.len().min(MAX_TYPED)).unwrap_or_default();
@@ -992,35 +1029,27 @@ async fn linked(
                 });
                 permit.send(message);
             }
-            Some(message) = took.recv() => match message {
-                FromMirror::Write { name, bytes } if name == "in" => {
-                    typed.bytes.drain(..bytes.len().min(typed.bytes.len()));
-                    typed.held.fetch_sub(bytes.len(), Ordering::Relaxed);
-                    offered = offered.saturating_sub(bytes.len());
-                }
-                FromMirror::Write { bytes, .. } if typed.asked.as_ref() == Some(&bytes) => typed.asked = None,
-                _ => {}
-            },
+            Some(message) = took.recv() => offered = offered.saturating_sub(typed.taken(message)),
             message = from.recv() => {
                 let message = match message {
                     Some(Ok(message)) => message,
                     // A message over its bound, or none that is known: refused, as one that
                     // the mirror refuses. Anything else is the transport's end.
-                    Some(Err(e)) if e.code == Exit::FAILED => return Err(refused(&e.message)),
-                    _ => return Ok(Link::Broken),
+                    Some(Err(e)) if e.code == Exit::FAILED => break Err(refused(&e.message)),
+                    _ => break Ok(Link::Broken),
                 };
                 let done = message == ToMirror::Done;
                 let take = move |mirror: &mut Mirror| (mirror.take(message, Instant::now()), mirror.due());
                 let (taken, until) = with(mirror, take).await?;
                 due = until;
                 match taken {
-                    Ok(true) => return Ok(Link::Ended),
+                    Ok(true) => break Ok(Link::Ended),
                     Ok(false) if done => _ = ready.take().map(|ready| ready.send(())),
                     Ok(false) => {}
-                    Err(Fault::Refused(what)) => return Err(refused(&what)),
+                    Err(Fault::Refused(what)) => break Err(refused(&what)),
                     Err(Fault::Failed(what)) => {
                         say(corner, &format!("the mirror was not written: {what}"));
-                        return Ok(Link::Broken);
+                        break Ok(Link::Broken);
                     }
                 }
             }
@@ -1032,18 +1061,48 @@ async fn linked(
             },
             // An open round that stands still is the transport's end.
             () = async { tokio::time::sleep_until(due.unwrap_or_else(Instant::now).into()).await }, if due.is_some() => {
-                return Ok(Link::Broken);
+                break Ok(Link::Broken);
             }
             // What the viewer here wrote of its terminal, at each attach and when it changes.
             _ = tick.tick() => for (name, seen) in ["colours", "keyboard"].into_iter().zip(&mut seen) {
                 let Some(file) = told.map(|session| session.join(name)) else { continue };
                 let stamp = fs::metadata(&file).ok().filter(|file| file.is_file()).map(fux::stamp);
-                if stamp.is_some() && stamp != *seen && let Ok(bytes) = fs::read(&file) && bytes.len() <= MAX_TYPED {
+                let mut bytes = Vec::new();
+                let read = File::open(&file).map(|file| file.take(MAX_TYPED as u64 + 1).read_to_end(&mut bytes));
+                if stamp.is_some() && stamp != *seen && matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_TYPED {
                     waits.push_back(FromMirror::Told { name: name.into(), bytes });
                 }
                 *seen = stamp;
             },
         }
+    };
+    // Every way out takes what the writer says the stream took before any of it is offered
+    // to another link: what a stream took is never sent again.
+    while let Ok(message) = took.try_recv() {
+        typed.taken(message);
+    }
+    link
+}
+
+/// What a client is told that comes again to a name another run has by now.
+fn another_run(name: &str) -> KohError {
+    let why = format!("another run has the session's name {name}: nothing is typed into it");
+    KohError::new(Exit::NOT_FOUND, "not_found", why)
+}
+
+/// Waits until this process is told to end: interrupted, terminated, or hung up, as a terminal
+/// that is closed hangs up what runs in it.
+async fn told_to_end() {
+    let told = |kind| async move {
+        match signal(kind) {
+            Ok(mut told) => _ = told.recv().await,
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = told(SignalKind::interrupt()) => {}
+        () = told(SignalKind::terminate()) => {}
+        () = told(SignalKind::hangup()) => {}
     }
 }
 

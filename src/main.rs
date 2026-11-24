@@ -914,7 +914,7 @@ async fn cmd_session(args: &[String], mount: bool) -> Result<Exit> {
     }
     let server = server.ok_or_else(|| {
         let (what, place) = if mount {
-            ("mount", " [DIR]")
+            ("mount", " [MIRROR]")
         } else {
             ("connect", "")
         };

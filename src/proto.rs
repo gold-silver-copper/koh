@@ -132,10 +132,14 @@ pub struct Run {
 }
 
 /// A name a session may have: one of fux's names (letters, digits, `.`, `_` and `-`, at most 64,
-/// no dot first), and so one folder: never a path. Each end holds the other's word to it.
+/// no dot first, none that fux keeps), and so one folder: never a path. Each end holds the
+/// other's word to it.
 pub fn session_name(name: &str) -> bool {
     let letters = |b: u8| b.is_ascii_alphanumeric() || b"._-".contains(&b);
-    !name.is_empty() && name.len() <= 64 && !name.starts_with('.') && name.bytes().all(letters)
+    // (And none of the four names fux keeps for itself in a session and a workspace.)
+    let kept = ["-", "colours", "keyboard", "layout"].contains(&name);
+    let fits = !name.is_empty() && name.len() <= 64 && !name.starts_with('.');
+    fits && !kept && name.bytes().all(letters)
 }
 
 /// What follows `Ok` on an attach: the session's name and its run.

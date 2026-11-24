@@ -101,7 +101,7 @@ fn state_of(said: Option<String>, alive: bool) -> String {
 
 /// A session as its folder says it is, read of one round of its holder's writing.
 fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
-    let (alive, state, size, title, marks) = pane::together(dir, lives, || {
+    let ((alive, state, size, title, marks), _) = pane::together(dir, lives, || {
         let line = |name| pane::line(dir, name);
         let size = line("size").unwrap_or_default();
         (
@@ -109,7 +109,7 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
             line("state"),
             size,
             line("title"),
-            Marks::read(dir),
+            Marks::read(dir, None),
         )
     });
     let mut size = size.split(' ').map(|cells| cells.parse().unwrap_or(0));
@@ -120,8 +120,8 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
         cols: size.next().unwrap_or(0),
         rows: size.next().unwrap_or(0),
         title: title.unwrap_or_default(),
-        running_command: alive && marks.busy(),
-        last_exit: marks.ended(None).and_then(|(_, code, _)| code),
+        running_command: alive && marks.busy,
+        last_exit: marks.ended.and_then(|(_, code, _)| code),
         age_secs: written.elapsed().map_or(0, |age| age.as_secs()),
         pane_dir: dir.display().to_string(),
     }
@@ -130,7 +130,7 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
 /// What a session shows; or with `last` what its last command printed, which is what it
 /// shows where its shell has marked no command that ended.
 fn text(dir: &Path, last: bool) -> Vec<u8> {
-    let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)));
+    let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)).0);
     printed.flatten().unwrap_or_else(|| screen(dir))
 }
 
@@ -145,15 +145,17 @@ fn screen(dir: &Path) -> Vec<u8> {
 /// that ended, what `state` says and its last screen. A folder that is gone or another run's
 /// once all that was read has ended, and nothing of it is given.
 fn looked(dir: &Path, run: Run, asked: u64) -> Option<(i32, String, Vec<u8>)> {
-    let ended = pane::whole(dir, lives, || pane::ended_since(asked, dir));
-    let answer = match (ended.ok().flatten(), lives(dir)) {
+    // (What is not known to be of one round is not believed: the next look is.)
+    let (ended, whole) = pane::together(dir, lives, || pane::ended_since(asked, dir));
+    let answer = match (ended.filter(|_| whole), lives(dir)) {
         (Some((code, printed, unread)), _) => {
-            // (More marks came than the file keeps: what is left of them is not all of them.)
-            let missed = format!(
-                ": the oldest still kept, not known to be the first ({unread} marks came and went unread)"
-            );
-            let said =
-                "command ended (OSC 133)".to_string() + if unread > 0 { &missed } else { "" };
+            let said = match unread {
+                0 => "command ended (OSC 133)".to_string(),
+                // (More marks came than the file keeps: what is left of them is not all.)
+                n => format!(
+                    "command ended (OSC 133): the oldest still kept, not known to be the first ({n} marks came and went unread)"
+                ),
+            };
             Some((
                 code.map_or(0, i32::from),
                 said,
@@ -292,24 +294,16 @@ impl Sessions {
     ) -> Result<()> {
         let (dir, run) = self.named(name)?;
         let read = dir.clone();
-        let numbered = move || {
-            (
-                pane::whole(&read, lives, || Marks::read(&read).asked()),
-                lives(&read),
-            )
-        };
-        let asked = match pooled(numbered).await? {
-            (Ok(Some(asked)), _) => asked,
-            // (An ended session of an older holder is answered with its end: no `end` comes.)
-            (Ok(None), false) => u64::MAX,
-            (Ok(None), true) => {
-                let older = "is kept by a holder of before fux 0.43.2, which does not number its marks (it has no `marks.dropped`): a wait cannot tell its commands' ends. End that session and start it anew";
-                return Err(KohError::failed(format!("the session {name} {older}")));
-            }
-            (Err(_), _) => {
-                let moving = "is written without a pause: its marks were not read as of one moment. Ask again";
-                return Err(KohError::failed(format!("the session {name} {moving}")));
-            }
+        // No number to count from: an older holder's pane, or one whose two files were not
+        // read as of one round. No wait is taken for either.
+        let numbered = move || pane::together(&read, lives, || Marks::read(&read, None).asked());
+        let (asked, whole) = pooled(numbered).await?;
+        let Some(asked) = asked.filter(|_| whole) else {
+            let older = "is kept by a holder of before fux 0.43.2, which does not number its marks (it has no `marks.dropped`): a wait cannot tell its commands' ends. End that session and start it anew";
+            let moving =
+                "is written without a pause: its marks were not read as of one moment. Ask again";
+            let why = if whole { older } else { moving };
+            return Err(KohError::failed(format!("the session {name} {why}")));
         };
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         // (A time too far off for the clock is no time.)
@@ -840,7 +834,10 @@ mod tests {
         // A session that runs (the test holds its lock), and has marked no command.
         let (_fifos, holder) = (pane(&dir, 7), lock(&dir));
         fs::write(dir.join("marks.dropped"), "0\n").unwrap();
-        let (run, asked) = (run_of(&dir).unwrap(), Marks::read(&dir).asked().unwrap());
+        let (run, asked) = (
+            run_of(&dir).unwrap(),
+            Marks::read(&dir, None).asked().unwrap(),
+        );
         assert_eq!((asked, looked(&dir, run, asked)), (0, None));
         // Between two looks it ends, and another run has its name, whose shell has marked a
         // command's end with 7: that is not what was waited for. The session has ended.

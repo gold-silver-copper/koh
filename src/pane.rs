@@ -14,37 +14,29 @@ pub fn read(dir: &Path, name: &str) -> Option<Vec<u8>> {
     file.read_to_end(&mut bytes).ok().map(|_| bytes)
 }
 
-/// What `read_them` reads of the pane `dir`, of one round of its holder's writing: between two
-/// looks at the same even `generation`. With no holder (`lives` says) nothing writes, and the
-/// files are as they stay. What is not known to be of one round is an `Err`: a pane that is
-/// written without a pause, or whose number stays odd, as it was read at the fiftieth try.
-pub fn whole<T>(
+/// What `read_them` reads of the pane `dir`, and whether that is of one round of its holder's
+/// writing: between two looks at the same even `generation`, or with no holder (`lives` says),
+/// when nothing writes. It is not known to be where a pane is written without a pause, or its
+/// number stays odd: then it is given as it was read at the fiftieth try.
+pub fn together<T>(
     dir: &Path,
     lives: impl Fn(&Path) -> bool,
     read_them: impl Fn() -> T,
-) -> Result<T, T> {
+) -> (T, bool) {
     let even = |number: &[u8]| {
         let number = String::from_utf8_lossy(number);
         number.trim().parse::<u64>().is_ok_and(|n| n % 2 == 0)
     };
-    for tries in 1.. {
+    let mut tries = 0;
+    loop {
         let (before, held) = (read(dir, "generation"), lives(dir));
         let read_now = read_them();
-        if !held || (before.as_deref().is_some_and(even) && before == read(dir, "generation")) {
-            return Ok(read_now);
-        }
-        if tries == 50 {
-            return Err(read_now);
+        tries += 1;
+        let whole = before.as_deref().is_some_and(even) && before == read(dir, "generation");
+        if whole || !held || tries == 50 {
+            return (read_now, whole || !held);
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
-    Err(read_them())
-}
-
-/// The same, for a reader that takes the files as they are where they are of no one round.
-pub fn together<T>(dir: &Path, lives: impl Fn(&Path) -> bool, read_them: impl Fn() -> T) -> T {
-    match whole(dir, lives, read_them) {
-        Ok(read) | Err(read) => read,
     }
 }
 
@@ -72,24 +64,18 @@ pub fn code(state: &str) -> Option<i32> {
 /// how many bytes of that line are before it.
 type Place = (u64, usize);
 
-/// What a mark says is at its place: an `end` with the command's code, if the shell gave one.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Kind {
-    Prompt,
-    Command,
-    Output,
-    End(Option<u8>),
-}
-
-/// A pane's `marks`: where its shell put its marks (OSC 133), the last of them; and from
-/// `marks.dropped`, how many are gone from the file's front. The mark on the file's line n
-/// (from 1) has the number of those and n for as long as it is listed: whatever moves a mark
-/// leaves it its number. A pane with no `marks.dropped` is an older holder's, and its marks
-/// have no numbers. (The two files are of one round only where they are read under `whole`.)
+/// What a pane's `marks` say of its shell's commands (OSC 133), by the marks' numbers: the
+/// mark on the file's line n (from 1) has the number `marks.dropped` + n for as long as it is
+/// listed, whatever moves it. (The two files are of one round only where `together` says so.)
 #[derive(Debug, Default, PartialEq)]
 pub struct Marks {
+    /// How many marks are gone from the file's front. None in a pane an older holder keeps:
+    /// its marks have no numbers.
     dropped: Option<u64>,
-    marks: Vec<(Place, Kind)>,
+    /// The last mark is an `output`: a command runs.
+    pub busy: bool,
+    /// The command that was asked for.
+    pub ended: Option<Command>,
 }
 
 /// A command by its `end`: that mark's number and code, and from where to where the last
@@ -99,62 +85,47 @@ pub struct Marks {
 type Command = (u64, Option<u8>, Option<(Place, Place)>);
 
 impl Marks {
-    pub fn read(dir: &Path) -> Self {
-        let text = read(dir, "marks").unwrap_or_default();
-        let mark = |mark: &str| {
-            let mut words = mark.split(' ');
-            let place = (words.next()?.parse().ok()?, words.next()?.parse().ok()?);
-            let kind = match words.next()? {
-                "prompt" => Kind::Prompt,
-                "command" => Kind::Command,
-                "output" => Kind::Output,
-                "end" => Kind::End(words.next().and_then(|code| code.parse().ok())),
-                _ => return None,
-            };
-            Some((place, kind))
-        };
-        let marks = String::from_utf8_lossy(&text)
-            .lines()
-            .filter_map(mark)
-            .collect();
+    /// Reads them for the first command whose `end` has a number above `after`; with none,
+    /// for the last command that has ended.
+    pub fn read(dir: &Path, after: Option<u64>) -> Self {
         let dropped = line(dir, "marks.dropped").and_then(|dropped| dropped.parse().ok());
-        Self { dropped, marks }
-    }
-
-    /// The last mark is an `output`: a command runs.
-    pub fn busy(&self) -> bool {
-        matches!(self.marks.last(), Some((_, Kind::Output)))
-    }
-
-    /// The first command whose `end` has a number above `after`; with none, the last command
-    /// that has ended.
-    pub fn ended(&self, after: Option<u64>) -> Option<Command> {
-        let (mut open, mut printed, mut last) = (None, None, None);
-        let dropped = self.dropped.unwrap_or(0);
-        for (line, (place, kind)) in (1u64..).zip(&self.marks) {
+        let (mut marks, mut open, mut printed) = (Self::default(), None, None);
+        marks.dropped = dropped;
+        let text = read(dir, "marks").unwrap_or_default();
+        for (n, mark) in (1u64..).zip(String::from_utf8_lossy(&text).lines()) {
+            let mut words = mark.split(' ');
+            let line = words.next().and_then(|line| line.parse::<u64>().ok());
+            let at = words.next().and_then(|at| at.parse::<usize>().ok());
+            let (Some(place), Some(kind)) = (line.zip(at), words.next()) else {
+                continue;
+            };
+            marks.busy = kind == "output";
             match kind {
-                Kind::Output => open = Some(*place),
-                Kind::End(code) => {
-                    printed = open.take().map(|from| (from, *place)).or(printed);
-                    last = Some((dropped.saturating_add(line), *code, printed));
-                    if after.is_some_and(|after| dropped.saturating_add(line) > after) {
-                        return last;
+                "output" => open = Some(place),
+                "end" => {
+                    let number = dropped.unwrap_or(0).saturating_add(n);
+                    let code = words.next().and_then(|code| code.parse().ok());
+                    printed = open.take().map(|from| (from, place)).or(printed);
+                    marks.ended = Some((number, code, printed));
+                    if after.is_some_and(|after| number > after) {
+                        return marks;
                     }
                 }
                 _ => {}
             }
         }
-        last.filter(|_| after.is_none())
+        marks.ended = marks.ended.filter(|_| after.is_none());
+        marks
     }
 
-    /// What a wait counts from: the number of the last `end`, or with none in the file, of the
-    /// last mark that was dropped: an `end` that comes has a higher number. (Not the file's
-    /// last mark: a prompt drawn again in its place takes back the `prompt` and `command`
-    /// that end the file, and what is marked next has their numbers.) None where the marks
-    /// have no numbers.
+    /// What a wait counts from, of marks read for the last command: the number of the last
+    /// `end`, or with none in the file, of the last mark that was dropped. An `end` that
+    /// comes has a higher number. (Not the file's last mark: a prompt drawn again in its
+    /// place takes back the `prompt` and `command` that end the file, and what is marked
+    /// next has their numbers.) None where the marks have no numbers.
     pub fn asked(&self) -> Option<u64> {
         let dropped = self.dropped?;
-        Some(self.ended(None).map_or(dropped, |(number, ..)| number))
+        Some(self.ended.map_or(dropped, |(number, ..)| number))
     }
 }
 
@@ -232,18 +203,18 @@ fn printed((from, to): (Place, Place), dir: &Path) -> Vec<u8> {
 /// What the last command that has ended printed: none if the shell has marked no output
 /// that ended.
 pub fn last(dir: &Path) -> Option<Vec<u8>> {
-    let (_, _, from_to) = Marks::read(dir).ended(None)?;
+    let (_, _, from_to) = Marks::read(dir, None).ended?;
     from_to.map(|from_to| printed(from_to, dir))
 }
 
 /// The first command that has ended since the `end` numbered `asked` was the last, if one
 /// has: its code, what it printed, and how many marks have come and gone unread since. With
 /// any of those it is the oldest `end` the file still has, and not known to be the first.
-/// Read under one `whole`, all of it is of one round.
+/// Read under one `together`, all of it is of one round.
 pub fn ended_since(asked: u64, dir: &Path) -> Option<(Option<u8>, Option<Vec<u8>>, u64)> {
-    let now = Marks::read(dir);
+    let now = Marks::read(dir, Some(asked));
     let unread = now.dropped?.saturating_sub(asked);
-    let (_, code, from_to) = now.ended(Some(asked))?;
+    let (_, code, from_to) = now.ended?;
     Some((code, from_to.map(|from_to| printed(from_to, dir)), unread))
 }
 
@@ -268,7 +239,10 @@ mod tests {
         let dir = pane("together", &[("generation", "7\n"), ("title", "half\n")]);
         let title = || line(&dir, "title");
         // No holder: nothing writes, and the files are taken as they are, under an odd number too.
-        assert_eq!(together(&dir, |_| false, title).as_deref(), Some("half"));
+        assert_eq!(
+            together(&dir, |_| false, title),
+            (Some("half".to_string()), true)
+        );
         // A holder is in the middle of a round: what is read then is read again once the
         // number is even.
         let round = dir.clone();
@@ -277,7 +251,10 @@ mod tests {
             fs::write(round.join("title"), "whole\n").unwrap();
             fs::write(round.join("generation"), "8\n").unwrap();
         });
-        assert_eq!(together(&dir, |_| true, title).as_deref(), Some("whole"));
+        assert_eq!(
+            together(&dir, |_| true, title),
+            (Some("whole".to_string()), true)
+        );
         holder.join().unwrap();
         // A round that was written between the two looks: read again.
         let reads = std::cell::Cell::new(0);
@@ -288,11 +265,11 @@ mod tests {
             }
             reads.get()
         };
-        assert_eq!(together(&dir, |_| true, read), 2);
+        assert_eq!(together(&dir, |_| true, read), (2, true));
         // A number that stays odd under a holder that lives does not hold a reader for ever.
         fs::write(dir.join("generation"), "11\n").unwrap();
         let read = || reads.replace(reads.get() + 1);
-        assert_eq!(together(&dir, |_| true, read), 2 + 49);
+        assert_eq!(together(&dir, |_| true, read), (2 + 49, false));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -306,9 +283,9 @@ mod tests {
         }
         let (done, read) = (std::sync::mpsc::channel(), dir.clone());
         std::thread::spawn(move || {
-            let title = together(&read, |_| false, || line(&read, "title"));
+            let (title, _) = together(&read, |_| false, || line(&read, "title"));
             done.0
-                .send((title, line(&read, "state"), Marks::read(&read)))
+                .send((title, line(&read, "state"), Marks::read(&read, None)))
                 .unwrap();
         });
         let read = done.1.recv_timeout(Duration::from_secs(5));
@@ -369,51 +346,47 @@ mod tests {
     #[test]
     fn the_first_end_of_a_higher_number_is_the_command_that_ended_since() {
         let dir = pane("ended", &[]);
-        let read = |dropped: &str, marks: &str| {
+        let read = |dropped: &str, marks: &str, after: Option<u64>| {
             fs::write(dir.join("marks"), marks).unwrap();
             fs::write(dir.join("marks.dropped"), dropped).unwrap();
-            Marks::read(&dir)
+            Marks::read(&dir, after)
         };
         // Line n of `marks` is the mark numbered `marks.dropped` + n. A wait counts from the
         // last `end`; with none in the file, from the last mark that was dropped.
-        let idle = read("40\n", "3 0 output\n4 0 end 0\n4 0 prompt\n4 2 command\n");
-        assert_eq!((idle.busy(), idle.asked()), (false, Some(42)));
+        let idle = "3 0 output\n4 0 end 0\n4 0 prompt\n4 2 command\n";
+        let last = read("40\n", idle, None);
+        assert_eq!((last.busy, last.asked()), (false, Some(42)));
+        assert_eq!(last.ended, Some((42, Some(0), Some(((3, 0), (4, 0))))));
+        let runs = idle.to_string() + "5 0 output\n";
+        let running = read("40\n", &runs, None);
+        assert_eq!((running.busy, running.asked()), (true, Some(42)));
+        assert_eq!(read("40\n", &runs, Some(42)).ended, None);
         assert_eq!(
-            idle.ended(None),
-            Some((42, Some(0), Some(((3, 0), (4, 0)))))
+            read("7\n", "9 0 prompt\n9 2 command\n", None).asked(),
+            Some(7)
         );
-        let runs = read(
-            "40\n",
-            "3 0 output\n4 0 end 0\n4 0 prompt\n4 2 command\n5 0 output\n",
-        );
+        // A line that is no mark is a line all the same: the marks after it keep their numbers.
         assert_eq!(
-            (runs.busy(), runs.asked(), runs.ended(Some(42))),
-            (true, Some(42), None)
+            read("40\n", &("?\n".to_string() + idle), None).asked(),
+            Some(43)
         );
-        assert_eq!(read("7\n", "9 0 prompt\n9 2 command\n").asked(), Some(7));
         // The prompt drawn again in its place took back the file's last two marks, and an `end`
         // came with the number one of them had: it is above the last `end`, and new.
-        let again = read("40\n", "3 0 output\n4 0 end 0\n4 0 prompt\n4 0 end 130\n");
-        assert_eq!(
-            again.ended(Some(42)),
-            Some((44, Some(130), Some(((3, 0), (4, 0)))))
-        );
+        let again = "3 0 output\n4 0 end 0\n4 0 prompt\n4 0 end 130\n";
+        let again = read("40\n", again, Some(42)).ended;
+        assert_eq!(again, Some((44, Some(130), Some(((3, 0), (4, 0))))));
         // Two have ended since, and the file has dropped the marks before them: the first of
         // the two, by its number, with its own output.
         let two = "5 0 output\n6 0 end 7\n6 0 prompt\n6 2 command\n7 0 output\n8 0 end 9\n";
-        assert_eq!(
-            read("44\n", two).ended(Some(42)),
-            Some((46, Some(7), Some(((5, 0), (6, 0)))))
-        );
-        assert_eq!(
-            read("44\n", two).ended(None),
-            Some((50, Some(9), Some(((7, 0), (8, 0)))))
-        );
+        let first = read("44\n", two, Some(42)).ended;
+        assert_eq!(first, Some((46, Some(7), Some(((5, 0), (6, 0))))));
+        let last = read("44\n", two, None).ended;
+        assert_eq!(last, Some((50, Some(9), Some(((7, 0), (8, 0))))));
         // An older holder's pane has no `marks.dropped`: its marks have no numbers to count from.
         fs::remove_file(dir.join("marks.dropped")).unwrap();
-        let old = Marks::read(&dir);
+        let old = Marks::read(&dir, None);
         assert_eq!(
-            (old.asked(), old.ended(None).map(|(_, code, _)| code)),
+            (old.asked(), old.ended.map(|(_, code, _)| code)),
             (None, Some(Some(9)))
         );
         assert_eq!(ended_since(42, &dir), None);

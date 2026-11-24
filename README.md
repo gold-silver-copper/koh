@@ -20,22 +20,29 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`
     in it: the server starts a session with `koh fux start`, and the pane is kept by `fux`'s
     holder (the process `koh hold …`), not by `koh serve`: sessions live on when `koh serve`
-    is stopped, and are there when it is started again. `koh fux …` is `fux …`.
+    is stopped, and are there when it is started again. `koh fux …` is `fux …`, and it and
+    `koh hold …` are words of this machine: they ask no server anything.
   - A client has a **mirror** of the session: a copy of the pane's folder that koh makes and
-    alone writes, brought up to date in rounds, each applied whole or not at all (`koh/19`).
-    What is typed into the mirror's `in` and `ctl` is typed into the session's.
-  - `koh connect SERVER [--session NAME | --new] [-- PROG…]` shows a private mirror with
-    `fux`'s viewer, in the same process. With a name it is that session, started if there is
+    alone writes, brought up to date in rounds (`koh/19`). A round is checked whole before
+    anything of it is done to the mirror, and what a server may not send changes nothing. (A
+    disk that fails while a round is done can leave it part done, under an odd `generation`:
+    the next attach puts it right.) What is typed into the mirror's `in` and `ctl` is typed
+    into the session's.
+  - `koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG…]` shows a private mirror
+    with `fux`'s viewer, in the same process. With a name it is that session, started if there is
     none; with none, the newest that lives, or a new one. Leave it with `Ctrl-] .` or `C-b d`
     (`Ctrl-] Ctrl-]` and `C-b C-b` type the key itself). It ends with the session's program:
     with its status, with 128 + N if signal N ended it, and with 1 if nothing says how it
     ended (its holder was killed, the machine was restarted, its folder was moved).
-  - `koh mount SERVER [--session NAME | --new] [DIR]` keeps a mirror for any `fux view`, `cat`
-    or script: in `DIR`, which koh makes (a folder that is there is not taken), or with none in
-    a `fux` session of koh's own on the client, `K/fux/koh-mounts/SERVER.NAME` (`K` is
-    `$XDG_RUNTIME_DIR/koh`, else `~/.cache/koh`). Nothing of koh's is in your own `fux`
-    session unless you name a folder there. The mirror is removed when the session ends or
-    koh is stopped (SIGINT, SIGTERM). A mirror has no `status` and no `command`: its program
+  - `koh mount SERVER [--session NAME | --new] [-C DIR] [MIRROR] [-- PROG…]` keeps a mirror
+    for any `fux view`, `cat` or script: in `MIRROR`, which koh makes (a folder that is there
+    is not taken), or with none in a `fux` session of koh's own on the client,
+    `K/fux/koh-mounts/SERVER.NAME` (`K` is `$XDG_RUNTIME_DIR/koh`, else `~/.cache/koh`; the
+    server's part is cut to fit a pane's name, 64 characters). Nothing of koh's is in your own
+    `fux` session unless you name a folder there. It ends as `koh connect` does, with the
+    session's program and its status. The mirror is removed when the session ends or koh is
+    stopped: SIGINT, SIGTERM, or SIGHUP, which a terminal that is closed sends (`koh connect`
+    removes its private folder then, too). Stopped so, both end with 0. A mirror has no `status` and no `command`: its program
     and its holder are on the server.
   - **Without a link** koh says so (in the viewer's corner; `koh mount` on its standard error)
     and dials again. What you type while it says so is held and typed when the link is back.
@@ -67,7 +74,7 @@ koh adds nothing to stop these. What happens instead is said.
   does not look there): it starts every session that has ended anew, with whatever `fux` is on
   the path.
 - Don't write `kill` to a session's `ctl`, or a mirror's, unless you mean it: it hangs up the
-  program for every client. Any allowed key may; it may run any command.
+  program for every client. Any key with no scope may; it may run any command.
 - Don't write to a mirror's `ctl` while it has no link: only the last `resize` written then is
   sent, and koh says that the other lines were dropped.
 - Don't keep a mirror after a `koh mount` that was killed: it is a still picture. Remove it; a
@@ -78,9 +85,17 @@ koh adds nothing to stop these. What happens instead is said.
 **Do**
 
 - After a stall, look at the screen before you type on. What you type while koh says there is
-  no link is held and typed on return; what was on its way when a link died may be lost, so a
-  line can arrive without its beginning. A link that dies without a word is noticed after
-  thirty seconds: what is typed in that time is lost with it.
+  no link is held (64 KiB of it; past that whoever writes waits) and typed on return; what
+  was on its way when a link died may be lost, so a line can arrive without its beginning. A
+  link that dies without a word, or a server that does (killed, its machine gone), is noticed
+  after thirty seconds: what was typed since may be lost with it. After a long cut the link
+  is back within some seconds of the path, not at once: koh dials again every five.
+- To take a session's size back, resize your terminal. A session has the size of the terminal
+  that last changed: a second client of another size, or one that left, leaves it as it is,
+  and a smaller terminal shows the top left of a larger session.
+- To start a name again that has ended, remove its folder on the server (`koh exec box -- rm
+  -r PATH/NAME`, the path `koh serve` printed). Until then `--session NAME` shows how it
+  ended, and ends the same.
 - On Linux, restart `koh serve` after you replace the `koh` binary. Until then no new session
   starts: koh runs itself by its own path, which is gone, and says "cannot run PATH (deleted):
   No such file or directory". Sessions that run go on.
@@ -90,6 +105,8 @@ koh adds nothing to stop these. What happens instead is said.
   anything is started.)
 - Under systemd, give `koh serve`'s unit `KillMode=process` and the user
   `loginctl enable-linger`: else stopping the service, or logging out, kills every session.
+  A session's holder and its program inherit what `koh serve` had open when it started them
+  (a socket the unit was passed, say): pass `koh serve` nothing its sessions should not hold.
 - To see every session on the server as tabs: `koh fux view PATH`, the path `koh serve` printed.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default

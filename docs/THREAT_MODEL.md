@@ -51,9 +51,12 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
   (a list of jobs); 256 KiB for a piece of a file, of input or of output, and for every message
   of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
   for a copy's manifest and what a wait returns. Of a session's client the server takes
-  16 KiB a message of typed bytes, keeps 64 KiB waiting for each of a pane's two FIFOs (with
-  that many it reads the stream no more), and takes a list of at most 256 names of what a
-  mirror has, of which it believes nothing its own bytes do not bear out. A message that is
+  16 KiB a message of typed bytes, and stops taking messages while 64 KiB wait for one of a
+  pane's two FIFOs: so up to 80 KiB can wait for a FIFO, and beside them the stream's reader
+  holds up to seventeen messages it has read (256 KiB each at the most). It takes a list of
+  at most 256 names of what a mirror has, of which it believes nothing its own bytes do not
+  bear out. What it holds of a pane to send (a round, whole, and what it keeps of the files
+  it sent) is as large as the pane's folder: fux's bounds, not a figure of koh's. A message that is
   more than it should be, or one that has bytes after it, ends the stream. What a pane's
   folder holds is bounded by fux's holder, not by koh. A copy's tree is at most 100,000 entries, each at
   most 128 directories beneath it. With `--delete` that holds for what the destination already
@@ -118,19 +121,25 @@ A wrong endpoint id, or a host someone else now controls.
      name, which the server says and a mirror's default place is made of, is one plain name
      or the client ends.
   2. **Names** are one or two plain names (letters, digits, `.`, `_`, `-`, 64 at most, no dot
-     first); never `generation`, which koh writes itself; a name of two has a folder the
-     mirror made as its first. One name has one spelling: a name that differs from one the
-     mirror has only in the case of its letters is refused.
-  3. **`command` and `status` are never written**, by any message, in any spelling: `command`
-     is what fux's `.restore` would run, and `status` names processes of the server.
+     first); a name of two has a folder the mirror made as its first. One name has one
+     spelling: a name that differs from one the mirror has only in the case of its letters
+     is refused.
+  3. **Three names at the mirror's root are never written**, by any message, in any case of
+     their letters: `generation`, which koh writes itself; `command`, which is what fux's
+     `.restore` would run; and `status`, which names processes of the server. (In a folder
+     of the mirror they are names as any other: nothing reads them there.)
   4. **One kind of link:** at the mirror's root, to a folder at its root, true of every link
      when it comes and after every round. Nothing can be written through it, as a name of
      two needs a folder for its first.
   5. **A name keeps its kind.** A thing of one kind is refused where a thing of another is; a
      FIFO is `in` or `ctl`.
 
-  A round is applied whole or not at all: its files wait beside the mirror, in a folder
-  whose name has a dot first, until the round is whole. At most 256 names, 32 MiB a file,
+  A round is checked whole before anything of it is done: its files wait in the mirror, in a
+  folder whose name has a dot first (`.koh`: fux passes it over, and no message can name
+  it), until the round is whole and every rule holds of what it would leave. Then it is
+  done, under an odd `generation`. What the server sends can therefore change nothing or
+  all of a round; a failure of the client's own disk in the middle can leave a round part
+  done, the number odd, and the next attach sends what puts it right. At most 256 names, 32 MiB a file,
   128 MiB a mirror and as much waiting, 4,096 messages a round, 256 KiB a message; thirty
   seconds between two messages of an open round and ten minutes for all of it. Past any of
   it, or at any message the rules refuse, the client ends, having changed nothing; a round
@@ -154,8 +163,10 @@ A wrong endpoint id, or a host someone else now controls.
 - **A command's output from it** (`koh exec`, `koh logs`) is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
 - **It learns** every key typed into a session (what was typed while there was no link too,
-  on return), the client's terminal colours and keyboard flags, what the client's mirror
-  holds (names, lengths and hashes, at each attach), and every file sent to it.
+  on return), the client's terminal colours and keyboard flags (from `koh connect`'s
+  viewer; from a mount, those of the `fux` session its mirror was put in, viewer or none),
+  what the client's mirror holds (names, lengths and hashes, at each attach), and every
+  file sent to it.
 - **Not defended:** a server can mislead a user who chose to connect to it. The endpoint id is
   all that ties a name to a server: check it out of band.
 

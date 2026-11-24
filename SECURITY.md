@@ -40,7 +40,7 @@ credit reporters who want it.
 - Commands and jobs the server starts (`src/server.rs`, `handle_exec`; `src/jobs.rs`).
 - What a server can make a client write: a session's mirror and the files of a copy. The
   mirror's rules are `src/carry.rs` (`Mirror`: the names a round may have, the one kind of
-  link, a round whole or not at all, the bounds); where a mirror is made, and that a
+  link, a round checked whole before any of it is done, the bounds); where a mirror is made, and that a
   server's name for a session is a name and no path, is `src/client.rs` (`attach`,
   `default_mount`, `connect_interactive`, `mount`). What the server reads of a pane's folder
   into a round is `src/carry.rs` (`Reader`). A copy is `src/sync.rs`.
@@ -61,7 +61,9 @@ credit reporters who want it.
 - A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
   can read or write, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
   session: such a key starts them, types into them, resizes them and hangs them up, and says
-  what its terminal is like into that `fux` session's `colours` and `keyboard`.
+  what its terminal is like into that `fux` session's `colours` and `keyboard` (the two are
+  the session's, not a pane's: every session's program is answered from them). `koh fux …`
+  and `koh hold …` are no requests: they are fux, run by whoever runs koh, on his machine.
 - A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
   the path begins with `DIR` and goes on with plain names (no `..`). **It is not a
   confinement.** `DIR` itself is resolved, and a path may begin with it as `clients` has it or

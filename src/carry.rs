@@ -203,6 +203,17 @@ fn opened(path: &Path) -> Option<(File, Stamp)> {
     Some((file, stamp))
 }
 
+/// How long no file is proved after a look that proved one: nine times as long as the look
+/// took, and nine times what the reads took that were thrown away before it with a file to
+/// prove, as far as that is no more than one rest of the look's own (nine times its length).
+/// So proving has a tenth of a core where up to nine reads are thrown away for each that
+/// stands, and reads thrown away for a long time are never one long rest after it: a rest
+/// is ninety-one times its look at the most.
+fn rest(took: Duration, owed: Duration) -> Duration {
+    let owed = owed.min(took.saturating_mul(REST));
+    took.saturating_add(took.saturating_add(owed).saturating_mul(REST))
+}
+
 /// A file's bytes as as many pieces as it takes, one at least.
 fn pieces(bytes: &[u8]) -> Vec<&[u8]> {
     if bytes.is_empty() {
@@ -443,8 +454,8 @@ pub struct Reader {
     moved: Vec<(String, String)>,
     /// A round was sent since the client said what it has: the first is sent whatever it holds.
     sent: bool,
-    /// Until when no file is proved; and how long the reads took that were thrown away since
-    /// one was, which the next rest is for too.
+    /// Until when no file is proved; and how long the reads took that had a file to prove and
+    /// were thrown away since one was, which the next rest is for too (`rest`).
     rests: Option<Instant>,
     owed: Duration,
     /// What a test does between a reading and the second look at the folder's number.
@@ -591,7 +602,8 @@ impl Reader {
     /// nine times as long as that look took has passed, so whatever proving costs, it has a
     /// tenth of a core at most. A look that proves nothing owes none, and is not held back.
     /// A read that is thrown away is not rested for then, or a holder that keeps writing
-    /// would starve the mirror: the next look is at once, and the rest after it is for both.
+    /// would starve the mirror: the next look is at once, and the rest after it is for both
+    /// (`rest`).
     pub fn look(&mut self, dead: bool, now: Instant) -> Look {
         let began = Instant::now();
         let Some(numbers) = self.number(dead) else {
@@ -612,13 +624,14 @@ impl Reader {
         match round {
             Some(round) => {
                 if proves {
-                    self.rests =
-                        now.checked_add(took + (took + std::mem::take(&mut self.owed)) * REST);
+                    self.rests = now.checked_add(rest(took, std::mem::take(&mut self.owed)));
                 }
                 Look::Round(round)
             }
             None => {
-                self.owed += took;
+                if proves {
+                    self.owed = self.owed.saturating_add(took);
+                }
                 Look::Moved
             }
         }

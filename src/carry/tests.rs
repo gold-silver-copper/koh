@@ -1162,8 +1162,8 @@ fn nothing_kept_changes_unless_the_round_is_one() {
         panic!("a read that was thrown away earned a rest")
     };
     give(&mut line.mirror, &round);
-    // (What the reading cost is rested for after the look that proves: a tenth of a core holds.)
-    assert!(line.reader.rests.unwrap() > line.clock + thrown * 9 && line.reader.owed.is_zero());
+    // (What the read took, having a file to prove, is rested for after the look that proves.)
+    assert!(line.reader.rests.is_some() && line.reader.owed.is_zero());
     assert_eq!(
         round,
         round_of(
@@ -1403,13 +1403,42 @@ fn the_reader_rests_nine_times_as_long_as_its_round_took() {
         Some(round_of(hand.number, vec![put("main/screen", b"$ l\n")]))
     );
     assert_eq!(line.reader.rests, Some(rests));
-    // Nine times: also what the reads took that were thrown away before the look (here a
-    // hundred seconds, by the test's own hand).
-    line.reader.owed = Duration::from_secs(100);
+    // Nine times the look, and nine times what the reads took that were thrown away before
+    // it: as far as that is no more than one rest of the look's own, so that reads thrown
+    // away for a minute are not nine minutes of rest. And no length of time overflows it.
+    let second = Duration::from_secs(1);
+    assert_eq!(rest(second, Duration::ZERO), 10 * second);
+    assert_eq!(rest(2 * second, second), 29 * second);
+    assert_eq!(rest(second, 9 * second), 91 * second);
+    assert_eq!(rest(second, 100 * second), 91 * second);
+    assert_eq!(rest(Duration::MAX, Duration::MAX), Duration::MAX);
+    line.reader.owed = 1000 * second;
     hand.round(|hand| hand.append("history", b"and yet more\n"));
     assert_eq!(line.reader.round(false, rests).unwrap().len(), 3);
-    let rest = line.reader.rests.unwrap() - rests;
-    assert!((900..901).contains(&rest.as_secs()), "{rest:?}");
+    assert!(line.reader.rests.unwrap() - rests < 100 * second && line.reader.owed.is_zero());
+    // Only a read that had a file to prove is owed for. Twenty reads of a screen thrown away,
+    // each with a round of a screen after it, a day apart: nothing is owed, then or ever.
+    let later = line.reader.rests.unwrap();
+    for day in 1..=20 {
+        hand.round(|hand| hand.replace("main/screen", format!("day {day}\n").as_bytes()));
+        let (pane, number) = (hand.dir.clone(), hand.number);
+        line.reader.midway = Some(Box::new(move || {
+            fux::replace(
+                pane.join("generation"),
+                format!("{}\n", number + 2).as_bytes(),
+            )
+            .unwrap();
+        }));
+        hand.number += 2;
+        let at = later + 86_400 * day * second;
+        assert_eq!(line.reader.look(false, at), Look::Moved);
+        assert!(matches!(line.reader.look(false, at), Look::Round(round) if round.len() == 3));
+        assert!(
+            line.reader.owed.is_zero(),
+            "day {day}: {:?}",
+            line.reader.owed
+        );
+    }
 }
 
 #[test]

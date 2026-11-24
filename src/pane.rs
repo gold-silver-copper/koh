@@ -381,6 +381,14 @@ mod tests {
         ] {
             assert_eq!(idle.first_since(&read(moved)), None, "{moved:?}");
         }
+        // (Also where the moved first mark is as another was: empty lines entered, each a
+        // prompt and an `end` a line further down, and a line inserted above them. A file
+        // that is not full has dropped nothing, and its first mark is not asked.)
+        let entered = |from: usize| {
+            let line = |n: usize| format!("{n} 0 end 0\n{n} 0 prompt\n{n} 2 command\n");
+            read(&(from..from + 3).map(line).collect::<String>())
+        };
+        assert_eq!(entered(0).first_since(&entered(1)), None);
         // One more `end`: the command that ran, wherever the screen has its marks by then.
         let next = read(
             "0 0 output\n0 0 end 0\n0 0 prompt\n0 0 command\n0 0 output\n0 0 end 7\n0 0 prompt\n",

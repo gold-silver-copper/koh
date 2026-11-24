@@ -4425,6 +4425,14 @@ fn output_last_is_the_last_commands_output_across_history() {
     let (code, _, said) = host.asked("output", &["--session", "none"]);
     assert_eq!(code, Some(127), "{said}");
     assert!(said.contains("no session none"), "{said}");
+    // Nor is a name that is none a path: the folder above the sessions is no session, also
+    // where it looks like a pane.
+    let above = host.sessions.parent().unwrap();
+    fs::create_dir_all(above.join("shown")).unwrap();
+    fs::write(above.join("status"), "holder 1\n").unwrap();
+    fs::write(above.join("shown/screen"), "not a session's\n").unwrap();
+    let (code, shown, said) = host.asked("output", &["--session", ".."]);
+    assert_eq!((code, shown.as_str()), (Some(127), ""), "{said}");
 }
 
 #[test]

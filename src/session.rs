@@ -91,8 +91,8 @@ fn not_found(what: String) -> KohError {
 
 /// What `state` says became of a session's program. It runs only while a holder lives:
 /// where none does and the file says nothing else, nothing says how it ended.
-fn state_of(dir: &Path, alive: bool) -> String {
-    match pane::line(dir, "state") {
+fn state_of(said: Option<String>, alive: bool) -> String {
+    match said {
         Some(state) if state != "running" => state,
         _ if alive => "running".into(),
         _ => "ended".into(),
@@ -101,15 +101,22 @@ fn state_of(dir: &Path, alive: bool) -> String {
 
 /// A session as its folder says it is, read of one round of its holder's writing.
 fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
-    let (alive, size, title, marks) = pane::together(dir, lives, || {
-        let size = pane::line(dir, "size").unwrap_or_default();
-        (lives(dir), size, pane::line(dir, "title"), Marks::read(dir))
+    let (alive, state, size, title, marks) = pane::together(dir, lives, || {
+        let line = |name| pane::line(dir, name);
+        let size = line("size").unwrap_or_default();
+        (
+            lives(dir),
+            line("state"),
+            size,
+            line("title"),
+            Marks::read(dir),
+        )
     });
     let mut size = size.split(' ').map(|cells| cells.parse().unwrap_or(0));
     SessionInfo {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
         attached,
-        state: state_of(dir, alive),
+        state: state_of(state, alive),
         cols: size.next().unwrap_or(0),
         rows: size.next().unwrap_or(0),
         title: title.unwrap_or_default(),
@@ -150,7 +157,7 @@ fn looked(dir: &Path, run: Run, was: &Marks) -> Option<(i32, String, Vec<u8>)> {
         let printed = printed.unwrap_or_else(|| screen(dir));
         return Some((code.map_or(0, i32::from), said, printed));
     }
-    let state = (!alive).then(|| state_of(dir, false))?;
+    let state = (!alive).then(|| state_of(pane::line(dir, "state"), false))?;
     Some((pane::code(&state).unwrap_or(1), state, screen(dir)))
 }
 

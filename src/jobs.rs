@@ -2,7 +2,7 @@
 //! (no PTY, no 80-column wrapping, no 4 MiB screen truncation).
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -11,9 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
+use tokio::time::Instant as Timer;
 
 use crate::proto::{JobInfo, WaitResult};
-use crate::{Exit, KohError, Result, atomic_write, is_safe_name};
+use crate::{Aside, Exit, KohError, Result, after, atomic_write, is_safe_name};
 
 struct JobRecord {
     name: String,
@@ -57,6 +58,9 @@ impl JobManager {
         cwd: &Path,
         shell: bool,
     ) -> Result<JobInfo> {
+        // What an older job of the name left, to be removed with the lock let go: it is named
+        // here, before the lock, so it is dropped after it however this returns.
+        let mut _old = None;
         let mut guard = mgr
             .lock()
             .map_err(|_| KohError::internal("job lock poisoned"))?;
@@ -81,7 +85,7 @@ impl JobManager {
             },
         };
         let dir = guard.root.join(&job_name);
-        let _ = fs::remove_dir_all(&dir);
+        _old = Aside::of(&dir);
         fs::create_dir_all(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
 
         let log_path = dir.join("log");
@@ -327,7 +331,10 @@ pub fn build_command(argv: &[String], cwd: &Path, shell: bool) -> Result<Command
 
 /// Reads the last `tail_lines` lines (or all bytes if `tail_lines == None`) of a job log file.
 pub fn read_log_tail(path: &Path, tail_lines: Option<usize>) -> Result<Vec<u8>> {
-    let data = fs::read(path).map_err(|e| KohError::failed(format!("read log: {e}")))?;
+    let mut data = Vec::new();
+    fuxix::open_regular(path)
+        .and_then(|mut log| log.read_to_end(&mut data))
+        .map_err(|e| KohError::failed(format!("read log: {e}")))?;
     let Some(n) = tail_lines else {
         return Ok(data);
     };
@@ -349,7 +356,8 @@ pub fn read_log_tail(path: &Path, tail_lines: Option<usize>) -> Result<Vec<u8>> 
     Ok(data.get(start..).unwrap_or_default().to_vec())
 }
 
-/// Waits for a job to finish (or for `text` to appear in its raw log), up to `timeout_secs`.
+/// Waits for a job to finish (or for `text` to appear in its raw log), up to `timeout_secs`:
+/// more of them than the clock has is no limit (`after`).
 pub async fn wait_job(
     log_path: PathBuf,
     mut state_rx: watch::Receiver<(String, Option<i32>)>,
@@ -357,12 +365,12 @@ pub async fn wait_job(
     tail: usize,
     timeout_secs: Option<u64>,
 ) -> Result<WaitResult> {
-    let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
+    let deadline = timeout_secs.map(|s| after(Timer::now(), Duration::from_secs(s)));
     let mut scan_offset = 0u64;
 
     loop {
         if let Some(needle) = text.as_deref()
-            && let Ok(mut f) = File::open(&log_path)
+            && let Ok(mut f) = fuxix::open_regular(&log_path)
             && f.seek(SeekFrom::Start(scan_offset)).is_ok()
         {
             let mut chunk = Vec::new();
@@ -404,7 +412,7 @@ pub async fn wait_job(
         }
 
         if let Some(dl) = deadline
-            && Instant::now() >= dl
+            && Timer::now() >= dl
         {
             let tail_bytes = read_log_tail(&log_path, Some(tail)).unwrap_or_default();
             return Ok(WaitResult {
@@ -421,7 +429,7 @@ pub async fn wait_job(
             Duration::from_millis(200)
         };
         let wait_for = deadline.map_or(sleep, |dl| {
-            dl.saturating_duration_since(Instant::now()).min(sleep)
+            dl.saturating_duration_since(Timer::now()).min(sleep)
         });
         tokio::select! {
             _ = state_rx.changed() => {}

@@ -15,6 +15,7 @@ use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
 use crate::jobs::JobManager;
@@ -29,7 +30,7 @@ use crate::proto::{
 };
 use crate::session::Sessions;
 use crate::sync::{receive_tree, send_tree};
-use crate::{Exit, KohError, Result};
+use crate::{Exit, KohError, Result, after};
 
 pub struct ServeOptions {
     pub key_file: Option<PathBuf>,
@@ -57,13 +58,9 @@ pub struct ServeOptions {
 /// then is dropped without being told.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
 
-/// The time `long` after `from`. More than thirty years is thirty years, the timer's own "never":
-/// a time the clock cannot say (`Duration::MAX` is one) would panic where it is added. (And were
-/// the clock itself that near its end, the time is `from`: a deadline that has come.)
-fn after(from: Instant, long: Duration) -> Instant {
-    const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
-    from.checked_add(long.min(NEVER)).unwrap_or(from)
-}
+/// How long the requests of a connection that is gone have to end by themselves, before they
+/// are ended: the connection keeps its place until none is left.
+const LEFT_WAIT: Duration = Duration::from_secs(5);
 
 /// The CLI's default for `--max-connections`.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
@@ -270,13 +267,21 @@ async fn default_state_dir() -> Result<PathBuf> {
 /// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
 /// the server took it up) no request of it has proved a key the server allows: a peer that
 /// proves nothing does not keep its place.
+///
+/// Each request is a task of the connection's own, and no task of a request is started but as
+/// one of these or of its request's: when this returns none is left, so the place its caller
+/// then gives back is one that nothing uses. Once the connection is gone they have `LEFT_WAIT`
+/// to end, and what has not ended by then is ended.
 async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: Instant) {
     let proven = Arc::new(AtomicBool::new(false));
     let deadline = tokio::time::sleep_until(prove_by);
     tokio::pin!(deadline);
     let mut unproven = true;
+    let mut requests = JoinSet::new();
     loop {
         let (mut send, mut recv) = tokio::select! {
+            // (One that has ended is kept no longer.)
+            Some(_) = requests.join_next() => continue,
             () = &mut deadline, if unproven => {
                 if !proven.load(Ordering::Relaxed) {
                     close_with(&conn, CloseCode::Refused);
@@ -293,7 +298,7 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
         let conn_clone = conn.clone();
         let st = state.clone();
         let proven = proven.clone();
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let client_id = match verify_client(&conn_clone, &mut recv).await {
                 Ok(id) => id,
                 Err(_) => {
@@ -324,6 +329,9 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
             let _ = send.finish();
         });
     }
+    let ended = async { while requests.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(LEFT_WAIT, ended).await;
+    requests.shutdown().await;
 }
 
 fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
@@ -354,7 +362,11 @@ async fn dispatch(
         } => {
             let dir = resolve_cwd(cwd.as_deref())?;
             scope.check_exec(&dir)?;
-            let info = JobManager::start(&state.jobs, name, &argv, &dir, shell)?;
+            // (A start is file work and a process made: not on a thread that serves requests.)
+            let jobs = state.jobs.clone();
+            let start = move || JobManager::start(&jobs, name, &argv, &dir, shell);
+            let started = tokio::task::spawn_blocking(start).await;
+            let info = started.map_err(|_| KohError::internal("a job's start"))??;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }
@@ -398,7 +410,7 @@ async fn dispatch(
                 loop {
                     let meta_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(offset);
                     if meta_len > offset
-                        && let Ok(mut f) = fs::File::open(&log_path)
+                        && let Ok(mut f) = fuxix::open_regular(&log_path)
                     {
                         use std::io::{Read as _, Seek as _, SeekFrom};
                         if f.seek(SeekFrom::Start(offset)).is_ok() {
@@ -428,6 +440,8 @@ async fn dispatch(
                     }
                     tokio::select! {
                         _ = rx.changed() => {}
+                        // (A client that has left is followed for no longer.)
+                        _ = send.stopped() => return Ok(()),
                         () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
                     }
                 }
@@ -467,9 +481,13 @@ async fn dispatch(
                 guard.get(&name)?
             };
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let res =
-                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs)
-                    .await?;
+            let waited =
+                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs);
+            // (A client that has left is waited for no longer.)
+            let res = tokio::select! {
+                res = waited => res?,
+                _ = send.stopped() => return Ok(()),
+            };
             send_msg(send, &res, MAX_FRAME).await
         }
         Request::CpPush {
@@ -575,8 +593,10 @@ async fn handle_exec(
     let mut child_stderr = child.stderr.take();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ExecServerMsg>(32);
 
+    // (The two that read what the command writes are this request's own, and end with it.)
+    let mut pipes = JoinSet::new();
     let tx1 = out_tx.clone();
-    let stdout_task = tokio::spawn(async move {
+    pipes.spawn(async move {
         if let Some(mut out) = child_stdout.take() {
             let mut buf = vec![0u8; 32 << 10];
             while let Ok(n @ 1..) = out.read(&mut buf).await {
@@ -592,7 +612,7 @@ async fn handle_exec(
         }
     });
     let tx2 = out_tx.clone();
-    let stderr_task = tokio::spawn(async move {
+    pipes.spawn(async move {
         if let Some(mut err) = child_stderr.take() {
             let mut buf = vec![0u8; 32 << 10];
             while let Ok(n @ 1..) = err.read(&mut buf).await {
@@ -646,6 +666,9 @@ async fn handle_exec(
         }
     }
 
+    // (What the command writes from here on is read by nobody: its two readers end at what
+    // they read next, and do not wait with it for room that will not come.)
+    drop(out_rx);
     // (Its client is gone, so that it could not be hung up is told to whoever reads what the
     // server says.)
     if disconnected
@@ -655,8 +678,7 @@ async fn handle_exec(
         let said = format!("koh: a command whose client went was not hung up: {err}");
         let _ = writeln!(std::io::stderr(), "{said}");
     }
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    while pipes.join_next().await.is_some() {}
     let code = match child.wait().await {
         Ok(status) => status
             .code()

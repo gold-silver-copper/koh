@@ -1,5 +1,7 @@
 //! A pane's folder written by hand as fux's holder writes one, its rounds through the wire, and
 //! a mirror: what must be carried right, and what a mirror must not take.
+// (A test reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 use super::*;
 use crate::proto::{FromMirror, decode, encode};

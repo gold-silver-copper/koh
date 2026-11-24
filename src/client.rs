@@ -499,10 +499,10 @@ impl Client {
 
     /// An attach after a link went: a new stream on the connection if it lives (iroh may have
     /// moved it), and on a new connection of the same endpoint if it does not, or brings no
-    /// answer in five seconds.
+    /// answer in five seconds. On the new connection it has five seconds to be answered too.
     async fn attach_again(&mut self, asks: &Attach) -> Attaching {
+        let answer = Duration::from_secs(5);
         if self.conn.close_reason().is_none() {
-            let answer = Duration::from_secs(5);
             match tokio::time::timeout(answer, self.attach(asks)).await {
                 Ok(Err((false, _))) | Err(_) => {}
                 Ok(answered) => return answered,
@@ -513,7 +513,9 @@ impl Client {
         let dialled = tokio::time::timeout(Duration::from_secs(5), self.redial()).await;
         let timed_out = |_| (false, KohError::unreachable("timed out dialing server"));
         dialled.map_err(timed_out)?.map_err(|e| (false, e))?;
-        self.attach(asks).await
+        let answered = tokio::time::timeout(answer, self.attach(asks)).await;
+        let unanswered = |_| (false, KohError::unreachable("the server did not answer"));
+        answered.map_err(unanswered)?
     }
 
     /// `koh connect`: a session in this terminal. Its mirror is in a private folder, shown by

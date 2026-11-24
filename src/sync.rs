@@ -197,6 +197,19 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// File work that can take long, a tree read and hashed, done where it holds up nothing else:
+/// for as long as it takes, the thread hands whatever else it serves (other requests, and the
+/// links of other clients) to another. The work stays its request's own, which is not over
+/// before it is. (On a runtime of one thread there is no other thread, and nothing is handed.
+/// It is not for a task of a `LocalSet`: tokio hands nothing over from one, and panics.)
+fn long<T>(work: impl FnOnce() -> T) -> T {
+    let flavor = tokio::runtime::Handle::try_current().map(|runtime| runtime.runtime_flavor());
+    match flavor {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(work),
+        _ => work(),
+    }
+}
+
 /// The directories and regular files beneath `rel` of `root`, into `out`: an entry that is
 /// neither (a symlink, to whatever) is not one and is not entered. With `hash`, each file's
 /// blake3. `depth` is how many names the path of the directory has as it is sent: an entry in a
@@ -335,7 +348,7 @@ pub async fn send_tree(
 ) -> Result<SyncSummary> {
     let meta = fs::metadata(root)
         .map_err(|e| KohError::failed(format!("stat {}: {e}", root.display())))?;
-    let (manifest, prefix) = manifest(root, &meta, excludes, preserve_root)?;
+    let (manifest, prefix) = long(|| manifest(root, &meta, excludes, preserve_root))?;
     let files: BTreeMap<String, SyncEntry> = manifest
         .iter()
         .filter(|e| !e.is_dir)
@@ -440,47 +453,52 @@ pub async fn receive_tree(
         )));
     }
 
-    for entry in &src_entries {
-        let target = beneath(dst, &entry.path)?;
-        src_set.insert(entry.path.clone());
-        if entry.is_dir {
-            if !dry_run {
-                mkdir(&target)?;
-            }
-            continue;
-        }
-        // (What is there itself: a symlink is no file to compare with, and the file replaces it.)
-        match found(&target, fs::symlink_metadata(&target))?.filter(|m| m.is_file()) {
-            // (A file of another size differs, and need not be read to know.)
-            Some(there) if there.len() == entry.size && hash_file(&target)? == entry.hash => {
-                summary.unchanged += 1;
+    // (Each file that is there in the size it is to have is hashed: in one stretch, as the
+    // sender's list is made.)
+    long(|| -> Result<()> {
+        for entry in &src_entries {
+            let target = beneath(dst, &entry.path)?;
+            src_set.insert(entry.path.clone());
+            if entry.is_dir {
+                if !dry_run {
+                    mkdir(&target)?;
+                }
                 continue;
             }
-            Some(_) => summary.updated.push(entry.path.clone()),
-            None => summary.added.push(entry.path.clone()),
+            // (What is there itself: a symlink is no file to compare with, and the file replaces it.)
+            match found(&target, fs::symlink_metadata(&target))?.filter(|m| m.is_file()) {
+                // (A file of another size differs, and need not be read to know.)
+                Some(there) if there.len() == entry.size && hash_file(&target)? == entry.hash => {
+                    summary.unchanged += 1;
+                    continue;
+                }
+                Some(_) => summary.updated.push(entry.path.clone()),
+                None => summary.added.push(entry.path.clone()),
+            }
+            needed.push(entry.path.clone());
         }
-        needed.push(entry.path.clone());
-    }
 
-    if delete && dst.is_dir() {
-        let mut local = Vec::new();
-        scan(dst, "", None, excludes, false, 0, &mut local)?;
-        local.sort_by(|a, b| a.path.cmp(&b.path));
-        for local in local.into_iter().rev() {
-            if src_set.contains(&local.path) {
-                continue;
+        if delete && dst.is_dir() {
+            let mut local = Vec::new();
+            scan(dst, "", None, excludes, false, 0, &mut local)?;
+            local.sort_by(|a, b| a.path.cmp(&b.path));
+            for local in local.into_iter().rev() {
+                if src_set.contains(&local.path) {
+                    continue;
+                }
+                if !dry_run {
+                    let target = dst.join(&local.path);
+                    let _ = if local.is_dir {
+                        fs::remove_dir(target)
+                    } else {
+                        fs::remove_file(target)
+                    };
+                }
+                summary.deleted.push(local.path);
             }
-            if !dry_run {
-                let target = dst.join(&local.path);
-                let _ = if local.is_dir {
-                    fs::remove_dir(target)
-                } else {
-                    fs::remove_file(target)
-                };
-            }
-            summary.deleted.push(local.path);
         }
-    }
+        Ok(())
+    })?;
 
     if dry_run {
         send_msg(send, &SyncMsg::Need(Vec::new()), MAX_CTRL).await?;

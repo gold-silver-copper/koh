@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as Timer;
 
 use crate::carry::{Look, Reader};
 use crate::pane::{self, Marks};
@@ -25,7 +26,7 @@ use crate::proto::{
     Attach, Attached, FromMirror, Had, MAX_CHUNK, MAX_CTRL, MAX_HELD, MAX_TYPED, Reply, Run,
     SessionInfo, ToMirror, WaitResult, send_msg, send_pieces, session_name, spawn_msg_reader,
 };
-use crate::{Exit, KohError, Result};
+use crate::{Aside, Exit, KohError, Result, after};
 
 /// The most bytes a FIFO is given in one write: no other writer's bytes come between them.
 const PIECE: usize = 512;
@@ -306,14 +307,14 @@ impl Sessions {
             return Err(KohError::failed(format!("the session {name} {why}")));
         };
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-        // (A time too far off for the clock is no time.)
-        let until = seconds.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
+        // (More seconds than the clock has are no limit, as for a job: `after`.)
+        let until = seconds.map(|s| after(Timer::now(), Duration::from_secs(s)));
         let (timed_out, (exit, detail, text)) = loop {
             let look = dir.clone();
             if let Some(ended) = pooled(move || looked(&look, run, asked)).await? {
                 break (false, ended);
             }
-            if until.is_some_and(|until| Instant::now() >= until) {
+            if until.is_some_and(|until| Timer::now() >= until) {
                 let shown = dir.clone();
                 let ours = move || (run_of(&shown) == Some(run)).then(|| screen(&shown));
                 let shown = pooled(ours).await?.unwrap_or_default();
@@ -373,7 +374,7 @@ impl Sessions {
     /// one, always if `new` or a program was given. A new one is one more folder: with `max`
     /// there, the oldest that has ended and has no client goes for it, once it has started.
     async fn find(&self, asked: &Attach, cwd: &Path) -> Result<PathBuf> {
-        let _one = self.starting.lock().await;
+        let one = self.starting.lock().await;
         let folders = self.folders();
         let wanted = asked.name.as_ref().map(|name| self.dir.join(name));
         let newest = || {
@@ -408,9 +409,12 @@ impl Sessions {
             None
         };
         let started = self.start(asked, cwd).await?;
-        // (Only now that the new one runs does the old one go.)
-        if let Some(gone) = goes {
-            self.goes(&gone);
+        // (Only now that the new one runs does the old one go; and what it held is removed
+        // with nothing held, where no other request waits for it: the next start does not
+        // either, for the folder has no session's name any more.)
+        if let Some(gone) = goes.and_then(|gone| self.goes(&gone)) {
+            drop(one);
+            let _ = pooled(move || drop(gone)).await;
         }
         Ok(started)
     }
@@ -435,15 +439,14 @@ impl Sessions {
     /// Removes an ended session's folder for a new one, unless a client has come to it since
     /// it was chosen (one that comes again does not wait for a start): then the folder stays,
     /// and there is one session more than the cap until a later start finds it without a
-    /// client. Looked at and removed under the streams' lock, which a client takes its place
-    /// under before it opens anything (`seat`): it has its place before this looks, or finds
-    /// no folder.
-    fn goes(&self, dir: &Path) {
+    /// client. Looked at and given another name under the streams' lock, which a client takes
+    /// its place under before it opens anything (`seat`): it has its place before this looks,
+    /// or finds no folder. What the folder held is removed when what this gives is let go: the
+    /// lock is not held for as long as that takes.
+    fn goes(&self, dir: &Path) -> Option<Aside> {
         let streams = self.streams();
         let streamed = run_of(dir).is_some_and(|run| streams.keys().any(|(had, _)| *had == run));
-        if !streamed {
-            let _ = fs::remove_dir_all(dir);
-        }
+        if streamed { None } else { Aside::of(dir) }
     }
 
     /// Serves one attach, from the request to the stream's end. Checked in this order before
@@ -827,7 +830,7 @@ mod tests {
         let tmp = scratch("looked");
         let (dir, aside) = (tmp.join("s"), tmp.join("aside"));
         let lock = |dir: &Path| {
-            let held = File::open(dir).unwrap();
+            let held = fuxix::open(dir, false).unwrap();
             held.try_lock().unwrap();
             held
         };
@@ -914,6 +917,32 @@ mod tests {
     }
 
     #[test]
+    fn a_session_that_goes_is_given_another_name_under_the_lock_and_removed_after() {
+        let tmp = scratch("aside");
+        let sessions = Sessions::new(&tmp, 1, "sh".into()).unwrap();
+        let dir = sessions.dir().join("1");
+        let _fifos = pane(&dir, 7);
+        let names = || {
+            let entries = fs::read_dir(sessions.dir()).unwrap();
+            let names = entries.map(|entry| entry.unwrap().file_name().into_string().unwrap());
+            names.collect::<Vec<_>>()
+        };
+        // What `goes` did under its lock is one rename, to a name that is no session's: the
+        // folder is whole there, and is removed by whoever lets go of what `goes` gave.
+        let gone = sessions.goes(&dir);
+        let aside = names();
+        assert!(!dir.exists() && sessions.folders().is_empty());
+        assert!(
+            matches!(aside.as_slice(), [name] if name.starts_with('.')
+                && sessions.dir().join(name).join("status").is_file()),
+            "{aside:?}"
+        );
+        drop(gone);
+        assert_eq!(names(), [""; 0]);
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn a_client_has_its_place_before_the_folder_is_looked_at_to_go() {
         let tmp = scratch("seat");
         let sessions = std::sync::Arc::new(Sessions::new(&tmp, 1, "sh".into()).unwrap());
@@ -923,7 +952,7 @@ mod tests {
         // The session was chosen to go for a new one. As a client that comes back to it is
         // seated, the new one has started, and the folder is looked at to be removed.
         let (looks, chosen) = (sessions.clone(), dir.clone());
-        MIDWAY.set(Some(Box::new(move || looks.goes(&chosen))));
+        MIDWAY.set(Some(Box::new(move || drop(looks.goes(&chosen)))));
         // The client had its place by then: the folder stays, and it is seated on it.
         let seat = sessions.seat(&dir, named, 1);
         assert!(seat.is_some() && dir.is_dir());

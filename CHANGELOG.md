@@ -56,6 +56,26 @@ binary, its tests and the fuzz targets share code, and any release may change it
   removed the other's marker.
 - A copy that its other end stops says why and exits with that reason (a refusal: 4); it was a
   decode error, exit 1.
+- `koh wait SERVER JOB --timeout N` with more seconds than the clock has (18446744073709551615,
+  say) is a wait with no limit. It panicked the server's task for the request, and the client
+  was told its connection had closed. Every limit a peer or a flag sets is made in one place:
+  one that is out of range means no limit, and is refused nowhere.
+- `koh logs -f` and `koh wait JOB` end on the server when their client's stream does. They
+  went on reading the job's log until the job ended.
+- A connection's place among `--max-connections` is given back when its requests have ended:
+  5 s after the connection is gone those still going are ended, and then the place is given
+  back. It was given back at once, and a command that hanging up does not end, or a copy still
+  at its files, went on beside the client that had the place next.
+- A copy of a large tree does not hold up the server's other clients while the tree is hashed.
+  Beside a 3 GB tree, a key typed into another client's session waited up to 2.2 s, the whole
+  time the hashing took (it grows with the tree, towards the 15 s and 30 s a silent connection
+  is allowed). Nor is the folder of a session that goes for a new one removed while every
+  attach waits, nor a job started on a thread that serves other requests.
+- After a redial, `koh connect` and `koh mount` give the server five seconds to answer, as on
+  the connection they had. A server that took the new connection and did not answer held them
+  for as long as it lived.
+- A FIFO where a key, `clients`, `servers` or a job's log is expected holds no reader. `koh
+  serve` reads `clients` at every request, and one there held it for good.
 
 ### Changed
 

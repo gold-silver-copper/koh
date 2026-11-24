@@ -1,4 +1,6 @@
 //! End-to-end integration tests over real loopback iroh QUIC connections.
+// (A test reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -176,6 +178,65 @@ async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
         .unwrap();
     assert!(!killed.timed_out && killed.exit != 0);
 
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
+    let (tmp, srv, client, _, _) = boot_pair("wait-limit").await;
+    let cwd = Some(tmp.0.display().to_string());
+    let script = vec!["sleep 0.3; exit 3".to_string()];
+    client
+        .run_job(Some("brief".into()), script, cwd, true)
+        .await
+        .unwrap();
+    // More seconds than the clock has: the job is waited for to its end, and the server serves on.
+    let waited = client
+        .wait_job("brief".into(), None, 10, Some(u64::MAX))
+        .await
+        .unwrap();
+    assert!(!waited.timed_out && waited.exit == 3, "{waited:?}");
+    assert_eq!(client.jobs(None).await.unwrap().len(), 1);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_does() {
+    let (tmp, srv, client, _, _) = boot_pair("left").await;
+    let cwd = Some(tmp.0.display().to_string());
+    let script = vec!["sleep 60".to_string()];
+    client
+        .run_job(Some("long".into()), script, cwd, true)
+        .await
+        .unwrap();
+    let name = || "long".to_string();
+    let (wait, follow) = (
+        Request::WaitJob {
+            name: name(),
+            text: Some("NEVER_APPEARS".into()),
+            tail: 10,
+            timeout_secs: None,
+        },
+        Request::Logs {
+            name: name(),
+            tail: None,
+            all: false,
+            follow: true,
+        },
+    );
+    for request in [wait, follow] {
+        // The client lets go of what it reads, on a connection that lives: the server lets go
+        // of the request, which is seen here as its end of what the client sends being let go.
+        let (send, recv) = client.request(&request).await.unwrap();
+        drop(recv);
+        let ended = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+        assert!(ended.is_ok(), "still served after 5 s: {request:?}");
+    }
+
+    client.kill_job(name(), 9).await.unwrap();
     client.close().await;
     srv.shutdown().await;
 }
@@ -1049,6 +1110,171 @@ async fn a_command_that_fails_gives_its_place_back_at_once() {
     let next = koh(&["jobs"]).await;
     assert_eq!(next.status.code(), Some(0), "{next:?}");
 
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_seconds_after_it() {
+    let tmp = TempDir::new("place-requests");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+    // A command, which hanging up does not end, of a client that then leaves.
+    let left = |script: &str| {
+        let exec = Request::Exec {
+            argv: vec![format!("trap '' HUP; {script}")],
+            cwd: Some(tmp.0.display().to_string()),
+            shell: true,
+        };
+        async move {
+            let client = dial().await.unwrap();
+            let streams = client.request(&exec).await.unwrap();
+            (client, streams)
+        }
+    };
+    // The next client is served: asked again for as long as the server is busy.
+    let served = || async {
+        let serving = async {
+            loop {
+                let listed = match dial().await {
+                    Ok(next) => {
+                        let listed = next.jobs(None).await;
+                        next.close().await;
+                        listed
+                    }
+                    Err(busy) => Err(busy),
+                };
+                match listed {
+                    Ok(_) => break,
+                    Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let served = tokio::time::timeout(Duration::from_secs(20), serving).await;
+        served.expect("the place came back within 20 s");
+    };
+
+    // The command goes on for a second after its client left: the place is the connection's
+    // until then, and the next client's only once the command has ended.
+    let (client, streams) = left("sleep 1; : > ended").await;
+    drop(streams);
+    client.close().await;
+    served().await;
+    assert!(tmp.0.join("ended").exists(), "served beside the command");
+
+    // A command that goes on writing to a client that left is read no further, and so ends:
+    // it does not hold the place for the five seconds a command that does not end has.
+    let (client, streams) = left("sleep 0.2; head -c 2097152 /dev/zero").await;
+    drop(streams);
+    client.close().await;
+    let cut_off = tokio::time::timeout(Duration::from_secs(3), served()).await;
+    cut_off.expect("the place of a command that only writes came back within 3 s");
+
+    // A command that does not end is let go of five seconds after its connection: the place
+    // is not its to keep.
+    let (client, streams) = left("echo $$ > pid; exec sleep 600").await;
+    until("the command runs", || tmp.0.join("pid").is_file());
+    drop(streams);
+    client.close().await;
+    let left_at = Instant::now();
+    served().await;
+    let after = left_at.elapsed();
+    assert!(after >= Duration::from_secs(4), "after {after:?}");
+    signal(
+        fs::read_to_string(tmp.0.join("pid")).unwrap().trim(),
+        "-KILL",
+    );
+
+    srv.shutdown().await;
+}
+
+#[test]
+fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
+    let tmp = TempDir::new("fifo-list");
+    // A FIFO nobody writes to, where the server reads who is allowed at every request: it is
+    // read as a list of nobody, and whoever reads it is not kept waiting for a writer.
+    drop(fuxix::fifo(tmp.0.join("clients")).unwrap());
+    let key = tmp.0.join("server.key");
+    let (tell, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tell.send(koh::keys::load_clients(Some(&key)).map(|list| list.len()))
+    });
+    let read = told.recv_timeout(Duration::from_secs(5));
+    assert!(matches!(read, Ok(Ok(0))), "{read:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_tree_that_takes_long_to_hash_holds_up_nothing_else_the_server_serves() {
+    use koh::proto::{SyncEntry, SyncMsg};
+    let (tmp, srv, client, _, _) = boot_pair("cp-beside").await;
+    // As much of nothing as takes about half a second to hash here (8 MiB to 2 GiB): long to
+    // hash, and nothing to make.
+    let began = Instant::now();
+    blake3::hash(&vec![0u8; 8 << 20]);
+    let eighth = began.elapsed().as_micros().max(1) as u64;
+    let (size, tree) = (
+        (8u64 << 20) * (500_000 / eighth).clamp(1, 256),
+        tmp.0.join("tree"),
+    );
+    fs::create_dir_all(&tree).unwrap();
+    let big = fs::File::create(tree.join("big")).unwrap();
+    big.set_len(size).unwrap();
+    // The server is in this process, and one thread serves all its requests: what else that
+    // thread serves stands in for another client's link. It wakes every two milliseconds.
+    let woken = Arc::new(AtomicUsize::new(0));
+    let wakes = woken.clone();
+    let beside = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            wakes.fetch_add(1, SeqCst);
+        }
+    });
+    // It went on waking while the server hashed: for a quarter of that time at the least.
+    // (Held up, it wakes a few times in all: the hashing is nearly all the time there is.)
+    let went_on = |what: &str, began: Instant, woke: usize| {
+        let took = began.elapsed();
+        let awake = Duration::from_millis(2) * (woken.load(SeqCst) - woke) as u32;
+        assert!(awake >= took / 4, "{what}: awake for {awake:?} of {took:?}");
+    };
+
+    // A pull: the server hashes the tree before it sends its list. (Nothing is made here.)
+    let (began, woke) = (Instant::now(), woken.load(SeqCst));
+    let (from, to) = (tree.display().to_string(), tmp.0.join("back"));
+    let pulled = client.cp_pull(from.clone(), &to, vec![], false, false, true);
+    assert_eq!(pulled.await.unwrap().added, ["big"]);
+    went_on("a pull", began, woke);
+
+    // A push of a file as long as the one that is there: the server hashes its own to compare.
+    let push = Request::CpPush {
+        dst: from,
+        excludes: Vec::new(),
+        delete: false,
+        preserve_mtime: false,
+        dry_run: true,
+    };
+    let (mut send, mut recv) = client.request(&push).await.unwrap();
+    let entry = SyncEntry {
+        path: "big".into(),
+        size,
+        mtime_secs: 0,
+        mode: 0o644,
+        hash: [0; 32],
+        is_dir: false,
+    };
+    let (began, woke) = (Instant::now(), woken.load(SeqCst));
+    let list = SyncMsg::Manifest(vec![entry]);
+    send_msg(&mut send, &list, MAX_CTRL).await.unwrap();
+    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
+    assert!(matches!(need, SyncMsg::Need(..)), "{need:?}");
+    went_on("a push", began, woke);
+
+    beside.abort();
+    client.close().await;
     srv.shutdown().await;
 }
 
@@ -2202,8 +2428,11 @@ struct Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
+        // The holders of the sessions that live are ended: each keeps its folder locked. (A
+        // pane a test wrote by hand names a holder that is none, or is some other process.)
         for pane in fs::read_dir(&self.sessions).into_iter().flatten().flatten() {
-            if pane.path().join("status").is_file() {
+            let folder = fuxix::open(pane.path(), false).map(|folder| folder.try_lock_shared());
+            if matches!(folder, Ok(Err(fs::TryLockError::WouldBlock))) {
                 signal(&holder_of(&pane.path()), "-KILL");
             }
         }
@@ -3985,6 +4214,39 @@ async fn an_open_round_that_stands_still_is_a_broken_link() {
     assert_eq!(names_in(&mount.dir.join(".koh")), [""; 0]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_on_a_new_connection_has_five_seconds_to_be_answered_too() {
+    let host = Host::start("unanswered", &[]);
+    let hostile = Hostile::start(&host).await;
+    let mount = host.mount("a", Some(&hostile.at), &[], &[]);
+    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
+    // A first link, with a whole round; then its connection goes.
+    let (mut send, mut recv, _) = Hostile::asked(&conn).await;
+    let attached = Attached {
+        name: "1".into(),
+        run: RUNS[0],
+    };
+    send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
+    let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
+    for message in [
+        ToMirror::Round(2),
+        ToMirror::Fifo("in".into()),
+        ToMirror::Done,
+    ] {
+        send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
+    }
+    until("the mirror has its FIFO", || mount.dir.join("in").exists());
+    conn.close(0u32.into(), b"");
+    // The client dials anew and asks, and is not answered: the connection lives, and its
+    // request is read no further.
+    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
+    let _unanswered = conn.accept_bi().await.unwrap();
+    // It does not wait for that answer for ever: it asks again, on the connection it has.
+    let again = tokio::time::timeout(Duration::from_secs(15), Hostile::asked(&conn)).await;
+    let (_send, _recv, asks) = again.expect("the client did not ask again");
+    assert_eq!(asks.run, Some(RUNS[0]));
+}
+
 #[test]
 fn an_ended_session_with_a_client_is_not_removed_and_a_start_that_fails_removes_none() {
     let host = Host::start("kept", &["--max-sessions", "1"]);
@@ -4220,13 +4482,13 @@ impl Host {
     }
 
     /// A session of that name running `program`, with nobody attached once this returns: its
-    /// folder, when its screen shows `ready`.
+    /// folder, when its screen shows `ready`. That is read in the mount's own mirror, and the
+    /// mount told to end only then: the session's pane shows it before `koh mount` has been
+    /// answered, and a `koh mount` that does not listen yet dies of the signal.
     fn session(&self, name: &str, program: &[String], ready: &str) -> PathBuf {
         let mut mount = self.mount(name, None, &["--session", name], program);
         let pane = self.pane(name);
-        until(&format!("the session {name} shows {ready:?}"), || {
-            screen(&pane).contains(ready)
-        });
+        mount.shows(ready);
         signal(&mount.koh.id().to_string(), "-TERM");
         assert_eq!(mount.ends(), Some(0), "{}", mount.said());
         pane
@@ -4713,12 +4975,28 @@ impl Stepped {
     /// Has the next step done, and gives the pane's `marks` after it.
     fn step(&mut self) -> String {
         self.1 += 1;
-        fs::write(self.0.join("in"), "\n").unwrap();
-        let title = format!("done-{}\n", self.1);
-        let said = || fs::read_to_string(self.0.join("title")).unwrap_or_default();
-        until(&title, || said() == title);
-        fs::read_to_string(self.0.join("marks")).unwrap()
+        stepped(&self.0, self.1)
     }
+}
+
+/// Has a session of `marks_by_steps` do its next step, the `done`th, and gives the pane's
+/// `marks` once its title says so: the two as one round of the holder's left them, read
+/// between two looks at the same even `generation`. (A round writes `title` before `marks`:
+/// read one after the other and no more, the marks may be those of the round before, which
+/// under load is one from the middle of the step.)
+fn stepped(pane: &Path, done: u32) -> String {
+    fs::write(pane.join("in"), "\n").unwrap();
+    let title = format!("done-{done}\n");
+    let read = |name: &str| fs::read_to_string(pane.join(name)).unwrap_or_default();
+    let mut marks = String::new();
+    until(&title, || {
+        let number = read("generation");
+        let even = number.trim().parse::<u64>().is_ok_and(|n| n % 2 == 0);
+        let said = read("title");
+        marks = read("marks");
+        even && said == title && read("generation") == number
+    });
+    marks
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4735,12 +5013,7 @@ async fn a_wait_is_not_ended_by_marks_that_only_moved() {
     let mut done = 0;
     let mut step = || {
         done += 1;
-        fs::write(pane.join("in"), "\n").unwrap();
-        let title = format!("done-{done}\n");
-        until(&title, || {
-            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
-        });
-        fs::read_to_string(pane.join("marks")).unwrap()
+        stepped(&pane, done)
     };
     let client = host.client().await;
     // A command has ended with 7; a wait is asked at the prompt after it. The marks are few, and
@@ -4944,23 +5217,33 @@ async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed
     session.step();
     let client = host.client().await;
     let wait = waits(&client, "s").await;
+    // The server looks ten times a second, and the holder writes the burst in as many rounds
+    // as it reads it in. So that all of it is between two looks, the server stands still
+    // from the look the wait was asked with until the pane has the whole burst: a look in the
+    // middle would find the first command, or the oldest of that moment.
+    let server = host.served.as_ref().unwrap().server.id().to_string();
+    let state = || {
+        let ps = Command::new("ps")
+            .args(["-o", "state=", "-p", &server])
+            .output();
+        String::from_utf8_lossy(&ps.unwrap().stdout).into_owned()
+    };
+    signal(&server, "-STOP");
+    until("the server is stopped", || state().contains('T'));
     let marks = session.step();
+    signal(&server, "-CONT");
     assert_eq!(marks.lines().count(), 1000);
     let (code, text, said) = told(wait).await;
     // The first that ended is not there any more. The wait gives the oldest that is, and says
-    // that it is not known to be the first; or, had it looked in the middle of the write,
-    // the first itself.
+    // that it is not known to be the first.
     let kept = marks.lines().filter(|mark| mark.contains(" end")).count();
     let oldest = 300 - kept;
-    if said.contains("unread") {
-        assert_eq!(
-            (code, text),
-            ((oldest % 100) as i32, format!("burst-{oldest}\n")),
-            "{said}"
-        );
-    } else {
-        assert_eq!((code, text), (0, "burst-0\n".to_string()), "{said}");
-    }
+    assert!(said.contains("marks came and went unread"), "{said}");
+    assert_eq!(
+        (code, text),
+        ((oldest % 100) as i32, format!("burst-{oldest}\n")),
+        "{said}"
+    );
     client.close().await;
 }
 

@@ -1277,7 +1277,7 @@ impl Mirror {
                     }
                     file.set_len(cut)?;
                     file.seek(SeekFrom::End(0))?;
-                    io::copy(&mut File::open(&staged)?, &mut file)?;
+                    io::copy(&mut fuxix::open_regular(&staged)?, &mut file)?;
                     fs::remove_file(staged)?;
                 }
                 Staged::Moved(from, to) => fs::rename(dir.join(from), dir.join(to))?,

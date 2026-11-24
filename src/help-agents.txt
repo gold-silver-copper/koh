@@ -30,8 +30,8 @@ list() { # NAME <tab> alive|ended <tab> STATE <tab> COLSxROWS <tab> busy|idle <t
     if alive "$p"; then a=alive; else a=ended; fi
     read -r cols rows < "$p/size"
     # A command runs when the last mark is `output`: after `command` the shell waits at its prompt.
-    work=$(awk -v a=$a '$3 == "end" { code = $4 == "" ? "-" : $4 } { last = $3 }
-      END { printf "%s\t%s", (a == "alive" && last == "output") ? "busy" : "idle", code == "" ? "-" : code }' "$p/marks")
+    work=$(awk -v a=$a '$3 == "end" { code = $4 } { last = $3 }
+      END { if (code == "") code = "-"; printf "%s\t%s", (a == "alive" && last == "output" ? "busy" : "idle"), code }' "$p/marks")
     printf '%s\t%s\t%s\t%sx%s\t%s\t%s\n' "${p##*/}" "$a" "$(cat "$p/state")" "$cols" "$rows" "$work" "$(cat "$p/title" 2>/dev/null)"
   done
 }

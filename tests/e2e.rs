@@ -932,6 +932,50 @@ async fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does()
 }
 
 #[tokio::test]
+async fn koh_mount_with_no_directory_mirrors_into_the_default_fux_session() {
+    let (tmp, srv, client, _, _) = boot_pair("mount-default").await;
+    let (id, addr) = (srv.endpoint_id.to_string(), srv.direct_addr.unwrap());
+    let (home, runtime) = (tmp.0.join("home"), tmp.0.join("run"));
+    // The session is where fux has its default one: `$XDG_RUNTIME_DIR/fux`, and `~/.cache/fux`
+    // where that variable is not set or is empty. A `FUX_DIR` is nothing fux reads, nor koh.
+    let places = [
+        (runtime.as_os_str(), runtime.join("fux")),
+        ("".as_ref(), home.join(".cache/fux")),
+    ];
+    for (runtime, session) in places {
+        let mut koh = tokio::process::Command::new(env!("CARGO_BIN_EXE_koh"));
+        koh.env("KOH_CONFIG_DIR", tmp.0.join("cli_cfg"))
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("HOME", &home)
+            .env("FUX_DIR", tmp.0.join("elsewhere"))
+            .current_dir(&tmp.0)
+            .args(["mount", &id, "--direct", &addr.to_string()])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut koh = koh.spawn().unwrap();
+        let pane = session.join("main").join(format!("koh-{id}"));
+        let mirrored = async {
+            while !pane.join("shown/screen").is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), mirrored)
+            .await
+            .unwrap_or_else(|_| panic!("no mirror at {} in 20 s", pane.display()));
+        fs::write(pane.join("ctl"), "kill\n").unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), koh.wait()).await;
+        assert_eq!(ended.unwrap().unwrap().code(), Some(0));
+    }
+    assert_eq!(
+        names_in(&tmp.0),
+        ["cli_cfg", "home", "run", "srv_cfg", "state"]
+    );
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
     let tmp = TempDir::new("auth");
     let srv_cfg = tmp.0.join("srv_cfg");

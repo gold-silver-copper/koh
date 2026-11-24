@@ -1068,16 +1068,20 @@ async fn cmd_mount(args: &[String]) -> Result<Exit> {
     let dir = match local_dir {
         Some(d) => d,
         None => {
-            let fux_dir = std::env::var("FUX_DIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var("XDG_RUNTIME_DIR")
-                        .ok()
-                        .map(|r| PathBuf::from(r).join("fux"))
-                })
-                .unwrap_or_else(|| std::env::temp_dir().join("fux"));
+            // fux's default session, by fux's rule: `$XDG_RUNTIME_DIR/fux`, else `~/.cache/fux`,
+            // a variable that is set and empty counting as not set.
+            let var = |name| {
+                let set = std::env::var_os(name).filter(|v| !v.is_empty());
+                set.map(PathBuf::from)
+            };
+            let fux_dir = var("XDG_RUNTIME_DIR")
+                .map(|dir| dir.join("fux"))
+                .or_else(|| var("HOME").map(|dir| dir.join(".cache").join("fux")))
+                .ok_or_else(|| {
+                    KohError::failed(
+                        "no fux session to mirror into: neither XDG_RUNTIME_DIR nor HOME is set (name a directory: koh mount SERVER LOCAL_PANE_DIR)",
+                    )
+                })?;
             fux_dir.join("main").join(format!("koh-{server}"))
         }
     };

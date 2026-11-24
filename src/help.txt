@@ -1,7 +1,7 @@
 koh — peer-to-peer remote shell, headless jobs, delta sync, and fux sessions over iroh QUIC.
 
 SERVER is a saved name (`koh servers add NAME ID [--direct IP:PORT | --relay-url URL]`) or an
-endpoint id. Only `connect` needs a terminal.
+endpoint id. Only `connect` needs a terminal. `koh help-agents` is this and recipes for scripts.
 
 Keys & peers:
   koh id [client|server]                         print endpoint id (creates key if missing)
@@ -53,7 +53,8 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             until one more command has ended there than when it was asked: prints what that
             printed and exits with its code. Or until the session has: its screen, and its
             program's status as `koh connect` gives it. After SECS: the screen, and 124.
-            (--last and wait go by a shell's marks of its prompts, OSC 133.)
+            (--last and wait go by a shell's marks of its prompts, OSC 133: `koh help-agents`
+            has the lines for bash, and the three as a script over a session's files.)
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,

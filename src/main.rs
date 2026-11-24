@@ -17,6 +17,9 @@ use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
 const HELP: &str = include_str!("help.txt");
+/// What `koh help-agents` says after the help: a session's files, and the three commands
+/// that read them as a script for `koh exec`.
+const RECIPES: &str = include_str!("help-agents.txt");
 
 fn main() -> ExitCode {
     // fux's own command line, under two words: `koh fux …` is `fux …`, and `koh hold …` is how
@@ -72,7 +75,8 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         return Ok(Exit::OK);
     };
     if matches!(cmd, "-h" | "--help" | "help" | "help-agents") {
-        let _ = std::io::stdout().write_all(HELP.as_bytes());
+        let recipes = if cmd == "help-agents" { RECIPES } else { "" };
+        let _ = std::io::stdout().write_all([HELP, recipes].concat().as_bytes());
         return Ok(Exit::OK);
     }
     if matches!(cmd, "-V" | "--version" | "version") {

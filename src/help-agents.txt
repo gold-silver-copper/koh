@@ -1,0 +1,85 @@
+
+Recipes: a session's files, for whoever would rather script than ask.
+A session is a fux pane: a folder of plain files on the server, in the folder `koh serve`
+printed (`koh sessions SERVER --json` has each one's as `pane_dir`). `koh sessions`, `koh
+output` and `koh wait --session` read those files there and no more; the script below is the
+same four things as sh, for `koh exec` or for a script of your own on the server:
+
+  koh help-agents | sed -n '/^#!/,$p' > sessions.sh && koh cp sessions.sh SERVER:
+  koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed
+  koh exec SERVER -- sh sessions.sh wait DIR/NAME 60  and `screen`, `last` likewise
+
+What is typed goes into a session's `in`, a FIFO: `koh exec SERVER --sh 'printf "make\n" >
+DIR/NAME/in'`. A shell must mark its prompts for `last` and `wait` (OSC 133); for bash from 4.4:
+  PS1='\[\e]133;A\a\]'$PS1'\[\e]133;B\a\]'; PS0='\e]133;C\a'
+  PROMPT_COMMAND='printf "\e]133;D;%s\a" "$?"'
+fux's README, "A pane's files", says what every file is.
+
+#!/bin/sh
+# sessions.sh list DIR | screen PANE | last PANE | wait PANE [SECONDS]
+set -u
+# Whether a holder keeps the pane, by its number: one that was given to another process
+# since misleads. Only the lock on the folder is exact, which `koh` asks (and, on Linux,
+# `flock -n PANE true`: it fails while the holder lives).
+alive() { [ -p "$1/in" ] && kill -0 "$(sed -n '1s/^holder //p' "$1/status" 2>/dev/null)" 2>/dev/null; }
+
+list() { # NAME <tab> alive|ended <tab> STATE <tab> COLSxROWS <tab> busy|idle <tab> last exit or - <tab> TITLE
+  for p in "$1"/*/; do
+    p=${p%/}
+    [ -f "$p/status" ] || continue
+    if alive "$p"; then a=alive; else a=ended; fi
+    read -r cols rows < "$p/size"
+    # A command runs when the last mark is `output`: after `command` the shell waits at its prompt.
+    work=$(awk -v a=$a '$3 == "end" { code = $4 == "" ? "-" : $4 } { last = $3 }
+      END { printf "%s\t%s", (a == "alive" && last == "output") ? "busy" : "idle", code == "" ? "-" : code }' "$p/marks")
+    printf '%s\t%s\t%s\t%sx%s\t%s\t%s\n' "${p##*/}" "$a" "$(cat "$p/state")" "$cols" "$rows" "$work" "$(cat "$p/title" 2>/dev/null)"
+  done
+}
+
+# text PANE FILE: the pane's text into FILE (history.1, history, the main screen with the rows that
+# go on joined), and prints what to add to a line number of `marks` to have that line's number in FILE.
+text() {
+  { read -r top; read -r wraps; } < "$1/main/lines"
+  open=$(tail -c 1 "$1/history" 2> /dev/null)
+  case " $wraps " in *" 0 "*) open= ;; esac
+  { cat "$1/history.1" "$1/history" 2> /dev/null; [ -z "$open" ] || echo; } > "$2"
+  before=$(($(wc -l < "$2")))
+  awk -v wraps="$wraps" 'BEGIN { split(wraps, w, " "); for (i in w) joined[w[i] + 1] = 1 } { row[NR] = $0; if ($0 != "") last = NR }
+    END { for (i = 1; i <= last; i++) printf "%s%s", (i > 1 && !joined[i] ? "\n" : ""), row[i]; if (last) print "" }' "$1/main/screen" >> "$2"
+  echo $((before - top + 1))
+}
+
+last() { # what the last command that has ended printed: the lines from its `output` mark to its `end` mark
+  f=$(mktemp) m=$(mktemp) tries=0
+  # Of one round of the holder's writing: `generation` the same even number before and after
+  # (ten tries: a pane that never stops printing, or whose holder was killed as it wrote, is taken as it is).
+  while g=$(cat "$1/generation"); add=$(text "$1" "$f"); cat "$1/marks" > "$m"
+    { [ $((${g:-1} % 2)) -eq 1 ] || [ "$g" != "$(cat "$1/generation")" ]; } && [ $tries -lt 10 ]; do tries=$((tries + 1)); sleep 0.02; done
+  # (Whole lines: a last line with no line break is left out. `koh output --last` cuts at the
+  # marks' bytes, as fux's key `C-b C` does: its script, keys/C-b/S-c, is the longer form.)
+  awk -v add="$add" 'NR == FNR { if ($3 == "output") o = $1; if ($3 == "end" && o != "") { from = o; to = $1; o = "" }; next }
+    from != "" && FNR >= from + add && FNR < to + add' "$m" "$f"
+  rm -f "$f" "$m"
+}
+
+await() { # until one more command has ended (its exit code is this one's), or the session has; 124 after SECONDS
+  was=$(awk '$3 == "end" { n++; l = $1 } END { print n + 0, l + 0 }' "$1/marks") began=$(date +%s)
+  while :; do
+    # One more `end` than there was, or the last one further down (the file keeps a thousand marks).
+    now=$(awk -v was="$was" 'BEGIN { split(was, w, " ") } $3 == "end" { n++; l = $1; c = $4 }
+      END { if (n > w[1] || l > w[2]) print c + 0 }' "$1/marks")
+    [ -z "$now" ] || { last "$1"; exit "$now"; }
+    alive "$1" || { cat "$1/shown/screen"; s=$(cat "$1/state")
+      case $s in "exited "*) exit "${s#exited }" ;; "killed "*) exit $((128 + ${s#killed })) ;; *) exit 1 ;; esac; }
+    [ -z "${2:-}" ] || [ $(($(date +%s) - began)) -lt "$2" ] || { cat "$1/shown/screen"; exit 124; }
+    sleep 0.1
+  done
+}
+
+case ${1:-} in
+  list) list "$2" ;;
+  screen) cat "$2/shown/screen" ;;
+  last) last "$2" ;;
+  wait) await "$2" "${3:-}" ;;
+  *) echo "sessions.sh list DIR | screen PANE | last PANE | wait PANE [SECONDS]" >&2; exit 2 ;;
+esac

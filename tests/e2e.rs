@@ -4533,3 +4533,50 @@ fn the_three_commands_are_a_full_keys() {
     assert_eq!(code, Some(0), "{said}");
     assert!(list.starts_with("s\tdetached\trunning\t"), "{list:?}");
 }
+
+#[test]
+fn the_recipes_of_help_agents_read_what_the_commands_read() {
+    let host = Host::start("recipes", &[]);
+    let pane = host.session("s", &marking_shell(&host), "$");
+    // The script is the end of what `koh help-agents` prints, from its first line on; the help
+    // itself has none of it.
+    let (_, help, _) = koh(&host.tmp.0, &["help-agents"]);
+    let script = host.tmp.0.join("sessions.sh");
+    fs::write(&script, &help[help.find("#!/bin/sh").unwrap()..]).unwrap();
+    assert!(!koh(&host.tmp.0, &["--help"]).1.contains("#!/bin/sh"));
+    let recipe = |args: &[&str]| {
+        let mut sh = Command::new("sh");
+        let said = sh.arg(&script).args(args).output().unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (said.status.code(), text(&said.stdout), text(&said.stderr))
+    };
+    // Run on the server, where the folders are, it lists, shows and waits as the commands do.
+    let (dir, pane_dir) = (host.sessions.to_str().unwrap(), pane.to_str().unwrap());
+    fs::write(pane.join("in"), "sh -c 'echo from-the-recipe; exit 9'\n").unwrap();
+    until("the command has ended", || {
+        host.asked("sessions", &[]).1.contains("\texit=9\t")
+    });
+    let (code, list, said) = recipe(&["list", dir]);
+    assert_eq!(
+        (code, list.as_str()),
+        (Some(0), "s\talive\trunning\t80x24\tidle\t9\t\n"),
+        "{said}"
+    );
+    let (code, last, said) = recipe(&["last", pane_dir]);
+    assert_eq!(
+        (code, last.as_str()),
+        (Some(0), "from-the-recipe\n"),
+        "{said}"
+    );
+    assert_eq!(last, host.asked("output", &["--session", "s", "--last"]).1);
+    let (code, shown, said) = recipe(&["wait", pane_dir, "1"]);
+    assert_eq!((code, shown), (Some(124), screen(&pane)), "{said}");
+    assert_eq!(recipe(&["screen", pane_dir]).1, screen(&pane));
+    // The session ends: the recipe's wait ends with the program's status.
+    fs::write(pane.join("in"), "exit 3\n").unwrap();
+    assert_eq!(recipe(&["wait", pane_dir, "20"]).0, Some(3));
+    assert_eq!(
+        recipe(&["list", dir]).1,
+        "s\tended\texited 3\t80x24\tidle\t9\t\n"
+    );
+}

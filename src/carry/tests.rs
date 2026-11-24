@@ -526,6 +526,20 @@ impl Hand {
     }
 }
 
+/// A look as the tests mostly ask for one: the round it read, if it read one.
+trait Rounds {
+    fn round(&mut self, dead: bool, now: Instant) -> Option<Vec<ToMirror>>;
+}
+
+impl Rounds for Reader {
+    fn round(&mut self, dead: bool, now: Instant) -> Option<Vec<ToMirror>> {
+        match self.look(dead, now) {
+            Look::Round(round) => Some(round),
+            _ => None,
+        }
+    }
+}
+
 /// How many bytes a round is as it is sent.
 fn wire(round: &[ToMirror]) -> usize {
     round
@@ -1218,25 +1232,15 @@ fn the_reader_rests_nine_times_as_long_as_its_round_took() {
     let at = line.clock + Duration::from_secs(3600);
     let outside = Instant::now();
     assert_eq!(line.reader.round(false, at).unwrap().len(), 3);
-    let (looked, took) = line.reader.looked.unwrap();
-    assert!(looked == at && !took.is_zero() && took <= outside.elapsed());
+    let rests = line.reader.rests.unwrap();
+    let took = (rests - at) / 10;
+    assert!(!took.is_zero() && took <= outside.elapsed());
     // The folder is not looked at again until nine times that long after the look: not though
-    // it has changed, and not though the look read nothing.
+    // it has changed.
     hand.round(|hand| hand.append("history", b"and more\n"));
-    let rested = at + took * 10;
-    assert!(
-        line.reader
-            .round(false, rested - Duration::from_nanos(1))
-            .is_none()
+    assert_eq!(
+        line.reader.look(false, rests - Duration::from_nanos(1)),
+        Look::Rests(rests)
     );
-    assert_eq!(line.reader.looked, Some((at, took)));
-    assert_eq!(line.reader.round(false, rested).unwrap().len(), 3);
-    hand.turn();
-    let (at, took) = line.reader.looked.unwrap();
-    assert!(
-        line.reader.round(false, at + took * 10).is_none(),
-        "the number is odd"
-    );
-    let (again, _) = line.reader.looked.unwrap();
-    assert_eq!(again, at + took * 10, "a look that read nothing is a look");
+    assert_eq!(line.reader.round(false, rests).unwrap().len(), 3);
 }

@@ -350,6 +350,20 @@ impl Kept {
     }
 }
 
+/// What a look at a pane's folder gave.
+#[derive(Debug, PartialEq)]
+pub enum Look {
+    /// What differs from what the client has, from `Round` to `Done`: to be sent. No message,
+    /// where nothing differs and a round was sent before.
+    Round(Vec<ToMirror>),
+    /// Nothing was read: the folder is being written (its number is odd), or has no number.
+    Odd,
+    /// What was read is thrown away: the folder's number moved meanwhile.
+    Moved,
+    /// Nothing was read: the reader rests until then.
+    Rests(Instant),
+}
+
 /// What a server reads of a pane's folder for one client: the folder, and name by name what
 /// that client has. After every `Done` this record and the client's mirror are the same; it
 /// moves only with a round that was read whole.
@@ -361,8 +375,8 @@ pub struct Reader {
     moved: Vec<(String, String)>,
     /// A round was sent since the client said what it has: the first is sent whatever it holds.
     sent: bool,
-    /// When the folder was last looked at, and how long that took.
-    looked: Option<(Instant, Duration)>,
+    /// Until when the folder is left alone.
+    rests: Option<Instant>,
     /// What a test does between a reading and the second look at the folder's number.
     #[cfg(test)]
     midway: Option<Box<dyn FnOnce()>>,
@@ -493,24 +507,23 @@ impl Reader {
         Ok(true)
     }
 
-    /// One look at the folder, at the moment `now`. None: nothing was read (the folder is being
-    /// written, or is left alone still). Else what differs from what the client has, as a round
-    /// from `Round` to `Done`; or no message, where nothing differs and a round was sent before.
-    /// After a look the folder is left alone nine times as long as the look took: whatever
-    /// proving a file costs, the reader has a tenth of a core at most.
-    pub fn round(&mut self, dead: bool, now: Instant) -> Option<Vec<ToMirror>> {
-        let rests = |(at, took): (Instant, Duration)| at.checked_add(took + took * REST);
-        if self.looked.and_then(rests).is_some_and(|rests| now < rests) {
-            return None;
+    /// One look at the folder, at the moment `now`. After a look that read it the folder is
+    /// left alone nine times as long as the look took: whatever proving a file costs, the
+    /// reader has a tenth of a core at most.
+    pub fn look(&mut self, dead: bool, now: Instant) -> Look {
+        if let Some(rests) = self.rests.filter(|rests| now < *rests) {
+            return Look::Rests(rests);
         }
+        let Some(numbers) = self.number(dead) else {
+            return Look::Odd;
+        };
         let began = Instant::now();
-        let round = self.read(dead);
-        self.looked = Some((now, began.elapsed()));
-        round
+        let round = self.read(numbers);
+        self.rests = now.checked_add(began.elapsed() * (1 + REST));
+        round.map_or(Look::Moved, Look::Round)
     }
 
-    fn read(&mut self, dead: bool) -> Option<Vec<ToMirror>> {
-        let (there, number) = self.number(dead)?;
+    fn read(&mut self, (there, number): (u64, u64)) -> Option<Vec<ToMirror>> {
         let now = walk(&self.root);
         let current: HashMap<&str, &Stamp> = now
             .iter()

@@ -869,6 +869,34 @@ mod tests {
     }
 
     #[test]
+    fn marks_that_came_and_went_unread_are_said_with_the_oldest_end_still_kept() {
+        let tmp = scratch("unread");
+        let dir = tmp.join("s");
+        let (_fifos, run) = (pane(&dir, 7), run_of(&tmp.join("s")));
+        // The last `end` was number 6 when the wait was asked. By its next look 1,200 marks
+        // have come, and the file has dropped 206: those up to 206 went unread, an `end` or
+        // more among them. The oldest it lists is given, with that said; never as the first.
+        let command = |n: usize| format!("{n} 0 output\n{n} 9 end {}\n", n % 100);
+        fs::write(
+            dir.join("marks"),
+            (50..550).map(command).collect::<String>(),
+        )
+        .unwrap();
+        fs::write(dir.join("marks.dropped"), "206\n").unwrap();
+        let (code, said, _) = looked(&dir, run.unwrap(), 6).unwrap();
+        let unread =
+            "the oldest still kept, not known to be the first (200 marks came and went unread)";
+        assert_eq!(
+            (code, said),
+            (50, format!("command ended (OSC 133): {unread}"))
+        );
+        // With the last `end` still listed nothing went unread, and the first is the first.
+        let (code, said, _) = looked(&dir, run.unwrap(), 208).unwrap();
+        assert_eq!((code, said.as_str()), (51, "command ended (OSC 133)"));
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
     fn a_session_a_client_came_to_since_it_was_chosen_does_not_go() {
         let tmp = scratch("goes");
         let sessions = Sessions::new(&tmp, 2, "sh".into()).unwrap();

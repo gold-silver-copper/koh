@@ -28,27 +28,43 @@ credit reporters who want it.
 - The proof of a client's key on each request (`src/net.rs`, `open_authed_stream` and
   `verify_client`), the allowlist and what each key may ask (`src/server.rs`, `authorize` and
   `dispatch`; `src/keys.rs`, `Scope`), and what bounds a peer before and after that
-  (`src/server.rs`, `start_server` and `handle_connection`; `src/pane.rs`, `SessionManager`).
+  (`src/server.rs`, `start_server` and `handle_connection`; `src/session.rs`, `Sessions`).
+- Sessions on the server (`src/session.rs`): which pane an attach is given or starts, the
+  check of a client's format and run before anything is made, a client's one stream on a
+  run, the two FIFOs typed bytes go into, and what a client may have written into koh's own
+  `fux` session (`told`).
 - The wire decoders and their bounds (`src/proto.rs`), on both ends.
 - The paths a copy's peer may name, on both ends (`src/sync.rs`, `wire_names`), and the paths a
   scoped key may name (`src/keys.rs`, `Scope`). Where a symlink leads is not in scope: see
   below.
 - Commands and jobs the server starts (`src/server.rs`, `handle_exec`; `src/jobs.rs`).
-- What a server can make a client write: a mirrored session's pane folder and the files of a
-  copy (`src/client.rs`, `mount_session` and `write_mirrored_pane`; `src/sync.rs`).
+- What a server can make a client write: a session's mirror and the files of a copy. The
+  mirror's rules are `src/carry.rs` (`Mirror`: the names a round may have, the one kind of
+  link, a round checked whole before any of it is done, the bounds); where a mirror is made, and that a
+  server's name for a session is a name and no path, is `src/client.rs` (`attach`,
+  `default_mount`, `connect_interactive`, `mount`). What the server reads of a pane's folder
+  into a round is `src/carry.rs` (`Reader`). A copy is `src/sync.rs`.
 
 **Out of scope: report upstream** (dependencies koh does not author):
 
 - Transport crypto, QUIC and TLS: **iroh** and its QUIC backend, **rustls**, **ring**.
-- The terminal emulator **`fux-vt`** that the server runs on its programs' output, the viewer
-  **`fux`** that `koh connect` embeds to draw a mirrored session on the user's terminal, and the
-  system-call layer **`fuxix`** (PTYs, sessions, signals): a parse or drawing bug there belongs to
-  the [fux](https://github.com/gold-silver-copper/fux) project.
+- **`fux`**, which is in koh's binary under `koh fux …` and `koh hold …`: the holder that keeps
+  a session's program and writes its pane's folder, with its terminal emulator **`fux-vt`**;
+  the viewer that `koh connect` runs to draw a mirror on the user's terminal, and its key
+  scripts; and the system-call layer **`fuxix`** (PTYs, sessions, signals). What a pane's
+  files mean and what a viewer does with them is fux's: a parse or drawing bug there belongs
+  to the [fux](https://github.com/gold-silver-copper/fux) project. Which files koh writes
+  into a mirror, under which names, in which rounds, and who may ask, is koh's.
 
 ## What a key can do
 
 - A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
-  can read or write, and sessions.
+  can read or write, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
+  session: such a key starts them, types into them, resizes them and hangs them up, and says
+  what its terminal is like into that `fux` session's `colours` and `keyboard` (the two are
+  the session's, not a pane's: a program of any session that asks its terminal is answered
+  from them, where they are there). `koh fux …`
+  and `koh hold …` are no requests: they are fux, run by whoever runs koh, on his machine.
 - A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
   the path begins with `DIR` and goes on with plain names (no `..`). **It is not a
   confinement.** `DIR` itself is resolved, and a path may begin with it as `clients` has it or

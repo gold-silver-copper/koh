@@ -28,15 +28,27 @@ Delta file sync (blake3 hashes, atomic replace):
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SRC... SERVER:DST
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SERVER:SRC... DST
 
-Interactive sessions (backed by fux pane folders + embedded fux::view + OSC 133 marks):
-  koh connect SERVER [--new | --session N] [-C DIR] [-- PROG ARG...]
-  koh sessions SERVER [--json]
-  koh output SERVER --session N [--last] [--json]
-  koh wait SERVER --session N [--timeout SECS] [--json]
-  koh mount SERVER [--session N] [LOCAL_PANE_DIR]   mirror remote session for local `fux view`
+Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
+`koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):
+  koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG ARG...]
+            the session NAME, started if there is none; with no name the newest that lives,
+            or a new one (always with --new or a program). Leave with Ctrl-] . or C-b d.
+            Ends with the session's program: its status, 128+N if signal N ended it, 1 if
+            nothing says how it ended.
+  koh mount SERVER [--session NAME | --new] [-C DIR] [MIRROR] [-- PROG ARG...]
+            the same session as a folder: a mirror for `koh fux view`, `cat` or a script, in
+            MIRROR (koh makes it; one that is there is not taken) or in koh's own fux session
+            here ($XDG_RUNTIME_DIR/koh/fux/koh-mounts/SERVER.NAME, else ~/.cache/koh/...; the
+            server's part cut to fit). Ends as `koh connect` does, with the program's status.
+            Removed when the session ends or koh is stopped (SIGINT, SIGTERM, SIGHUP: exit 0).
+  koh fux ...                                    fux itself, the one that reads koh's panes
+            (it and `koh hold` run on this machine, and ask no server)
+  koh sessions | output | wait --session         not in this build: a session's files are on
+            the server, where `koh exec` reads them
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
-            (`exec`, `wait`, and `logs -f` exit with the remote command's exit status.)
+            (`exec`, `wait`, `logs -f`, `connect` and `mount` exit with the remote
+            command's exit status.)
             `koh serve` exits 75 when another `koh serve` already holds its key.

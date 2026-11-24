@@ -463,7 +463,7 @@ pub struct Reader {
     owed: Duration,
     /// What a test does between a reading and the second look at the folder's number.
     #[cfg(test)]
-    midway: Option<Box<dyn FnOnce()>>,
+    midway: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Reader {

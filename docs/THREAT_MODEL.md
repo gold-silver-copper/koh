@@ -41,18 +41,32 @@ a QUIC handshake: the transport does not know the allowlist.
 ## 2. A client with an allowed key and no scope
 
 It is the server's user: it runs any command (`koh exec`, `koh run`), reads and writes any file
-that user can (`koh cp`), and attaches to any session. There is nothing to escalate to.
+that user can (`koh cp`), and attaches to any session. There is nothing to escalate to. Its
+sessions are `fux` panes of the server's user, in a `fux` session of koh's own beneath the
+server's state (`src/session.rs`): it starts them, types into them, resizes them and hangs
+them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboard`.
 
 - **Bounds:** a message is refused before it is read past its length (`src/proto.rs`): 512
   bytes for a proof; 1 MiB for a request, the answer that it was taken, and the short answers
-  (lists of jobs and sessions); 256 KiB for a piece of a file, of input or of output; 4 MiB for
-  what a copy says it needs and for its summary; 8 MiB for a copy's manifest, a screen, a
-  session's text and what a wait returns. A copy's tree is at most 100,000 entries, each at
+  (a list of jobs); 256 KiB for a piece of a file, of input or of output, and for every message
+  of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
+  for a copy's manifest and what a wait returns. Of a session's client the server takes
+  16 KiB a message of typed bytes, and stops taking messages while 64 KiB wait for one of a
+  pane's two FIFOs: so up to 80 KiB can wait for a FIFO, and beside them the stream's reader
+  holds up to seventeen messages it has read (256 KiB each at the most). It takes a list of
+  at most 256 names of what a mirror has, of which it believes nothing its own bytes do not
+  bear out. What it holds of a pane to send (a round, whole, and what it keeps of the files
+  it sent) is as large as the pane's folder: fux's bounds, not a figure of koh's. A message that is
+  more than it should be, or one that has bytes after it, ends the stream. What a pane's
+  folder holds is bounded by fux's holder, not by koh. A copy's tree is at most 100,000 entries, each at
   most 128 directories beneath it. With `--delete` that holds for what the destination already
   has: something deeper there fails the whole copy (exit 1) before anything is removed or any
   file is written, even where the copy would have removed it. At most `--max-sessions`
-  sessions (64) are kept, an ended one that no client is attached to making room for a new one
-  that has started.
+  sessions (64) are kept: folders in the sessions' folder, whoever made them. The oldest that
+  has ended and that no client is attached to makes room for a new one, once that has
+  started; with none such the client is told the server is busy. The cap can be over by one:
+  a client that comes back to the session that was chosen to go, while the new one starts,
+  keeps it, and both stay until a later start finds an ended one without a client.
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
   uses. A request that waits (`koh wait`, `koh logs -f`) is not stopped when its connection
   goes; it ends with what it waits for.
@@ -85,8 +99,9 @@ that user can (`koh cp`), and attaches to any session. There is nothing to escal
 - **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
   the same rule, and copies as above. **It is not a sandbox:** the command is any command,
   run as the server's user, and reaches whatever that user can. Every other request is refused:
-  sessions (attaching, their list, their text, a wait for one) and everything about jobs but
-  starting one (their list, their logs, a wait for one, killing one). Treat it as a full key
+  a session (the scope is looked at before the format, the run or anything else of an
+  attach, and before anything is made) and everything about jobs but starting one (their
+  list, their logs, a wait for one, killing one). Treat it as a full key
   that cannot open a terminal.
 - A scope is read with each request, so narrowing or removing a key takes effect on its next
   request; what it already started goes on.
@@ -100,16 +115,62 @@ A wrong endpoint id, or a host someone else now controls.
   a symlink already in `DST` is followed, as the user's own `cp` would follow it. The client
   takes at most 100,000 entries, only the files it asked for, and no file longer than the
   server said.
-- **A session from it** (`koh connect`, `koh mount`) is mirrored into a pane folder on the
-  client. The server chooses the contents of that folder's files (the screen, title, links,
-  clipboard, notice, pictures), never their names. The viewer then draws them, so the server
-  can show anything, set the terminal's title, and **replace what the user copied** (the
-  clipboard, as a program in a local terminal can). A frame is at most 8 MiB, its size and
-  cursor are held to 500 by 500, and at most 16 pictures or 32 MiB of them are kept.
+- **A session from it** (`koh connect`, `koh mount`) is a mirror on the client: a folder of
+  files that the server chooses, **names and contents**. It is confined by five rules
+  (`src/carry.rs`, `Mirror`; `src/client.rs`), and by nothing layered on them:
+  1. **The mirror is a folder koh makes**, mode 0700, in koh's own directory or where the
+     user said; a folder that is there is not taken, cleared or written into. The session's
+     name, which the server says and a mirror's default place is made of, is one plain name
+     or the client ends.
+  2. **Names** are one or two plain names (letters, digits, `.`, `_`, `-`, 64 at most, no dot
+     first); a name of two has a folder the mirror made as its first. One name has one
+     spelling: a name that differs from one the mirror has only in the case of its letters
+     is refused.
+  3. **Three names at the mirror's root are never written**, by any message, in any case of
+     their letters: `generation`, which koh writes itself; `command`, which is what fux's
+     `.restore` would run; and `status`, which names processes of the server. (In a folder
+     of the mirror they are names as any other: nothing reads them there.)
+  4. **One kind of link:** at the mirror's root, to a folder at its root, true of every link
+     when it comes and after every round. Nothing can be written through it, as a name of
+     two needs a folder for its first.
+  5. **A name keeps its kind.** A thing of one kind is refused where a thing of another is; a
+     FIFO is `in` or `ctl`.
+
+  A round is checked whole before anything of it is done: its files wait in the mirror, in a
+  folder whose name has a dot first (`.koh`: fux passes it over, and no message can name
+  it), until the round is whole and every rule holds of what it would leave. Then it is
+  done, under an odd `generation`. What the server sends can therefore change nothing or
+  all of a round; a failure of the client's own disk in the middle can leave a round part
+  done, the number odd, and the next attach that succeeds sends what puts it right. At most 256 names, 32 MiB a file,
+  128 MiB a mirror and as much waiting, 4,096 messages a round, 256 KiB a message; thirty
+  seconds between two messages of an open round and ten minutes for all of it. Past any of
+  it, or at any message the rules refuse, the client ends, having changed nothing; a round
+  that stands still is thrown away and the client dials again.
+- **What the server's files do on the client.** The viewer (`koh connect`'s, or any
+  `fux view` of a mount) draws them, and fux's default keys act on some. koh adds no switch
+  for any of it; `koh connect`'s own key set has only its detach keys.
+
+  | A file the server chooses | fux's viewer | fux's default keys (a `fux view` of a mount) |
+  |---|---|---|
+  | the screens, `size`, `cursor`, `modes`, `state` | drawn: text and colour codes only | |
+  | `title` | given to the terminal as its title, without control characters | the pane picker shows it |
+  | `clipboard` | when it changes in the pane that has the keys: put on the terminal's clipboard (up to 1 MiB), **replacing what the user copied** | |
+  | `notice` | a bell or a notice to the terminal | |
+  | `links` | addresses of links on cells: printable ASCII, 2,048 bytes | |
+  | `pictures`, `pic-N.sixel` | passed to the terminal once the viewer has found one whole sixel picture inside its tile | |
+  | `cwd` | | a new shell starts in that directory of the client, if it has one |
+  | `marks`, `history`, the main screen | | opened as text in the local editor |
+  | `in`, `ctl` (the mirror's own FIFOs) | keys and `resize` go there, and so to the server | `kill` hangs up the session's program; removing the pane's folder ends the mount |
+  | `status`, `command` | never in a mirror: `.here` and `.restore` pass it over | |
 - **A command's output from it** (`koh exec`, `koh logs`) is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
-- **It learns** every key typed into a session, the client's terminal colours and keyboard
-  flags, and every file sent to it.
+- **It learns** what is typed into a session and reaches it (what was typed while there
+  was no link too, on return; not what was lost with a link), the client's terminal colours
+  and keyboard flags where the files that say them are there and no longer than 16 KiB
+  (from `koh connect`'s viewer; from a mount, those of the `fux` session its mirror was
+  put in, viewer or none),
+  what the client's mirror holds (names, lengths and hashes, at each attach), and every
+  file sent to it.
 - **Not defended:** a server can mislead a user who chose to connect to it. The endpoint id is
   all that ties a name to a server: check it out of band.
 
@@ -118,6 +179,12 @@ A wrong endpoint id, or a host someone else now controls.
 Not defended against: koh trusts the machines it runs on. The key file is 0600 in a directory
 that koh makes 0700 and refuses if group or others may write to it; whose directory it is, koh
 does not check, and a key that is a symlink is read as the file it leads to (`src/keys.rs`).
-Sessions' pane folders and jobs' logs are kept in `$XDG_RUNTIME_DIR/koh`; where that is not set
-they are in the system's temporary directory under `koh-UID` (the number `id -u` gives), which
-koh does not check the ownership of.
+Sessions and jobs' logs are kept in the server's state: `$XDG_RUNTIME_DIR/koh`; where that is
+not set, the system's temporary directory under `koh-UID` (the number `id -u` gives), which koh
+does not check the ownership of. A state directory that is there is taken as it is; the
+sessions' folder beneath it (`fux/koh-sessions`) is made 0700 where koh makes it, and a
+pane's folder 0700 by fux. Anything that runs as the server's user can type into a session,
+resize it, hang it up and remove it, and start a pane there that koh takes for a session:
+the files are the interface. A session's holder is no child of `koh serve` and is not ended
+with it. On a client, a mirror and `koh connect`'s private folder are 0700 in
+`$XDG_RUNTIME_DIR` (else the temporary directory, or `~/.cache/koh` for a mount).

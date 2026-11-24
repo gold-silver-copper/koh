@@ -1,39 +1,36 @@
-//! Client operations for koh: exec, headless jobs, delta cp/--sync,
-//! OSC 133 session queries/wait, local `fux` pane-folder mirroring (`mount`),
-//! and interactive `connect` powered directly by embedded `fux::view`.
+//! Client operations for koh: exec, headless jobs, delta cp/--sync, and sessions. A session
+//! is mirrored here, a copy of its pane's folder on the server that koh makes and alone
+//! writes (`carry::Mirror`): `koh mount` keeps one for any `fux view`, `cat` or script, and
+//! `koh connect` shows a private one with fux's viewer in this process.
 
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fs::{self, DirBuilder, File};
+use std::hash::{BuildHasher as _, RandomState};
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::os::fd::AsFd as _;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fux_vt::PICTURE_MAX;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointId, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
 use tokio::io::AsyncReadExt as _;
-use tokio::sync::watch;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::keys::{Role, Route, load_or_create_key, resolve_server};
-use crate::net::{close_error, connect_server, map_conn_err, open_authed_stream};
-use crate::pane::write_v1_metadata;
+use crate::carry::{Fault, Mirror};
+use crate::keys::{Role, load_or_create_key, resolve_server};
+use crate::net::{close_error, connect_server, dial, map_conn_err, open_authed_stream};
 use crate::proto::{
-    ClientEvent, ExecClientMsg, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
-    PictureKind, Reply, Request, ScreenFrame, ServerEvent, SessionInfo, SyncSummary, WaitResult,
-    recv_msg, recv_msg_opt, send_msg, spawn_msg_reader,
+    Attach, Attached, ExecClientMsg, ExecServerMsg, FromMirror, JobInfo, LogMsg, MAX_CHUNK,
+    MAX_CTRL, MAX_FRAME, MAX_HELD, MAX_TYPED, Reply, Request, SyncSummary, ToMirror, WaitResult,
+    recv_msg, recv_msg_opt, send_msg, session_name, spawn_msg_reader,
 };
 use crate::sync::{receive_tree, send_tree};
-use crate::{Exit, KohError, Result, atomic_write};
-
-const PICTURE_CACHE_MAX_COUNT: usize = 16;
-const PICTURE_CACHE_MAX_BYTES: usize = 32 << 20; // 32 MiB (covers fux-vt's 8 x 4 MiB)
-const RECONNECT_INPUT_BUFFER_MAX: usize = 64 << 10; // 64 KiB
-const CTL_LINE_MAX: usize = 4096;
+use crate::{Exit, KohError, Result};
 
 #[derive(Clone, Debug)]
 pub struct DialOptions {
@@ -43,36 +40,22 @@ pub struct DialOptions {
     pub json: bool,
 }
 
+/// Which session `koh connect` and `koh mount` ask for: one by its name, started if there is
+/// none of it; or with no name the newest that lives, or a new one (always, with `new` or a
+/// program).
 #[derive(Clone, Debug, Default)]
 pub struct ConnectOptions {
-    pub session: Option<u32>,
+    pub session: Option<String>,
     pub new: bool,
     pub argv: Vec<String>,
     pub cwd: Option<String>,
 }
 
-struct MountSpec {
-    session: Option<u32>,
-    new: bool,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    cols: u16,
-    rows: u16,
-    cell_w: u16,
-    cell_h: u16,
-    initial_stream: Option<(SendStream, RecvStream)>,
-    preopened_fifos: Option<(File, File)>,
-    view_ctl: Option<PathBuf>,
-    view_exited: Option<Arc<AtomicBool>>,
-    cancel: watch::Receiver<bool>,
-}
-
 pub struct Client {
     secret: SecretKey,
-    server_id: EndpointId,
-    route: Option<Route>,
-    interactive: bool,
     endpoint: Endpoint,
+    /// Where the server is, for a connection made anew on the same endpoint.
+    addr: EndpointAddr,
     conn: Connection,
 }
 
@@ -90,35 +73,24 @@ impl Client {
 
     pub async fn connect_direct(
         secret: SecretKey,
-        server_id: EndpointId,
-        route: Option<Route>,
+        server_id: iroh::EndpointId,
+        route: Option<crate::keys::Route>,
         interactive: bool,
     ) -> Result<Self> {
-        let (endpoint, conn) =
-            connect_server(secret.clone(), server_id, route.clone(), interactive).await?;
+        let (endpoint, addr, conn) =
+            connect_server(secret.clone(), server_id, route, interactive).await?;
         Ok(Self {
             secret,
-            server_id,
-            route,
-            interactive,
             endpoint,
+            addr,
             conn,
         })
     }
 
-    /// Re-establishes the underlying QUIC endpoint and connection after a network drop or roam.
+    /// A new connection on the endpoint there is, after the one before was lost.
     pub async fn redial(&mut self) -> Result<()> {
         self.conn.close(0u32.into(), b"redial");
-        self.endpoint.close().await;
-        let (endpoint, conn) = connect_server(
-            self.secret.clone(),
-            self.server_id,
-            self.route.clone(),
-            self.interactive,
-        )
-        .await?;
-        self.endpoint = endpoint;
-        self.conn = conn;
+        self.conn = dial(&self.endpoint, self.addr.clone()).await?;
         Ok(())
     }
 
@@ -438,678 +410,724 @@ impl Client {
         Ok(total)
     }
 
-    pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
-        let (_, mut recv) = self.request(&Request::Sessions).await?;
-        recv_msg(&mut recv, MAX_CTRL).await
+    /// One attach: the request and the server's answer to it. What goes wrong is said with
+    /// whether it is the last word (the server's refusal, or its refusal of this key) or a
+    /// link that is not there, to be tried again.
+    async fn attach(&self, asks: &Attach) -> Attaching {
+        let asked = async {
+            let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
+            send_msg(&mut send, &Request::Attach(asks.clone()), MAX_CTRL).await?;
+            let reply: Reply = recv_msg(&mut recv, MAX_CTRL).await?;
+            Ok((send, recv, reply))
+        };
+        let (send, mut recv, reply) = asked.await.map_err(|e: KohError| {
+            let closed = close_error(&self.conn);
+            let last = closed.as_ref().is_some_and(|e| e.code == Exit::REFUSED);
+            (last, closed.unwrap_or(e))
+        })?;
+        reply.into_result().map_err(|e| (true, e))?;
+        // (An answer that is over its bound or is none is refused, as a message of a round
+        // is; the transport's end is not. The server chose the name, and a mirror's default
+        // place is made of it: a name it is, and no path. And a client that comes again is
+        // given the run it named, or types nothing.)
+        let attached: Attached = match recv_msg(&mut recv, MAX_CTRL).await {
+            Ok(attached) => attached,
+            Err(e) if e.code == Exit::FAILED => return Err((true, refused(&e.message))),
+            Err(e) => return Err((false, e)),
+        };
+        let name = &attached.name;
+        match (
+            session_name(name),
+            asks.run.is_none_or(|run| run == attached.run),
+        ) {
+            (true, true) => Ok((send, recv, attached)),
+            (true, false) => Err((true, another_run(name))),
+            (false, _) => Err((true, refused("a session's name that is none"))),
+        }
     }
 
-    pub async fn output(&self, session: u32, last: bool) -> Result<String> {
-        let (_, mut recv) = self.request(&Request::Output { session, last }).await?;
-        recv_msg(&mut recv, MAX_FRAME).await
+    /// An attach after a link went: a new stream on the connection if it lives (iroh may have
+    /// moved it), and on a new connection of the same endpoint if it does not, or brings no
+    /// answer in five seconds.
+    async fn attach_again(&mut self, asks: &Attach) -> Attaching {
+        if self.conn.close_reason().is_none() {
+            let answer = Duration::from_secs(5);
+            match tokio::time::timeout(answer, self.attach(asks)).await {
+                Ok(Err((false, _))) | Err(_) => {}
+                Ok(answered) => return answered,
+            }
+        }
+        // (A dial is given five seconds: one begun while there was no path sends again ever
+        // more seldom, and would be found waiting long after the path is back.)
+        let dialled = tokio::time::timeout(Duration::from_secs(5), self.redial()).await;
+        let timed_out = |_| (false, KohError::unreachable("timed out dialing server"));
+        dialled.map_err(timed_out)?.map_err(|e| (false, e))?;
+        self.attach(asks).await
     }
 
-    pub async fn wait_session(
-        &self,
-        session: u32,
-        timeout_secs: Option<u64>,
-    ) -> Result<WaitResult> {
-        let (_, mut recv) = self
-            .request(&Request::WaitSession {
-                session,
-                timeout_secs,
-            })
-            .await?;
-        recv_msg(&mut recv, MAX_FRAME).await
-    }
-
-    /// Attaches an interactive local TTY to a remote `fux`-backed session by mounting it into a
-    /// private temporary v1 `fux` session folder and running embedded `fux::view` in-process.
-    /// Automatically survives network drops and roaming; detach locally with `Ctrl-]` `.` or `C-b d`.
-    pub async fn connect_interactive(mut self, opts: ConnectOptions) -> Result<i32> {
+    /// `koh connect`: a session in this terminal. Its mirror is in a private folder, shown by
+    /// fux's viewer in this process with koh's own keys (`Ctrl-] .` and `C-b d` leave it), and
+    /// both are gone when it ends. Ends with the session's program, with its status.
+    pub async fn connect_interactive(self, opts: ConnectOptions) -> Result<i32> {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             self.close().await;
             return Err(KohError::usage(
-                "`koh connect` requires a terminal (for scripts/agents use `exec`, `run`, `sessions`, `output`, `wait`)",
+                "`koh connect` requires a terminal (for scripts/agents use `exec`, `run`, `mount`)",
             ));
         }
-        let winsz = std::io::stdin()
+        let tty = std::io::stdin()
             .as_fd()
             .try_clone_to_owned()
-            .map(fs::File::from)
-            .and_then(|f| fuxix::winsize(&f))
-            .unwrap_or(fuxix::Winsize {
-                rows: 24,
-                cols: 80,
-                xpixel: 800,
-                ypixel: 480,
-            });
-        let cols = winsz.cols.max(1);
-        let rows = winsz.rows.max(1);
-        let cell_w = if winsz.xpixel > 0 {
-            (winsz.xpixel / cols).clamp(1, 100)
-        } else {
-            10
-        };
-        let cell_h = if winsz.ypixel > 0 {
-            (winsz.ypixel / rows).clamp(1, 100)
-        } else {
-            20
-        };
-
-        // Validate initial attach BEFORE entering raw mode / alt screen so auth/not-found errors
-        // report cleanly on stderr without flashing the terminal.
-        let initial_stream = match self
-            .request(&Request::Attach {
-                session: opts.session,
-                new: opts.new,
-                cols,
-                rows,
-                cell_w,
-                cell_h,
-                argv: opts.argv.clone(),
-                cwd: opts.cwd.clone(),
-            })
-            .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
-                self.close().await;
-                return Err(err);
-            }
-        };
-
-        // Prepare private 0700 temp fux session + FIFOs BEFORE spawning `fux::view` so there is
-        // zero startup race and any setup failure closes the client without touching the TTY.
-        let setup = (|| -> Result<(TempConnectDir, PathBuf, PathBuf, PathBuf, File, File)> {
+            .map(File::from);
+        let size = tty.and_then(|tty| fuxix::winsize(&tty)).ok();
+        let (cols, rows) = size.map_or((80, 24), |size| (size.cols.max(1), size.rows.max(1)));
+        // The first attach comes before the terminal is touched: what the server refuses is
+        // said on a terminal that is as it was.
+        let asks = opts.asks(cols, rows);
+        let made = async {
+            let (send, recv, attached) = self.attach(&asks).await.map_err(|(_, e)| e)?;
             let temp = TempConnectDir::create()?;
-            let session_dir = temp.0.join("session");
-            let ws_dir = session_dir.join("connect");
-            let pane_dir = ws_dir.join("remote");
-            let keys_dir = temp.0.join("keys");
-            fs::create_dir_all(pane_dir.join("main"))
-                .map_err(|e| KohError::failed(format!("mkdir connect pane: {e}")))?;
-            atomic_write(&ws_dir.join("layout"), b"* remote focus=remote\n")
-                .map_err(|e| KohError::failed(format!("write layout: {e}")))?;
-            install_detach_keys(&keys_dir)?;
-            seed_initial_pane(&pane_dir, cols, rows)
-                .map_err(|e| KohError::failed(format!("seed pane: {e}")))?;
-            let in_fifo = fuxix::fifo(pane_dir.join("in"))
-                .map_err(|e| KohError::failed(format!("mkfifo in: {e}")))?;
-            let ctl_fifo = fuxix::fifo(pane_dir.join("ctl"))
-                .map_err(|e| KohError::failed(format!("mkfifo ctl: {e}")))?;
-            Ok((temp, session_dir, pane_dir, keys_dir, in_fifo, ctl_fifo))
-        })();
-        let (temp, session_dir, pane_dir, keys_dir, in_fifo, ctl_fifo) = match setup {
-            Ok(v) => v,
+            let (session, keys) = (temp.0.join("session"), temp.0.join("keys"));
+            let failed = |e: std::io::Error| KohError::failed(format!("{}: {e}", temp.0.display()));
+            fs::create_dir_all(session.join("connect")).map_err(failed)?;
+            fs::write(session.join("connect/layout"), "* remote focus=remote\n").map_err(failed)?;
+            install_detach_keys(&keys)?;
+            // (The mirror's folder is made here, and is koh's alone to write: what it holds is
+            // what the last whole round left, and nothing else is trusted to be there.)
+            let pane = session.join("connect/remote");
+            let mirror = Mirror::make(&pane).map_err(failed)?;
+            Ok((
+                temp,
+                session,
+                keys,
+                pane,
+                mirror,
+                asks.again(&attached),
+                (send, recv),
+            ))
+        };
+        let (temp, session, keys, pane, mirror, asks, link) = match made.await {
+            Ok(made) => made,
             Err(err) => {
                 self.close().await;
                 return Err(err);
             }
         };
-
-        // (The viewer's FIFO, in the folder it makes for itself in the session.)
-        let view_ctl = session_dir
-            .join(format!(".view.{}", std::process::id()))
-            .join("ctl");
-        let view_exited = Arc::new(AtomicBool::new(false));
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let mount_pane = pane_dir.clone();
-        let mount_view_exited = view_exited.clone();
-        let mut mount_task = tokio::spawn(async move {
-            let res = self
-                .mount_session(
-                    &mount_pane,
-                    MountSpec {
-                        session: opts.session,
-                        new: opts.new,
-                        argv: opts.argv,
-                        cwd: opts.cwd,
-                        cols,
-                        rows,
-                        cell_w,
-                        cell_h,
-                        initial_stream: Some(initial_stream),
-                        preopened_fifos: Some((in_fifo, ctl_fifo)),
-                        view_ctl: Some(view_ctl),
-                        view_exited: Some(mount_view_exited),
-                        cancel: cancel_rx,
-                    },
-                )
-                .await;
-            self.close().await;
-            res
+        // (The viewer's FIFO, in the folder it makes for itself in the session: what is
+        // written there is said in its corner.)
+        let corner = session.join(format!(".view.{}/ctl", std::process::id()));
+        let (stop, stopped) = watch::channel(false);
+        let stop = Arc::new(stop);
+        let (ready, first) = oneshot::channel();
+        let says = Some(corner.clone());
+        // Told to end (its terminal closed, as a rule), koh leaves as if its user had: the
+        // carrying is stopped, which also ends the wait for a first round that has not come;
+        // the viewer, if there is one yet, is told to go; and the private folder goes with
+        // them. (A signal in the moment before this task listens has its own way: koh dies
+        // of it, and a private folder made in that moment stays.)
+        let left = Arc::new(AtomicBool::new(false));
+        let (leaves, viewer, stops) = (left.clone(), corner.clone(), stop.clone());
+        let signals = tokio::spawn(async move {
+            told_to_end().await;
+            leaves.store(true, Ordering::Relaxed);
+            let _ = stops.send(true);
+            quit_viewer(&viewer).await;
         });
-
-        let view_join =
-            tokio::task::spawn_blocking(move || fux::view(session_dir, "connect".into(), keys_dir))
-                .await;
-
-        // Always cancel and reap `mount_task` BEFORE dropping `TempConnectDir`.
-        view_exited.store(true, Ordering::Relaxed);
-        let _ = cancel_tx.send_replace(true);
-        if let Ok(mut ctl) = fuxix::open(pane_dir.join("ctl"), true) {
-            let _ = ctl.write_all(b"kill\n");
-        }
-        let mount_res = match tokio::time::timeout(Duration::from_secs(3), &mut mount_task).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(e)) => Err(KohError::internal(format!("mount task: {e}"))),
-            Err(_) => {
-                mount_task.abort();
-                let _ = mount_task.await;
-                Ok(0)
+        let mut carried = tokio::spawn(async move {
+            let mut client = self;
+            let carried = carry(
+                &mut client,
+                &pane,
+                mirror,
+                asks,
+                link,
+                says,
+                Some(ready),
+                stopped,
+            )
+            .await;
+            // (A server that is not there to hear of the end is not waited for: whoever left
+            // the viewer is at a terminal.)
+            let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
+            carried
+        });
+        // The viewer starts once the mirror has a whole round: it finds a pane, with its FIFOs.
+        let mut ended = None;
+        let viewed = if first.await.is_ok() {
+            let view =
+                tokio::task::spawn_blocking(move || fux::view(session, "connect".into(), keys));
+            tokio::pin!(view);
+            tokio::select! {
+                // The viewer left: its user did, or it could not go on.
+                viewed = &mut view => viewed,
+                // The session ended, or koh cannot go on: the viewer is told to leave, once it
+                // has drawn what there was.
+                carried = &mut carried => {
+                    ended = Some(carried);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    tokio::select! {
+                        viewed = &mut view => viewed,
+                        () = quit_viewer(&corner) => view.await,
+                    }
+                }
             }
+        } else {
+            Ok(Ok(()))
+        };
+        let _ = stop.send(true);
+        let ended = match ended {
+            Some(ended) => ended,
+            None => match tokio::time::timeout(Duration::from_secs(3), &mut carried).await {
+                Ok(ended) => ended,
+                Err(_) => {
+                    carried.abort();
+                    Ok(Ok(0))
+                }
+            },
         };
         drop(temp);
-
-        match view_join {
-            Ok(Ok(())) => mount_res,
-            Ok(Err(msg)) => Err(KohError::failed(msg)),
-            Err(e) => Err(KohError::internal(format!("fux view thread: {e}"))),
+        signals.abort();
+        if left.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
+        match (viewed, ended) {
+            (Ok(Err(why)), _) => Err(KohError::failed(why)),
+            (Err(e), _) => Err(KohError::internal(format!("fux view thread: {e}"))),
+            (_, Err(e)) => Err(KohError::internal(format!("the session's task: {e}"))),
+            (_, Ok(ended)) => ended,
         }
     }
 
-    /// Mirrors a remote `fux`-backed session into a local v1 `fux` pane folder (`in` & `ctl` FIFOs +
-    /// validated screen/picture/clipboard/notice files) so unmodified local `fux view` renders it
-    /// alongside local panes, with automatic reconnect on network drops.
-    pub async fn mount_local_pane(
-        &mut self,
-        session: Option<u32>,
-        local_dir: &Path,
-        cols: u16,
-        rows: u16,
-    ) -> Result<()> {
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
-        let _ = self
-            .mount_session(
-                local_dir,
-                MountSpec {
-                    session,
-                    new: false,
-                    argv: Vec::new(),
-                    cwd: None,
-                    cols,
-                    rows,
-                    cell_w: 10,
-                    cell_h: 20,
-                    initial_stream: None,
-                    preopened_fifos: None,
-                    view_ctl: None,
-                    view_exited: None,
-                    cancel: cancel_rx,
-                },
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn mount_session(&mut self, local_dir: &Path, mut spec: MountSpec) -> Result<i32> {
-        let (in_fifo, ctl_fifo) = match spec.preopened_fifos.take() {
-            Some(pair) => pair,
-            None => {
-                if let Err(e) = fs::create_dir_all(local_dir.join("main")) {
-                    notify_view_quit(spec.view_ctl.as_deref(), spec.view_exited.as_deref()).await;
-                    return Err(KohError::failed(format!(
-                        "mkdir {}: {e}",
-                        local_dir.display()
-                    )));
-                }
-                let in_fifo = match fuxix::fifo(local_dir.join("in")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        notify_view_quit(spec.view_ctl.as_deref(), spec.view_exited.as_deref())
-                            .await;
-                        return Err(KohError::failed(format!("mkfifo in: {e}")));
-                    }
-                };
-                let ctl_fifo = match fuxix::fifo(local_dir.join("ctl")) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        notify_view_quit(spec.view_ctl.as_deref(), spec.view_exited.as_deref())
-                            .await;
-                        return Err(KohError::failed(format!("mkfifo ctl: {e}")));
-                    }
-                };
-                (in_fifo, ctl_fifo)
+    /// `koh mount`: a mirror of a session in `place`, or with none in koh's own fux session on
+    /// this machine (`K/fux/koh-mounts/SERVER.NAME`), for any `fux view`, `cat` or script to
+    /// look at and write to, until the session ends or koh is stopped (SIGINT, SIGTERM, or
+    /// SIGHUP as from a terminal that is closed). koh
+    /// makes the folder (one that is there is not taken) and removes it when the mount ends.
+    pub async fn mount(
+        self,
+        opts: ConnectOptions,
+        place: Option<PathBuf>,
+        server: &str,
+    ) -> Result<i32> {
+        let asks = opts.asks(80, 24);
+        let not_made = |dir: &Path, e: std::io::Error| {
+            let why = "koh makes a mirror's folder, and takes none that is there";
+            KohError::failed(format!("{}: {e} ({why})", dir.display()))
+        };
+        let made = async {
+            // (A place that is taken is said before anything is asked of the server.)
+            if let Some(dir) = place
+                .as_ref()
+                .filter(|dir| fs::symlink_metadata(dir).is_ok())
+            {
+                return Err(not_made(dir, std::io::ErrorKind::AlreadyExists.into()));
+            }
+            let (send, recv, attached) = self.attach(&asks).await.map_err(|(_, e)| e)?;
+            let dir = match place {
+                Some(dir) => dir,
+                None => default_mount(server, &attached.name)?,
+            };
+            // (Made here, and koh's alone to write from here on: see `connect_interactive`.)
+            let mirror = Mirror::make(&dir).map_err(|e| not_made(&dir, e))?;
+            Ok((dir, mirror, asks.again(&attached), (send, recv)))
+        };
+        let (dir, mirror, asks, link) = match made.await {
+            Ok(made) => made,
+            Err(err) => {
+                self.close().await;
+                return Err(err);
             }
         };
+        let _ = writeln!(
+            std::io::stderr(),
+            "mirroring remote session at {}",
+            dir.display()
+        );
+        let (stop, stopped) = watch::channel(false);
+        let signals = tokio::spawn(async move {
+            told_to_end().await;
+            let _ = stop.send(true);
+        });
+        let mut client = self;
+        let carried = carry(&mut client, &dir, mirror, asks, link, None, None, stopped).await;
+        signals.abort();
+        let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
+        let _ = fs::remove_dir_all(&dir);
+        carried
+    }
+}
 
-        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<ClientEvent>(64);
-        let pane_path = local_dir.to_path_buf();
+/// What an attach gives: the stream and what the server said of the session; or what went
+/// wrong, and whether that is the last word.
+type Attaching = std::result::Result<(SendStream, RecvStream, Attached), (bool, KohError)>;
+
+impl ConnectOptions {
+    /// A first attach as these options ask it, for a terminal of this size. (The client's
+    /// number is chosen here, once.)
+    fn asks(self, cols: u16, rows: u16) -> Attach {
+        Attach {
+            format: fux::FORMAT,
+            name: self.session,
+            new: self.new,
+            cols,
+            rows,
+            argv: self.argv,
+            cwd: self.cwd,
+            run: None,
+            client: RandomState::new().hash_one(std::process::id()),
+        }
+    }
+}
+
+impl Attach {
+    /// Every later attach of the client that was answered `attached`: to that run of that
+    /// name, and to nothing else.
+    fn again(&self, attached: &Attached) -> Attach {
+        Attach {
+            name: Some(attached.name.clone()),
+            new: false,
+            argv: Vec::new(),
+            cwd: None,
+            run: Some(attached.run),
+            ..self.clone()
+        }
+    }
+}
+
+/// Where `koh mount` puts a mirror it is given no place for: in a workspace of a fux session
+/// of koh's own on this machine, under the server's name and the session's (a pane's kind of
+/// name, so a viewer of that workspace shows it).
+fn default_mount(server: &str, session: &str) -> Result<PathBuf> {
+    let var = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+    let koh = var("XDG_RUNTIME_DIR")
+        .map(|dir| PathBuf::from(dir).join("koh"))
+        .or_else(|| var("HOME").map(|dir| PathBuf::from(dir).join(".cache/koh")));
+    let Some(koh) = koh else {
+        return Err(KohError::failed(
+            "no place for a mirror: neither XDG_RUNTIME_DIR nor HOME is set (name a directory: koh mount SERVER DIR)",
+        ));
+    };
+    let mounts = koh.join("fux").join("koh-mounts");
+    let made = DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&mounts);
+    made.map_err(|e| KohError::failed(format!("{}: {e}", mounts.display())))?;
+    let letters = |c: char| {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            c
+        } else {
+            '_'
+        }
+    };
+    // (A pane's name is 64 characters at most: the server's part is cut to fit, and with no
+    // room for any of it the name is the session's own.)
+    let room = 63usize.saturating_sub(session.len());
+    let server: String = server.chars().map(letters).take(room).collect();
+    Ok(mounts.join(match server.is_empty() {
+        true => session.to_string(),
+        false => format!("{server}.{session}"),
+    }))
+}
+
+/// What was written to a mirror's two FIFOs and no link has taken whole yet.
+struct Typed {
+    /// Typed bytes, in their order.
+    bytes: Vec<u8>,
+    /// The last line of `ctl` that asked for a size.
+    asked: Option<Vec<u8>>,
+    /// A line of `ctl` that has not ended yet.
+    line: Vec<u8>,
+    /// What the thread that reads the two FIFOs hands over: bytes of `in` (false) or of `ctl`.
+    read: mpsc::UnboundedReceiver<(bool, Vec<u8>)>,
+    /// How many typed bytes were read and no stream has taken: with `MAX_HELD` of them `in` is
+    /// read no more, its pipe fills, and whoever writes to it waits.
+    held: Arc<AtomicUsize>,
+}
+
+/// A line of `ctl` is 1,280 bytes at most, as fux has it: a longer one is dropped.
+const CTL_LINE: usize = 1280;
+
+impl Typed {
+    /// Starts the one thread that reads the mirror's two FIFOs, link or no link, for as long
+    /// as what it reads is taken from it. It waits on them as fux does on a pane's (`poll`).
+    fn of(mirror: Arc<Mutex<Mirror>>) -> Typed {
+        let (read, taken) = mpsc::unbounded_channel();
+        let held = Arc::new(AtomicUsize::new(0));
+        let counted = held.clone();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let mut ctl_buf: Vec<u8> = Vec::new();
-            let mut ctl_discard = false;
-            loop {
-                if !pane_path.join("in").exists() {
-                    let _ = ev_tx.blocking_send(ClientEvent::Detach);
+            let mut buffer = [0u8; 4096];
+            while !read.is_closed() {
+                // (The FIFOs the mirror has now: a round makes them, and a round removes them.)
+                let [input, ctl] = {
+                    let mirror = mirror.lock().unwrap_or_else(PoisonError::into_inner);
+                    ["in", "ctl"]
+                        .map(|name| mirror.fifo(name).and_then(|fifo| fifo.try_clone().ok()))
+                };
+                let room = MAX_HELD.saturating_sub(counted.load(Ordering::Relaxed));
+                let wanted = [input.as_ref().filter(|_| room > 0), ctl.as_ref()];
+                let fifos = wanted.map(|fifo| (fifo.map(|fifo| fifo.as_fd()), fuxix::POLLIN));
+                // (With no room it looks again soon: a stream may have taken some.)
+                let Ok(ready) = fuxix::wait(fifos, if room > 0 { 50 } else { 5 }) else {
                     break;
-                }
-                let ready = fuxix::wait(
-                    [
-                        (Some(in_fifo.as_fd()), fuxix::POLLIN),
-                        (Some(ctl_fifo.as_fd()), fuxix::POLLIN),
-                    ],
-                    50,
-                );
-                let Ok([in_ev, ctl_ev]) = ready else { break };
-                if in_ev != 0
-                    && let Ok(n @ 1..) = (&in_fifo).read(&mut buf)
-                    && let Some(slice) = buf.get(..n)
-                    && ev_tx
-                        .blocking_send(ClientEvent::Input(slice.to_vec()))
-                        .is_err()
-                {
-                    break;
-                }
-                if ctl_ev != 0
-                    && let Ok(n @ 1..) = (&ctl_fifo).read(&mut buf)
-                    && let Some(mut rem) = buf.get(..n)
-                {
-                    while !rem.is_empty() {
-                        if ctl_discard {
-                            if let Some(nl) = rem.iter().position(|&b| b == b'\n') {
-                                ctl_discard = false;
-                                rem = rem.get(nl + 1..).unwrap_or_default();
-                            } else {
-                                break;
-                            }
-                            continue;
-                        }
-                        if let Some(nl) = rem.iter().position(|&b| b == b'\n') {
-                            let part = rem.get(..nl).unwrap_or_default();
-                            rem = rem.get(nl + 1..).unwrap_or_default();
-                            if ctl_buf.len().saturating_add(part.len()) > CTL_LINE_MAX {
-                                ctl_buf.clear();
-                                continue;
-                            }
-                            ctl_buf.extend_from_slice(part);
-                            let line = String::from_utf8_lossy(&ctl_buf).trim().to_string();
-                            ctl_buf.clear();
-                            let mut words = line.split_whitespace();
-                            if words.next() == Some("resize")
-                                && let (Some(c), Some(r)) = (
-                                    words.next().and_then(|s| s.parse::<u16>().ok()),
-                                    words.next().and_then(|s| s.parse::<u16>().ok()),
-                                )
-                            {
-                                let cw = words
-                                    .next()
-                                    .and_then(|s| s.parse::<u16>().ok())
-                                    .unwrap_or(0);
-                                let ch = words
-                                    .next()
-                                    .and_then(|s| s.parse::<u16>().ok())
-                                    .unwrap_or(0);
-                                let _ = ev_tx.blocking_send(ClientEvent::Resize {
-                                    cols: c,
-                                    rows: r,
-                                    cell_w: cw,
-                                    cell_h: ch,
-                                });
-                            } else if line == "kill" {
-                                let _ = ev_tx.blocking_send(ClientEvent::Detach);
-                                return;
-                            }
-                        } else if ctl_buf.len().saturating_add(rem.len()) > CTL_LINE_MAX {
-                            ctl_buf.clear();
-                            ctl_discard = true;
-                            break;
-                        } else {
-                            ctl_buf.extend_from_slice(rem);
-                            break;
-                        }
+                };
+                for ((fifo, lined), ready) in wanted.into_iter().zip([false, true]).zip(ready) {
+                    let most = if lined {
+                        buffer.len()
+                    } else {
+                        room.min(buffer.len())
+                    };
+                    let into = buffer.get_mut(..most).unwrap_or_default();
+                    let got = fifo.filter(|_| ready != 0).map(|mut fifo| fifo.read(into));
+                    if let Some(Ok(n @ 1..)) = got {
+                        counted.fetch_add(if lined { 0 } else { n }, Ordering::Relaxed);
+                        let _ = read.send((lined, buffer.get(..n).unwrap_or_default().to_vec()));
                     }
                 }
             }
         });
-
-        let (mut cur_cols, mut cur_rows, mut cur_cw, mut cur_ch) =
-            (spec.cols, spec.rows, spec.cell_w, spec.cell_h);
-        let mut active_session = spec.session;
-        let mut initial_attach = spec.initial_stream.is_none();
-        let mut generation = 2u64;
-        let mut written_pics: BTreeMap<u32, (PictureKind, usize)> = BTreeMap::new();
-        let mut buffered_input = Vec::new();
-        let mut current_frame: Option<ScreenFrame> = None;
-        let mut exit_code = 0i32;
-
-        let session_root = local_dir
-            .parent()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf);
-        let mut last_colours_stamp: Option<FileStamp> = None;
-        let mut last_keyboard_stamp: Option<FileStamp> = None;
-        let mut last_colours_text = String::new();
-        let mut last_keyboard_flags: Option<u8> = None;
-
-        'mount: loop {
-            if *spec.cancel.borrow() {
-                break 'mount;
-            }
-            let (mut send, recv) = if let Some(pair) = spec.initial_stream.take() {
-                pair
-            } else {
-                let attach_req = Request::Attach {
-                    session: active_session,
-                    new: initial_attach && spec.new,
-                    cols: cur_cols,
-                    rows: cur_rows,
-                    cell_w: cur_cw,
-                    cell_h: cur_ch,
-                    argv: if initial_attach {
-                        spec.argv.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    cwd: if initial_attach {
-                        spec.cwd.clone()
-                    } else {
-                        None
-                    },
-                };
-                let req_res = tokio::select! {
-                    _ = spec.cancel.changed() => {
-                        if *spec.cancel.borrow() {
-                            break 'mount;
-                        }
-                        continue 'mount;
-                    }
-                    res = self.request(&attach_req) => res,
-                };
-                match req_res {
-                    Ok(pair) => {
-                        initial_attach = false;
-                        pair
-                    }
-                    Err(err) if is_fatal_attach_err(&err) || initial_attach => {
-                        notify_view_quit(spec.view_ctl.as_deref(), spec.view_exited.as_deref())
-                            .await;
-                        let _ = fs::remove_file(local_dir.join("in"));
-                        let _ = fs::remove_file(local_dir.join("ctl"));
-                        return Err(err);
-                    }
-                    Err(_) => {
-                        write_mirrored_state(local_dir, "reconnecting", &mut generation);
-                        if !reconnect_wait(
-                            self,
-                            &mut ev_rx,
-                            &mut spec.cancel,
-                            &mut cur_cols,
-                            &mut cur_rows,
-                            &mut cur_cw,
-                            &mut cur_ch,
-                            &mut buffered_input,
-                        )
-                        .await?
-                        {
-                            break 'mount;
-                        }
-                        continue 'mount;
-                    }
-                }
-            };
-
-            // Forward host colours / Kitty keyboard flags already written by `fux view`.
-            sync_viewer_told(
-                session_root.as_deref(),
-                &mut last_colours_stamp,
-                &mut last_keyboard_stamp,
-                &mut last_colours_text,
-                &mut last_keyboard_flags,
-                true,
-                &mut send,
-            )
-            .await;
-
-            // Flush any FIFO input that arrived while reconnecting so writes to `in` are never lost.
-            if !buffered_input.is_empty() {
-                let bytes = std::mem::take(&mut buffered_input);
-                if send_msg(&mut send, &ClientEvent::Input(bytes.clone()), MAX_CHUNK)
-                    .await
-                    .is_err()
-                {
-                    push_bounded(&mut buffered_input, &bytes, RECONNECT_INPUT_BUFFER_MAX);
-                    write_mirrored_state(local_dir, "reconnecting", &mut generation);
-                    if !reconnect_wait(
-                        self,
-                        &mut ev_rx,
-                        &mut spec.cancel,
-                        &mut cur_cols,
-                        &mut cur_rows,
-                        &mut cur_cw,
-                        &mut cur_ch,
-                        &mut buffered_input,
-                    )
-                    .await?
-                    {
-                        break 'mount;
-                    }
-                    continue 'mount;
-                }
-            }
-
-            current_frame = None;
-            let mut server_rx = spawn_msg_reader::<ServerEvent>(recv, MAX_FRAME);
-            let mut told_tick = tokio::time::interval(Duration::from_millis(50));
-
-            loop {
-                tokio::select! {
-                    _ = spec.cancel.changed() => {
-                        if *spec.cancel.borrow() {
-                            let _ = tokio::time::timeout(
-                                Duration::from_millis(200),
-                                send_msg(&mut send, &ClientEvent::Detach, MAX_CTRL),
-                            )
-                            .await;
-                            break 'mount;
-                        }
-                    }
-                    msg = server_rx.recv() => {
-                        match msg {
-                            Some(Ok(ServerEvent::Picture(blob))) => {
-                                if blob.bytes.len() <= PICTURE_MAX {
-                                    while written_pics.len() >= PICTURE_CACHE_MAX_COUNT
-                                        || written_pics
-                                            .values()
-                                            .map(|(_, n)| *n)
-                                            .sum::<usize>()
-                                            .saturating_add(blob.bytes.len())
-                                            > PICTURE_CACHE_MAX_BYTES
-                                    {
-                                        let Some((old_id, (old_kind, _))) = written_pics.pop_first()
-                                        else {
-                                            break;
-                                        };
-                                        let _ = fs::remove_file(
-                                            local_dir.join(format!("pic-{old_id}.{}", old_kind.ext())),
-                                        );
-                                    }
-                                    let name = format!("pic-{}.{}", blob.id, blob.kind.ext());
-                                    let _ = atomic_write(&local_dir.join(name), &blob.bytes);
-                                    written_pics.insert(blob.id, (blob.kind, blob.bytes.len()));
-                                }
-                            }
-                            Some(Ok(ServerEvent::Full(mut frame))) => {
-                                frame.clamp_bounds();
-                                active_session = Some(frame.session_id);
-                                let done = frame.state != "running";
-                                let done_exit = frame.exit.unwrap_or(0);
-                                write_mirrored_pane(local_dir, &frame, &mut generation, &mut written_pics);
-                                current_frame = Some(frame);
-                                if done {
-                                    exit_code = done_exit;
-                                    // Brief settle so embedded `fux::view` flushes final frame/clipboard/notice.
-                                    if spec.view_ctl.is_some() {
-                                        tokio::time::sleep(Duration::from_millis(80)).await;
-                                    }
-                                    break 'mount;
-                                }
-                            }
-                            Some(Ok(ServerEvent::Delta(delta))) => {
-                                if let Some(frame) = current_frame.as_mut() {
-                                    let _ = frame.apply_delta(delta);
-                                    active_session = Some(frame.session_id);
-                                    let done = frame.state != "running";
-                                    let done_exit = frame.exit.unwrap_or(0);
-                                    write_mirrored_pane(local_dir, frame, &mut generation, &mut written_pics);
-                                    if done {
-                                        exit_code = done_exit;
-                                        if spec.view_ctl.is_some() {
-                                            tokio::time::sleep(Duration::from_millis(80)).await;
-                                        }
-                                        break 'mount;
-                                    }
-                                }
-                            }
-                            Some(Err(_)) | None => break,
-                        }
-                    }
-                    ev = ev_rx.recv() => {
-                        match ev {
-                            Some(ClientEvent::Detach) | None => {
-                                let _ = send_msg(&mut send, &ClientEvent::Detach, MAX_CTRL).await;
-                                break 'mount;
-                            }
-                            Some(ClientEvent::Resize { cols, rows, cell_w, cell_h }) => {
-                                cur_cols = cols;
-                                cur_rows = rows;
-                                if cell_w > 0 && cell_h > 0 {
-                                    cur_cw = cell_w;
-                                    cur_ch = cell_h;
-                                }
-                                if send_msg(
-                                    &mut send,
-                                    &ClientEvent::Resize { cols, rows, cell_w, cell_h },
-                                    MAX_CHUNK,
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Some(ClientEvent::Input(bytes)) => {
-                                if send_msg(&mut send, &ClientEvent::Input(bytes.clone()), MAX_CHUNK)
-                                    .await
-                                    .is_err()
-                                {
-                                    push_bounded(&mut buffered_input, &bytes, RECONNECT_INPUT_BUFFER_MAX);
-                                    break;
-                                }
-                            }
-                            Some(other) => {
-                                if send_msg(&mut send, &other, MAX_CHUNK).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    _ = told_tick.tick() => {
-                        sync_viewer_told(
-                            session_root.as_deref(),
-                            &mut last_colours_stamp,
-                            &mut last_keyboard_stamp,
-                            &mut last_colours_text,
-                            &mut last_keyboard_flags,
-                            false,
-                            &mut send,
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            write_mirrored_state(local_dir, "reconnecting", &mut generation);
-            if !reconnect_wait(
-                self,
-                &mut ev_rx,
-                &mut spec.cancel,
-                &mut cur_cols,
-                &mut cur_rows,
-                &mut cur_cw,
-                &mut cur_ch,
-                &mut buffered_input,
-            )
-            .await?
-            {
-                break 'mount;
-            }
+        Typed {
+            bytes: Vec::new(),
+            asked: None,
+            line: Vec::new(),
+            read: taken,
+            held,
         }
-        let _ = current_frame;
-        // Always signal embedded `fux::view` to exit on EVERY mount termination path.
-        notify_view_quit(spec.view_ctl.as_deref(), spec.view_exited.as_deref()).await;
-        let _ = fs::remove_file(local_dir.join("in"));
-        let _ = fs::remove_file(local_dir.join("ctl"));
-        Ok(exit_code)
+    }
+
+    /// A message the stream has taken whole: what it carried is held no more. Says how many
+    /// typed bytes those were.
+    fn taken(&mut self, message: FromMirror) -> usize {
+        match message {
+            FromMirror::Write { name, bytes } if name == "in" => {
+                let typed = bytes.len().min(self.bytes.len());
+                self.bytes.drain(..typed);
+                self.held.fetch_sub(typed, Ordering::Relaxed);
+                typed
+            }
+            FromMirror::Write { bytes, .. } => {
+                self.asked.take_if(|asked| *asked == bytes);
+                0
+            }
+            _ => 0,
+        }
+    }
+
+    /// Waits for what was written to one of the mirror's FIFOs: typed bytes are kept; the
+    /// lines of `ctl` that ended are given.
+    async fn typing(&mut self) -> Vec<Vec<u8>> {
+        match self.read.recv().await {
+            Some((false, bytes)) => self.bytes.extend(bytes),
+            Some((true, bytes)) => {
+                let lines = fux::lines(&mut self.line, &bytes, CTL_LINE);
+                let lines = lines.into_iter().flatten();
+                return lines.map(|line| format!("{line}\n").into_bytes()).collect();
+            }
+            None => std::future::pending().await,
+        }
+        Vec::new()
     }
 }
 
-type FileStamp = (u64, i64, i64, u64);
-
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let m = fs::metadata(path).ok()?;
-    Some((m.ino(), m.mtime(), m.mtime_nsec(), m.len()))
+/// Something done to the mirror, on the blocking pool: its files are read and written there.
+async fn with<T: Send + 'static>(
+    mirror: &Arc<Mutex<Mirror>>,
+    work: impl FnOnce(&mut Mirror) -> T + Send + 'static,
+) -> Result<T> {
+    let mirror = mirror.clone();
+    let work = move || work(&mut mirror.lock().unwrap_or_else(PoisonError::into_inner));
+    let done = tokio::task::spawn_blocking(work).await;
+    done.map_err(|e| KohError::internal(format!("the mirror's work: {e}")))
 }
 
-async fn sync_viewer_told(
-    session_root: Option<&Path>,
-    last_colours_stamp: &mut Option<FileStamp>,
-    last_keyboard_stamp: &mut Option<FileStamp>,
-    last_colours_text: &mut String,
-    last_keyboard_flags: &mut Option<u8>,
-    force_resend: bool,
-    send: &mut SendStream,
-) {
-    if let Some(root) = session_root {
-        let colours_path = root.join("colours");
-        let stamp = file_stamp(&colours_path);
-        if stamp.is_some() && stamp != *last_colours_stamp {
-            *last_colours_stamp = stamp;
-            if let Ok(text) = fs::read_to_string(&colours_path)
-                && !text.is_empty()
-                && text.len() <= (16 << 10)
-            {
-                *last_colours_text = text;
-                let _ = send_msg(
-                    send,
-                    &ClientEvent::Colours(last_colours_text.clone()),
-                    MAX_CTRL,
-                )
-                .await;
+/// A line for whoever looks at the session: in the corner of koh's viewer (a line to its
+/// FIFO), or with no viewer on standard error.
+fn say(corner: Option<&Path>, line: &str) {
+    match corner {
+        Some(ctl) => {
+            if let Ok(mut ctl) = fuxix::open(ctl, true) {
+                let _ = ctl.write_all(format!("{line}\n").as_bytes());
             }
-        } else if force_resend && !last_colours_text.is_empty() {
-            let _ = send_msg(
-                send,
-                &ClientEvent::Colours(last_colours_text.clone()),
-                MAX_CTRL,
-            )
-            .await;
         }
+        None => _ = writeln!(std::io::stderr(), "koh: {line}"),
+    }
+}
 
-        let kb_path = root.join("keyboard");
-        let kb_stamp = file_stamp(&kb_path);
-        if kb_stamp.is_some() && kb_stamp != *last_keyboard_stamp {
-            *last_keyboard_stamp = kb_stamp;
-            if let Ok(text) = fs::read_to_string(&kb_path)
-                && let Ok(flags) = text.trim().parse::<u8>()
-            {
-                *last_keyboard_flags = Some(flags);
-                let _ = send_msg(send, &ClientEvent::Keyboard(flags), MAX_CTRL).await;
+/// What became of a link.
+enum Link {
+    /// The server said that nothing follows: the session is over.
+    Ended,
+    /// The client was told to stop.
+    Stopped,
+    /// The transport ended, a round stood still, or the mirror could not be written.
+    Broken,
+}
+
+/// Carries a session into its mirror `dir` over one link after another, until the session
+/// ends (its program's status), the client is stopped (0) or the server says a last word.
+/// `asks` is what each new attach asks; `ready` is told when the mirror has its first whole
+/// round. Without a link, what is typed is held and the mirror is as its last round left it.
+#[allow(clippy::too_many_arguments)]
+async fn carry(
+    client: &mut Client,
+    dir: &Path,
+    mirror: Mirror,
+    asks: Attach,
+    first: (SendStream, RecvStream),
+    corner: Option<PathBuf>,
+    mut ready: Option<oneshot::Sender<()>>,
+    mut stop: watch::Receiver<bool>,
+) -> Result<i32> {
+    let (mirror, corner) = (Arc::new(Mutex::new(mirror)), corner.as_deref());
+    let (mut typed, mut link) = (Typed::of(mirror.clone()), Some(first));
+    loop {
+        let (send, recv) = match link.take() {
+            Some(link) => link,
+            None => match away(client, &asks, &mut typed, corner, &mut stop).await? {
+                Some(link) => link,
+                None => return Ok(0),
+            },
+        };
+        let told = dir.parent().and_then(Path::parent);
+        match linked(
+            &mirror, send, recv, &mut typed, told, corner, &mut ready, &mut stop,
+        )
+        .await?
+        {
+            Link::Stopped => return Ok(0),
+            Link::Broken => with(&mirror, Mirror::discard).await?,
+            // The exit code is the program's, from the mirror's `state`; and never 0 where
+            // that does not say the program exited with it.
+            Link::Ended => {
+                let mut state = String::new();
+                let file = fuxix::open_regular(dir.join("state"));
+                let _ = file.map(|file| file.take(64).read_to_string(&mut state));
+                let mut words = state.split_whitespace();
+                let code = words
+                    .next()
+                    .zip(words.next().and_then(|n| n.parse::<u8>().ok()));
+                return match code {
+                    Some(("exited", code)) => Ok(i32::from(code)),
+                    Some(("killed", signal)) => Ok(128 + i32::from(signal)),
+                    _ => Err(KohError::failed("the session ended without saying how")),
+                };
             }
-        } else if force_resend && let Some(flags) = *last_keyboard_flags {
-            let _ = send_msg(send, &ClientEvent::Keyboard(flags), MAX_CTRL).await;
         }
     }
 }
 
-async fn notify_view_quit(view_ctl: Option<&Path>, view_exited: Option<&AtomicBool>) {
-    let Some(ctl) = view_ctl else { return };
+/// Without a link: says so, tries again after today's delays (0.2, 0.5, 1, 2, then 5 s), and
+/// reads the mirror's FIFOs meanwhile. Typed bytes are held; of `ctl` only the last line that asks for
+/// a size is, and any other line is dropped, which is said. Gives the new link, or none if
+/// the client was stopped; the server's last word ends the client.
+async fn away(
+    client: &mut Client,
+    asks: &Attach,
+    typed: &mut Typed,
+    corner: Option<&Path>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Option<(SendStream, RecvStream)>> {
+    let since = Instant::now();
+    // (Said again each second: a viewer's corner is cleared by the next key.)
+    let mut said = tokio::time::interval(Duration::from_secs(1));
+    for tries in 0u32.. {
+        let attempt = async {
+            tokio::time::sleep(reconnect_delay(tries)).await;
+            client.attach_again(asks).await
+        };
+        tokio::pin!(attempt);
+        let attached = loop {
+            tokio::select! {
+                _ = stop.changed() => return Ok(None),
+                attached = &mut attempt => break attached,
+                _ = said.tick() => {
+                    let held = "what is typed is held";
+                    match since.elapsed().as_secs() {
+                        0 => say(corner, &format!("no link: {held}")),
+                        secs => say(corner, &format!("no link for {secs} s: {held}")),
+                    }
+                }
+                lines = typed.typing() => for line in lines {
+                    match line.starts_with(b"resize ") {
+                        true => typed.asked = Some(line),
+                        false => say(corner, "no link: a line written to ctl was dropped"),
+                    }
+                },
+            }
+        };
+        match attached {
+            Ok((send, recv, _)) => {
+                say(corner, "the link is back");
+                return Ok(Some((send, recv)));
+            }
+            Err((true, e)) => {
+                let lost = match typed.bytes.len() {
+                    0 => String::new(),
+                    n => format!(" ({n} typed bytes were not sent)"),
+                };
+                return Err(KohError::new(
+                    e.code,
+                    e.kind,
+                    format!("{}{lost}", e.message),
+                ));
+            }
+            Err((false, _)) => {}
+        }
+    }
+    Ok(None)
+}
+
+/// One link, from the mirror's list to the link's end. What the server sends is a round's
+/// messages, held beside the mirror until the round is whole. What is written to the
+/// mirror's FIFOs is sent as it is read, and forgotten when the stream has taken all of its
+/// message: what it did not take whole is kept for the next link, and nothing is sent twice.
+#[allow(clippy::too_many_arguments)]
+async fn linked(
+    mirror: &Arc<Mutex<Mirror>>,
+    mut send: SendStream,
+    recv: RecvStream,
+    typed: &mut Typed,
+    told: Option<&Path>,
+    corner: Option<&Path>,
+    ready: &mut Option<oneshot::Sender<()>>,
+    stop: &mut watch::Receiver<bool>,
+) -> Result<Link> {
+    let list = with(mirror, Mirror::has).await?;
+    let list = list.map_err(|e| KohError::failed(format!("the mirror cannot be read: {e}")))?;
+    let mut from = spawn_msg_reader::<ToMirror>(recv, MAX_CHUNK);
+    // What is sent goes through one writer, a message at a time, which gives each back once
+    // the stream has taken all of it: a round is applied while typed bytes wait for the link.
+    let (out, mut queue) = mpsc::channel::<FromMirror>(1);
+    let (taken, mut took) = mpsc::unbounded_channel::<FromMirror>();
+    let writer = async move {
+        while let Some(message) = queue.recv().await {
+            let sent = send_msg(&mut send, &message, MAX_CHUNK).await;
+            if sent.is_err() || taken.send(message).is_err() {
+                break;
+            }
+        }
+    };
+    tokio::pin!(writer);
+    // First the list; then the size that was asked for while away; then what was typed.
+    let ctl = |bytes: Vec<u8>| FromMirror::Write {
+        name: "ctl".into(),
+        bytes,
+    };
+    let mut waits = VecDeque::from([FromMirror::Has(list)]);
+    waits.extend(typed.asked.clone().map(ctl));
+    // How many of the typed bytes the writer has been handed; when the open round is thrown
+    // away; and what the viewer here last wrote of its terminal.
+    let (mut offered, mut due, mut seen) = (0, None::<Instant>, [None, None]);
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let link = loop {
+        let more = !waits.is_empty() || offered < typed.bytes.len();
+        tokio::select! {
+            _ = stop.changed() => break Ok(Link::Stopped),
+            () = &mut writer => break Ok(Link::Broken),
+            permit = out.reserve(), if more => {
+                let Ok(permit) = permit else { break Ok(Link::Broken) };
+                let message = waits.pop_front().unwrap_or_else(|| {
+                    let piece = typed.bytes.get(offered..).unwrap_or_default();
+                    let piece = piece.get(..piece.len().min(MAX_TYPED)).unwrap_or_default();
+                    offered += piece.len();
+                    FromMirror::Write { name: "in".into(), bytes: piece.to_vec() }
+                });
+                permit.send(message);
+            }
+            Some(message) = took.recv() => offered = offered.saturating_sub(typed.taken(message)),
+            message = from.recv() => {
+                let message = match message {
+                    Some(Ok(message)) => message,
+                    // A message over its bound, or none that is known: refused, as one that
+                    // the mirror refuses. Anything else is the transport's end.
+                    Some(Err(e)) if e.code == Exit::FAILED => break Err(refused(&e.message)),
+                    _ => break Ok(Link::Broken),
+                };
+                let done = message == ToMirror::Done;
+                let take = move |mirror: &mut Mirror| (mirror.take(message, Instant::now()), mirror.due());
+                let (taken, until) = with(mirror, take).await?;
+                due = until;
+                match taken {
+                    Ok(true) => break Ok(Link::Ended),
+                    Ok(false) if done => _ = ready.take().map(|ready| ready.send(())),
+                    Ok(false) => {}
+                    Err(Fault::Refused(what)) => break Err(refused(&what)),
+                    Err(Fault::Failed(what)) => {
+                        say(corner, &format!("the mirror was not written: {what}"));
+                        break Ok(Link::Broken);
+                    }
+                }
+            }
+            lines = typed.typing() => for line in lines {
+                if line.starts_with(b"resize ") {
+                    typed.asked = Some(line.clone());
+                }
+                waits.push_back(ctl(line));
+            },
+            // An open round that stands still is the transport's end.
+            () = async { tokio::time::sleep_until(due.unwrap_or_else(Instant::now).into()).await }, if due.is_some() => {
+                break Ok(Link::Broken);
+            }
+            // What the viewer here wrote of its terminal, at each attach and when it changes.
+            _ = tick.tick() => for (name, seen) in ["colours", "keyboard"].into_iter().zip(&mut seen) {
+                let Some(file) = told.map(|session| session.join(name)) else { continue };
+                let stamp = fs::metadata(&file).ok().filter(|file| file.is_file()).map(fux::stamp);
+                // (Read when it is a file and another than was read, as fux's holder reads
+                // it: without waiting, and no more than a message holds.)
+                if stamp.is_some() && stamp != *seen {
+                    let mut bytes = Vec::new();
+                    let read = fuxix::open(&file, false).map(|file| file.take(MAX_TYPED as u64 + 1).read_to_end(&mut bytes));
+                    if matches!(read, Ok(Ok(_))) && bytes.len() <= MAX_TYPED {
+                        waits.push_back(FromMirror::Told { name: name.into(), bytes });
+                    }
+                }
+                *seen = stamp;
+            },
+        }
+    };
+    // Every way out to another link takes what the writer says the stream took before any of
+    // it is offered again: what a stream took is never sent again. (The one way out that
+    // takes nothing, a mirror whose work could not be done, ends the client.)
+    while let Ok(message) = took.try_recv() {
+        typed.taken(message);
+    }
+    link
+}
+
+/// What a client is told that comes again to a name another run has by now.
+fn another_run(name: &str) -> KohError {
+    let why = format!("another run has the session's name {name}: nothing is typed into it");
+    KohError::new(Exit::NOT_FOUND, "not_found", why)
+}
+
+/// Waits until this process is told to end: interrupted, terminated, or hung up, as a terminal
+/// that is closed hangs up what runs in it.
+async fn told_to_end() {
+    let told = |kind| async move {
+        match signal(kind) {
+            Ok(mut told) => _ = told.recv().await,
+            Err(_) => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        () = told(SignalKind::interrupt()) => {}
+        () = told(SignalKind::terminate()) => {}
+        () = told(SignalKind::hangup()) => {}
+    }
+}
+
+/// A message no server may send ends the client, saying which. Nothing was changed by it.
+fn refused(what: &str) -> KohError {
+    KohError::failed(format!(
+        "the server sent what a mirror does not take: {what}"
+    ))
+}
+
+/// Tells koh's viewer to leave, once its FIFO is there to be told.
+async fn quit_viewer(ctl: &Path) {
     for _ in 0..200 {
-        if view_exited.is_some_and(|v| v.load(Ordering::Relaxed)) {
-            return;
-        }
-        if let Ok(mut f) = fuxix::open(ctl, true)
-            && f.write_all(b"quit\n").is_ok()
+        if let Ok(mut ctl) = fuxix::open(ctl, true)
+            && ctl.write_all(b"quit\n").is_ok()
         {
             return;
         }
@@ -1183,35 +1201,6 @@ fn install_detach_keys(keys_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn seed_initial_pane(pane_dir: &Path, cols: u16, rows: u16) -> std::io::Result<()> {
-    let main_dir = pane_dir.join("main");
-    fs::create_dir_all(&main_dir)?;
-    let empty = "\n".repeat(usize::from(rows));
-    atomic_write(&main_dir.join("screen"), empty.as_bytes())?;
-    atomic_write(&main_dir.join("screen.styled"), empty.as_bytes())?;
-    atomic_write(&main_dir.join("lines"), b"0\n\n")?;
-    atomic_write(&main_dir.join("links"), b"")?;
-    atomic_write(&main_dir.join("pictures"), b"")?;
-    let tmp_link = pane_dir.join(".shown.new");
-    let _ = fs::remove_file(&tmp_link);
-    symlink("main", &tmp_link)?;
-    fs::rename(&tmp_link, pane_dir.join("shown"))?;
-    atomic_write(
-        &pane_dir.join("size"),
-        format!("{cols} {rows}\n").as_bytes(),
-    )?;
-    atomic_write(&pane_dir.join("cursor"), b"0 0 shown 0\n")?;
-    atomic_write(&pane_dir.join("modes"), b"\n")?;
-    atomic_write(&pane_dir.join("marks"), b"")?;
-    atomic_write(&pane_dir.join("state"), b"running\n")?;
-    atomic_write(&pane_dir.join("generation"), b"2\n")?;
-    Ok(())
-}
-
-fn is_fatal_attach_err(err: &KohError) -> bool {
-    matches!(err.code, Exit::REFUSED | Exit::NOT_FOUND | Exit::USAGE)
-}
-
 fn reconnect_delay(attempt: u32) -> Duration {
     match attempt {
         0 => Duration::from_millis(200),
@@ -1220,178 +1209,6 @@ fn reconnect_delay(attempt: u32) -> Duration {
         3 => Duration::from_secs(2),
         _ => Duration::from_secs(5),
     }
-}
-
-fn push_bounded(buf: &mut Vec<u8>, bytes: &[u8], cap: usize) {
-    let room = cap.saturating_sub(buf.len());
-    if room > 0 {
-        let take = bytes.len().min(room);
-        if let Some(slice) = bytes.get(..take) {
-            buf.extend_from_slice(slice);
-        }
-    }
-}
-
-/// Waits with bounded backoff and redials the server while still handling local Detach/Resize/Input
-/// (including cancelling an in-flight redial immediately on Detach or viewer shutdown).
-/// Returns `Ok(true)` once reconnected, `Ok(false)` if the user detached locally.
-#[allow(clippy::too_many_arguments)]
-async fn reconnect_wait(
-    client: &mut Client,
-    ev_rx: &mut tokio::sync::mpsc::Receiver<ClientEvent>,
-    cancel: &mut watch::Receiver<bool>,
-    cols: &mut u16,
-    rows: &mut u16,
-    cell_w: &mut u16,
-    cell_h: &mut u16,
-    pending_input: &mut Vec<u8>,
-) -> Result<bool> {
-    let mut attempt = 0u32;
-    loop {
-        if *cancel.borrow() {
-            return Ok(false);
-        }
-        let delay = reconnect_delay(attempt);
-        let sleep = tokio::time::sleep(delay);
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
-                        return Ok(false);
-                    }
-                }
-                () = &mut sleep => break,
-                ev = ev_rx.recv() => {
-                    match ev {
-                        Some(ClientEvent::Detach) | None => return Ok(false),
-                        Some(ClientEvent::Resize { cols: c, rows: r, cell_w: cw, cell_h: ch }) => {
-                            *cols = c;
-                            *rows = r;
-                            if cw > 0 && ch > 0 {
-                                *cell_w = cw;
-                                *cell_h = ch;
-                            }
-                        }
-                        Some(ClientEvent::Input(bytes)) => {
-                            push_bounded(pending_input, &bytes, RECONNECT_INPUT_BUFFER_MAX);
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-        let redial_fut = client.redial();
-        tokio::pin!(redial_fut);
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => {
-                    if *cancel.borrow() {
-                        return Ok(false);
-                    }
-                }
-                res = &mut redial_fut => {
-                    if res.is_ok() {
-                        return Ok(true);
-                    }
-                    break;
-                }
-                ev = ev_rx.recv() => {
-                    match ev {
-                        Some(ClientEvent::Detach) | None => return Ok(false),
-                        Some(ClientEvent::Resize { cols: c, rows: r, cell_w: cw, cell_h: ch }) => {
-                            *cols = c;
-                            *rows = r;
-                            if cw > 0 && ch > 0 {
-                                *cell_w = cw;
-                                *cell_h = ch;
-                            }
-                        }
-                        Some(ClientEvent::Input(bytes)) => {
-                            push_bounded(pending_input, &bytes, RECONNECT_INPUT_BUFFER_MAX);
-                        }
-                        Some(_) => {}
-                    }
-                }
-            }
-        }
-        attempt = attempt.saturating_add(1);
-    }
-}
-
-fn write_mirrored_state(dir: &Path, state: &str, generation: &mut u64) {
-    *generation = generation.wrapping_add(1);
-    let _ = atomic_write(
-        &dir.join("generation"),
-        format!("{}\n", *generation).as_bytes(),
-    );
-    let _ = atomic_write(&dir.join("state"), format!("{state}\n").as_bytes());
-    *generation = generation.wrapping_add(1);
-    let _ = atomic_write(
-        &dir.join("generation"),
-        format!("{}\n", *generation).as_bytes(),
-    );
-}
-
-fn write_mirrored_pane(
-    dir: &Path,
-    frame: &ScreenFrame,
-    generation: &mut u64,
-    written_pics: &mut BTreeMap<u32, (PictureKind, usize)>,
-) {
-    *generation = generation.wrapping_add(1);
-    let _ = atomic_write(
-        &dir.join("generation"),
-        format!("{}\n", *generation).as_bytes(),
-    );
-
-    let active = frame.referenced_picture_ids();
-    let stale: Vec<(u32, PictureKind)> = written_pics
-        .iter()
-        .filter(|(id, _)| !active.contains(id))
-        .map(|(id, (kind, _))| (*id, *kind))
-        .collect();
-    for (id, kind) in stale {
-        written_pics.remove(&id);
-        let _ = fs::remove_file(dir.join(format!("pic-{id}.{}", kind.ext())));
-    }
-
-    let folder = if frame.alt { "alt" } else { "main" };
-    let screen_dir = dir.join(folder);
-    let _ = fs::create_dir_all(&screen_dir);
-    let _ = atomic_write(&screen_dir.join("screen"), frame.screen.as_bytes());
-    let _ = atomic_write(&screen_dir.join("screen.styled"), frame.styled.as_bytes());
-    let _ = atomic_write(&screen_dir.join("lines"), frame.lines.as_bytes());
-    let _ = atomic_write(&screen_dir.join("links"), frame.links.as_bytes());
-    let _ = atomic_write(&screen_dir.join("pictures"), frame.pictures.as_bytes());
-
-    let tmp_link = dir.join(".shown.new");
-    let _ = fs::remove_file(&tmp_link);
-    if symlink(folder, &tmp_link).is_ok() {
-        let _ = fs::rename(&tmp_link, dir.join("shown"));
-    }
-    if !frame.alt {
-        let _ = fs::remove_dir_all(dir.join("alt"));
-    }
-    // (No `status`: it names a pane's holder and its program by their numbers on this machine,
-    // and a mirror has neither here. The viewer knows a pane by its folder.)
-    write_v1_metadata(dir, frame);
-    if let Some(bytes) = &frame.clipboard {
-        let _ = atomic_write(&dir.join("clipboard"), bytes);
-    }
-    if let Some(msg) = &frame.notice {
-        let line = if msg.is_empty() {
-            format!("{}\n", frame.notice_seq)
-        } else {
-            format!("{} {msg}\n", frame.notice_seq)
-        };
-        let _ = atomic_write(&dir.join("notice"), line.as_bytes());
-    }
-    *generation = generation.wrapping_add(1);
-    let _ = atomic_write(
-        &dir.join("generation"),
-        format!("{}\n", *generation).as_bytes(),
-    );
 }
 
 /// Helper for `--sync DIR` before `exec` or `run`.

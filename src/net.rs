@@ -14,7 +14,7 @@ use crate::keys::Route;
 use crate::proto::{ALPN, CloseCode, KeyProof, MAX_PROOF, recv_msg, send_msg};
 use crate::{KohError, Result};
 
-const PROOF_LABEL: &[u8] = b"koh/18 client proof";
+const PROOF_LABEL: &[u8] = b"koh/19 client proof";
 
 fn transport_config(interactive: bool) -> QuicTransportConfig {
     let (idle_ms, keepalive) = if interactive {
@@ -61,7 +61,7 @@ pub async fn connect_server(
     server_id: EndpointId,
     route: Option<Route>,
     interactive: bool,
-) -> Result<(Endpoint, Connection)> {
+) -> Result<(Endpoint, EndpointAddr, Connection)> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
         .transport_config(transport_config(interactive));
@@ -89,14 +89,19 @@ pub async fn connect_server(
         .bind()
         .await
         .map_err(|e| KohError::unreachable(format!("bind client endpoint: {e}")))?;
-    let conn = tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN))
+    let conn = dial(&endpoint, addr.clone()).await?;
+    Ok((endpoint, addr, conn))
+}
+
+/// A connection to the server at `addr`, in fifteen seconds or not at all.
+pub async fn dial(endpoint: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
+    tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN))
         .await
         .map_err(|_| KohError::unreachable("timed out dialing server"))?
         .map_err(|e| match refused(&e) {
             true => busy(),
             false => KohError::unreachable(format!("cannot reach server: {e}")),
-        })?;
-    Ok((endpoint, conn))
+        })
 }
 
 /// Whether the server was reached and refused the connection before it began (QUIC's

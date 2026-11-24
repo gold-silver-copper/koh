@@ -103,6 +103,16 @@ impl From<anyhow::Error> for KohError {
 
 pub type Result<T> = std::result::Result<T, KohError>;
 
+/// The time `long` after `from`: what every limit somebody else chose is made with (a peer's
+/// seconds, a flag's). One that is out of range means no limit, and is refused nowhere: more
+/// than thirty years is thirty years, the timer's own "never", and a time the clock cannot
+/// say (`Duration::MAX` is one) would panic where it is added. (And were the clock itself that
+/// near its end, the time is `from`: a deadline that has come.)
+pub(crate) fn after(from: tokio::time::Instant, long: std::time::Duration) -> tokio::time::Instant {
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(30 * 365 * 86_400);
+    from.checked_add(long.min(NEVER)).unwrap_or(from)
+}
+
 /// Valid single path component (no slashes, no `.` or `..`, printable ASCII/UTF-8 without controls).
 pub fn is_safe_name(name: &str) -> bool {
     !name.is_empty()

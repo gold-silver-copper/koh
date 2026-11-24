@@ -29,7 +29,7 @@ use crate::proto::{
 };
 use crate::session::Sessions;
 use crate::sync::{receive_tree, send_tree};
-use crate::{Exit, KohError, Result};
+use crate::{Exit, KohError, Result, after};
 
 pub struct ServeOptions {
     pub key_file: Option<PathBuf>,
@@ -53,14 +53,6 @@ pub struct ServeOptions {
 /// and ask: it is told as soon as it asks, and at the latest then. One that has not connected by
 /// then is dropped without being told.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
-
-/// The time `long` after `from`. More than thirty years is thirty years, the timer's own "never":
-/// a time the clock cannot say (`Duration::MAX` is one) would panic where it is added. (And were
-/// the clock itself that near its end, the time is `from`: a deadline that has come.)
-fn after(from: Instant, long: Duration) -> Instant {
-    const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
-    from.checked_add(long.min(NEVER)).unwrap_or(from)
-}
 
 /// The CLI's default for `--max-connections`.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;

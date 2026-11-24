@@ -181,6 +181,27 @@ async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
 }
 
 #[tokio::test]
+async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
+    let (tmp, srv, client, _, _) = boot_pair("wait-limit").await;
+    let cwd = Some(tmp.0.display().to_string());
+    let script = vec!["sleep 0.3; exit 3".to_string()];
+    client
+        .run_job(Some("brief".into()), script, cwd, true)
+        .await
+        .unwrap();
+    // More seconds than the clock has: the job is waited for to its end, and the server serves on.
+    let waited = client
+        .wait_job("brief".into(), None, 10, Some(u64::MAX))
+        .await
+        .unwrap();
+    assert!(!waited.timed_out && waited.exit == 3, "{waited:?}");
+    assert_eq!(client.jobs(None).await.unwrap().len(), 1);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
 async fn delta_cp_push_pull_exclude_delete_dry_run_and_preserve() {
     let (tmp, srv, client, _, _) = boot_pair("cp").await;
     let src = tmp.0.join("src");

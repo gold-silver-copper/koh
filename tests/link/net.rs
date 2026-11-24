@@ -103,6 +103,8 @@ pub struct Counts {
     pub black_holed: u64,
     /// Dropped because the limited link's buffer was full.
     pub overflowed: u64,
+    /// Waited their turn on a limited link behind a packet before them, and were carried.
+    pub waited: u64,
     /// Delivered a second time.
     pub duplicated: u64,
     /// Held back so that later packets overtook them.
@@ -342,6 +344,7 @@ impl FaultNet {
                 towards.counts.overflowed += 1;
                 return Ok(());
             }
+            towards.counts.waited += u64::from(free > now);
             let bits = datagram.len() as u64 * 8;
             let done = free + Duration::from_nanos(bits * 1_000_000_000 / rate);
             towards.busy_until = done;

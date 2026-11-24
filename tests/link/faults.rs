@@ -252,6 +252,7 @@ async fn a_rate_carries_no_more_than_it_says_and_drops_what_its_buffer_cannot_ho
     let counts = net.counts(id(2));
     assert_eq!(counts.sent, sent.len() as u64);
     assert_eq!(counts.overflowed + counts.delivered, counts.sent);
+    assert!(counts.waited > counts.delivered / 2, "{counts:?}");
     // Never more than the rate for the time it was offered, the buffer and a packet more; and
     // most of that, for it was always offered more than it carries.
     let bits = (counts.bytes * 8) as f64;

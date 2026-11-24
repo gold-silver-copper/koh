@@ -61,7 +61,7 @@ async fn the_mirror_is_the_pane_on(name: &str, seed: u64) {
     println!("{name}, seed {seed}: to the client {down:?}, to the server {up:?}");
     match name {
         "25ms-5%" => assert!(down.lost > 0 && up.lost > 0),
-        "256kbit" => assert!(down.overflowed > 0),
+        "256kbit" | "1Mbit" => assert!(down.waited > 0),
         "dup-reorder" => assert!(down.duplicated > 0 && down.held_back > 0),
         _ => {}
     }

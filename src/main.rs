@@ -19,9 +19,9 @@ const HELP: &str = include_str!("help.txt");
 
 fn main() -> ExitCode {
     // fux's own command line, under two words: `koh fux …` is `fux …`, and `koh hold …` is how
-    // `koh fux start` runs this file to hold a pane. Both are fux's from their first word on,
-    // and handed over before anything else is done: a holder has no thread but fux's own, and
-    // no runtime.
+    // `koh fux start` runs this file to hold a pane (a session is such a pane). Both are fux's
+    // from their first word on, and handed over before anything else is done: a holder has no
+    // thread but fux's own, and no runtime.
     let mut words = std::env::args_os().skip(1).peekable();
     match words.peek().and_then(|word| word.to_str()) {
         Some("fux") => return fux::command(words.skip(1)),
@@ -93,14 +93,19 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "kill" => cmd_kill(rest).await,
         "wait" => cmd_wait(rest).await,
         "cp" => cmd_cp(rest).await,
-        "sessions" => cmd_sessions(rest).await,
-        "output" => cmd_output(rest).await,
-        "connect" => cmd_connect(rest).await,
-        "mount" => cmd_mount(rest).await,
+        // (Answered from a session's files on the server, by the build that follows this one.)
+        "sessions" | "output" => Err(not_in_this_build(cmd)),
+        "connect" => cmd_session(rest, false).await,
+        "mount" => cmd_session(rest, true).await,
         other => Err(KohError::usage(format!(
             "unknown command {other:?} (try `koh --help`)"
         ))),
     }
+}
+
+fn not_in_this_build(what: &str) -> KohError {
+    let now = "a session is a fux pane on the server: `koh exec` reads its files there";
+    KohError::failed(format!("`koh {what}` is not in this build ({now})"))
 }
 
 fn parse_role(s: &str) -> Result<Role> {
@@ -685,11 +690,10 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         relay: None,
         json: false,
     };
-    let (mut server, mut job, mut text, mut session, mut tail, mut timeout) = (
+    let (mut server, mut job, mut text, mut tail, mut timeout) = (
         None::<String>,
         None::<String>,
         None::<String>,
-        None::<u32>,
         200usize,
         None::<u64>,
     );
@@ -702,13 +706,7 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
             "--text" => text = Some(take_opt(args, &mut i, a)?),
-            "--session" => {
-                session = Some(
-                    take_opt(args, &mut i, a)?
-                        .parse()
-                        .map_err(|_| KohError::usage("bad --session"))?,
-                )
-            }
+            "--session" => return Err(not_in_this_build("wait --session")),
             "--tail" => {
                 tail = take_opt(args, &mut i, a)?
                     .parse()
@@ -727,16 +725,11 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let server =
-        server.ok_or_else(|| KohError::usage("usage: koh wait SERVER (JOB | --session N)"))?;
-    let client = Client::connect(&server, &opts, true).await?;
-    let res = if let Some(sid) = session {
-        client.wait_session(sid, timeout).await
-    } else if let Some(name) = job {
-        client.wait_job(name, text, tail, timeout).await
-    } else {
-        Err(KohError::usage("wait needs JOB or --session N"))
+    let (Some(server), Some(name)) = (server, job) else {
+        return Err(KohError::usage("usage: koh wait SERVER JOB"));
     };
+    let client = Client::connect(&server, &opts, true).await?;
+    let res = client.wait_job(name, text, tail, timeout).await;
     client.close().await;
     let res = res?;
 
@@ -887,123 +880,22 @@ fn split_remote(s: &str) -> Option<(&str, &str)> {
     Some((host, path))
 }
 
-async fn cmd_sessions(args: &[String]) -> Result<Exit> {
+/// `koh connect` and `koh mount` name a session the same way; `mount` may name a directory too.
+async fn cmd_session(args: &[String], mount: bool) -> Result<Exit> {
     let mut opts = DialOptions {
         key_file: None,
         direct: None,
         relay: None,
         json: false,
     };
-    let mut server = None::<String>;
-    let mut i = 0;
-    while i < args.len() {
-        if parse_common_dial(args, &mut i, &mut opts)? {
-            i += 1;
-            continue;
-        }
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
-        if server.is_none() {
-            server = Some(a.to_string());
-        } else {
-            return Err(KohError::usage(format!("unexpected argument {a:?}")));
-        }
-        i += 1;
-    }
-    let server = server.ok_or_else(|| KohError::usage("usage: koh sessions SERVER [--json]"))?;
-    let client = Client::connect(&server, &opts, false).await?;
-    let list = client.sessions().await;
-    client.close().await;
-    let list = list?;
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::to_string(&list).unwrap_or_default()
-        );
-    } else {
-        for s in &list {
-            let att = if s.attached { "attached" } else { "detached" };
-            let cmd_st = if s.running_command { "busy" } else { "idle" };
-            let last = s.last_exit.map_or("-".to_string(), |c| c.to_string());
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}\t{att}\t{}\t{cmd_st}\texit={last}\t{}x{}\t{}",
-                s.id,
-                s.state,
-                s.cols,
-                s.rows,
-                s.title
-            );
-        }
-    }
-    Ok(Exit::OK)
-}
-
-async fn cmd_output(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut server, mut session, mut last) = (None::<String>, None::<u32>, false);
-    let mut i = 0;
-    while i < args.len() {
-        if parse_common_dial(args, &mut i, &mut opts)? {
-            i += 1;
-            continue;
-        }
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
-        match a {
-            "--session" => {
-                session = Some(
-                    take_opt(args, &mut i, a)?
-                        .parse()
-                        .map_err(|_| KohError::usage("bad --session"))?,
-                )
-            }
-            "--last" => last = true,
-            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
-            _ => return Err(KohError::usage(format!("unexpected output argument {a:?}"))),
-        }
-        i += 1;
-    }
-    let (Some(server), Some(session)) = (server, session) else {
-        return Err(KohError::usage(
-            "usage: koh output SERVER --session N [--last]",
-        ));
-    };
-    let client = Client::connect(&server, &opts, false).await?;
-    let text = client.output(session, last).await;
-    client.close().await;
-    let text = text?;
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::json!({ "session": session, "output": text })
-        );
-    } else {
-        let _ = std::io::stdout().write_all(text.as_bytes());
-    }
-    Ok(Exit::OK)
-}
-
-async fn cmd_connect(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut server, mut session, mut new, mut cwd) =
-        (None::<String>, None::<u32>, false, None::<String>);
-    let mut argv = Vec::new();
+    let (mut server, mut place) = (None::<String>, None::<PathBuf>);
+    let mut asks = ConnectOptions::default();
     let mut i = 0;
     while i < args.len() {
         let a = args.get(i).map(String::as_str).unwrap_or_default();
         if a == "--" {
-            argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
+            asks.argv
+                .extend_from_slice(args.get(i + 1..).unwrap_or_default());
             break;
         }
         if parse_common_dial(args, &mut i, &mut opts)? {
@@ -1011,98 +903,29 @@ async fn cmd_connect(args: &[String]) -> Result<Exit> {
             continue;
         }
         match a {
-            "--new" => new = true,
-            "--session" => {
-                session = Some(
-                    take_opt(args, &mut i, a)?
-                        .parse()
-                        .map_err(|_| KohError::usage("bad --session"))?,
-                )
-            }
-            "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
+            "--new" => asks.new = true,
+            "--session" => asks.session = Some(take_opt(args, &mut i, a)?),
+            "-C" | "--cwd" => asks.cwd = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
-            _ => {
-                return Err(KohError::usage(format!(
-                    "unexpected connect argument {a:?}"
-                )));
-            }
+            _ if mount && place.is_none() && !a.starts_with('-') => place = Some(a.into()),
+            _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
         }
         i += 1;
     }
     let server = server.ok_or_else(|| {
-        KohError::usage("usage: koh connect SERVER [--new | --session N] [-- PROG...]")
+        let (what, place) = if mount {
+            ("mount", " [DIR]")
+        } else {
+            ("connect", "")
+        };
+        KohError::usage(format!(
+            "usage: koh {what} SERVER [--session NAME | --new] [-C DIR]{place} [-- PROG...]"
+        ))
     })?;
     let client = Client::connect(&server, &opts, true).await?;
-    let code = client
-        .connect_interactive(ConnectOptions {
-            session,
-            new,
-            argv,
-            cwd,
-        })
-        .await?;
+    let code = match mount {
+        true => client.mount(asks, place, &server).await?,
+        false => client.connect_interactive(asks).await?,
+    };
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
-}
-
-async fn cmd_mount(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut server, mut session, mut local_dir) = (None::<String>, None::<u32>, None::<PathBuf>);
-    let mut i = 0;
-    while i < args.len() {
-        if parse_common_dial(args, &mut i, &mut opts)? {
-            i += 1;
-            continue;
-        }
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
-        match a {
-            "--session" => {
-                session = Some(
-                    take_opt(args, &mut i, a)?
-                        .parse()
-                        .map_err(|_| KohError::usage("bad --session"))?,
-                )
-            }
-            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
-            _ if local_dir.is_none() && !a.starts_with('-') => local_dir = Some(PathBuf::from(a)),
-            _ => return Err(KohError::usage(format!("unexpected mount argument {a:?}"))),
-        }
-        i += 1;
-    }
-    let server = server
-        .ok_or_else(|| KohError::usage("usage: koh mount SERVER [--session N] [LOCAL_PANE_DIR]"))?;
-    let dir = match local_dir {
-        Some(d) => d,
-        None => {
-            // fux's default session, by fux's rule: `$XDG_RUNTIME_DIR/fux`, else `~/.cache/fux`,
-            // a variable that is set and empty counting as not set.
-            let var = |name| {
-                let set = std::env::var_os(name).filter(|v| !v.is_empty());
-                set.map(PathBuf::from)
-            };
-            let fux_dir = var("XDG_RUNTIME_DIR")
-                .map(|dir| dir.join("fux"))
-                .or_else(|| var("HOME").map(|dir| dir.join(".cache").join("fux")))
-                .ok_or_else(|| {
-                    KohError::failed(
-                        "no fux session to mirror into: neither XDG_RUNTIME_DIR nor HOME is set (name a directory: koh mount SERVER LOCAL_PANE_DIR)",
-                    )
-                })?;
-            fux_dir.join("main").join(format!("koh-{server}"))
-        }
-    };
-    let mut client = Client::connect(&server, &opts, true).await?;
-    let _ = writeln!(
-        std::io::stderr(),
-        "mirroring remote session at {}",
-        dir.display()
-    );
-    let mirrored = client.mount_local_pane(session, &dir, 80, 24).await;
-    client.close().await;
-    mirrored?;
-    Ok(Exit::OK)
 }

@@ -11,8 +11,8 @@ use std::time::Instant;
 use koh::KohError;
 use koh::carry::{Fault, Mirror, Reader};
 use koh::proto::{
-    ClientEvent, ExecClientMsg, ExecServerMsg, FromMirror, JobInfo, KeyProof, LogMsg, MAX_CHUNK,
-    Reply, Request, ScreenFrame, ServerEvent, SessionInfo, SyncMsg, ToMirror, WaitResult,
+    Attached, ExecClientMsg, ExecServerMsg, FromMirror, JobInfo, KeyProof, LogMsg, MAX_CHUNK,
+    Reply, Request, SyncMsg, ToMirror, WaitResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -26,7 +26,6 @@ fn decode<T: DeserializeOwned>(data: &[u8]) -> Option<T> {
 pub fn to_server(data: &[u8]) {
     let _ = decode::<KeyProof>(data);
     let _ = decode::<Request>(data);
-    let _ = decode::<ClientEvent>(data);
     let _ = decode::<ExecClientMsg>(data);
     sync_msg(data);
 }
@@ -36,12 +35,11 @@ pub fn to_client(data: &[u8]) {
     if let Some(reply) = decode::<Reply>(data) {
         let _ = reply.into_result();
     }
-    let _ = decode::<ServerEvent>(data);
+    let _ = decode::<Attached>(data);
     let _ = decode::<ExecServerMsg>(data);
     let _ = decode::<LogMsg>(data);
     let _ = decode::<JobInfo>(data);
     let _ = decode::<Vec<JobInfo>>(data);
-    let _ = decode::<Vec<SessionInfo>>(data);
     let _ = decode::<WaitResult>(data);
     let _ = decode::<String>(data);
     sync_msg(data);
@@ -52,37 +50,6 @@ fn sync_msg(data: &[u8]) {
     if let Some(SyncMsg::Failed(why)) = decode::<SyncMsg>(data) {
         let _ = KohError::from(why);
     }
-}
-
-/// A session's screen and what follows it, as a client mirrors them: a frame is held to the
-/// bounds of a screen, and no update takes it out of them.
-pub fn frames(data: &[u8]) {
-    let Some((mut frame, events)) = decode::<(ScreenFrame, Vec<ServerEvent>)>(data) else {
-        return;
-    };
-    frame.clamp_bounds();
-    in_bounds(&frame);
-    for event in events {
-        match event {
-            ServerEvent::Full(mut next) => {
-                next.clamp_bounds();
-                frame = next;
-            }
-            ServerEvent::Delta(delta) => {
-                let changed = frame.apply_delta(delta);
-                assert!(changed.iter().all(|row| *row < frame.rows));
-            }
-            ServerEvent::Picture(_) => {}
-        }
-        in_bounds(&frame);
-    }
-}
-
-fn in_bounds(frame: &ScreenFrame) {
-    assert!(frame.cols <= fux_vt::SIZE_MAX && frame.rows <= fux_vt::SIZE_MAX);
-    assert!(frame.cursor_row < frame.rows.max(1) && frame.cursor_col < frame.cols.max(1));
-    let ids = frame.referenced_picture_ids();
-    assert!(ids.is_sorted_by(|a, b| a < b));
 }
 
 /// The first line as a path a copy's peer names, the rest as the patterns that leave entries

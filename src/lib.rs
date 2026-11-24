@@ -7,9 +7,9 @@ pub mod client;
 pub mod jobs;
 pub mod keys;
 pub mod net;
-pub mod pane;
 pub mod proto;
 pub mod server;
+mod session;
 pub mod sync;
 
 use std::fmt;

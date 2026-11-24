@@ -15,8 +15,7 @@ cargo-fuzz = true
 [dependencies]
 koh = { path = ".." }
 libfuzzer-sys = "0.4"
-# koh's own versions: the screen's bounds, and the wire's decoding as koh does it.
-fux-vt = "0.20.0"
+# koh's own versions: the wire's decoding as koh does it.
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
 serde = "=1.0.229"
 
@@ -33,13 +32,6 @@ bench = false
 [[bin]]
 name = "to_client"
 path = "fuzz_targets/to_client.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "frames"
-path = "fuzz_targets/frames.rs"
 test = false
 doc = false
 bench = false

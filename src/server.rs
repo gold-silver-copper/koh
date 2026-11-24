@@ -1,7 +1,6 @@
 //! `koh serve`: QUIC listener, TLS-bound client auth, scoped authorization,
-//! raw exec, headless jobs, delta sync, and fux-backed interactive sessions.
+//! raw exec, headless jobs, delta sync, and sessions, which are fux panes (`session`).
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
@@ -24,11 +23,11 @@ use crate::keys::{
     load_or_create_key, render_qr,
 };
 use crate::net::{bind_server, close_with, verify_client};
-use crate::pane::{AttachSpec, PaneSession, SessionManager};
 use crate::proto::{
-    ClientEvent, CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME,
-    Reply, Request, ScreenFrame, ServerEvent, SyncMsg, recv_msg, send_msg, spawn_msg_reader,
+    CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
+    Request, SyncMsg, recv_msg, send_msg, spawn_msg_reader,
 };
+use crate::session::Sessions;
 use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
 
@@ -43,7 +42,7 @@ pub struct ServeOptions {
     /// Most connections held at once, each counted from when the server takes it up, before it
     /// proves a key.
     pub max_connections: usize,
-    /// Most sessions kept at once, running or ended.
+    /// Most sessions kept at once, running or ended: folders in the sessions' folder.
     pub max_sessions: usize,
     /// How long a connection has, from when the server takes it up, to finish its handshake and
     /// prove a key the server allows before it is closed.
@@ -99,9 +98,8 @@ impl Default for ServeOptions {
 struct ServerState {
     key_file: Option<PathBuf>,
     extra_allow: Vec<EndpointId>,
-    default_shell: String,
     jobs: Arc<Mutex<JobManager>>,
-    sessions: Arc<Mutex<SessionManager>>,
+    sessions: Sessions,
     proof_timeout: Duration,
 }
 
@@ -160,17 +158,16 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         None => default_state_dir().await?,
     };
     let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
-    let sessions = SessionManager::new(base.join("sessions"), max_sessions)?;
-    let sessions = Arc::new(Mutex::new(sessions));
     let default_shell = opts
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_string());
+    let sessions = Sessions::new(&base, max_sessions, default_shell)?;
+    let sessions_dir = sessions.dir().to_path_buf();
 
     let state = Arc::new(ServerState {
         key_file: opts.key_file,
         extra_allow: opts.allow,
-        default_shell,
         jobs,
         sessions,
         proof_timeout: opts.proof_timeout,
@@ -182,7 +179,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         if let Some(addr) = direct_addr {
             let _ = writeln!(err, "listening:     {addr}");
         }
-        let _ = writeln!(err, "sessions dir:  {}", base.join("sessions").display());
+        let _ = writeln!(err, "sessions dir:  {}", sessions_dir.display());
         let _ = writeln!(err, "{}", render_qr(&endpoint_id));
     }
 
@@ -504,155 +501,10 @@ async fn dispatch(
             say_failure(send, sent).await;
             Ok(())
         }
-        Request::Sessions => {
+        Request::Attach(asked) => {
             scope.check_full()?;
-            let list = {
-                let guard = state
-                    .sessions
-                    .lock()
-                    .map_err(|_| KohError::internal("sessions lock"))?;
-                guard.list()
-            };
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            send_msg(send, &list, MAX_CTRL).await
-        }
-        Request::Output { session, last } => {
-            scope.check_full()?;
-            let sess = {
-                let guard = state
-                    .sessions
-                    .lock()
-                    .map_err(|_| KohError::internal("sessions lock"))?;
-                guard.get(session)?
-            };
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            send_msg(send, &sess.output(last), MAX_FRAME).await
-        }
-        Request::WaitSession {
-            session,
-            timeout_secs,
-        } => {
-            scope.check_full()?;
-            let sess = {
-                let guard = state
-                    .sessions
-                    .lock()
-                    .map_err(|_| KohError::internal("sessions lock"))?;
-                guard.get(session)?
-            };
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let res = sess.wait_command(timeout_secs).await?;
-            send_msg(send, &res, MAX_FRAME).await
-        }
-        Request::Attach {
-            session,
-            new,
-            cols,
-            rows,
-            cell_w,
-            cell_h,
-            argv,
-            cwd,
-        } => {
-            scope.check_full()?;
-            let dir = resolve_cwd(cwd.as_deref())?;
-            let (sess, created_new, _attached) = {
-                let mut guard = state
-                    .sessions
-                    .lock()
-                    .map_err(|_| KohError::internal("sessions lock"))?;
-                guard.attach_or_create(AttachSpec {
-                    requested: session,
-                    new,
-                    cols,
-                    rows,
-                    cell_w,
-                    cell_h,
-                    argv: &argv,
-                    cwd: &dir,
-                    default_shell: &state.default_shell,
-                })?
-            };
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            // On reattach to an existing session, don't replay stale pre-existing bell/clipboard.
-            let (mut last_clip_seq, mut last_notice_seq) = if created_new {
-                (0, 0)
-            } else {
-                sess.current_event_seqs()
-            };
-            let mut sent_pics = BTreeSet::new();
-            let mut last_sent: Option<ScreenFrame> = None;
-
-            let mut rx = sess.subscribe();
-            sess.resize(cols, rows, cell_w, cell_h);
-
-            // Send initial frame immediately.
-            let initial = rx.borrow_and_update().clone();
-            let ended = initial.state != "running";
-            send_frame_update(
-                &sess,
-                initial,
-                &mut last_sent,
-                &mut sent_pics,
-                &mut last_clip_seq,
-                &mut last_notice_seq,
-                send,
-            )
-            .await?;
-            // A session whose program has ended changes no more: its screen was the last there is
-            // to send. (Waiting for more would keep it attached for as long as its client stays.)
-            if ended {
-                return Ok(());
-            }
-
-            // Bridge client events -> PTY and watch frames -> client (cancel-safe reader task).
-            let mut client_rx = spawn_msg_reader::<ClientEvent>(recv, MAX_CHUNK);
-            loop {
-                tokio::select! {
-                    changed = rx.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let frame = rx.borrow_and_update().clone();
-                        let done = frame.state != "running";
-                        if send_frame_update(
-                            &sess,
-                            frame,
-                            &mut last_sent,
-                            &mut sent_pics,
-                            &mut last_clip_seq,
-                            &mut last_notice_seq,
-                            send,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                        if done {
-                            break;
-                        }
-                    }
-                    ev = client_rx.recv() => {
-                        match ev {
-                            Some(Ok(ClientEvent::Input(bytes))) => {
-                                let _ = sess.write_input(&bytes);
-                            }
-                            Some(Ok(ClientEvent::Resize { cols, rows, cell_w, cell_h })) => {
-                                sess.resize(cols, rows, cell_w, cell_h);
-                            }
-                            Some(Ok(ClientEvent::Colours(text))) => {
-                                sess.set_colours(&text);
-                            }
-                            Some(Ok(ClientEvent::Keyboard(flags))) => {
-                                sess.set_keyboard(flags);
-                            }
-                            Some(Ok(ClientEvent::Detach)) | Some(Err(_)) | None => break,
-                        }
-                    }
-                }
-            }
-            Ok(())
+            let dir = resolve_cwd(asked.cwd.as_deref())?;
+            state.sessions.attach(asked, &dir, send, recv).await
         }
     }
 }
@@ -663,55 +515,6 @@ async fn say_failure<T>(send: &mut SendStream, done: Result<T>) {
     if let Err(err) = done {
         let _ = send_msg(send, &SyncMsg::Failed((&err).into()), MAX_CTRL).await;
     }
-}
-
-async fn send_frame_update(
-    sess: &PaneSession,
-    mut frame: ScreenFrame,
-    last_sent: &mut Option<ScreenFrame>,
-    sent_pics: &mut BTreeSet<u32>,
-    last_clip_seq: &mut u64,
-    last_notice_seq: &mut u64,
-    send: &mut SendStream,
-) -> Result<()> {
-    // Transfer each referenced picture payload at most once per attach stream.
-    let active_ids = frame.referenced_picture_ids();
-    for id in &active_ids {
-        if sent_pics.insert(*id)
-            && let Some(blob) = sess.picture_blob(*id)
-        {
-            send_msg(send, &ServerEvent::Picture(blob), MAX_FRAME).await?;
-        }
-    }
-    sent_pics.retain(|id| active_ids.contains(id));
-
-    if let Some((seq, bytes)) = sess.clipboard_since(*last_clip_seq) {
-        *last_clip_seq = seq;
-        frame.clipboard_seq = seq;
-        frame.clipboard = Some(bytes);
-    } else {
-        frame.clipboard_seq = *last_clip_seq;
-        frame.clipboard = None;
-    }
-    if let Some((seq, msg)) = sess.notice_since(*last_notice_seq) {
-        *last_notice_seq = seq;
-        frame.notice_seq = seq;
-        frame.notice = Some(msg);
-    } else {
-        frame.notice_seq = *last_notice_seq;
-        frame.notice = None;
-    }
-
-    let event = match last_sent.as_ref().and_then(|prev| frame.diff(prev)) {
-        Some(delta) => ServerEvent::Delta(delta),
-        None => ServerEvent::Full(frame.clone()),
-    };
-    send_msg(send, &event, MAX_FRAME).await?;
-
-    frame.clipboard = None;
-    frame.notice = None;
-    *last_sent = Some(frame);
-    Ok(())
 }
 
 /// Raw non-PTY exec: separate stdout/stderr, binary-clean, stdin EOF, and SIGHUP on client drop.

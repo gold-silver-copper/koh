@@ -6,9 +6,9 @@
 mod entry;
 
 use koh::proto::{
-    ClientEvent, Edit, ExecClientMsg, ExecServerMsg, Failure, FrameDelta, FromMirror, Had, JobInfo,
-    KeyProof, Kind, LogMsg, PictureBlob, PictureKind, Reply, Request, RowPatch, ScreenFrame,
-    ServerEvent, SessionInfo, SyncEntry, SyncMsg, SyncSummary, ToMirror, WaitResult,
+    Attach, Attached, Edit, ExecClientMsg, ExecServerMsg, Failure, FromMirror, Had, JobInfo,
+    KeyProof, Kind, LogMsg, Reply, Request, Run, SyncEntry, SyncMsg, SyncSummary, ToMirror,
+    WaitResult,
 };
 
 /// xorshift64*: the same numbers on every run.
@@ -31,45 +31,6 @@ fn bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     postcard::to_allocvec(value).unwrap()
 }
 
-fn frame() -> ScreenFrame {
-    ScreenFrame {
-        session_id: 3,
-        generation: 8,
-        cols: 20,
-        rows: 4,
-        screen: "one\ntwo\n\nfour\n".into(),
-        styled: "one\n\x1b[31mtwo\x1b[m\n\nfour\n".into(),
-        lines: "0\n".into(),
-        links: "1 https://example.org\n".into(),
-        pictures: "pic-2.png 0 0 4 2 10 20\npic-1.sixel -1 3 4 2 10 20\n".into(),
-        cursor_row: 3,
-        cursor_col: 4,
-        cursor_shown: true,
-        cursor_colour: Some([1, 2, 3]),
-        modes: "paste keys=3".into(),
-        title: "sh".into(),
-        marks: "prompt 0\nend 7 2\n".into(),
-        state: "running".into(),
-        clipboard: Some(b"copied".to_vec()),
-        notice: Some("done".into()),
-        ..ScreenFrame::default()
-    }
-}
-
-fn delta() -> FrameDelta {
-    let mut next = frame();
-    next.screen = "one\nTWO\n\nfour\n".into();
-    next.pictures.clear();
-    next.title = "vi".into();
-    let mut delta = next.diff(&frame()).unwrap();
-    delta.changed_rows.push(RowPatch {
-        row: 3,
-        screen: "last".into(),
-        styled: "last".into(),
-    });
-    delta
-}
-
 /// One valid encoding of every message a peer sends, and paths as a copy's peer names them.
 fn seeds() -> Vec<Vec<u8>> {
     let text = |s: &str| s.to_string();
@@ -89,29 +50,11 @@ fn seeds() -> Vec<Vec<u8>> {
         age_secs: 9,
         command: text("make -j4"),
     };
-    let session = SessionInfo {
-        id: 1,
-        attached: true,
-        state: text("running"),
-        cols: 80,
-        rows: 24,
-        title: text("sh"),
-        running_command: false,
-        last_exit: Some(1),
-        age_secs: 3,
-        pane_dir: text("/run/koh/sessions/s1"),
+    let run = Run {
+        device: 40,
+        folder: 123_456,
+        holder: 4242,
     };
-    let picture = PictureBlob {
-        id: 2,
-        kind: PictureKind::Png,
-        bytes: vec![0x89, b'P', b'N', b'G'],
-    };
-    let events = vec![
-        ServerEvent::Delta(delta()),
-        ServerEvent::Picture(picture.clone()),
-        ServerEvent::Full(frame()),
-        ServerEvent::Delta(delta()),
-    ];
     vec![
         bytes(&KeyProof {
             key: [9; 32],
@@ -160,35 +103,21 @@ fn seeds() -> Vec<Vec<u8>> {
             dry_run: true,
             preserve_root: true,
         }),
-        bytes(&Request::Sessions),
-        bytes(&Request::Output {
-            session: 1,
-            last: true,
-        }),
-        bytes(&Request::WaitSession {
-            session: 1,
-            timeout_secs: None,
-        }),
-        bytes(&Request::Attach {
-            session: Some(1),
+        bytes(&Request::Attach(Attach {
+            format: 1,
+            name: Some(text("3")),
             new: false,
             cols: 80,
             rows: 24,
-            cell_w: 10,
-            cell_h: 20,
             argv: vec![text("vi")],
             cwd: Some(text("/tmp")),
+            run: Some(run),
+            client: 7,
+        })),
+        bytes(&Attached {
+            name: text("3"),
+            run,
         }),
-        bytes(&ClientEvent::Input(b"ls\r".to_vec())),
-        bytes(&ClientEvent::Resize {
-            cols: 100,
-            rows: 30,
-            cell_w: 9,
-            cell_h: 18,
-        }),
-        bytes(&ClientEvent::Colours(text("foreground #aabbcc\n"))),
-        bytes(&ClientEvent::Keyboard(3)),
-        bytes(&ClientEvent::Detach),
         bytes(&ExecClientMsg::Stdin(b"in".to_vec())),
         bytes(&ExecClientMsg::Eof),
         bytes(&SyncMsg::Manifest(vec![entry.clone(), entry])),
@@ -230,17 +159,12 @@ fn seeds() -> Vec<Vec<u8>> {
             age_secs: 2,
         }),
         bytes(&vec![job.clone(), job]),
-        bytes(&vec![session]),
         bytes(&WaitResult {
             timed_out: true,
             exit: 124,
             tail: text("tail"),
             detail: text("timed out"),
         }),
-        bytes(&ServerEvent::Full(frame())),
-        bytes(&ServerEvent::Delta(delta())),
-        bytes(&ServerEvent::Picture(picture)),
-        bytes(&(frame(), events)),
         bytes(&ToMirror::Round(4)),
         bytes(&ToMirror::Lines {
             name: text("main/screen"),
@@ -325,72 +249,12 @@ fn mutate(rng: &mut Rng, data: &mut Vec<u8>, seeds: &[Vec<u8>]) {
     }
 }
 
-/// A size, row or column as a hostile server would say it: at and past every bound.
-fn number(rng: &mut Rng) -> usize {
-    const EDGES: [usize; 9] = [0, 1, 3, 4, 5, 499, 500, 501, usize::MAX];
-    EDGES[rng.below(EDGES.len())]
-}
-
-/// A few short lines, some of them a picture's.
-fn lines(rng: &mut Rng) -> String {
-    let mut text = String::new();
-    for _ in 0..rng.below(7) {
-        match rng.below(4) {
-            0 => text.push_str(&format!("pic-{}.png 0 0 1 1 10 20", rng.below(5))),
-            1 => text.push_str("\x1b[1mbold\x1b[m"),
-            2 => {}
-            _ => text.push_str("row"),
-        }
-        text.push('\n');
-    }
-    if rng.below(3) == 0 {
-        text.pop();
-    }
-    text
-}
-
-/// A screen and updates to it that decode, built of such numbers and lines: what bytes changed
-/// at random seldom are.
-fn screens(rng: &mut Rng) -> Vec<u8> {
-    let mut first = ScreenFrame {
-        cols: number(rng),
-        rows: number(rng),
-        cursor_row: number(rng),
-        cursor_col: number(rng),
-        screen: lines(rng),
-        styled: lines(rng),
-        pictures: lines(rng),
-        ..frame()
-    };
-    let mut events = Vec::new();
-    for _ in 0..rng.below(5) {
-        if rng.below(4) == 0 {
-            first.rows = number(rng);
-            events.push(ServerEvent::Full(first.clone()));
-            continue;
-        }
-        let mut update = delta();
-        update.changed_rows = (0..rng.below(5))
-            .map(|_| RowPatch {
-                row: number(rng),
-                screen: lines(rng),
-                styled: lines(rng),
-            })
-            .collect();
-        (update.cursor_row, update.cursor_col) = (number(rng), number(rng));
-        update.pictures = Some(lines(rng));
-        events.push(ServerEvent::Delta(update));
-    }
-    bytes(&(first, events))
-}
-
 #[test]
-fn no_mutated_message_panics_a_decoder_or_takes_a_frame_out_of_bounds() {
+fn no_mutated_message_panics_a_decoder() {
     let seeds = seeds();
     let run = |data: &[u8]| {
         entry::to_server(data);
         entry::to_client(data);
-        entry::frames(data);
         entry::paths(data);
         entry::carry_decode(data);
     };
@@ -405,9 +269,6 @@ fn no_mutated_message_panics_a_decoder_or_takes_a_frame_out_of_bounds() {
                 mutate(&mut rng, &mut data, &seeds);
             }
             run(&data);
-        }
-        for _ in 0..4 {
-            entry::frames(&screens(&mut rng));
         }
     }
 }
@@ -542,6 +403,5 @@ fn no_sequence_of_messages_leaves_a_mirror_that_no_whole_round_left() {
 /// How many sequences are built: each is given to a mirror of its own, and once more changed.
 const SEQUENCES: usize = 1500;
 
-/// Rounds: each puts every seed, mutated, through every entry point (44 seeds: 220,000 messages
-/// in all), and four built screens with their updates through the frames' (20,000).
+/// Rounds: each puts every seed, mutated, through every entry point.
 const ROUNDS: usize = 5000;

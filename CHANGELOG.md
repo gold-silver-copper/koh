@@ -72,7 +72,6 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (it is still refused if group or others may write to it). `koh cp -p` sets a file's
   modification time and leaves its access time alone.
 - `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
-  process group of a job, a- `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
   process group of a job, and of a `koh exec` command the server hangs up, is signalled with
   it. `koh kill` waits for it without holding up other requests, for 5 s at most, and fails
   (exit 1) if a group that is still there was not signalled, whether or not the job's first
@@ -80,7 +79,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - Where `XDG_RUNTIME_DIR` is not set, `koh serve` needs `id(1)` on its `PATH` too: the number
   in the state directory's name (`TMPDIR/koh-UID`) is what `id -u` says, and a server that is
   not told does not start (exit 1).
- holds fuzz targets for what a peer sends; `cargo test` runs the same entry
+- `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
+  this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
   points under a fixed-seed mutation run.
 
 ## [0.17.2] — 2026-11-16

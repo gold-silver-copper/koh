@@ -325,6 +325,11 @@ fn a_round_a_server_must_not_send_changes_nothing() {
             vec![],
             vec![link("way", "alt"), folder("alt")],
         ),
+        (
+            "the file `status`",
+            vec![],
+            vec![put("status", b"holder 1\n")],
+        ),
         // (The first has no `Round` before it; the last one's link ends before its `Done`.)
         ("a message outside a round", vec![], vec![]),
         ("an odd round", vec![], vec![]),
@@ -646,7 +651,7 @@ impl Line {
     /// What differs between the pane and its mirror, of what is carried: nothing, after a round.
     fn differs(&self) -> Vec<String> {
         let mut pane = snapshot(&self.pane, false);
-        pane.remove("command");
+        pane.retain(|name, _| name != "command" && name != "status");
         let mirror = snapshot(&self.pane.with_file_name("mirror"), false);
         let names = pane
             .keys()
@@ -713,7 +718,12 @@ fn a_folder_through_a_pipe_is_the_same_folder() {
         (&b"4\n"[..], &b"-> main"[..])
     );
     assert_eq!(mirror["in"], b"a FIFO");
-    assert!(!mirror.contains_key("command") && !mirror.contains_key(".view.7"));
+    let never = ["command", "status", ".view.7"];
+    assert!(
+        !never.iter().any(|name| mirror.contains_key(*name)),
+        "{:?}",
+        mirror.keys()
+    );
     assert_eq!(
         fs::metadata(scratch.0.join("mirror")).unwrap().mode() & 0o777,
         0o700

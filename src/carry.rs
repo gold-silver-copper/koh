@@ -4,9 +4,10 @@
 //! beside the mirror until the round is whole, and applies it or throws it away. Plain functions
 //! over a folder and messages: no network, and no clock but the one they are given.
 //!
-//! Of fux's format this knows four names and no file's meaning: `generation` (odd while a round
-//! is written, even when the files agree), `in` and `ctl` (the two FIFOs) and `command` (never
-//! carried: it is what starts a program). A name with a dot first is not carried.
+//! Of fux's format this knows five names and no file's meaning: `generation` (odd while a round
+//! is written, even when the files agree), `in` and `ctl` (the two FIFOs), and the two never
+//! carried: `command` (it is what starts a program) and `status` (it names the holder and the
+//! program by their numbers on the server). A name with a dot first is not carried.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File};
@@ -62,19 +63,19 @@ fn refused<T>(what: &str, name: &str) -> Result<T, Fault> {
     Err(Fault::Refused(format!("{what}{about}")))
 }
 
+/// The names a mirror never has: the one it writes itself, and the two that are not carried.
+const NEVER: [&str; 3] = ["generation", "command", "status"];
+
 /// A name a mirror has: one or two of fux's names with `/` between (letters, digits, `.`, `_`
-/// and `-`, 64 at most, no dot first), and neither of the two that are never carried, however
-/// they are spelled: where a file system takes `COMMAND` for `command`, it is that file.
+/// and `-`, 64 at most, no dot first), and none of those it never has, however they are
+/// spelled: where a file system takes `COMMAND` for `command`, it is that file.
 fn plain(name: &str) -> bool {
     let part = |part: &str| {
         let letters = |b: u8| b.is_ascii_alphanumeric() || b"._-".contains(&b);
         !part.is_empty() && part.len() <= 64 && !part.starts_with('.') && part.bytes().all(letters)
     };
-    let never = |never: &str| name.eq_ignore_ascii_case(never);
-    name.split('/').count() <= 2
-        && name.split('/').all(part)
-        && !never("generation")
-        && !never("command")
+    let never = |never: &&str| name.eq_ignore_ascii_case(never);
+    name.split('/').count() <= 2 && name.split('/').all(part) && !NEVER.iter().any(never)
 }
 
 /// The lines of a file, each with the line end it has.

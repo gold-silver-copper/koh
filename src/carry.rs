@@ -440,8 +440,10 @@ pub struct Reader {
     moved: Vec<(String, String)>,
     /// A round was sent since the client said what it has: the first is sent whatever it holds.
     sent: bool,
-    /// Until when no file is proved.
+    /// Until when no file is proved; and how long the reads took that were thrown away since
+    /// one was, which the next rest is for too.
     rests: Option<Instant>,
+    owed: Duration,
     /// What a test does between a reading and the second look at the folder's number.
     #[cfg(test)]
     midway: Option<Box<dyn FnOnce()>>,
@@ -458,6 +460,7 @@ impl Reader {
             moved: Vec::new(),
             sent: false,
             rests: None,
+            owed: Duration::ZERO,
             #[cfg(test)]
             midway: None,
         }
@@ -583,6 +586,8 @@ impl Reader {
     /// place, or one that has another name now) owes a rest: no file is proved again until
     /// nine times as long as that look took has passed, so whatever proving costs, it has a
     /// tenth of a core at most. A look that proves nothing owes none, and is not held back.
+    /// A read that is thrown away is not rested for then, or a holder that keeps writing
+    /// would starve the mirror: the next look is at once, and the rest after it is for both.
     pub fn look(&mut self, dead: bool, now: Instant) -> Look {
         let Some(numbers) = self.number(dead) else {
             return Look::Odd;
@@ -599,10 +604,20 @@ impl Reader {
         }
         let began = Instant::now();
         let round = self.read(numbers, here);
-        if proves {
-            self.rests = now.checked_add(began.elapsed() * (1 + REST));
+        let took = began.elapsed();
+        match round {
+            Some(round) => {
+                if proves {
+                    self.rests =
+                        now.checked_add(took + (took + std::mem::take(&mut self.owed)) * REST);
+                }
+                Look::Round(round)
+            }
+            None => {
+                self.owed += took;
+                Look::Moved
+            }
         }
-        round.map_or(Look::Moved, Look::Round)
     }
 
     fn read(

@@ -1016,10 +1016,18 @@ fn nothing_kept_changes_unless_the_round_is_one() {
         fux::replace(pane.join("generation"), b"8\n").unwrap();
     }));
     line.clock += Duration::from_secs(3600);
-    assert!(line.reader.round(false, line.clock).is_none());
-    // So nothing was sent, and nothing is taken as sent: the next round has all of it.
+    assert_eq!(line.reader.look(false, line.clock), Look::Moved);
+    // So nothing was sent, and nothing is taken as sent: the next round has all of it. And
+    // the reader does not rest then, with nothing sent: the next look is read at once.
     hand.number = 8;
-    let round = line.round();
+    let thrown = line.reader.owed;
+    assert!(line.reader.rests.is_none() && !thrown.is_zero());
+    let Look::Round(round) = line.reader.look(false, line.clock) else {
+        panic!("a read that was thrown away earned a rest")
+    };
+    give(&mut line.mirror, &round);
+    // (What the reading cost is rested for after the look that proves: a tenth of a core holds.)
+    assert!(line.reader.rests.unwrap() > line.clock + thrown * 9 && line.reader.owed.is_zero());
     assert_eq!(
         round,
         round_of(
@@ -1031,7 +1039,7 @@ fn nothing_kept_changes_unless_the_round_is_one() {
     // While the holder writes (an odd number) nothing is read at all.
     hand.turn();
     line.clock += Duration::from_secs(3600);
-    assert!(line.reader.round(false, line.clock).is_none());
+    assert_eq!(line.reader.look(false, line.clock), Look::Odd);
 }
 
 #[test]

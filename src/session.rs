@@ -23,7 +23,7 @@ use crate::carry::{Look, Reader};
 use crate::pane::{self, Marks};
 use crate::proto::{
     Attach, Attached, FromMirror, Had, MAX_CHUNK, MAX_CTRL, MAX_HELD, MAX_TYPED, Reply, Run,
-    SessionInfo, ToMirror, WaitResult, send_msg, send_text, session_name, spawn_msg_reader,
+    SessionInfo, ToMirror, WaitResult, send_msg, send_pieces, session_name, spawn_msg_reader,
 };
 use crate::{Exit, KohError, Result};
 
@@ -303,7 +303,7 @@ impl Sessions {
             detail,
         };
         send_msg(send, &waited, MAX_CTRL).await?;
-        send_text(send, &text).await
+        send_pieces(send, &text).await
     }
 
     /// Starts a pane with this binary as fux, `koh fux start SESSIONS/NAME -- PROGRAM` (no

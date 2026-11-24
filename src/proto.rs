@@ -99,7 +99,8 @@ pub enum Request {
     },
     Attach(Attach),
     /// The three that read a session's folder on the server (`pane`), after `Attach`, whose
-    /// number they leave as it was. `Sessions` is answered with a list of `SessionInfo`.
+    /// number they leave as it was. `Sessions` is answered with a list of `SessionInfo`, in
+    /// pieces as a text is: it is as long as the sessions that are kept make it.
     Sessions,
     /// A session's screen, or with `last` what its last command printed: `Ok`, then the text
     /// in pieces of bytes until the stream's end.
@@ -531,22 +532,22 @@ pub async fn recv_msg_opt<T: DeserializeOwned>(
     decode(&buf, max).map(Some)
 }
 
-/// Sends a text in pieces, a message each: it has no bound of its own, and no message is
-/// over its bound.
-pub async fn send_text(stream: &mut SendStream, text: &[u8]) -> Result<()> {
-    for piece in text.chunks(64 << 10) {
+/// Sends bytes in pieces, a message each: a session's text, or a list of sessions, has no
+/// bound of its own, and no message is over its bound.
+pub async fn send_pieces(stream: &mut SendStream, bytes: &[u8]) -> Result<()> {
+    for piece in bytes.chunks(64 << 10) {
         send_msg(stream, &piece, MAX_CHUNK).await?;
     }
     Ok(())
 }
 
-/// Reads a text that was sent in pieces, to the stream's end.
-pub async fn recv_text(stream: &mut RecvStream) -> Result<String> {
-    let mut text = Vec::new();
+/// Reads what was sent in pieces, to the stream's end.
+pub async fn recv_pieces(stream: &mut RecvStream) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
     while let Some(mut piece) = recv_msg_opt::<Vec<u8>>(stream, MAX_CHUNK).await? {
-        text.append(&mut piece);
+        bytes.append(&mut piece);
     }
-    Ok(String::from_utf8_lossy(&text).into_owned())
+    Ok(bytes)
 }
 
 /// Read and decode one required frame.

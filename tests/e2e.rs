@@ -4630,7 +4630,8 @@ async fn waits(client: &Client, session: &str) -> RecvStream {
 /// What a wait was answered: its exit code and its text.
 async fn waited(mut wait: RecvStream) -> (i32, String) {
     let ended: koh::proto::WaitResult = recv_msg(&mut wait, MAX_CTRL).await.unwrap();
-    (ended.exit, koh::proto::recv_text(&mut wait).await.unwrap())
+    let text = koh::proto::recv_pieces(&mut wait).await.unwrap();
+    (ended.exit, String::from_utf8(text).unwrap())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4723,4 +4724,26 @@ async fn a_wait_gives_the_first_command_that_ended_since_it_was_asked() {
     // It is the first of them that the wait was for: its code, and what it printed.
     assert_eq!(waited(wait).await, (0, "two\n".to_string()));
     client.close().await;
+}
+
+#[tokio::test]
+async fn a_list_of_sessions_longer_than_one_message_is_whole() {
+    let (_tmp, srv, client, _, state) = boot_pair("many").await;
+    // As many ended panes as `--max-sessions` may keep, each with a title as long as fux
+    // writes one: more than a message holds.
+    let sessions = state.join("fux/koh-sessions");
+    for n in 1..=4500 {
+        let pane = sessions.join(n.to_string());
+        fs::create_dir(&pane).unwrap();
+        fs::write(pane.join("status"), "holder 1\npid 1\n").unwrap();
+        fs::write(pane.join("title"), "t".repeat(256) + "\n").unwrap();
+    }
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.len(), 4500);
+    assert!(
+        list.iter()
+            .all(|session| session.title.len() == 256 && session.state == "ended")
+    );
+    client.close().await;
+    srv.shutdown().await;
 }

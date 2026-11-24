@@ -2,10 +2,17 @@
 //! mutation test (`tests/mutation.rs`) both run these; none may panic, whatever the bytes.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
 use koh::KohError;
+use koh::carry::{Fault, Mirror, Reader};
 use koh::proto::{
-    ClientEvent, ExecClientMsg, ExecServerMsg, JobInfo, KeyProof, LogMsg, Reply, Request,
-    ScreenFrame, ServerEvent, SessionInfo, SyncMsg, WaitResult,
+    ClientEvent, ExecClientMsg, ExecServerMsg, FromMirror, JobInfo, KeyProof, LogMsg, MAX_CHUNK,
+    Reply, Request, ScreenFrame, ServerEvent, SessionInfo, SyncMsg, ToMirror, WaitResult,
 };
 use serde::de::DeserializeOwned;
 
@@ -94,4 +101,108 @@ pub fn paths(data: &[u8]) {
     }
     let patterns: Vec<String> = lines.map(String::from).collect();
     let _ = koh::sync::matches_exclude(path, &patterns);
+}
+
+/// Any bytes as a message of a carried pane, either way, as koh reads one: all of it or none.
+/// A list of what a mirror has is checked before any folder is looked at: here there is none.
+pub fn carry_decode(data: &[u8]) {
+    let _ = koh::proto::decode::<ToMirror>(data, MAX_CHUNK);
+    if let Ok(FromMirror::Has(list)) = koh::proto::decode(data, MAX_CHUNK) {
+        let nowhere = std::env::temp_dir().join("koh-fuzz-no-pane");
+        assert!(!matches!(Reader::new(&nowhere).has(&list, false), Ok(true)));
+    }
+}
+
+/// What a folder holds, by name: a file's bytes, where a link leads, what else a name is.
+fn held(dir: &Path, prefix: &str, found: &mut BTreeMap<String, Vec<u8>>) {
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let (path, name) = (
+            entry.path(),
+            entry.file_name().to_string_lossy().into_owned(),
+        );
+        let kind = entry.file_type().unwrap();
+        let what = match () {
+            () if kind.is_file() => [b"file ", fs::read(&path).unwrap().as_slice()].concat(),
+            () if kind.is_symlink() => {
+                format!("-> {}", fs::read_link(&path).unwrap().display()).into()
+            }
+            () if kind.is_dir() => b"folder".to_vec(),
+            () => b"other".to_vec(),
+        };
+        if kind.is_dir() {
+            held(&path, &format!("{prefix}{name}/"), found);
+        }
+        found.insert(format!("{prefix}{name}"), what);
+    }
+}
+
+/// Any messages a server sends, one after the other, into a mirror made for them. After each
+/// that is not taken, and when no more come, the mirror is what the last whole round left; and
+/// what a whole round leaves is a mirror: its number in `generation`, every link to a folder of
+/// its own, no `command`, nothing staged. Nothing is ever beside it.
+pub fn carry_sequence(data: &[u8]) {
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    let Some(messages) = decode::<Vec<ToMirror>>(data) else {
+        return;
+    };
+    let run = RUNS.fetch_add(1, Ordering::Relaxed);
+    let root = std::env::temp_dir().join(format!("koh-fuzz-{}-{run}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+    let mut mirror = Mirror::make(&root.join("mirror")).unwrap();
+    let look = || {
+        let mut found = BTreeMap::new();
+        held(&root, "", &mut found);
+        found
+    };
+    let (mut whole, mut number, now) = (look(), 0, Instant::now());
+    for message in messages {
+        let done = message == ToMirror::Done;
+        if let ToMirror::Round(n) = message {
+            number = n;
+        }
+        match mirror.take(message, now) {
+            Ok(_) if done => {
+                whole = look();
+                let is = |name: &str, what: &str| {
+                    whole.get(name).is_some_and(|is| is == what.as_bytes())
+                };
+                assert!(
+                    is("mirror/generation", &format!("file {number}\n"))
+                        && is("mirror/.koh", "folder")
+                );
+                for (name, what) in &whole {
+                    let name = name.strip_prefix("mirror/").unwrap_or(name);
+                    let led = what
+                        .strip_prefix(b"-> ")
+                        .map(|to| format!("mirror/{}", String::from_utf8_lossy(to)));
+                    assert!(
+                        led.is_none_or(|to| !name.contains('/') && is(&to, "folder")),
+                        "{name}"
+                    );
+                    assert!(
+                        !name.eq_ignore_ascii_case("command") && !name.starts_with(".koh/"),
+                        "{name}"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(Fault::Refused(_)) => {
+                assert!(look() == whole, "a refused message changed the mirror")
+            }
+            // (A round that could not be written leaves the mirror between two: the next list says how.)
+            Err(Fault::Failed(_)) => whole.clear(),
+        }
+        if whole.is_empty() {
+            break;
+        }
+    }
+    mirror.discard();
+    let left = look();
+    assert!(
+        whole.is_empty() || left == whole,
+        "the mirror is not what the last whole round left"
+    );
+    assert!(left.keys().all(|name| name.starts_with("mirror")));
+    let _ = fs::remove_dir_all(&root);
 }

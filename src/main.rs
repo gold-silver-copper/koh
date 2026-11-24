@@ -694,7 +694,7 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         None::<String>,
         None::<String>,
         None::<String>,
-        200usize,
+        None::<usize>,
         None::<u64>,
     );
     let mut i = 0;
@@ -708,9 +708,8 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
             "--text" => text = Some(take_opt(args, &mut i, a)?),
             "--session" => session = Some(take_opt(args, &mut i, a)?),
             "--tail" => {
-                tail = take_opt(args, &mut i, a)?
-                    .parse()
-                    .map_err(|_| KohError::usage("bad --tail"))?
+                let lines = take_opt(args, &mut i, a)?.parse();
+                tail = Some(lines.map_err(|_| KohError::usage("bad --tail"))?)
             }
             "--timeout" => {
                 timeout = Some(
@@ -730,10 +729,20 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
     if session.is_none() && job.is_none() {
         return Err(KohError::usage(usage));
     }
+    if session.is_some() && (job.is_some() || text.is_some() || tail.is_some()) {
+        let both = "a wait is for a job or for a session: JOB, --text and --tail are a job's";
+        return Err(KohError::usage(format!(
+            "{both}, and are not said with --session"
+        )));
+    }
     let client = Client::connect(&server, &opts, true).await?;
     let res = match (session, job) {
         (Some(session), _) => client.wait_session(session, timeout).await,
-        (None, Some(name)) => client.wait_job(name, text, tail, timeout).await,
+        (None, Some(name)) => {
+            client
+                .wait_job(name, text, tail.unwrap_or(200), timeout)
+                .await
+        }
         (None, None) => Err(KohError::usage(usage)),
     };
     client.close().await;

@@ -4747,3 +4747,19 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
     client.close().await;
     srv.shutdown().await;
 }
+
+#[test]
+fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
+    let tmp = TempDir::new("wait-usage");
+    // A wait is for a job or for a session; what is a job's alone is not said of a session.
+    for more in [&["build"][..], &["--text", "done"], &["--tail", "5"]] {
+        let mut args = vec!["wait", "nowhere", "--session", "s"];
+        args.extend(more);
+        let (code, _, said) = koh(&tmp.0, &args);
+        assert_eq!(code, Some(2), "{more:?}: {said}");
+        assert!(
+            said.contains("a job's") && said.contains("--session"),
+            "{more:?}: {said}"
+        );
+    }
+}

@@ -25,6 +25,11 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["full"] }
 
+# What proving a file costs the reader of a pane's folder: prints, and is no test.
+[[bench]]
+name = "carry"
+harness = false
+
 [profile.release]
 opt-level = 2
 lto = "thin"

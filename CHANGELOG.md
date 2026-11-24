@@ -109,12 +109,15 @@ binary, its tests and the fuzz targets share code, and any release may change it
     (an empty line entered) ends no command: it reached back to the output of the one before. A
     text of any length comes, in pieces (past 8 MiB it failed).
   - **`koh wait --session`** is for the first command that ends after it was asked: its code and
-    what it printed, read together. A command has ended when there is one more `end` mark,
-    counting those a full `marks` dropped from its front (it counted `end` marks alone, of which a
-    pane keeps a thousand, and so saw none once a session had some 250 commands). It exits 1, not
-    0, for a session that ended without saying how, or whose folder is gone or another run's. It
-    is no longer waited for once its client has left. `koh wait SERVER JOB --session NAME`, and
-    `--text` or `--tail` with `--session`, are a usage error (exit 2).
+    what it printed, read together. It goes by the numbers `fux` 0.43.2 gives a pane's marks
+    (`marks.dropped`): a command has ended when an `end` of a higher number than the last is
+    there, whatever the screen did meanwhile (it counted `end` marks, of which a pane keeps a
+    thousand, and so saw none once a session had some 250 commands). Where more marks came than a
+    pane keeps, it gives the oldest `end` still listed and says that it is not known to be the
+    first. A session whose holder is of an older `fux` has no numbers, and a wait for it is
+    refused. It exits 1, not 0, for a session that ended without saying how, or whose folder is
+    gone or another run's. It is no longer waited for once its client has left. `koh wait SERVER
+    JOB --session NAME`, and `--text` or `--tail` with `--session`, are a usage error (exit 2).
   - **`koh help-agents`** prints the help and, after it, recipes: a session's files, and
     `sessions`, `output` and `wait --session` as a script over them for `koh exec`. `koh help` is
     as it was.

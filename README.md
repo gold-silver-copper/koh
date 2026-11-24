@@ -76,9 +76,11 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
       `--text` and `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
-      the last mark is `output`. A command has ended when there is one more `end`: where the
-      marks are on the screen is not asked, so a screen that scrolls, has a line inserted or
-      is cleared ends nothing. koh sets up no shell: `koh help-agents` has the lines for
+      the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
+      line in `marks`): a command has ended when an `end` is there with a higher number than
+      the last `end` had when the wait was asked. Where a mark is on the screen is not
+      asked, so a screen that scrolls, has a line inserted or is cleared ends nothing, and
+      nothing is inferred. koh sets up no shell: `koh help-agents` has the lines for
       bash, and nearly the same three commands as a script over the files, for `koh exec`. In
       a shell that marks an `end` at every prompt, an empty line entered is an `end` too: a
       `wait` then returns the output and the code of the command before, again.
@@ -163,16 +165,15 @@ koh adds nothing to stop these. What happens instead is said.
 - Ask `koh wait --session` before you type the command it is to wait for (`koh wait … &`,
   type, `wait $!`): a command that has ended when the server takes the request is not waited
   for, and the wait is then for the next.
-- In a session of some 250 commands or more, `koh wait --session` counts by a second fact.
-  The pane's `marks` keeps the last thousand and drops one from its front for each it takes,
-  so there are never more `end`s there than before: koh finds the file's first mark in the
-  file as it was, and so knows how many went. Two things can then go wrong, and only then.
-  Where the oldest marks are several alike at one place (commands of one exit code that were
-  on a screen when it was cleared, 250 commands ago), fewer are taken for gone than are: a
-  command's end is then seen late, once the file's front has passed them, a few commands
-  on; the wait returns then, still for the first command that ended. And where all thousand
-  marks are still on the screen (250 commands, none scrolled out: a pane of 250 rows or
-  more), a screen that moves can be taken for an end.
+- If a `koh wait --session` says `the oldest still kept, not known to be the first (N marks
+  came and went unread)`, more marks came between two of its looks than a pane keeps (a
+  thousand: some 250 commands inside a tenth of a second, a script's doing). The first
+  command that ended is then no longer listed: what it gives is the oldest that is, its code
+  and its output, and it says so on that line (`detail`, with `--json`).
+- End the sessions that a koh built on a `fux` before 0.43.2 started, if you `koh wait` on
+  them: such a session's holder does not number its marks (its folder has no
+  `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh
+  sessions`, `koh output` and `koh connect` go on with it as it is.
 - On a kernel before 6.13 a file's time is the clock's tick: a file of a session's folder
   rewritten in place to the same length within one tick is not seen by a client until it
   changes again. Replace it, or add to its end.

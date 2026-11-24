@@ -4474,13 +4474,13 @@ impl Host {
     }
 
     /// A session of that name running `program`, with nobody attached once this returns: its
-    /// folder, when its screen shows `ready`.
+    /// folder, when its screen shows `ready`. That is read in the mount's own mirror, and the
+    /// mount told to end only then: the session's pane shows it before `koh mount` has been
+    /// answered, and a `koh mount` that does not listen yet dies of the signal.
     fn session(&self, name: &str, program: &[String], ready: &str) -> PathBuf {
         let mut mount = self.mount(name, None, &["--session", name], program);
         let pane = self.pane(name);
-        until(&format!("the session {name} shows {ready:?}"), || {
-            screen(&pane).contains(ready)
-        });
+        mount.shows(ready);
         signal(&mount.koh.id().to_string(), "-TERM");
         assert_eq!(mount.ends(), Some(0), "{}", mount.said());
         pane

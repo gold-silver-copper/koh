@@ -1154,17 +1154,19 @@ impl Drop for TempConnectDir {
     }
 }
 
+/// koh's keys for its viewer. A key's script runs in a folder the viewer makes for it, where `pane`
+/// is a link to the pane that has the keys.
 fn install_detach_keys(keys_dir: &Path) -> Result<()> {
     const SCRIPTS: [(&str, &[u8]); 4] = [
         ("C-]/dot", b"#!/bin/sh\n# detach\necho quit\n"),
         (
             "C-]/C-]",
-            b"#!/bin/sh\n# send C-]\n[ -p \"$FUX_PANE/in\" ] && printf '\\035' 1<>\"$FUX_PANE/in\"\n",
+            b"#!/bin/sh\n# send C-]\n[ -p pane/in ] && printf '\\035' 1<>pane/in\n",
         ),
         ("C-b/d", b"#!/bin/sh\n# detach\necho quit\n"),
         (
             "C-b/C-b",
-            b"#!/bin/sh\n# send C-b\n[ -p \"$FUX_PANE/in\" ] && printf '\\002' 1<>\"$FUX_PANE/in\"\n",
+            b"#!/bin/sh\n# send C-b\n[ -p pane/in ] && printf '\\002' 1<>pane/in\n",
         ),
     ];
     for (rel, body) in SCRIPTS {

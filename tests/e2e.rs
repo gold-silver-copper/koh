@@ -887,7 +887,7 @@ impl InTerminal {
 }
 
 #[tokio::test]
-async fn koh_connect_in_a_terminal_leaves_at_its_detach_key_and_ends_when_the_program_does() {
+async fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
     let (tmp, srv, client, _, _) = boot_pair("connect-tty").await;
     let (config, runtime) = (tmp.0.join("cli_cfg"), tmp.0.join("run"));
     fs::create_dir_all(&runtime).unwrap();
@@ -895,7 +895,7 @@ async fn koh_connect_in_a_terminal_leaves_at_its_detach_key_and_ends_when_the_pr
         srv.endpoint_id.to_string(),
         srv.direct_addr.unwrap().to_string(),
     );
-    let program = "stty -icanon -echo; echo READY; head -c 1 >/dev/null; exit 7";
+    let program = "stty -icanon -echo; echo READY; od -An -tx1 -N2; head -c 1 >/dev/null; exit 7";
 
     // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
     let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
@@ -907,12 +907,20 @@ async fn koh_connect_in_a_terminal_leaves_at_its_detach_key_and_ends_when_the_pr
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].state, "running");
 
-    // The program's end is the end of `koh connect`, with the program's status: nobody has to
-    // type the detach key at a session that is over.
-    let session = sessions[0].id.to_string();
-    let again = ["--direct", &addr, &id, "--session", &session];
+    // Each of koh's two prefix keys typed twice is the key's own byte, typed to the program.
+    let session = sessions[0].id;
+    let again = ["--direct", &addr, &id, "--session", &session.to_string()];
     let mut second = InTerminal::connect(&config, &runtime, &again);
     second.shows("READY").await;
+    second.types(b"\x1d\x1d\x02\x02");
+    let typed = async |_: &mut InTerminal| {
+        let screen = client.output(session, false).await.unwrap();
+        screen.split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
+    };
+    second.until("the program reads the two bytes", typed).await;
+
+    // The program's end is the end of `koh connect`, with the program's status: nobody has to
+    // type the detach key at a session that is over.
     second.types(b"x");
     assert_eq!(second.ends().await, Some(7));
 

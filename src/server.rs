@@ -403,7 +403,7 @@ async fn dispatch(
                 loop {
                     let meta_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(offset);
                     if meta_len > offset
-                        && let Ok(mut f) = fs::File::open(&log_path)
+                        && let Ok(mut f) = fuxix::open_regular(&log_path)
                     {
                         use std::io::{Read as _, Seek as _, SeekFrom};
                         if f.seek(SeekFrom::Start(offset)).is_ok() {

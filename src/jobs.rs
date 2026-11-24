@@ -2,7 +2,7 @@
 //! (no PTY, no 80-column wrapping, no 4 MiB screen truncation).
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -331,7 +331,10 @@ pub fn build_command(argv: &[String], cwd: &Path, shell: bool) -> Result<Command
 
 /// Reads the last `tail_lines` lines (or all bytes if `tail_lines == None`) of a job log file.
 pub fn read_log_tail(path: &Path, tail_lines: Option<usize>) -> Result<Vec<u8>> {
-    let data = fs::read(path).map_err(|e| KohError::failed(format!("read log: {e}")))?;
+    let mut data = Vec::new();
+    fuxix::open_regular(path)
+        .and_then(|mut log| log.read_to_end(&mut data))
+        .map_err(|e| KohError::failed(format!("read log: {e}")))?;
     let Some(n) = tail_lines else {
         return Ok(data);
     };
@@ -367,7 +370,7 @@ pub async fn wait_job(
 
     loop {
         if let Some(needle) = text.as_deref()
-            && let Ok(mut f) = File::open(&log_path)
+            && let Ok(mut f) = fuxix::open_regular(&log_path)
             && f.seek(SeekFrom::Start(scan_offset)).is_ok()
         {
             let mut chunk = Vec::new();

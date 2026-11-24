@@ -1,4 +1,6 @@
 //! End-to-end integration tests over real loopback iroh QUIC connections.
+// (A test reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -1181,6 +1183,21 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_se
     );
 
     srv.shutdown().await;
+}
+
+#[test]
+fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
+    let tmp = TempDir::new("fifo-list");
+    // A FIFO nobody writes to, where the server reads who is allowed at every request: it is
+    // read as a list of nobody, and whoever reads it is not kept waiting for a writer.
+    drop(fuxix::fifo(tmp.0.join("clients")).unwrap());
+    let key = tmp.0.join("server.key");
+    let (tell, told) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tell.send(koh::keys::load_clients(Some(&key)).map(|list| list.len()))
+    });
+    let read = told.recv_timeout(Duration::from_secs(5));
+    assert!(matches!(read, Ok(Ok(0))), "{read:?}");
 }
 
 /// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.

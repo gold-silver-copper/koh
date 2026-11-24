@@ -11,6 +11,8 @@
 //! the time the reader worked. Then how long a change that needs no proof (a key's echo on the
 //! screen, 10 ms after a line scrolled) waits for its round. First, for the list a client
 //! sends: blake3 over the two files, one time after the other and each time after a rest.
+// (A bench reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};

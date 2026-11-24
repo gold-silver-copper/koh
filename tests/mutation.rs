@@ -1,6 +1,8 @@
 //! The fuzz targets' entry points (`fuzz/entry.rs`) under a mutation run that every `cargo test`
 //! repeats exactly: a fixed seed, a fixed number of rounds, a few seconds at most. It stands in
 //! for coverage-guided fuzzing where that cannot run, and keeps the entry points compiling.
+// (A test reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 #[path = "../fuzz/entry.rs"]
 mod entry;

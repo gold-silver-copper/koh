@@ -198,7 +198,7 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
         .ok_or_else(|| KohError::usage("invalid key path"))?;
     ensure_private_dir(parent)?;
 
-    match File::open(&path) {
+    match fuxix::open(&path, false) {
         Ok(file) => {
             let meta = file
                 .metadata()
@@ -220,7 +220,7 @@ pub fn load_or_create_key(role: Role, explicit: Option<&Path>) -> Result<SecretK
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let mut raw = [0u8; KEY_LEN];
-            File::open("/dev/urandom")
+            fuxix::open("/dev/urandom", false)
                 .and_then(|mut f| f.read_exact(&mut raw))
                 .map_err(|e| KohError::failed(format!("read /dev/urandom: {e}")))?;
             let key = SecretKey::from_bytes(&raw);
@@ -295,7 +295,7 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl> {
 /// Loads saved `servers` list beside `client.key`.
 pub fn load_servers(key_file: Option<&Path>) -> Result<Vec<ServerEntry>> {
     let path = config_dir(key_file)?.join(Role::Client.list_file());
-    let text = match fs::read_to_string(&path) {
+    let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
@@ -349,7 +349,7 @@ pub fn save_servers(key_file: Option<&Path>, entries: &[ServerEntry]) -> Result<
 /// Loads allowed `clients` list beside `server.key`.
 pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
     let path = config_dir(key_file)?.join(Role::Server.list_file());
-    let text = match fs::read_to_string(&path) {
+    let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),

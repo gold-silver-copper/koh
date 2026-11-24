@@ -2,3 +2,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-indexing-slicing-in-tests = true
 allow-panic-in-tests = true
+disallowed-methods = [
+    { path = "std::fs::File::open", reason = "a FIFO there holds the caller: use fuxix::open or fuxix::open_regular" },
+    { path = "std::fs::read", reason = "a FIFO there holds the caller: use fuxix::open or fuxix::open_regular" },
+    { path = "std::fs::read_to_string", reason = "a FIFO there holds the caller: use fuxix::open or fuxix::open_regular" },
+]

@@ -2984,6 +2984,20 @@ async fn typed_bytes_go_to_the_run_that_was_checked() {
         "{said}"
     );
     assert!(said.contains("17 typed bytes were not sent"), "{said}");
+    // (That is the server's word as well as the client's: asked for a run the name has not,
+    // by a client that would take any answer, it answers none.)
+    let client = host.client().await;
+    let asks = Attach {
+        run: Some(RUNS[0]),
+        ..asks(Some("s"), &[])
+    };
+    let err = attach(&client, asks).await.unwrap_err();
+    assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
+    assert!(
+        err.message.contains("another run has the session's name s"),
+        "{err:?}"
+    );
+    client.close().await;
     // While the stream lives: what is typed then goes into the FIFOs of the run that was
     // checked, and the client is told that its session ended.
     let mut live = host.mount("b", None, &["--session", "t"], &reads_into(&outs[2], 0));

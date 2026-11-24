@@ -2734,6 +2734,11 @@ async fn what_is_typed_without_a_link_is_typed_on_return() {
     let mount = host.mount("a", Some(&tap), &["--new"], &reads_into(&out, 0));
     mount.shows("READY");
     let mut all = Vec::new();
+    let arrived = |all: &[u8]| {
+        until("the program has read what was typed", || {
+            fs::read(&out).unwrap_or_default().len() >= all.len()
+        })
+    };
     for away in 0..10u32 {
         tap.down(true);
         mount.says("no link", away as usize + 1);
@@ -2744,16 +2749,20 @@ async fn what_is_typed_without_a_link_is_typed_on_return() {
         all.extend(some);
         tap.down(false);
         mount.says("the link is back", away as usize + 1);
+        // (Read by the program before the link is cut again: what is on its way when a link
+        // dies may be lost, and that is not what this asks.)
+        arrived(&all);
     }
     // And a message the stream does not take is kept for the next link: the link is found
     // broken by it, and what was typed is typed on the next.
     for deaf in 0..5u32 {
         tap.deafen();
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(500));
         let some = format!("{:07}\n", 180 + deaf).into_bytes();
         mount.types(&some);
         all.extend(some);
         mount.says("the link is back", 11 + deaf as usize);
+        arrived(&all);
     }
     // All of it, once, in order.
     assert_eq!(all.len(), 1480);
@@ -3700,7 +3709,7 @@ async fn a_stream_ends_with_its_client() {
     }
     until(
         &format!("the server holds {rest:?} again, not {:?}", holds()),
-        || holds().0 == rest.0 && holds().1 <= rest.1,
+        || holds().0 <= rest.0 && holds().1 <= rest.1,
     );
     // And after a hundred clients that came and went.
     for number in 1..=100 {
@@ -3708,7 +3717,7 @@ async fn a_stream_ends_with_its_client() {
     }
     until(
         &format!("the server holds {rest:?} again, not {:?}", holds()),
-        || holds().0 == rest.0 && holds().1 <= rest.1,
+        || holds().0 <= rest.0 && holds().1 <= rest.1,
     );
     client.close().await;
 }

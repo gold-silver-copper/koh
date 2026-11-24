@@ -2620,26 +2620,25 @@ fn the_mirror_is_the_pane() {
     assert!(fifo("in") && fifo("ctl"));
     assert!(pane.join("status").is_file() && pane.join("command").is_file());
     assert!(!mount.dir.join("status").exists() && !mount.dir.join("command").exists());
-    // A shell; output that scrolls into history.
+    // A shell; output that scrolls into history. (Each is waited for by what the program
+    // printed, which the command as it was typed does not have.)
     mount.types(b"echo typed-$((6 * 7)); seq 1 3000\n");
-    mount.shows("3000");
-    assert!(
-        fs::read_to_string(mount.dir.join("history"))
-            .unwrap()
-            .contains("typed-42")
-    );
+    let history = || fs::read_to_string(mount.dir.join("history")).unwrap_or_default();
+    until("the mirror's history has what scrolled", || {
+        history().contains("typed-42\n") && history().contains("\n2900\n")
+    });
     agrees(&pane, &mount.dir);
     // The alternate screen comes, `shown` turns to it; and goes again.
     mount.types(b"printf '\\033[?1049hALTERNATE'\n");
-    mount.shows("ALTERNATE");
-    assert_eq!(
-        fs::read_link(mount.dir.join("shown")).unwrap(),
-        Path::new("alt")
-    );
+    let shown = || fs::read_link(mount.dir.join("shown")).unwrap_or_default();
+    until("the mirror shows the alternate screen", || {
+        shown() == Path::new("alt") && screen(&mount.dir).contains("ALTERNATE")
+    });
     agrees(&pane, &mount.dir);
     mount.types(b"printf '\\033[?1049l'; echo back\n");
-    mount.shows("back");
-    assert!(!mount.dir.join("alt").exists());
+    until("the mirror shows the main screen again", || {
+        shown() == Path::new("main") && !mount.dir.join("alt").exists()
+    });
     agrees(&pane, &mount.dir);
     // A size asked through the mirror's `ctl` is the pane's.
     fs::write(mount.dir.join("ctl"), "resize 100 30\n").unwrap();
@@ -2839,10 +2838,18 @@ fn a_paste_larger_than_the_pipe_waits_and_is_not_cut() {
     });
     std::thread::sleep(Duration::from_secs(1));
     assert!(!done.load(SeqCst), "the writer was not made to wait");
-    // All of it reaches the program, in order: nothing was dropped to make room.
-    until("the program has read the paste", || {
-        fs::read(&out).unwrap_or_default().len() >= paste.len()
-    });
+    // All of it reaches the program, in order: nothing was dropped to make room. (A terminal
+    // takes typed bytes slowly on some systems: two minutes, and it must keep coming.)
+    let (began, mut read) = (Instant::now(), 0);
+    while read < paste.len() {
+        std::thread::sleep(Duration::from_millis(50));
+        read = fs::metadata(&out).map_or(0, |out| out.len() as usize);
+        let of = paste.len();
+        assert!(
+            began.elapsed() < Duration::from_secs(120),
+            "the program read {read} of {of} bytes in two minutes"
+        );
+    }
     writer.join().unwrap();
     assert!(fs::read(&out).unwrap() == paste);
 }

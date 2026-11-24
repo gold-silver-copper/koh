@@ -267,7 +267,7 @@ impl Sessions {
         }
         if !asked.name.as_deref().is_none_or(session_name) {
             return Err(KohError::usage(
-                "a session's name is letters, digits, '.', '_' and '-', at most 64, not starting with a dot",
+                "a session's name is letters, digits, '.', '_' and '-', at most 64, not starting with a dot, and none of fux's own: -, colours, keyboard, layout",
             ));
         }
         let dir = match (&asked.run, &asked.name) {

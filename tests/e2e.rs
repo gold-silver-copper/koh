@@ -2660,6 +2660,16 @@ fn the_mirror_is_the_pane() {
         history().contains("typed-42\n") && history().contains("\n2900\n")
     });
     agrees(&pane, &mount.dir);
+    // What a program puts on the clipboard, and a picture it draws, are files of the pane: the
+    // mirror has them.
+    mount.types(b"printf '\\033]52;c;aGVsbG8=\\007\\033Pq#0;2;100;0;0#0~~~~~~-~~~~~~\\033\\\\'\n");
+    until("the mirror has the clipboard and the picture", || {
+        let listed = fs::read_to_string(mount.dir.join("main/pictures")).unwrap_or_default();
+        fs::read(mount.dir.join("clipboard")).is_ok_and(|bytes| bytes == b"hello")
+            && listed.starts_with("pic-1.sixel ")
+            && mount.dir.join("pic-1.sixel").is_file()
+    });
+    agrees(&pane, &mount.dir);
     // The alternate screen comes, `shown` turns to it; and goes again.
     mount.types(b"printf '\\033[?1049hALTERNATE'\n");
     let shown = || fs::read_link(mount.dir.join("shown")).unwrap_or_default();

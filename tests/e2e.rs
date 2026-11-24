@@ -763,11 +763,9 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_sixel_pictures
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(fs::read(local_mirror.join("pic-1.sixel")).unwrap(), sixel);
-    assert!(
-        fs::read_to_string(local_mirror.join("status"))
-            .unwrap()
-            .starts_with("pid ")
-    );
+    // A mirror's program and its holder are on another machine: no `status` names a process of
+    // this one for them.
+    assert!(!local_mirror.join("status").exists());
     assert!(
         fs::read_to_string(local_mirror.join("cursor"))
             .unwrap()
@@ -918,6 +916,23 @@ async fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does()
         screen.split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
     };
     second.until("the program reads the two bytes", typed).await;
+
+    // The terminal's size is the session's, also when it changes: the viewer asks koh's pane to
+    // take it, as it asks any pane.
+    let size = fuxix::Winsize {
+        rows: 30,
+        cols: 100,
+        xpixel: 1000,
+        ypixel: 600,
+    };
+    fuxix::set_winsize(&second.tty, size).unwrap();
+    let resized = async |_: &mut InTerminal| {
+        let sessions = client.sessions().await.unwrap();
+        (sessions[0].cols, sessions[0].rows) == (100, 30)
+    };
+    second
+        .until("the session takes the terminal's size", resized)
+        .await;
 
     // The program's end is the end of `koh connect`, with the program's status: nobody has to
     // type the detach key at a session that is over.

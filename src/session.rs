@@ -236,10 +236,29 @@ impl Sessions {
         Ok(started)
     }
 
+    /// A client's seat on a session: its place among the streams of the folder's run, and
+    /// then the run's two FIFOs (`held`), in that order. The place is taken under the lock
+    /// `goes` looks under, before anything of the folder is opened: so a folder is not removed
+    /// for a new session once a client has its place on it, and a client whose folder went
+    /// before that has no FIFOs, no seat and no answer.
+    fn seat(&self, dir: &Path, named: Option<Run>, client: u64) -> Option<Seat<'_>> {
+        let run = named.or_else(|| run_of(dir))?;
+        let number = self.streamed.fetch_add(1, Ordering::Relaxed);
+        let (stop, stopped) = watch::channel(false);
+        let place = Place(self, (run, client), number);
+        let older = self.streams().insert(place.1, (number, stop));
+        #[cfg(test)]
+        tests::MIDWAY.take().into_iter().for_each(|midway| midway());
+        let (run, fifos) = held(dir, Some(run))?;
+        Some((place, older, stopped, run, fifos))
+    }
+
     /// Removes an ended session's folder for a new one, unless a client has come to it since
-    /// it was chosen (one that comes again does not wait for a start). Looked at and removed
-    /// under the streams' lock, which a stream takes its place under: a client either has its
-    /// place before this looks, or finds no folder.
+    /// it was chosen (one that comes again does not wait for a start): then the folder stays,
+    /// and there is one session more than the cap until a later start finds it without a
+    /// client. Looked at and removed under the streams' lock, which a client takes its place
+    /// under before it opens anything (`seat`): it has its place before this looks, or finds
+    /// no folder.
     fn goes(&self, dir: &Path) {
         let streams = self.streams();
         let streamed = run_of(dir).is_some_and(|run| streams.keys().any(|(had, _)| *had == run));
@@ -285,8 +304,8 @@ impl Sessions {
             (Some(_), None) => return Err(KohError::usage("a run of no session")),
             (None, _) => self.find(&asked, cwd).await?,
         };
-        // The run is the one the client named, or with none the folder's as it is now; and
-        // the two FIFOs are that run's (`held`).
+        // The run is the one the client named, or with none the folder's as it is now; the
+        // client takes its place on it, and the two FIFOs are that run's (`seat`).
         let gone = || match &asked.run {
             Some(_) => not_found(format!(
                 "another run has the session's name {name}: nothing is typed into it",
@@ -294,18 +313,16 @@ impl Sessions {
             )),
             None => not_found(format!("the session at {} is gone", dir.display())),
         };
-        let (run, fifos) = held(&dir, asked.run).ok_or_else(gone)?;
+        let seat = self.seat(&dir, asked.run, asked.client);
+        let (place, older, mut stopped, run, fifos) = seat.ok_or_else(gone)?;
         // This client's older stream on the run ends first, and has stopped writing before
         // this one is answered: what it still held for the FIFOs is not typed after what
         // this one brings.
-        let number = self.streamed.fetch_add(1, Ordering::Relaxed);
-        let (stop, mut stopped) = watch::channel(false);
-        let place = Place(self, (run, asked.client), number);
-        let older = self.streams().insert(place.1, (number, stop));
         if let Some((_, older)) = older {
             let _ = older.send(true);
             older.closed().await;
         }
+        let number = place.2;
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         let attached = Attached {
@@ -559,6 +576,16 @@ impl Sessions {
 /// of the same client has it by then.
 struct Place<'a>(&'a Sessions, (Run, u64), u64);
 
+/// What an attach has once it is seated: its place, this client's older stream on the run if
+/// there is one, what tells this stream to stop, the run and the run's two FIFOs.
+type Seat<'a> = (
+    Place<'a>,
+    Option<Stream>,
+    watch::Receiver<bool>,
+    Run,
+    [Option<File>; 2],
+);
+
 impl Drop for Place<'_> {
     fn drop(&mut self) {
         let mut streams = self.0.streams();
@@ -574,6 +601,11 @@ impl Drop for Place<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// What a test does between a client's taking its place and the opening of its FIFOs.
+        pub(super) static MIDWAY: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+    }
 
     /// A folder as a pane's is, as far as a run and its FIFOs go: held by `holder`.
     fn pane(dir: &Path, holder: u32) -> [File; 2] {
@@ -628,6 +660,28 @@ mod tests {
         sessions.streams().remove(&place);
         sessions.goes(&dir);
         assert!(!dir.exists());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_client_has_its_place_before_the_folder_is_looked_at_to_go() {
+        let tmp = scratch("seat");
+        let sessions = std::sync::Arc::new(Sessions::new(&tmp, 1, "sh".into()).unwrap());
+        let dir = sessions.dir().join("1");
+        let _fifos = pane(&dir, 7);
+        let named = run_of(&dir);
+        // The session was chosen to go for a new one. As a client that comes back to it is
+        // seated, the new one has started, and the folder is looked at to be removed.
+        let (looks, chosen) = (sessions.clone(), dir.clone());
+        MIDWAY.set(Some(Box::new(move || looks.goes(&chosen))));
+        // The client had its place by then: the folder stays, and it is seated on it.
+        let seat = sessions.seat(&dir, named, 1);
+        assert!(seat.is_some() && dir.is_dir());
+        drop(seat);
+        // Once it has left the folder goes, and a client that comes then has no seat and no place.
+        sessions.goes(&dir);
+        assert!(!dir.exists() && sessions.seat(&dir, named, 1).is_none());
+        assert!(sessions.streams().is_empty());
         let _ = fs::remove_dir_all(tmp);
     }
 }

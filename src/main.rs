@@ -18,6 +18,16 @@ use koh::{Exit, KohError, Result};
 const HELP: &str = include_str!("help.txt");
 
 fn main() -> ExitCode {
+    // fux's own command line, under two words: `koh fux …` is `fux …`, and `koh hold …` is how
+    // `koh fux start` runs this file to hold a pane. Both are fux's from their first word on,
+    // and handed over before anything else is done: a holder has no thread but fux's own, and
+    // no runtime.
+    let mut words = std::env::args_os().skip(1).peekable();
+    match words.peek().and_then(|word| word.to_str()) {
+        Some("fux") => return fux::command(words.skip(1)),
+        Some("hold") => return fux::command(words),
+        _ => {}
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
     let rt = match tokio::runtime::Builder::new_multi_thread()

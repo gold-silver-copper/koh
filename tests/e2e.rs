@@ -2765,3 +2765,78 @@ async fn koh_serve_does_not_take_its_user_from_an_id_that_failed() {
     assert_eq!(served.server.wait().unwrap().code(), Some(1));
     assert!(!tmp.0.join("koh-42424").exists());
 }
+
+/// `koh` run with `args` and a runtime directory: how it ended, and what it said on its
+/// standard output and its standard error.
+fn koh(runtime: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+    let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
+    koh.env("XDG_RUNTIME_DIR", runtime).args(args);
+    let said = koh.stdin(std::process::Stdio::null()).output().unwrap();
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
+    (said.status.code(), text(&said.stdout), text(&said.stderr))
+}
+
+/// What `ps` says of a process under one of its headings.
+fn ps(pid: &str, what: &str) -> String {
+    let said = Command::new("ps").args(["-o", what, "-p", pid]).output();
+    String::from_utf8_lossy(&said.unwrap().stdout)
+        .trim()
+        .to_string()
+}
+
+/// The holder a pane's `status` names.
+fn holder_of(pane: &Path) -> String {
+    let status = fs::read_to_string(pane.join("status")).unwrap();
+    status
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("holder ")
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn koh_fux_is_fux_and_a_holder_has_no_runtime() {
+    let tmp = TempDir::new("koh-fux");
+    let run = fs::canonicalize(&tmp.0).unwrap().join("run");
+    // `koh fux …` is fux's command line: its default session, by fux's rule.
+    let (code, dir, _) = koh(&run, &["fux", "dir"]);
+    assert_eq!(
+        (code, dir.as_str()),
+        (Some(0), run.join("fux").to_str().unwrap())
+    );
+    // A pane it starts is held by this same file, under the word `hold`: no `fux` is looked for.
+    let named = run.join("ws/p");
+    let (code, pane, said) = koh(
+        &run,
+        &["fux", "start", named.to_str().unwrap(), "--", "sleep", "30"],
+    );
+    assert_eq!(
+        (code, pane.as_str()),
+        (Some(0), named.to_str().unwrap()),
+        "{said}"
+    );
+    let holder = holder_of(&named);
+    let args = ps(&holder, "args=");
+    let words: Vec<&str> = args.split_whitespace().collect();
+    assert_eq!(words[..2], [env!("CARGO_BIN_EXE_koh"), "hold"], "{args}");
+    assert_eq!(words[words.len() - 2..], ["sleep", "30"], "{args}");
+    // The holder is fux's code and nothing of koh's: the thread it began with and the one fux
+    // waits for the program on. A runtime would be a thread for each core.
+    if cfg!(target_os = "linux") {
+        let threads = fs::read_dir(format!("/proc/{holder}/task"))
+            .unwrap()
+            .count();
+        assert_eq!(threads, 2);
+    }
+    // `koh fux wait` waits for the holder's end and says what became of the program.
+    fs::write(named.join("ctl"), "kill\n").unwrap();
+    let (code, state, said) = koh(&run, &["fux", "wait", &pane]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(state.ends_with("state killed 1"), "{state}");
+    // A word fux does not know is fux's to refuse.
+    let (code, _, said) = koh(&run, &["fux", "nothing"]);
+    assert_eq!(code, Some(1));
+    assert!(said.starts_with("fux: usage:"), "{said}");
+}

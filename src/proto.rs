@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use iroh::endpoint::{RecvStream, SendStream};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{Exit, KohError, Result};
@@ -613,8 +614,87 @@ pub enum ClientEvent {
     Keyboard(u8),
 }
 
-/// Encode and write one length-prefixed postcard frame.
-pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usize) -> Result<()> {
+/// What a name in a pane's folder is the name of. Nothing else is carried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Kind {
+    File,
+    Folder,
+    Link,
+    Fifo,
+}
+
+/// One thing a client's mirror has: its name, its kind, and of a file its length and its hash
+/// (blake3). A server believes none of it that its own bytes do not bear out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Had {
+    pub name: String,
+    pub kind: Kind,
+    pub len: u64,
+    pub hash: [u8; 32],
+}
+
+/// A stretch of a file that is told as lines of the file before it: `count` of that file's lines
+/// from its line `from` (a line is bytes up to and with its `\n`), or bytes it has not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Edit {
+    Run { from: u32, count: u32 },
+    New(Vec<u8>),
+}
+
+/// What a server sends of a pane's folder. Everything from `Round` to `Done` is one round: a
+/// client's mirror takes it whole or not at all (`carry`, which has each message's rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToMirror {
+    /// A round begins: the number `generation` has once it is applied.
+    Round(u64),
+    Folder(String),
+    Fifo(String),
+    Link {
+        name: String,
+        to: String,
+    },
+    /// A file, whole: in pieces that follow each other while `more`.
+    Put {
+        name: String,
+        more: bool,
+        bytes: Vec<u8>,
+    },
+    /// A file as lines of the one the mirror has under that name.
+    Lines {
+        name: String,
+        edits: Vec<Edit>,
+    },
+    /// A file keeps its first `at` bytes and these follow; further pieces carry the place of
+    /// their own first byte.
+    Add {
+        name: String,
+        at: u64,
+        bytes: Vec<u8>,
+    },
+    /// The file `from` is `to`.
+    Moved {
+        from: String,
+        to: String,
+    },
+    /// It is gone: a folder with what is in it.
+    Remove(String),
+    /// The round is whole: now it is applied.
+    Done,
+    /// No holder is left: nothing follows.
+    Ended,
+}
+
+/// What a client sends of its mirror: once, first, what the mirror has; then what was written to
+/// the mirror's `in` and `ctl`, and what its viewer wrote of its terminal (`colours`, `keyboard`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FromMirror {
+    Has(Vec<Had>),
+    Write { name: String, bytes: Vec<u8> },
+    Told { name: String, bytes: Vec<u8> },
+}
+
+/// A message as it is sent, without its length: refused when it is longer than `max`.
+pub fn encode<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>> {
     let bytes =
         postcard::to_allocvec(value).map_err(|e| KohError::internal(format!("encode: {e}")))?;
     if bytes.len() > max {
@@ -623,6 +703,27 @@ pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usi
             bytes.len()
         )));
     }
+    Ok(bytes)
+}
+
+/// The message `bytes` are, and are all of: nothing may follow it, and it is no longer than `max`.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T> {
+    if bytes.len() > max {
+        return Err(KohError::failed(format!(
+            "incoming message exceeds bound ({} > {max})",
+            bytes.len()
+        )));
+    }
+    match postcard::take_from_bytes(bytes) {
+        Ok((value, [])) => Ok(value),
+        Ok(_) => Err(KohError::failed("more in a message than it is")),
+        Err(e) => Err(KohError::failed(format!("decode message: {e}"))),
+    }
+}
+
+/// Encode and write one length-prefixed postcard frame.
+pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usize) -> Result<()> {
+    let bytes = encode(value, max)?;
     let len = u32::try_from(bytes.len()).map_err(|_| KohError::internal("message too large"))?;
     stream
         .write_all(&len.to_be_bytes())

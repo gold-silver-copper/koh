@@ -424,7 +424,7 @@ pub enum Look {
     Odd,
     /// What was read is thrown away: the folder's number moved meanwhile.
     Moved,
-    /// Nothing was read: the reader rests until then.
+    /// Nothing was read: a file must be proved, and the reader rests until then.
     Rests(Instant),
 }
 
@@ -440,7 +440,7 @@ pub struct Reader {
     moved: Vec<(String, String)>,
     /// A round was sent since the client said what it has: the first is sent whatever it holds.
     sent: bool,
-    /// Until when the folder is left alone.
+    /// Until when no file is proved.
     rests: Option<Instant>,
     /// What a test does between a reading and the second look at the folder's number.
     #[cfg(test)]
@@ -579,24 +579,37 @@ impl Reader {
         Ok(true)
     }
 
-    /// One look at the folder, at the moment `now`. After a look that read it the folder is
-    /// left alone nine times as long as the look took: whatever proving a file costs, the
-    /// reader has a tenth of a core at most.
+    /// One look at the folder, at the moment `now`. A look that proves a file (one written in
+    /// place, or one that has another name now) owes a rest: no file is proved again until
+    /// nine times as long as that look took has passed, so whatever proving costs, it has a
+    /// tenth of a core at most. A look that proves nothing owes none, and is not held back.
     pub fn look(&mut self, dead: bool, now: Instant) -> Look {
-        if let Some(rests) = self.rests.filter(|rests| now < *rests) {
-            return Look::Rests(rests);
-        }
         let Some(numbers) = self.number(dead) else {
             return Look::Odd;
         };
+        let here = walk(&self.root);
+        let known = |name: &String, stamp: &Stamp, (old, kept): (&String, &Kept)| {
+            kept.is(stamp) && (old != name || kept.stamp != *stamp)
+        };
+        let proves =
+            |(name, stamp): &(String, Stamp)| self.kept.iter().any(|kept| known(name, stamp, kept));
+        let proves = here.iter().any(proves);
+        if let Some(rests) = self.rests.filter(|rests| proves && now < *rests) {
+            return Look::Rests(rests);
+        }
         let began = Instant::now();
-        let round = self.read(numbers);
-        self.rests = now.checked_add(began.elapsed() * (1 + REST));
+        let round = self.read(numbers, here);
+        if proves {
+            self.rests = now.checked_add(began.elapsed() * (1 + REST));
+        }
         round.map_or(Look::Moved, Look::Round)
     }
 
-    fn read(&mut self, (there, number): (u64, u64)) -> Option<Vec<ToMirror>> {
-        let now = walk(&self.root);
+    fn read(
+        &mut self,
+        (there, number): (u64, u64),
+        now: Vec<(String, Stamp)>,
+    ) -> Option<Vec<ToMirror>> {
         let current: HashMap<&str, &Stamp> = now
             .iter()
             .map(|(name, stamp)| (name.as_str(), stamp))

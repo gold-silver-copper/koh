@@ -1235,14 +1235,21 @@ fn the_reader_rests_nine_times_as_long_as_its_round_took() {
     let rests = line.reader.rests.unwrap();
     let took = (rests - at) / 10;
     assert!(!took.is_zero() && took <= outside.elapsed());
-    // The folder is not looked at again until nine times that long after the look: not though
-    // it has changed.
+    // No file is proved again until nine times that long after the look: not though one changed.
     hand.round(|hand| hand.append("history", b"and more\n"));
-    assert_eq!(
-        line.reader.look(false, rests - Duration::from_nanos(1)),
-        Look::Rests(rests)
-    );
+    let before = rests - Duration::from_nanos(1);
+    assert_eq!(line.reader.look(false, before), Look::Rests(rests));
     assert_eq!(line.reader.round(false, rests).unwrap().len(), 3);
+    // The rest is owed by proving alone. A look that proves nothing is not held back by it (a
+    // key's echo changes a screen), and earns none.
+    let rests = line.reader.rests.unwrap();
+    hand.round(|hand| hand.replace("main/screen", b"$ l\n"));
+    let round = line.reader.round(false, rests - Duration::from_nanos(1));
+    assert_eq!(
+        round,
+        Some(round_of(hand.number, vec![put("main/screen", b"$ l\n")]))
+    );
+    assert_eq!(line.reader.rests, Some(rests));
 }
 
 #[test]

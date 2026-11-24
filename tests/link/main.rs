@@ -5,6 +5,8 @@
 //! Two more are no tests and are run by hand (`-- --ignored --nocapture`): `measure` prints
 //! what a key's echo and a build cost on each link, and `frozen` stops a real `koh mount` for
 //! forty seconds.
+// (A test reads files of its own making.)
+#![allow(clippy::disallowed_methods)]
 
 mod faults;
 mod frozen;

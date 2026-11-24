@@ -1,22 +1,26 @@
 //! Carrying a fux pane's folder to another machine: a mirror there is such a folder again.
-//! `Mirror` is the client's half: it takes a round's messages, holds them beside the mirror
-//! until the round is whole, and applies it or throws it away. Plain functions over a folder
-//! and messages: no network, and no clock but the one it is given.
+//! `Reader` is the server's half: it reads the folder into rounds of messages, each what differs
+//! from what the client has. `Mirror` is the client's: it takes a round's messages, holds them
+//! beside the mirror until the round is whole, and applies it or throws it away. Plain functions
+//! over a folder and messages: no network, and no clock but the one they are given.
 //!
 //! Of fux's format this knows four names and no file's meaning: `generation` (odd while a round
 //! is written, even when the files agree), `in` and `ctl` (the two FIFOs) and `command` (never
 //! carried: it is what starts a program). A name with a dot first is not carried.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::discriminant;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::proto::{Edit, Had, Kind, ToMirror};
+use crate::proto::{Edit, Had, Kind, MAX_CHUNK, ToMirror};
 
+/// The most of a file's bytes in one message: with its name and its numbers the message is
+/// within `MAX_CHUNK` as it is sent.
+const PIECE: usize = MAX_CHUNK - 512;
 /// A file of more lines than this is never told as lines of the one before it.
 const LINES: usize = 4096;
 /// What a mirror holds at most: a file, all its files together (and all a round stages), its
@@ -77,15 +81,34 @@ fn lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     bytes.split_inclusive(|b| *b == b'\n')
 }
 
-/// What a name is the name of; and of a link where it leads.
+/// What tells one writing of a name from the next: what it is, which file, its time and its
+/// length; and of a link where it leads.
+#[derive(Clone, PartialEq)]
 struct Stamp {
     kind: Kind,
+    file: (u64, u64),
+    time: (i64, i64),
+    len: u64,
     to: String,
+}
+
+impl Stamp {
+    fn of(kind: Kind, meta: &fs::Metadata, to: String) -> Stamp {
+        let (file, time) = ((meta.dev(), meta.ino()), (meta.mtime(), meta.mtime_nsec()));
+        Stamp {
+            kind,
+            file,
+            time,
+            len: meta.len(),
+            to,
+        }
+    }
 }
 
 /// The stamp of what a name is the name of (a link is not followed), if that is carried.
 fn stamp_of(path: &Path) -> Option<Stamp> {
-    let kind = match fs::symlink_metadata(path).ok()?.file_type() {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let kind = match meta.file_type() {
         kind if kind.is_file() => Kind::File,
         kind if kind.is_dir() => Kind::Folder,
         kind if kind.is_symlink() => Kind::Link,
@@ -96,7 +119,7 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
         Kind::Link => fs::read_link(path).ok()?.to_str()?.to_string(),
         _ => String::new(),
     };
-    Some(Stamp { kind, to })
+    Some(Stamp::of(kind, &meta, to))
 }
 
 /// Everything a folder has that is carried, by name and in the names' order: what is at its
@@ -142,6 +165,522 @@ fn read_at(mut file: &File, from: u64, most: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(most).read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+// ---- the server's half -------------------------------------------------------------------------
+
+/// A file up to this long is sent whole without a look at its lines.
+const SMALL: usize = 128;
+/// What is kept of the end of a file as it was sent (its kept end): where a file written in
+/// place was cut is looked for in these bytes. A cut takes from them what it takes from the
+/// file, and what is added after fills them again.
+const END: usize = 64 << 10;
+/// How many places of the file before are tried for a line of the new one, and how many bytes
+/// a run of its lines must be to be told as one.
+const PLACES: usize = 16;
+const WORTH: usize = 6;
+/// A file a mirror has is looked for under another name here only if it is this long.
+const MOVED: u64 = 4096;
+/// How many times as long as a look at the folder took it is then left alone.
+const REST: u32 = 9;
+
+/// The number in a folder's `generation`.
+fn number_in(root: &Path) -> Option<u64> {
+    let file = fuxix::open_regular(root.join("generation")).ok()?;
+    String::from_utf8(read_at(&file, 0, 32).ok()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A file as it is opened to be read, and its stamp then: what is read of it is no older.
+fn opened(path: &Path) -> Option<(File, Stamp)> {
+    let file = fuxix::open_regular(path).ok()?;
+    let stamp = Stamp::of(Kind::File, &file.metadata().ok()?, String::new());
+    Some((file, stamp))
+}
+
+/// A file's bytes as as many pieces as it takes, one at least.
+fn pieces(bytes: &[u8]) -> Vec<&[u8]> {
+    if bytes.is_empty() {
+        vec![bytes]
+    } else {
+        bytes.chunks(PIECE).collect()
+    }
+}
+
+fn put(out: &mut Vec<ToMirror>, name: &str, bytes: &[u8]) {
+    let pieces = pieces(bytes);
+    for (n, piece) in pieces.iter().enumerate() {
+        let (name, more) = (name.to_string(), n + 1 < pieces.len());
+        out.push(ToMirror::Put {
+            name,
+            more,
+            bytes: piece.to_vec(),
+        });
+    }
+}
+
+/// A file as lines of the one before it: runs of that one's lines, from anywhere in it, and new
+/// bytes. None where that is no smaller than the file, fits no message, or the file has too
+/// many lines.
+fn edits(old: &[u8], new: &[u8]) -> Option<Vec<Edit>> {
+    let (old, lined): (Vec<&[u8]>, Vec<&[u8]>) =
+        (lines(old).collect(), lines(new).take(LINES + 1).collect());
+    if lined.len() > LINES {
+        return None;
+    }
+    let mut places: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for (at, line) in old.iter().enumerate() {
+        let known = places.entry(line).or_default();
+        if known.len() < PLACES {
+            known.push(at);
+        }
+    }
+    let run = |from: usize, at: usize| {
+        old.iter()
+            .skip(from)
+            .zip(lined.iter().skip(at))
+            .take_while(|(a, b)| a == b)
+            .count()
+    };
+    let (mut out, mut cost, mut at) = (Vec::new(), 0, 0);
+    while let Some(line) = lined.get(at) {
+        // (The same place in the file before is tried first, then the places that have the line.)
+        let tried = [at]
+            .into_iter()
+            .chain(places.get(line).into_iter().flatten().copied());
+        let (count, from) = tried.map(|from| (run(from, at), from)).max()?;
+        let worth: usize = lined
+            .iter()
+            .skip(at)
+            .take(count)
+            .map(|line| line.len())
+            .sum();
+        match out.last_mut() {
+            _ if worth >= WORTH => {
+                out.push(Edit::Run {
+                    from: u32::try_from(from).ok()?,
+                    count: u32::try_from(count).ok()?,
+                });
+                (cost, at) = (cost + 8, at + count);
+                continue;
+            }
+            Some(Edit::New(bytes)) => bytes.extend_from_slice(line),
+            _ => out.push(Edit::New(line.to_vec())),
+        }
+        (cost, at) = (cost + 8 + line.len(), at + 1);
+    }
+    (cost < new.len() && cost <= PIECE).then_some(out)
+}
+
+/// What a client has of a name, as the server knows it.
+struct Kept {
+    /// What was read: of a file, with the length that was sent.
+    stamp: Stamp,
+    /// The file as it was read, held open: while it is, its number is no other file's.
+    held: Option<File>,
+    /// What was sent of a replaced file of few lines: the next one is told against it.
+    content: Option<Vec<u8>>,
+    /// The last bytes sent of the file, and the hash of all that was sent before those.
+    end: Vec<u8>,
+    before: blake3::Hasher,
+}
+
+impl Kept {
+    /// A name the client has that is no file, or a file of which nothing is proved.
+    fn marker(stamp: Stamp) -> Kept {
+        Kept {
+            stamp,
+            held: None,
+            content: None,
+            end: Vec::new(),
+            before: blake3::Hasher::new(),
+        }
+    }
+
+    /// A file of which the client has these bytes: `whole` if they are all it has here now.
+    fn of(stamp: Stamp, held: File, bytes: &[u8], whole: bool) -> Kept {
+        let (head, end) = bytes.split_at(bytes.len().saturating_sub(END));
+        let mut before = blake3::Hasher::new();
+        before.update(head);
+        let content =
+            (whole && lines(bytes).take(LINES + 1).count() <= LINES).then(|| bytes.to_vec());
+        let stamp = Stamp {
+            len: bytes.len() as u64,
+            ..stamp
+        };
+        Kept {
+            stamp,
+            held: Some(held),
+            content,
+            end: end.to_vec(),
+            before,
+        }
+    }
+
+    /// Whether the file a name has now is the one that was read.
+    fn is(&self, now: &Stamp) -> bool {
+        self.held.is_some() && now.kind == Kind::File && self.stamp.file == now.file
+    }
+
+    /// Where the kept end begins in the file.
+    fn from(&self) -> u64 {
+        self.stamp.len.saturating_sub(self.end.len() as u64)
+    }
+
+    /// Where the file as it is now parts from what was sent of it, if all before that place is
+    /// proved to be what was sent: the bytes before the kept end by their hash, the kept end by
+    /// itself. Not proved: nothing is said, and the file goes whole.
+    fn parts_at(&self) -> Option<u64> {
+        let (mut held, mut hasher) = (self.held.as_ref()?, blake3::Hasher::new());
+        held.seek(SeekFrom::Start(0)).ok()?;
+        hasher.update_reader(held.take(self.from())).ok()?;
+        if hasher.count() != self.from() || hasher.finalize() != self.before.finalize() {
+            return None;
+        }
+        let there = read_at(held, self.from(), self.end.len() as u64).ok()?;
+        let same = there
+            .iter()
+            .zip(&self.end)
+            .take_while(|(a, b)| a == b)
+            .count();
+        Some(self.from() + same as u64)
+    }
+}
+
+/// What a server reads of a pane's folder for one client: the folder, and name by name what
+/// that client has. After every `Done` this record and the client's mirror are the same; it
+/// moves only with a round that was read whole.
+#[derive(Default)]
+pub struct Reader {
+    root: PathBuf,
+    kept: BTreeMap<String, Kept>,
+    /// Files the client has under another name than they have here (`has` found them): moved first.
+    moved: Vec<(String, String)>,
+    /// A round was sent since the client said what it has: the first is sent whatever it holds.
+    sent: bool,
+    /// When the folder was last looked at, and how long that took.
+    looked: Option<(Instant, Duration)>,
+    /// What a test does between a reading and the second look at the folder's number.
+    #[cfg(test)]
+    midway: Option<Box<dyn FnOnce()>>,
+}
+
+impl Reader {
+    /// A reader of the pane's folder `root`, for a client that has not yet said what it has.
+    pub fn new(root: &Path) -> Reader {
+        Reader {
+            root: root.into(),
+            ..Reader::default()
+        }
+    }
+
+    /// The number the folder has, and the number a round of the folder as it is has: the same
+    /// even one; or, with no holder left (`dead`), the next after an odd one, which a holder
+    /// that died as it wrote left for good.
+    fn number(&self, dead: bool) -> Option<(u64, u64)> {
+        let there = number_in(&self.root)?;
+        match (there % 2, dead) {
+            (0, _) => Some((there, there)),
+            (_, true) => Some((there, there.checked_add(1)?)),
+            _ => None,
+        }
+    }
+
+    /// The second look: whether the folder's number is still the one a reading began under.
+    fn stood_still(&mut self, there: u64) -> bool {
+        #[cfg(test)]
+        self.midway.take().into_iter().for_each(|midway| midway());
+        number_in(&self.root) == Some(there)
+    }
+
+    /// A file here of which the client has the first `had.len` bytes, if these hash as it says.
+    /// (Its lines are kept only where it has the client's name for it and no more than those.)
+    fn proved(&self, name: &str, had: &Had) -> Option<Kept> {
+        let (held, stamp) = opened(&self.root.join(name)).filter(|(_, now)| now.len >= had.len)?;
+        let bytes = read_at(&held, 0, had.len.min(FILE)).ok()?;
+        let same = bytes.len() as u64 == had.len && *blake3::hash(&bytes).as_bytes() == had.hash;
+        let whole = stamp.len == had.len && name == had.name;
+        same.then(|| Kept::of(stamp, held, &bytes, whole))
+    }
+
+    /// What a client says its mirror has. Nothing of it is believed: a file counts as had only
+    /// if the bytes here hash as the client says, whole or as what a longer file here begins
+    /// with, under its name or under another that no entry accounts for. Everything else it
+    /// lists is taken as not had. False when the folder was written meanwhile: to be read again.
+    pub fn has(&mut self, list: &[Had], dead: bool) -> Result<bool, Fault> {
+        let mut seen = HashSet::new();
+        if list.len() > NAMES
+            || !list
+                .iter()
+                .all(|had| plain(&had.name) && seen.insert(&had.name))
+        {
+            return refused("a list of what a mirror has that is none", "");
+        }
+        let Some((there, _)) = self.number(dead) else {
+            return Ok(false);
+        };
+        let here = walk(&self.root);
+        let (mut kept, mut open) = (BTreeMap::new(), Vec::new());
+        for had in list {
+            let now = here
+                .iter()
+                .find(|(name, _)| *name == had.name)
+                .map(|(_, stamp)| stamp);
+            let file = now.filter(|now| had.kind == Kind::File && now.kind == Kind::File);
+            let was = match (file.and_then(|_| self.proved(&had.name, had)), now) {
+                (Some(proved), _) => proved,
+                (None, Some(now))
+                    if now.kind == had.kind && matches!(had.kind, Kind::Folder | Kind::Fifo) =>
+                {
+                    Kept::marker(now.clone())
+                }
+                _ => {
+                    if had.kind == Kind::File && had.len >= MOVED {
+                        open.push(had);
+                    }
+                    // (No stamp that is read is this one: whatever is here is sent over it.)
+                    let (file, time, to) = ((0, 0), (0, 0), String::new());
+                    Kept::marker(Stamp {
+                        kind: had.kind,
+                        file,
+                        time,
+                        len: 0,
+                        to,
+                    })
+                }
+            };
+            kept.insert(had.name.clone(), was);
+        }
+        let mut moved: Vec<(&String, &String, Kept)> = Vec::new();
+        for had in open {
+            // (At the root: a move is told before the folders are, and fux renames nothing else.)
+            let free = |name: &String, now: &Stamp| {
+                let unproved = kept.get(name).is_none_or(|kept| kept.held.is_none());
+                let taken = moved.iter().any(|(_, to, _)| *to == name);
+                now.kind == Kind::File
+                    && *name != had.name
+                    && !name.contains('/')
+                    && unproved
+                    && !taken
+            };
+            let mut others = here.iter().filter(|(name, now)| free(name, now));
+            if let Some((to, was)) =
+                others.find_map(|(name, _)| Some((name, self.proved(name, had)?)))
+            {
+                moved.push((&had.name, to, was));
+            }
+        }
+        // (Never a move onto what another move takes from: those files go whole.)
+        if moved
+            .iter()
+            .any(|(_, to, _)| moved.iter().any(|(from, ..)| from == to))
+        {
+            moved.clear();
+        }
+        if !self.stood_still(there) {
+            return Ok(false);
+        }
+        self.moved.clear();
+        for (from, to, was) in moved {
+            kept.remove(from);
+            kept.insert(to.clone(), was);
+            self.moved.push((from.clone(), to.clone()));
+        }
+        (self.kept, self.sent) = (kept, false);
+        Ok(true)
+    }
+
+    /// One look at the folder, at the moment `now`. None: nothing was read (the folder is being
+    /// written, or is left alone still). Else what differs from what the client has, as a round
+    /// from `Round` to `Done`; or no message, where nothing differs and a round was sent before.
+    /// After a look the folder is left alone nine times as long as the look took: whatever
+    /// proving a file costs, the reader has a tenth of a core at most.
+    pub fn round(&mut self, dead: bool, now: Instant) -> Option<Vec<ToMirror>> {
+        let rests = |(at, took): (Instant, Duration)| at.checked_add(took + took * REST);
+        if self.looked.and_then(rests).is_some_and(|rests| now < rests) {
+            return None;
+        }
+        let began = Instant::now();
+        let round = self.read(dead);
+        self.looked = Some((now, began.elapsed()));
+        round
+    }
+
+    fn read(&mut self, dead: bool) -> Option<Vec<ToMirror>> {
+        let (there, number) = self.number(dead)?;
+        let now = walk(&self.root);
+        let current: HashMap<&str, &Stamp> = now
+            .iter()
+            .map(|(name, stamp)| (name.as_str(), stamp))
+            .collect();
+        // A file that has another name now, that name having it no more: the same file, and what
+        // was sent of it is where it was. Not where one move's target is another's source.
+        let mut moved: Vec<(&str, &str)> = Vec::new();
+        for (name, stamp) in now
+            .iter()
+            .filter(|(name, stamp)| !self.kept.get(name).is_some_and(|kept| kept.is(stamp)))
+        {
+            let left =
+                |old: &str, kept: &Kept| !current.get(old).is_some_and(|there| kept.is(there));
+            let mut was = self
+                .kept
+                .iter()
+                .filter(|(old, kept)| kept.is(stamp) && left(old, kept));
+            if let Some((old, _)) = was.find(|(_, kept)| kept.parts_at().is_some()) {
+                moved.push((old, name));
+            }
+        }
+        if moved
+            .iter()
+            .any(|(_, to)| moved.iter().any(|(from, _)| from == to))
+        {
+            moved.clear();
+        }
+        // The round's order: moves, folders and files, links, then what is gone. So a screen's
+        // folder is filled before `shown` is turned to it, and removed after it is turned back.
+        let said = self
+            .moved
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()));
+        let moves = said.chain(moved.iter().copied());
+        let mut first: Vec<ToMirror> = moves
+            .map(|(from, to)| ToMirror::Moved {
+                from: from.into(),
+                to: to.into(),
+            })
+            .collect();
+        let (mut links, mut next) = (Vec::new(), Vec::new());
+        for (name, stamp) in &now {
+            let from = moved
+                .iter()
+                .find(|(_, to)| to == name)
+                .map(|(from, _)| *from);
+            let away = moved.iter().any(|(from, _)| from == name);
+            let kept = self
+                .kept
+                .get(from.unwrap_or(name))
+                .filter(|_| from.is_some() || !away);
+            let kind = kept.is_some_and(|kept| kept.stamp.kind == stamp.kind);
+            match stamp.kind {
+                // Its stamp is the one that was read: nothing.
+                _ if from.is_none() && kept.is_some_and(|kept| kept.stamp == *stamp) => continue,
+                Kind::Folder | Kind::Fifo if kind => continue,
+                Kind::Folder => first.push(ToMirror::Folder(name.clone())),
+                Kind::Fifo => first.push(ToMirror::Fifo(name.clone())),
+                Kind::Link => links.push(ToMirror::Link {
+                    name: name.clone(),
+                    to: stamp.to.clone(),
+                }),
+                Kind::File => {
+                    next.push((name.clone(), self.file(name, stamp, kept, &mut first)?));
+                    continue;
+                }
+            }
+            next.push((name.clone(), Kept::marker(stamp.clone())));
+        }
+        // (A folder goes after what was in it.)
+        let left = |name: &&String| {
+            !current.contains_key(name.as_str()) && !moved.iter().any(|(from, _)| from == *name)
+        };
+        let gone: Vec<String> = self.kept.keys().rev().filter(left).cloned().collect();
+        let leaves: Vec<String> = moved
+            .iter()
+            .map(|(from, _)| from.to_string())
+            .chain(gone.clone())
+            .collect();
+        let last = gone
+            .into_iter()
+            .map(ToMirror::Remove)
+            .chain([ToMirror::Done]);
+        let round: Vec<ToMirror> = [ToMirror::Round(number)]
+            .into_iter()
+            .chain(first)
+            .chain(links)
+            .chain(last)
+            .collect();
+        // Nothing of what is kept is changed unless the round is one.
+        if !self.stood_still(there) {
+            return None;
+        }
+        leaves.iter().for_each(|name| _ = self.kept.remove(name));
+        self.kept.extend(next);
+        self.moved.clear();
+        // The first round is sent whatever it holds: it makes a mirror that a failed write left
+        // odd even, and its number the pane's. After it, a round that changes nothing is not sent.
+        let sent = std::mem::replace(&mut self.sent, true);
+        Some(if sent && round.len() == 2 {
+            Vec::new()
+        } else {
+            round
+        })
+    }
+
+    /// A file that is not as it was read: what is sent of it, and what the client then has.
+    fn file(
+        &self,
+        name: &str,
+        stamp: &Stamp,
+        kept: Option<&Kept>,
+        out: &mut Vec<ToMirror>,
+    ) -> Option<Kept> {
+        // Written in place: it is the file that was read. If all of it up to some place is proved
+        // to be what was sent, what follows that place is sent with the place (a cut, then what
+        // was added). Not proved: whole.
+        if let Some(kept) = kept.filter(|kept| kept.is(stamp)) {
+            let held = kept.held.as_ref()?.try_clone().ok()?;
+            let Some(at) = kept.parts_at() else {
+                let bytes = read_at(&held, 0, FILE).ok()?;
+                put(out, name, &bytes);
+                return Some(Kept::of(stamp.clone(), held, &bytes, false));
+            };
+            let bytes = read_at(&held, at, FILE.saturating_sub(at)).ok()?;
+            if at < kept.stamp.len || !bytes.is_empty() {
+                for (n, piece) in pieces(&bytes).iter().enumerate() {
+                    let (name, at) = (name.to_string(), at + (n * PIECE) as u64);
+                    out.push(ToMirror::Add {
+                        name,
+                        at,
+                        bytes: piece.to_vec(),
+                    });
+                }
+            }
+            // What the client has from the kept end's start on, once this is done to its file.
+            let same = usize::try_from(at.checked_sub(kept.from())?).ok()?;
+            let mut end = [kept.end.get(..same)?, &bytes].concat();
+            let (over, mut before) = (end.len().saturating_sub(END), kept.before.clone());
+            before.update(end.get(..over)?);
+            end.drain(..over);
+            let stamp = Stamp {
+                len: at + bytes.len() as u64,
+                ..stamp.clone()
+            };
+            return Some(Kept {
+                stamp,
+                held: Some(held),
+                content: None,
+                end,
+                before,
+            });
+        }
+        // Replaced, or new: whole, or as lines of the one before it where that is less.
+        let (held, stamp) = opened(&self.root.join(name))?;
+        let bytes = read_at(&held, 0, FILE).ok()?;
+        let old = kept.and_then(|kept| kept.content.as_deref());
+        let told = old
+            .filter(|old| old.len() > SMALL && bytes.len() > SMALL)
+            .and_then(|old| edits(old, &bytes));
+        match told {
+            Some(edits) => out.push(ToMirror::Lines {
+                name: name.into(),
+                edits,
+            }),
+            None => put(out, name, &bytes),
+        }
+        Some(Kept::of(stamp, held, &bytes, true))
+    }
 }
 
 // ---- the client's half -------------------------------------------------------------------------

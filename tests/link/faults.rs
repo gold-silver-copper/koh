@@ -241,17 +241,16 @@ async fn a_rate_carries_no_more_than_it_says_and_drops_what_its_buffer_cannot_ho
     };
     let (net, came) = link(profile, 1);
     // Offered four times what the link carries, for two seconds: 1,000 bytes every 8 ms.
-    let began = Instant::now();
-    let mut n = 0;
+    let (began, mut sent) = (Instant::now(), Vec::new());
     while began.elapsed() < Duration::from_secs(2) {
-        send(&net, n, 1000);
-        n += 1;
+        sent.push(Instant::now());
+        send(&net, sent.len() as u32 - 1, 1000);
         tokio::time::sleep(Duration::from_millis(8)).await;
     }
     let offered = began.elapsed();
     let came = arrived(&came).await;
     let counts = net.counts(id(2));
-    assert_eq!(counts.sent, u64::from(n));
+    assert_eq!(counts.sent, sent.len() as u64);
     assert_eq!(counts.overflowed + counts.delivered, counts.sent);
     // Never more than the rate for the time it was offered, the buffer and a packet more; and
     // most of that, for it was always offered more than it carries.
@@ -263,15 +262,14 @@ async fn a_rate_carries_no_more_than_it_says_and_drops_what_its_buffer_cannot_ho
         "{bits} bits"
     );
     assert!(counts.overflowed > counts.sent / 2, "{counts:?}");
-    // In order, and each no closer behind the one before than its own bytes take to send.
+    // In order. Each took at least the time its own bytes take to send (31 ms), and most of
+    // them more: they waited their turn behind the one before, in the buffer.
     assert!(numbers(&came).is_sorted());
-    let gaps = came.windows(2).map(|two| two[1].1 - two[0].1);
-    let close = gaps.filter(|gap| *gap < Duration::from_millis(25)).count();
-    assert!(
-        close <= came.len() / 4,
-        "{close} of {} came close together",
-        came.len()
-    );
+    let took = |(n, at): &(u32, Instant)| *at - sent[*n as usize];
+    let own = Duration::from_millis(31);
+    assert!(came.iter().all(|packet| took(packet) >= own));
+    let waited = came.iter().filter(|packet| took(packet) >= own * 2).count();
+    assert!(waited > came.len() / 2, "{waited} of {} waited", came.len());
 }
 
 #[tokio::test]
@@ -310,6 +308,15 @@ async fn every_fault_at_once_falls_on_the_same_packets_for_the_same_seed() {
     }
     assert_eq!(runs[0], runs[1]);
     assert_ne!(runs[0].1, runs[2].1);
+    // Each way has a generator of its own: what falls on a packet one way does not fall on
+    // its like the other way.
+    let net = FaultNet::new(profile.clone(), 42);
+    let _places = (net.join(id(1)), net.join(id(2)));
+    for _ in 0..3000 {
+        net.route(id(1), id(2), &[0; 100]).unwrap();
+        net.route(id(2), id(1), &[0; 100]).unwrap();
+    }
+    assert_ne!(net.counts(id(1)), net.counts(id(2)));
     // A profile changed on the way holds from then on.
     let (net, came) = link(profile, 1);
     net.set(Profile::default());

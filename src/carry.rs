@@ -593,6 +593,7 @@ impl Reader {
     /// A read that is thrown away is not rested for then, or a holder that keeps writing
     /// would starve the mirror: the next look is at once, and the rest after it is for both.
     pub fn look(&mut self, dead: bool, now: Instant) -> Look {
+        let began = Instant::now();
         let Some(numbers) = self.number(dead) else {
             return Look::Odd;
         };
@@ -606,7 +607,6 @@ impl Reader {
         if let Some(rests) = self.rests.filter(|rests| proves && now < *rests) {
             return Look::Rests(rests);
         }
-        let began = Instant::now();
         let round = self.read(numbers, here);
         let took = began.elapsed();
         match round {

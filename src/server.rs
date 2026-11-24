@@ -39,6 +39,9 @@ pub struct ServeOptions {
     pub shell: Option<String>,
     pub state_dir: Option<PathBuf>,
     pub disable_relay: bool,
+    /// An endpoint that is there, of the server's key, in place of one bound here: a test's,
+    /// on a link of its own. `koh serve` gives none.
+    pub endpoint: Option<iroh::Endpoint>,
     pub quiet: bool,
     /// Most connections held at once, each counted from when the server takes it up, before it
     /// proves a key.
@@ -84,6 +87,7 @@ impl Default for ServeOptions {
             shell: None,
             state_dir: None,
             disable_relay: false,
+            endpoint: None,
             quiet: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -147,7 +151,10 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
     let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
-    let endpoint = bind_server(secret, opts.direct, opts.disable_relay).await?;
+    let endpoint = match opts.endpoint {
+        Some(endpoint) => endpoint,
+        None => bind_server(secret, opts.direct, opts.disable_relay).await?,
+    };
     let direct_addr = endpoint.bound_sockets().into_iter().next();
 
     let base = match opts.state_dir {

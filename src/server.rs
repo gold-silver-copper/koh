@@ -15,6 +15,7 @@ use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
 use crate::jobs::JobManager;
@@ -53,6 +54,10 @@ pub struct ServeOptions {
 /// and ask: it is told as soon as it asks, and at the latest then. One that has not connected by
 /// then is dropped without being told.
 const BUSY_WAIT: Duration = Duration::from_secs(2);
+
+/// How long the requests of a connection that is gone have to end by themselves, before they
+/// are ended: the connection keeps its place until none is left.
+const LEFT_WAIT: Duration = Duration::from_secs(5);
 
 /// The CLI's default for `--max-connections`.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
@@ -255,13 +260,21 @@ async fn default_state_dir() -> Result<PathBuf> {
 /// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
 /// the server took it up) no request of it has proved a key the server allows: a peer that
 /// proves nothing does not keep its place.
+///
+/// Each request is a task of the connection's own, and no task of a request is started but as
+/// one of these or of its request's: when this returns none is left, so the place its caller
+/// then gives back is one that nothing uses. Once the connection is gone they have `LEFT_WAIT`
+/// to end, and what has not ended by then is ended.
 async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: Instant) {
     let proven = Arc::new(AtomicBool::new(false));
     let deadline = tokio::time::sleep_until(prove_by);
     tokio::pin!(deadline);
     let mut unproven = true;
+    let mut requests = JoinSet::new();
     loop {
         let (mut send, mut recv) = tokio::select! {
+            // (One that has ended is kept no longer.)
+            Some(_) = requests.join_next() => continue,
             () = &mut deadline, if unproven => {
                 if !proven.load(Ordering::Relaxed) {
                     close_with(&conn, CloseCode::Refused);
@@ -278,7 +291,7 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
         let conn_clone = conn.clone();
         let st = state.clone();
         let proven = proven.clone();
-        tokio::spawn(async move {
+        requests.spawn(async move {
             let client_id = match verify_client(&conn_clone, &mut recv).await {
                 Ok(id) => id,
                 Err(_) => {
@@ -309,6 +322,9 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
             let _ = send.finish();
         });
     }
+    let ended = async { while requests.join_next().await.is_some() {} };
+    let _ = tokio::time::timeout(LEFT_WAIT, ended).await;
+    requests.shutdown().await;
 }
 
 fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
@@ -546,8 +562,10 @@ async fn handle_exec(
     let mut child_stderr = child.stderr.take();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ExecServerMsg>(32);
 
+    // (The two that read what the command writes are this request's own, and end with it.)
+    let mut pipes = JoinSet::new();
     let tx1 = out_tx.clone();
-    let stdout_task = tokio::spawn(async move {
+    pipes.spawn(async move {
         if let Some(mut out) = child_stdout.take() {
             let mut buf = vec![0u8; 32 << 10];
             while let Ok(n @ 1..) = out.read(&mut buf).await {
@@ -563,7 +581,7 @@ async fn handle_exec(
         }
     });
     let tx2 = out_tx.clone();
-    let stderr_task = tokio::spawn(async move {
+    pipes.spawn(async move {
         if let Some(mut err) = child_stderr.take() {
             let mut buf = vec![0u8; 32 << 10];
             while let Ok(n @ 1..) = err.read(&mut buf).await {
@@ -626,8 +644,7 @@ async fn handle_exec(
         let said = format!("koh: a command whose client went was not hung up: {err}");
         let _ = writeln!(std::io::stderr(), "{said}");
     }
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    while pipes.join_next().await.is_some() {}
     let code = match child.wait().await {
         Ok(status) => status
             .code()

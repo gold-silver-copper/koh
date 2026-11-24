@@ -1111,6 +1111,78 @@ async fn a_command_that_fails_gives_its_place_back_at_once() {
     srv.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_seconds_after_it() {
+    let tmp = TempDir::new("place-requests");
+    let friend = new_key(&tmp, "friend.key");
+    let more = ServeOptions {
+        max_connections: 1,
+        ..ServeOptions::default()
+    };
+    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
+    // A command, which hanging up does not end, of a client that then leaves.
+    let left = |script: &str| {
+        let exec = Request::Exec {
+            argv: vec![format!("trap '' HUP; {script}")],
+            cwd: Some(tmp.0.display().to_string()),
+            shell: true,
+        };
+        async move {
+            let client = dial().await.unwrap();
+            let streams = client.request(&exec).await.unwrap();
+            (client, streams)
+        }
+    };
+    // The next client is served: asked again for as long as the server is busy.
+    let served = || async {
+        let serving = async {
+            loop {
+                let listed = match dial().await {
+                    Ok(next) => {
+                        let listed = next.jobs(None).await;
+                        next.close().await;
+                        listed
+                    }
+                    Err(busy) => Err(busy),
+                };
+                match listed {
+                    Ok(_) => break,
+                    Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let served = tokio::time::timeout(Duration::from_secs(20), serving).await;
+        served.expect("the place came back within 20 s");
+    };
+
+    // The command goes on for a second after its client left: the place is the connection's
+    // until then, and the next client's only once the command has ended.
+    let (client, streams) = left("sleep 1; : > ended").await;
+    drop(streams);
+    client.close().await;
+    served().await;
+    assert!(tmp.0.join("ended").exists(), "served beside the command");
+
+    // A command that does not end is let go of five seconds after its connection: the place
+    // is not its to keep.
+    let (client, streams) = left("echo $$ > pid; exec sleep 600").await;
+    until("the command runs", || tmp.0.join("pid").is_file());
+    drop(streams);
+    client.close().await;
+    let left_at = Instant::now();
+    served().await;
+    let after = left_at.elapsed();
+    assert!(after >= Duration::from_secs(4), "after {after:?}");
+    signal(
+        fs::read_to_string(tmp.0.join("pid")).unwrap().trim(),
+        "-KILL",
+    );
+
+    srv.shutdown().await;
+}
+
 /// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.
 fn deep(root: &std::path::Path, dirs: usize) -> PathBuf {
     let inner = (0..dirs).fold(root.to_path_buf(), |at, _| at.join("d"));

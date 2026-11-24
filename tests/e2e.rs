@@ -4589,6 +4589,43 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
         recipe(&["list", dir]).1,
         "s\tended\texited 3\t80x24\tidle\t9\t\n"
     );
+    // Its wait has the command's rule: marks that only moved end nothing (a line inserted
+    // above the prompt), and of two commands that ended the code is the first's.
+    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5"];
+    let moving = host.session("m", &marks_by_steps(&steps), "$");
+    let step = |done: u32| {
+        fs::write(moving.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(moving.join("title")).is_ok_and(|said| said == title)
+        });
+    };
+    step(1);
+    let mut wait = Command::new("sh");
+    wait.arg(&script)
+        .args(["wait", moving.to_str().unwrap(), "30"]);
+    let mut wait = Waits(
+        wait.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    step(2);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!wait.ended(), "{:?}", wait.said());
+    step(3);
+    until("the recipe's wait ends", || wait.ended());
+    assert_eq!(wait.said().0, Some(9));
+    // And its list has a pane that has only begun: a `status`, and nothing else yet.
+    fs::create_dir(host.sessions.join("bare")).unwrap();
+    fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();
+    let (code, list, said) = recipe(&["list", dir]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        list.starts_with("bare\tended\t\t0x0\tidle\t-\t\n"),
+        "{list:?} {said}"
+    );
 }
 
 /// A program for a session that marks as a shell does (OSC 133), by itself: a prompt, and then,

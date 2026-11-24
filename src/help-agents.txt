@@ -2,15 +2,19 @@
 Recipes: a session's files, for whoever would rather script than ask.
 A session is a fux pane: a folder of plain files on the server, in the folder `koh serve`
 printed (`koh sessions SERVER --json` has each one's as `pane_dir`). `koh sessions`, `koh
-output` and `koh wait --session` read those files there and no more; the script below is the
-same four things as sh, for `koh exec` or for a script of your own on the server:
+output` and `koh wait --session` read those files there and no more; the script below is
+nearly the same as sh, for `koh exec` or for a script of your own on the server (where it is
+not the same, its comments say: `last` cuts whole lines, `wait` prints the last output):
 
   koh help-agents | sed -n '/^#!/,$p' > sessions.sh && koh cp sessions.sh SERVER:
   koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed
   koh exec SERVER -- sh sessions.sh wait DIR/NAME 60  and `screen`, `last` likewise
 
 What is typed goes into a session's `in`, a FIFO: `koh exec SERVER --sh 'printf "make\n" >
-DIR/NAME/in'`. A shell must mark its prompts for `last` and `wait` (OSC 133); for bash from 4.4:
+DIR/NAME/in'`. Ask a wait before you type what it is to wait for (`koh wait … &`, then type,
+then `wait $!`): it is for the first command that ends after it was asked, and one that has
+ended by then is not that. A shell must mark its prompts for `last` and `wait` (OSC 133); for
+bash from 4.4:
   PS1='\[\e]133;A\a\]'$PS1'\[\e]133;B\a\]'; PS0='\e]133;C\a'
   PROMPT_COMMAND='printf "\e]133;D;%s\a" "$?"'
 fux's README, "A pane's files", says what every file is.
@@ -28,11 +32,11 @@ list() { # NAME <tab> alive|ended <tab> STATE <tab> COLSxROWS <tab> busy|idle <t
     p=${p%/}
     [ -f "$p/status" ] || continue
     if alive "$p"; then a=alive; else a=ended; fi
-    read -r cols rows < "$p/size"
+    cols=0 rows=0; { read -r cols rows < "$p/size"; } 2> /dev/null   # (a pane that has only begun has none yet)
     # A command runs when the last mark is `output`: after `command` the shell waits at its prompt.
     work=$(awk -v a=$a '$3 == "end" { code = $4 } { last = $3 }
-      END { if (code == "") code = "-"; printf "%s\t%s", (a == "alive" && last == "output" ? "busy" : "idle"), code }' "$p/marks")
-    printf '%s\t%s\t%s\t%sx%s\t%s\t%s\n' "${p##*/}" "$a" "$(cat "$p/state")" "$cols" "$rows" "$work" "$(cat "$p/title" 2>/dev/null)"
+      END { if (code == "") code = "-"; printf "%s\t%s", (a == "alive" && last == "output" ? "busy" : "idle"), code }' "$p/marks" 2> /dev/null) || work=$(printf 'idle\t-')
+    printf '%s\t%s\t%s\t%sx%s\t%s\t%s\n' "${p##*/}" "$a" "$(cat "$p/state" 2>/dev/null)" "$cols" "$rows" "$work" "$(cat "$p/title" 2>/dev/null)"
   done
 }
 
@@ -62,12 +66,19 @@ last() { # what the last command that has ended printed: the lines from its `out
   rm -f "$f" "$m"
 }
 
-await() { # until one more command has ended (its exit code is this one's), or the session has; 124 after SECONDS
-  was=$(awk '$3 == "end" { n++; l = $1 } END { print n + 0, l + 0 }' "$1/marks") began=$(date +%s)
+await() { # until a command has ended since this was asked (its exit code is this one's), or the session has; 124 after SECONDS
+  w=$(mktemp); trap 'rm -f "$w"' EXIT; cat "$1/marks" > "$w" 2> /dev/null; began=$(date +%s)
   while :; do
-    # One more `end` than there was, or the last one further down (the file keeps a thousand marks).
-    now=$(awk -v was="$was" 'BEGIN { split(was, w, " ") } $3 == "end" { n++; l = $1; c = $4 }
-      END { if (n > w[1] || l > w[2]) print c + 0 }' "$1/marks")
+    # More `end`s than there were, counting those the file has dropped: full (a thousand marks) it
+    # drops one from its front for each it takes, and where its first mark stood in the file as it
+    # was says how many. No mark's place is asked: a screen that scrolls or is cleared moves them.
+    now=$(awk -v was="$w" 'BEGIN { while ((getline old < was) > 0) had[++n] = old }
+      NR == 1 { first = $0 } $3 == "end" { code[++ends] = $4 }
+      END { if (NR >= 1000) for (i = n; i >= 1; i--) if (had[i] == first) gone = i - 1
+        for (i = gone + 1; i <= n; i++) { split(had[i], word, " "); if (word[3] == "end") kept++ }
+        if (ends > kept) print code[kept + 1] + 0 }' "$1/marks" 2> /dev/null)
+    # (The code is the first such command's. If another has ended by now too, `last` prints that
+    # one's output: `koh wait --session` gives the first's, read with its code.)
     [ -z "$now" ] || { last "$1"; exit "$now"; }
     alive "$1" || { cat "$1/shown/screen"; s=$(cat "$1/state")
       case $s in "exited "*) exit "${s#exited }" ;; "killed "*) exit $((128 + ${s#killed })) ;; *) exit 1 ;; esac; }

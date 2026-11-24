@@ -200,7 +200,8 @@ fn hash_file(path: &Path) -> Result<[u8; 32]> {
 /// File work that can take long, a tree read and hashed, done where it holds up nothing else:
 /// for as long as it takes, the thread hands whatever else it serves (other requests, and the
 /// links of other clients) to another. The work stays its request's own, which is not over
-/// before it is. (On a runtime of one thread there is no other thread, and nothing is handed.)
+/// before it is. (On a runtime of one thread there is no other thread, and nothing is handed.
+/// It is not for a task of a `LocalSet`: tokio hands nothing over from one, and panics.)
 fn long<T>(work: impl FnOnce() -> T) -> T {
     let flavor = tokio::runtime::Handle::try_current().map(|runtime| runtime.runtime_flavor());
     match flavor {

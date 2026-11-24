@@ -75,9 +75,10 @@ binary, its tests and the fuzz targets share code, and any release may change it
     ends the same, until the folder is removed. It counts against `--max-sessions`, where the
     oldest ended one that no client has makes room for a new one.
   - **`--session NAME` is a name:** letters, digits, `.`, `_` and `-`, 64 at the most, no dot
-    first. With none given a new session has fux's first free number, which is free again once its
-    folder is removed; it was a number counted up and never used twice. **A name that is not there
-    is started** (it was "no session", exit 127).
+    first, and none of the four `fux` keeps for itself (`-`, `colours`, `keyboard`, `layout`).
+    With none given a new session has fux's first free number, which is free again once its folder
+    is removed; it was a number counted up and never used twice. **A name that is not there is
+    started** (it was "no session", exit 127).
   - **Exit codes.** `koh connect` exits 1, not 0, where nothing says how the session ended (its
     holder was killed, the machine was restarted, its folder was moved). `koh mount` ends with the
     session, with its program's status, as `koh connect` does (it was 0). Stopped by SIGINT,
@@ -96,20 +97,24 @@ binary, its tests and the fuzz targets share code, and any release may change it
     KiB it was dropped.
   - **Pictures** are sixel alone, as in `fux` 0.43, within fux's bounds on a pane: a program that
     draws with the Kitty graphics protocol alone shows nothing.
-  - **`koh sessions`:** `id`, a number, is `name`. `state` is what the pane's `state` says
+  - **`koh sessions`:** `id`, a number, is `name`. The list is the oldest first, by when each
+    pane's `status` was written (it was by number). `state` is what the pane's `state` says
     (`exited N`, `killed N`, `hungup`): `running` only while its holder lives, and `ended` where
     none does and nothing says how. A session is busy (`running_command`) while its shell's last
     mark is `output`; it was `command` or `output`, which said busy at an idle prompt. `age_secs`
-    counts from when the pane's `status` was written.
-  - **`koh output --last`** is cut at the marks' bytes, as fux's own key for it cuts, not at whole
-    lines: a last line with no line break is there, and the prompt after it is not. An `end` that
-    has no `output` since the `end` before it (an empty line entered) ends no command: it reached
-    back to the output of the one before. A text of any length comes, in pieces (past 8 MiB it
-    failed).
-  - **`koh wait --session`** exits 1, not 0, for a session that ended without saying how. A
-    command has ended by one more `end` mark, by a last `end` further down, or by an output that
-    ran and has its `end` (it counted `end` marks alone, of which a pane keeps a thousand). It is
-    no longer waited for once its client has left.
+    counts from when the pane's `status` was written. A list of any length comes, in pieces.
+  - **`koh output --last`** is selected by the marks' lines and bytes, as fux's own key for it
+    cuts, not by whole lines: a last line with no line break is there (a line break is added to
+    it), and the prompt after it is not. An `end` that has no `output` since the `end` before it
+    (an empty line entered) ends no command: it reached back to the output of the one before. A
+    text of any length comes, in pieces (past 8 MiB it failed).
+  - **`koh wait --session`** is for the first command that ends after it was asked: its code and
+    what it printed, read together. A command has ended when there is one more `end` mark,
+    counting those a full `marks` dropped from its front (it counted `end` marks alone, of which a
+    pane keeps a thousand, and so saw none once a session had some 250 commands). It exits 1, not
+    0, for a session that ended without saying how, or whose folder is gone or another run's. It
+    is no longer waited for once its client has left. `koh wait SERVER JOB --session NAME`, and
+    `--text` or `--tail` with `--session`, are a usage error (exit 2).
   - **`koh help-agents`** prints the help and, after it, recipes: a session's files, and
     `sessions`, `output` and `wait --session` as a script over them for `koh exec`. `koh help` is
     as it was.

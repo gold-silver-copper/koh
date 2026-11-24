@@ -52,9 +52,11 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     only in a terminal that draws sixel.
   - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
     --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
-    session's files, for a key with no scope. They read what a script there could, and as one
-    should: between two looks at the same even `generation`, and a session lives while its
-    holder has the lock on its folder.
+    session's files, for a key with no scope. They read what a script there could. What is
+    of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
+    marks and the text) is read between two looks at the same even `generation`; what is of
+    one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
+    replaces a file whole. A session lives while its holder has the lock on its folder.
     - `sessions` lists each folder that has a `status`, the oldest first: its name, whether a
       client is attached, what `state` says became of its program (`running` only while the
       holder lives; `ended` where none does and nothing says how), whether a command runs,
@@ -62,17 +64,24 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     - `output` is the screen the session shows. With `--last` it is what the last command
       that has ended printed: the text from where its output began to where it ended, out of
       `history.1`, `history` and the main screen, each line whole however the screen wrapped
-      it, and also its last line where that has no line break. Where the shell has marked no
-      command that ended, it is the screen.
-    - `wait` returns when one more command has ended than when the server took the request:
-      it prints what that command printed and exits with its code. When the session has ended
-      instead, it prints the last screen and exits as `koh connect` does; after `SECS`, the
-      screen and 124.
+      it. The marks' lines and bytes say where that is; what is printed is text: a line
+      break is added to a last line that has none, and bytes that are no UTF-8 are shown as
+      U+FFFD. Where the shell has marked no output that ended, it is the screen.
+    - `wait` is for the first command that ends after the server took the request: it prints
+      what that command printed and exits with its code, the two read together. A second
+      command that has ended by the time it looks is not the one it gives. When the session
+      ends instead, it prints the last screen and exits as `koh connect` does; so too, with
+      1 and nothing printed, when the session's folder is gone or another run has its name.
+      After `SECS`: the screen, and 124. A `wait` is for a job or for a session: `JOB`,
+      `--text` and `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
-      the last mark is `output`. koh sets up no shell: `koh help-agents` has the lines for
-      bash, and the three commands as a script over the files, for `koh exec`. A shell that
-      marks an `end` at every prompt ends a `wait` also when an empty line is entered.
+      the last mark is `output`. A command has ended when there is one more `end`: where the
+      marks are on the screen is not asked, so a screen that scrolls, has a line inserted or
+      is cleared ends nothing. koh sets up no shell: `koh help-agents` has the lines for
+      bash, and nearly the same three commands as a script over the files, for `koh exec`. In
+      a shell that marks an `end` at every prompt, an empty line entered is an `end` too: a
+      `wait` then returns the output and the code of the command before, again.
 
 ### Sessions: don't, and do
 
@@ -151,13 +160,19 @@ koh adds nothing to stop these. What happens instead is said.
   PS1='\[\e]133;A\a\]'$PS1'\[\e]133;B\a\]'; PS0='\e]133;C\a'
   PROMPT_COMMAND='printf "\e]133;D;%s\a" "$?"'
   ```
-- Ask `koh wait --session` before the command ends that it is to wait for: it counts from
-  when the server took the request. The pane's `marks` keeps the last thousand, and a
-  cleared screen moves the marks on it up, so koh takes any one of three signs for a
-  command's end: one more `end`, the last `end` further down in the text, or an output that
-  ran when it was asked and has its `end`. In a session of more than some 250 commands, a
-  wait asked at an idle prompt does not see a command that clears the screen and ends no
-  further down than the last one did; it sees the next that does.
+- Ask `koh wait --session` before you type the command it is to wait for (`koh wait … &`,
+  type, `wait $!`): a command that has ended when the server takes the request is not waited
+  for, and the wait is then for the next.
+- In a session of some 250 commands or more, `koh wait --session` counts by a second fact.
+  The pane's `marks` keeps the last thousand and drops one from its front for each it takes,
+  so there are never more `end`s there than before: koh finds the file's first mark in the
+  file as it was, and so knows how many went. Two things can then go wrong, and only then.
+  Where the oldest marks are several alike at one place (commands of one exit code that were
+  on a screen when it was cleared, 250 commands ago), fewer are taken for gone than are: a
+  command's end is then seen late, once the file's front has passed them, a few commands
+  on; the wait returns then, still for the first command that ended. And where all thousand
+  marks are still on the screen (250 commands, none scrolled out: a pane of 250 rows or
+  more), a screen that moves can be taken for an end.
 - On a kernel before 6.13 a file's time is the clock's tick: a file of a session's folder
   rewritten in place to the same length within one tick is not seen by a client until it
   changes again. Replace it, or add to its end.

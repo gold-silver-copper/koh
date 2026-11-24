@@ -53,8 +53,11 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
   (a list of jobs); 256 KiB for a piece of a file, of input or of output, and for every message
   of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
   for a copy's manifest and what a job's wait returns. A session's text (`koh output`, `koh
-  wait --session`) is sent in pieces of 64 KiB and is as long as the pane's files make it:
-  fux's bounds, not a figure of koh's. Of a session's client the server takes
+  wait --session`) and the list of sessions are sent in pieces of 64 KiB and are as long as
+  the pane's files, and the folders kept, make them: for files that fux wrote, fux's bounds,
+  not a figure of koh's. A pane's files are read whole, whatever is in them (one that the
+  server's user wrote there himself, of any length, too), and what has a file's name and is
+  none (a FIFO, a link) is not read and not waited on. Of a session's client the server takes
   16 KiB a message of typed bytes, and stops taking messages while 64 KiB wait for one of a
   pane's two FIFOs: so up to 80 KiB can wait for a FIFO, and beside them the stream's reader
   holds up to seventeen messages it has read (256 KiB each at the most). It takes a list of
@@ -74,7 +77,9 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
   uses. A request that waits for a job (`koh wait`, `koh logs -f`) is not stopped when its
   connection goes; it ends with what it waits for. (`koh wait --session` looks at the pane ten
-  times a second, and ends when its client's stream has.)
+  times a second, and between two looks sees that its client's stream has ended: it looks no
+  more. A look that has begun is finished; so is a read for `koh output` or `koh sessions`,
+  whose client is not looked for until the answer is sent.)
 - **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
   itself may come as slowly as its sender likes, and a connection that has proved a key may
   stay, asking nothing, for as long as it is kept alive. So a client with any allowed key, a

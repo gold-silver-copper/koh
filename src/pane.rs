@@ -429,7 +429,34 @@ mod tests {
             ),
             (None, None)
         );
+        // The limit that is left: the file's oldest marks are alike, three commands that a
+        // clear put at one place. One command on, its first mark is as before and none is
+        // taken for gone: the end is not seen. Once the front is past them it is, and it is
+        // still the first command that ended since.
+        let alike = "5 0 prompt\n5 0 command\n5 0 output\n5 0 end 0\n".repeat(3);
+        let rest = |from: usize, to: usize| {
+            let command = |n: usize| {
+                format!(
+                    "{n} 0 prompt\n{n} 2 command\n{n} 9 output\n{n} 9 end {}\n",
+                    n % 200
+                )
+            };
+            (from..to).map(command).collect::<String>()
+        };
+        let was = read(&(alike.clone() + &rest(6, 253)));
+        let one = read(&(alike.split_once("end 0\n").unwrap().1.to_string() + &rest(6, 254)));
+        let three = read(&rest(6, 256));
+        assert_eq!(
+            (was.0.len(), one.0.len(), three.0.len()),
+            (KEPT, KEPT, KEPT)
+        );
+        assert_eq!(
+            (was.first_since(&one), was.first_since(&three)),
+            (None, Some(247))
+        );
+        assert_eq!(three.command(247).0, Some(53));
         // It took a prompt and a command, and dropped two: no `end` came, and none went.
+        let was = read(&full(0, ""));
         let typed = full(0, "250 0 prompt\n250 2 command\n");
         let typed = read(typed.split_once("0 2 command\n").unwrap().1);
         assert_eq!((typed.0.len(), was.first_since(&typed)), (KEPT, None));

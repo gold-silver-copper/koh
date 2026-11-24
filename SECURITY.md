@@ -32,7 +32,8 @@ credit reporters who want it.
 - Sessions on the server (`src/session.rs`): which pane an attach is given or starts, the
   check of a client's format and run before anything is made, a client's one stream on a
   run, the two FIFOs typed bytes go into, and what a client may have written into koh's own
-  `fux` session (`told`).
+  `fux` session (`told`); and what a key with no scope is told of a session's folder
+  (`src/pane.rs`: `koh sessions`, `koh output`, `koh wait --session`).
 - The wire decoders and their bounds (`src/proto.rs`), on both ends.
 - The paths a copy's peer may name, on both ends (`src/sync.rs`, `wire_names`), and the paths a
   scoped key may name (`src/keys.rs`, `Scope`). Where a symlink leads is not in scope: see

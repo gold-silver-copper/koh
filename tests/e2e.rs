@@ -2660,6 +2660,16 @@ fn the_mirror_is_the_pane() {
         history().contains("typed-42\n") && history().contains("\n2900\n")
     });
     agrees(&pane, &mount.dir);
+    // What a program puts on the clipboard, and a picture it draws, are files of the pane: the
+    // mirror has them.
+    mount.types(b"printf '\\033]52;c;aGVsbG8=\\007\\033Pq#0;2;100;0;0#0~~~~~~-~~~~~~\\033\\\\'\n");
+    until("the mirror has the clipboard and the picture", || {
+        let listed = fs::read_to_string(mount.dir.join("main/pictures")).unwrap_or_default();
+        fs::read(mount.dir.join("clipboard")).is_ok_and(|bytes| bytes == b"hello")
+            && listed.starts_with("pic-1.sixel ")
+            && mount.dir.join("pic-1.sixel").is_file()
+    });
+    agrees(&pane, &mount.dir);
     // The alternate screen comes, `shown` turns to it; and goes again.
     mount.types(b"printf '\\033[?1049hALTERNATE'\n");
     let shown = || fs::read_link(mount.dir.join("shown")).unwrap_or_default();
@@ -4157,4 +4167,836 @@ async fn koh_connect_told_to_end_before_its_first_round_ends_and_leaves_nothing(
         );
         assert_eq!(names_in(&runtime), [""; 0], "{told}");
     }
+}
+
+// ---- the three commands: `koh sessions`, `koh output`, `koh wait --session` ---------------------
+
+/// A shell for a session that marks its prompts and its commands as fux reads them (OSC 133):
+/// bash, as Linux and macOS have it (3.2 there, which has no `PS0`). Its prompt says how the
+/// command before it ended (`D;$?`), where the prompt begins (`A`) and where what is typed does
+/// (`B`); a `DEBUG` trap says where a command's output begins (`C`), once for each simple
+/// command, so a test types one at a time.
+fn marking_shell(host: &Host) -> Vec<String> {
+    let rc = host.tmp.0.join("marks.bashrc");
+    let prompt = r"PS1='\[\e]133;D;$?\a\e]133;A\a\]$ \[\e]133;B\a\]'";
+    let output = r#"trap 'printf "\033]133;C\007"' DEBUG"#;
+    fs::write(&rc, format!("{prompt}\n{output}\n")).unwrap();
+    [
+        "bash",
+        "--noprofile",
+        "--rcfile",
+        rc.to_str().unwrap(),
+        "-i",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn sh(script: &str) -> Vec<String> {
+    ["sh", "-c", script].map(String::from).to_vec()
+}
+
+impl Host {
+    /// One of the client's `koh` commands about this server, run to its end: how it ended,
+    /// what it printed and what it said.
+    fn asked(&self, command: &str, args: &[&str]) -> (Option<i32>, String, String) {
+        let mut koh = self.koh(&[command, &self.id, "--direct", &self.addr()]);
+        koh.args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let said = koh.output().unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (said.status.code(), text(&said.stdout), text(&said.stderr))
+    }
+
+    /// `koh wait` for the session `s` of this server, started, with whatever else it is told.
+    fn waits(&self, more: &[&str]) -> Waits {
+        let mut koh = self.koh(&["wait", &self.id, "--direct", &self.addr()]);
+        koh.args(["--session", "s"])
+            .args(more)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Waits(koh.spawn().unwrap())
+    }
+
+    /// A session of that name running `program`, with nobody attached once this returns: its
+    /// folder, when its screen shows `ready`.
+    fn session(&self, name: &str, program: &[String], ready: &str) -> PathBuf {
+        let mut mount = self.mount(name, None, &["--session", name], program);
+        let pane = self.pane(name);
+        until(&format!("the session {name} shows {ready:?}"), || {
+            screen(&pane).contains(ready)
+        });
+        signal(&mount.koh.id().to_string(), "-TERM");
+        assert_eq!(mount.ends(), Some(0), "{}", mount.said());
+        pane
+    }
+}
+
+/// A `koh wait` that runs. It is killed if the test lets go of it before it has ended.
+struct Waits(std::process::Child);
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Waits {
+    fn ended(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_some()
+    }
+
+    /// Once it has ended: its exit code, what it printed and what it said.
+    fn said(&mut self) -> (Option<i32>, String, String) {
+        let (code, mut printed, mut said) =
+            (self.0.wait().unwrap().code(), String::new(), String::new());
+        let _ = self.0.stdout.take().unwrap().read_to_string(&mut printed);
+        let _ = self.0.stderr.take().unwrap().read_to_string(&mut said);
+        (code, printed, said)
+    }
+}
+
+#[test]
+fn sessions_lists_what_the_folders_say() {
+    let host = Host::start("list", &[]);
+    // Three sessions: one that lives, with a shell that marks its commands and a client; one
+    // whose program has ended; one whose holder was killed, so that nothing says how it ended.
+    let mut live = host.mount("a", None, &["--session", "live"], &marking_shell(&host));
+    let pane = host.pane("live");
+    until("the shell has its prompt", || screen(&pane).contains('$'));
+    let mut done = host.mount("b", None, &["--session", "done"], &sh("exit 7"));
+    assert_eq!(done.ends(), Some(7));
+    let mut dead = host.mount("c", None, &["--session", "dead"], &marking_shell(&host));
+    let killed = host.pane("dead");
+    until("the third has its prompt", || screen(&killed).contains('$'));
+    fs::write(killed.join("in"), "sleep 30\n").unwrap();
+    let marks = || fs::read_to_string(killed.join("marks")).unwrap_or_default();
+    until("its command runs", || marks().ends_with(" output\n"));
+    signal(&holder_of(&killed), "-KILL");
+    assert_eq!(dead.ends(), Some(1));
+    assert_eq!(
+        fs::read_to_string(host.pane("dead").join("state")).unwrap(),
+        "running\n"
+    );
+    let list = || -> Vec<serde_json::Value> {
+        let (code, list, said) = host.asked("sessions", &["--json"]);
+        assert_eq!(code, Some(0), "{said}");
+        serde_json::from_str(&list).unwrap()
+    };
+    let of = |name: &str, what: &str| {
+        let list = list();
+        let session = list.iter().find(|session| session["name"] == name);
+        session.unwrap_or_else(|| panic!("no {name} in {list:?}"))[what].clone()
+    };
+    // Each by its name, the oldest first; where it is, its size and whether a client has it.
+    let names: Vec<_> = list().iter().map(|s| s["name"].clone()).collect();
+    assert_eq!(names, ["live", "done", "dead"]);
+    assert_eq!(of("live", "pane_dir"), pane.to_str().unwrap());
+    assert_eq!(
+        (of("live", "cols"), of("live", "rows")),
+        (80.into(), 24.into())
+    );
+    assert_eq!(
+        (of("live", "attached"), of("done", "attached")),
+        (true.into(), false.into())
+    );
+    // What became of each program is what `state` says; but only a session whose holder lives
+    // runs: of the one that was killed nothing says how it ended.
+    let states = ["live", "done", "dead"].map(|name| of(name, "state"));
+    assert_eq!(states, ["running", "exited 7", "ended"]);
+    // At a prompt no command runs: the last mark is where what is typed begins. One runs from
+    // where its output begins (the last mark is `output`) to its end, which has its code.
+    assert_eq!(of("live", "running_command"), false);
+    let gate = host.tmp.0.join("gate");
+    let waits = format!(
+        "sh -c 'until [ -e {} ]; do sleep 0.1; done; exit 5'\n",
+        gate.display()
+    );
+    fs::write(pane.join("in"), waits).unwrap();
+    until("the command runs", || of("live", "running_command") == true);
+    assert!(
+        fs::read_to_string(pane.join("marks"))
+            .unwrap()
+            .ends_with(" output\n")
+    );
+    fs::write(&gate, "").unwrap();
+    until("the command has ended", || {
+        of("live", "running_command") == false
+    });
+    assert_eq!(of("live", "last_exit"), 5);
+    // A session whose holder is gone runs no command, whatever its marks say: the last mark
+    // of the one that was killed is still the `output` of the command it ran.
+    assert_eq!(
+        (of("done", "running_command"), of("dead", "running_command")),
+        (false.into(), false.into())
+    );
+    // The client leaves: the session is not attached. As a line for a person to read.
+    signal(&live.koh.id().to_string(), "-TERM");
+    assert_eq!(live.ends(), Some(0));
+    until("the session has no client", || {
+        of("live", "attached") == false
+    });
+    let (code, lines, said) = host.asked("sessions", &[]);
+    assert_eq!(code, Some(0), "{said}");
+    let lines: Vec<&str> = lines.lines().collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[0].starts_with("live\tdetached\trunning\tidle\texit=5\t80x24\t"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("done\tdetached\texited 7\tidle\texit=-\t80x24\t"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn output_last_is_the_last_commands_output_across_history() {
+    let host = Host::start("last", &[]);
+    let pane = host.session("1", &marking_shell(&host), "$");
+    // A pane of ten rows, forty wide; and so much output that `history` has become `history.1`.
+    fs::write(pane.join("ctl"), "resize 40 10\n").unwrap();
+    until("the pane takes the size", || {
+        fs::read_to_string(pane.join("size")).unwrap() == "40 10\n"
+    });
+    fs::write(pane.join("in"), "seq 1 800000\n").unwrap();
+    until(
+        "history has become history.1, and the command has ended",
+        || {
+            let marks = fs::read_to_string(pane.join("marks")).unwrap_or_default();
+            pane.join("history.1").is_file() && marks.ends_with(" command\n")
+        },
+    );
+    // That command's output began in `history.1`: all of it is there, in pieces.
+    let (code, flood, said) = host.asked("output", &["--session", "1", "--last"]);
+    let numbers: String = (1..=800_000).map(|n| format!("{n}\n")).collect();
+    assert_eq!((code, flood.len()), (Some(0), numbers.len()), "{said}");
+    assert!(flood == numbers);
+    // A command that prints 26 lines, one of them wider than the pane: 19 of them are in
+    // `history` by its end, and the wide one is three rows of the screen.
+    let lines: Vec<String> = (1..=26)
+        .map(|n| match n {
+            24 => "wide-".repeat(20),
+            n => format!("line-{n}"),
+        })
+        .collect();
+    fs::write(
+        pane.join("in"),
+        format!("printf '%s\\n' {}\n", lines.join(" ")),
+    )
+    .unwrap();
+    let printed = lines.join("\n") + "\n";
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let last = loop {
+        let last = host.asked("output", &["--session", "1", "--last"]);
+        if last.0 != Some(0) || last.1 == printed || Instant::now() > deadline {
+            break last;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // What it printed, each line whole, from where its output began to where it ended: not
+    // the command, not the prompt after it.
+    assert_eq!(
+        (last.0, last.1.as_str()),
+        (Some(0), printed.as_str()),
+        "{}",
+        last.2
+    );
+    let rows = screen(&pane);
+    assert!(
+        rows.contains(&format!("{}\n", "wide-".repeat(8))),
+        "{rows:?}"
+    );
+    let history = fs::read_to_string(pane.join("history")).unwrap();
+    assert!(history.ends_with("line-19\n") && rows.contains("line-20\n"));
+    // Without `--last` it is the screen that is shown; `--json` has it as one value.
+    let (code, shown, said) = host.asked("output", &["--session", "1"]);
+    assert_eq!((code, shown.as_str()), (Some(0), rows.as_str()), "{said}");
+    let (code, json, said) = host.asked("output", &["--session", "1", "--last", "--json"]);
+    assert_eq!(code, Some(0), "{said}");
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "session": "1", "output": printed })
+    );
+    // A name that is no session's is not found.
+    let (code, _, said) = host.asked("output", &["--session", "none"]);
+    assert_eq!(code, Some(127), "{said}");
+    assert!(said.contains("no session none"), "{said}");
+    // Nor is a name that is none a path: the folder above the sessions is no session, also
+    // where it looks like a pane.
+    let above = host.sessions.parent().unwrap();
+    fs::create_dir_all(above.join("shown")).unwrap();
+    fs::write(above.join("status"), "holder 1\n").unwrap();
+    fs::write(above.join("shown/screen"), "not a session's\n").unwrap();
+    let (code, shown, said) = host.asked("output", &["--session", ".."]);
+    assert_eq!((code, shown.as_str()), (Some(127), ""), "{said}");
+}
+
+#[test]
+fn wait_session_returns_the_commands_code_or_124() {
+    let host = Host::start("wait", &[]);
+    let pane = host.session("s", &marking_shell(&host), "$");
+    // No command ends: when the time given is over it is 124, with the screen as it is.
+    let began = Instant::now();
+    let (code, waited, said) = host.asked("wait", &["--session", "s", "--timeout", "1", "--json"]);
+    assert_eq!(code, Some(124), "{said}");
+    assert!(began.elapsed() >= Duration::from_secs(1));
+    let waited: serde_json::Value = serde_json::from_str(&waited).unwrap();
+    assert_eq!(
+        (&waited["timed_out"], &waited["exit"]),
+        (&true.into(), &124.into())
+    );
+    assert_eq!(waited["tail"], screen(&pane));
+    // A wait returns when one more command has ended than when it was asked, with that
+    // command's code and what it printed. (When the server takes the request the test cannot
+    // see: it types one command after the other until the wait has returned. Each prints a
+    // line of its own and ends with 42.)
+    let mut wait = host.waits(&["--timeout", "30"]);
+    let mut typed = 0;
+    until("koh wait returns", || {
+        typed += 1;
+        let command = format!("sh -c 'echo waited-{typed}; exit 42'\n");
+        fs::write(pane.join("in"), command).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        wait.ended()
+    });
+    let (code, printed, said) = wait.said();
+    assert_eq!(code, Some(42), "{said}");
+    let line = printed
+        .strip_prefix("waited-")
+        .and_then(|n| n.strip_suffix('\n'));
+    assert!(
+        line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
+        "{printed:?}"
+    );
+    // A pane with no `marks.dropped` is kept by a holder of before there was one, whose marks
+    // have no numbers: a wait for it is refused, with what to do.
+    fs::remove_file(pane.join("marks.dropped")).unwrap();
+    let (code, _, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains("marks.dropped") && said.contains("End that session"),
+        "{said}"
+    );
+}
+
+#[test]
+fn wait_session_ends_when_the_session_does() {
+    let host = Host::start("wait-end", &[]);
+    let pane = host.session(
+        "s",
+        &sh("echo ready; read line; echo bye-$line; exit 3"),
+        "ready",
+    );
+    // A wait with no time given, of a program that marks nothing: it waits while that runs.
+    let mut wait = host.waits(&[]);
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(!wait.ended());
+    // The program ends: the wait ends with its status and its last screen.
+    fs::write(pane.join("in"), "now\n").unwrap();
+    until("koh wait ends", || wait.ended());
+    let (code, shown, said) = wait.said();
+    assert_eq!(code, Some(3), "{said}");
+    assert!(
+        shown.contains("bye-now") && said.contains("exited 3"),
+        "{shown:?} {said}"
+    );
+    // Asked of a session that has ended, it says the same at once.
+    let (code, shown, said) = host.asked("wait", &["--session", "s"]);
+    assert_eq!(code, Some(3), "{said}");
+    assert!(shown.contains("bye-now"), "{shown:?}");
+    // Of one whose holder was killed nothing says how it ended: that is 1, not 0.
+    let dead = host.session("dead", &sh("echo ready; sleep 30"), "ready");
+    signal(&holder_of(&dead), "-KILL");
+    until("the holder is gone", || {
+        fs::File::open(&dead).unwrap().try_lock_shared().is_ok()
+    });
+    let (code, _, said) = host.asked("wait", &["--session", "dead"]);
+    assert_eq!(code, Some(1), "{said}");
+    // And a name that is no session's is not found.
+    let (code, _, said) = host.asked("wait", &["--session", "none"]);
+    assert_eq!(code, Some(127), "{said}");
+}
+
+#[test]
+fn the_three_commands_are_a_full_keys() {
+    let host = Host::start("full-key", &[]);
+    host.session("s", &sh("echo ready; sleep 30"), "ready");
+    // A key with a scope, of either kind, beside the full key: it lists no session, reads
+    // none and waits for none, and is told so.
+    let bot = host.tmp.0.join("bot_cfg");
+    fs::create_dir_all(&bot).unwrap();
+    let id = load_or_create_key(Role::Client, Some(&bot.join("client.key")))
+        .unwrap()
+        .public();
+    let dir = host.tmp.0.join("home");
+    for scope in [Scope::Cp(dir.clone()), Scope::Exec(dir.clone())] {
+        let entry = ClientEntry {
+            name: "bot".into(),
+            id,
+            scope,
+        };
+        save_clients(Some(&host.tmp.0.join("srv_cfg/server.key")), &[entry]).unwrap();
+        let asks: [&[&str]; 4] = [
+            &["sessions"],
+            &["output", "--session", "s"],
+            &["output", "--session", "s", "--last"],
+            &["wait", "--session", "s", "--timeout", "1"],
+        ];
+        for asks in asks {
+            let mut koh = host.koh(&[asks[0], &host.id, "--direct", &host.addr()]);
+            koh.args(&asks[1..]).env("KOH_CONFIG_DIR", &bot);
+            let said = koh.stderr(std::process::Stdio::piped()).output().unwrap();
+            let why = String::from_utf8_lossy(&said.stderr);
+            assert_eq!(said.status.code(), Some(4), "{asks:?}: {why}");
+            assert!(why.contains("scope"), "{asks:?}: {why}");
+        }
+    }
+    // The full key is answered.
+    let (code, list, said) = host.asked("sessions", &[]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(list.starts_with("s\tdetached\trunning\t"), "{list:?}");
+}
+
+#[test]
+fn the_recipes_of_help_agents_read_what_the_commands_read() {
+    let host = Host::start("recipes", &[]);
+    let pane = host.session("s", &marking_shell(&host), "$");
+    // The script is the end of what `koh help-agents` prints, from its first line on; the help
+    // itself has none of it.
+    let (_, help, _) = koh(&host.tmp.0, &["help-agents"]);
+    let script = host.tmp.0.join("sessions.sh");
+    fs::write(&script, &help[help.find("#!/bin/sh").unwrap()..]).unwrap();
+    assert!(!koh(&host.tmp.0, &["--help"]).1.contains("#!/bin/sh"));
+    let recipe = |args: &[&str]| {
+        let mut sh = Command::new("sh");
+        let said = sh.arg(&script).args(args).output().unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (said.status.code(), text(&said.stdout), text(&said.stderr))
+    };
+    // Run on the server, where the folders are, it lists, shows and waits as the commands do.
+    let (dir, pane_dir) = (host.sessions.to_str().unwrap(), pane.to_str().unwrap());
+    fs::write(pane.join("in"), "sh -c 'echo from-the-recipe; exit 9'\n").unwrap();
+    until("the command has ended", || {
+        host.asked("sessions", &[]).1.contains("\texit=9\t")
+    });
+    let (code, list, said) = recipe(&["list", dir]);
+    assert_eq!(
+        (code, list.as_str()),
+        (Some(0), "s\talive\trunning\t80x24\tidle\t9\t\n"),
+        "{said}"
+    );
+    let (code, last, said) = recipe(&["last", pane_dir]);
+    assert_eq!(
+        (code, last.as_str()),
+        (Some(0), "from-the-recipe\n"),
+        "{said}"
+    );
+    assert_eq!(last, host.asked("output", &["--session", "s", "--last"]).1);
+    let (code, shown, said) = recipe(&["wait", pane_dir, "1"]);
+    assert_eq!((code, shown), (Some(124), screen(&pane)), "{said}");
+    assert_eq!(recipe(&["screen", pane_dir]).1, screen(&pane));
+    // The session ends: the recipe's wait ends with the program's status.
+    fs::write(pane.join("in"), "exit 3\n").unwrap();
+    assert_eq!(recipe(&["wait", pane_dir, "20"]).0, Some(3));
+    assert_eq!(
+        recipe(&["list", dir]).1,
+        "s\tended\texited 3\t80x24\tidle\t9\t\n"
+    );
+    // Its wait has the command's rule: marks that only moved end nothing (a line inserted
+    // above the prompt), and of two commands that ended the code is the first's.
+    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5"];
+    let moving = host.session("m", &marks_by_steps(&steps), "$");
+    let step = |done: u32| {
+        fs::write(moving.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(moving.join("title")).is_ok_and(|said| said == title)
+        });
+    };
+    step(1);
+    let mut wait = Command::new("sh");
+    wait.arg(&script)
+        .args(["wait", moving.to_str().unwrap(), "30"]);
+    let mut wait = Waits(
+        wait.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    step(2);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!wait.ended(), "{:?}", wait.said());
+    step(3);
+    until("the recipe's wait ends", || wait.ended());
+    assert_eq!(wait.said().0, Some(9));
+    // And its list has a pane that has only begun: a `status`, and nothing else yet.
+    fs::create_dir(host.sessions.join("bare")).unwrap();
+    fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();
+    let (code, list, said) = recipe(&["list", dir]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(
+        list.starts_with("bare\tended\t\t0x0\tidle\t-\t\n"),
+        "{list:?} {said}"
+    );
+}
+
+/// A program for a session that marks as a shell does (OSC 133), by itself: a prompt, and then,
+/// each time a line is entered, the next of `steps` (sh, with `prompt` and `ran TEXT CODE` for a
+/// command that printed and ended); after each the pane's title says how many are done.
+fn marks_by_steps(steps: &[&str]) -> Vec<String> {
+    let script = r#"stty -echo
+m() { printf '\033]133;%s\007' "$1"; }
+prompt() { m A; printf '$ '; m B; }
+ran() { printf '\r\n'; m C; printf '%s\r\n' "$1"; m "D;$2"; prompt; }
+n=0; prompt; printf '\033]2;done-0\007'
+for step in "$@"; do read line; eval "$step"; n=$((n + 1)); printf '\033]2;done-%s\007' "$n"; done
+read line"#;
+    let mut program = sh(script);
+    program.push("sh".into());
+    program.extend(steps.iter().map(|step| step.to_string()));
+    program
+}
+
+/// The four ways a screen moves its marks without a command's end: a line inserted above the
+/// prompt, a scroll down, a clear with the prompt drawn anew, the prompt drawn again in its place.
+const MOVES: [&str; 4] = [
+    r"printf '\0337\033[1;1H\033[L\0338\033[B'",
+    r"printf '\033[T\033[B'",
+    r"printf '\033[H\033[2J'; prompt",
+    r"printf '\r'; prompt",
+];
+
+/// A wait asked of the server by the client in this process: the stream, once the server has
+/// taken the request.
+async fn waits(client: &Client, session: &str) -> RecvStream {
+    let asked = Request::WaitSession {
+        session: session.into(),
+        timeout_secs: Some(8),
+    };
+    client.request(&asked).await.unwrap().1
+}
+
+/// What a wait was answered: its exit code and its text.
+async fn waited(wait: RecvStream) -> (i32, String) {
+    let (exit, text, _) = told(wait).await;
+    (exit, text)
+}
+
+/// The same, and the word it was answered with.
+async fn told(mut wait: RecvStream) -> (i32, String, String) {
+    let ended: koh::proto::WaitResult = recv_msg(&mut wait, MAX_CTRL).await.unwrap();
+    let text = koh::proto::recv_pieces(&mut wait).await.unwrap();
+    (ended.exit, String::from_utf8(text).unwrap(), ended.detail)
+}
+
+/// Whether a wait has said nothing for four looks of the server's.
+async fn silent(wait: &mut RecvStream) -> bool {
+    let look = Duration::from_millis(400);
+    tokio::time::timeout(look, wait.read(&mut [0; 1]))
+        .await
+        .is_err()
+}
+
+/// A session of `marks_by_steps`, and how many of its steps are done.
+struct Stepped(PathBuf, u32);
+
+impl Stepped {
+    fn start(host: &Host, steps: &[&str]) -> Self {
+        Self(host.session("s", &marks_by_steps(steps), "$"), 0)
+    }
+
+    /// Has the next step done, and gives the pane's `marks` after it.
+    fn step(&mut self) -> String {
+        self.1 += 1;
+        fs::write(self.0.join("in"), "\n").unwrap();
+        let title = format!("done-{}\n", self.1);
+        let said = || fs::read_to_string(self.0.join("title")).unwrap_or_default();
+        until(&title, || said() == title);
+        fs::read_to_string(self.0.join("marks")).unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_is_not_ended_by_marks_that_only_moved() {
+    let host = Host::start("moved", &[]);
+    let fill = "i=0; while [ $i -lt 260 ]; do ran fill 0; i=$((i + 1)); done";
+    let cleared = r"printf '\r\n'; m C; printf '\033[H\033[2Jfour\r\n'; m 'D;4'; prompt";
+    let mut steps = vec!["ran one 7"];
+    steps.extend(MOVES);
+    steps.extend(["ran two 9", fill]);
+    steps.extend(MOVES);
+    steps.push(cleared);
+    let pane = host.session("s", &marks_by_steps(&steps), "$");
+    let mut done = 0;
+    let mut step = || {
+        done += 1;
+        fs::write(pane.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
+        });
+        fs::read_to_string(pane.join("marks")).unwrap()
+    };
+    let client = host.client().await;
+    // A command has ended with 7; a wait is asked at the prompt after it. The marks are few, and
+    // all on the screen.
+    let before = step();
+    let mut wait = waits(&client, "s").await;
+    // Whatever moves the screen moves its marks, and is no command's end: the wait says nothing.
+    for moved in [
+        "a line inserted",
+        "a scroll down",
+        "a clear",
+        "the prompt again",
+    ] {
+        let marks = step();
+        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
+        assert!(
+            said.is_err(),
+            "after {moved} the wait ended: {before:?} became {marks:?}"
+        );
+    }
+    // A command's end is one.
+    step();
+    assert_eq!(waited(wait).await, (9, "two\n".to_string()));
+    // The same in a pane whose `marks` is full: it keeps a thousand, and drops one for each it takes.
+    let full = step();
+    assert_eq!(full.lines().count(), 1000);
+    let mut wait = waits(&client, "s").await;
+    for moved in [
+        "a line inserted",
+        "a scroll down",
+        "a clear",
+        "the prompt again",
+    ] {
+        let marks = step();
+        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
+        assert!(
+            said.is_err(),
+            "full, after {moved} the wait ended: {marks:?}"
+        );
+    }
+    // There a command that clears the screen and ends no further down than the last has ended too.
+    let marks = step();
+    assert_eq!(marks.lines().count(), 1000);
+    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_gives_the_first_command_that_ended_since_it_was_asked() {
+    let host = Host::start("first", &[]);
+    // Two commands end before the wait looks again: one typed while the other ran.
+    let pane = host.session(
+        "s",
+        &marks_by_steps(&["ran one 7", "ran two 0; ran three 5"]),
+        "$",
+    );
+    let step = |done: u32| {
+        fs::write(pane.join("in"), "\n").unwrap();
+        let title = format!("done-{done}\n");
+        until(&title, || {
+            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
+        });
+    };
+    step(1);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    step(2);
+    // It is the first of them that the wait was for: its code, and what it printed.
+    assert_eq!(waited(wait).await, (0, "two\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test]
+async fn a_list_of_sessions_longer_than_one_message_is_whole() {
+    let (_tmp, srv, client, _, state) = boot_pair("many").await;
+    // As many ended panes as `--max-sessions` may keep, each with a title as long as fux
+    // writes one: more than a message holds.
+    let sessions = state.join("fux/koh-sessions");
+    for n in 1..=4500 {
+        let pane = sessions.join(n.to_string());
+        fs::create_dir(&pane).unwrap();
+        fs::write(pane.join("status"), "holder 1\npid 1\n").unwrap();
+        fs::write(pane.join("title"), "t".repeat(256) + "\n").unwrap();
+    }
+    let list = client.sessions().await.unwrap();
+    assert_eq!(list.len(), 4500);
+    assert!(
+        list.iter()
+            .all(|session| session.title.len() == 256 && session.state == "ended")
+    );
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[test]
+fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
+    let tmp = TempDir::new("wait-usage");
+    // A wait is for a job or for a session; what is a job's alone is not said of a session.
+    for more in [&["build"][..], &["--text", "done"], &["--tail", "5"]] {
+        let mut args = vec!["wait", "nowhere", "--session", "s"];
+        args.extend(more);
+        let (code, _, said) = koh(&tmp.0, &args);
+        assert_eq!(code, Some(2), "{more:?}: {said}");
+        assert!(
+            said.contains("a job's") && said.contains("--session"),
+            "{more:?}: {said}"
+        );
+    }
+}
+
+// The sequences of the second round of reviews, each against fux's holder: what a full `marks`
+// could not say, and its count of the marks it dropped does.
+
+/// So many times `body`, as one step of a session's program.
+fn times(n: u32, body: &str) -> String {
+    format!("i=0; while [ $i -lt {n} ]; do {body}; i=$((i + 1)); done")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_sees_a_commands_end_in_a_shell_that_clears_at_every_command() {
+    let host = Host::start("clears", &[]);
+    // `clear; echo hi N`, 255 times, in a pane of 80 by 24: the file is full, and every mark
+    // of it but the last few is at one place. Then a command that ends with 4, and 16 more.
+    let clears = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2Jhi %s\r\n' $i; m 'D;0'; prompt",
+    );
+    let more = times(16, "ran more $((i + 10))");
+    let mut session = Stepped::start(&host, &[&clears, "ran four 4", &more, "ran fresh 3"]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    session.step();
+    session.step();
+    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
+    // And a wait asked afresh after those.
+    let wait = waits(&client, "s").await;
+    session.step();
+    assert_eq!(waited(wait).await, (3, "fresh\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_screen_that_moves_ends_nothing_where_every_mark_is_on_it() {
+    let host = Host::start("on-screen", &[]);
+    // `clear` 255 times and `true`: a full file whose first mark is still on the screen. A
+    // command begins, scrolls the screen down, and ends with 5 only later.
+    let clears = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2J'; m 'D;0'; prompt",
+    );
+    let begun = r"printf '\r\n'; m C; printf '\033[1T'";
+    let steps = [
+        &clears,
+        r"printf '\r\n'; m C; m 'D;0'; prompt",
+        begun,
+        "m 'D;5'; prompt",
+    ];
+    let mut session = Stepped::start(&host, &steps);
+    session.step();
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let mut wait = waits(&client, "s").await;
+    let scrolled = session.step();
+    assert!(
+        silent(&mut wait).await,
+        "the wait ended at a scroll down: {scrolled:?}"
+    );
+    session.step();
+    assert_eq!(waited(wait).await.0, 5);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_line_inserted_ends_nothing_where_a_shell_clears_at_each_prompt() {
+    let host = Host::start("inserted", &[]);
+    // 260 commands, each at a prompt drawn on a cleared screen: a full file on three rows.
+    let cleared = r"printf '\033[H\033[2J'; prompt; printf '\r\n'; m C; printf 'x\r\n'; m 'D;7'";
+    let fill = times(260, cleared) + "; prompt";
+    let mut session = Stepped::start(&host, &[&fill, MOVES[0], "ran after 3"]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let mut wait = waits(&client, "s").await;
+    let inserted = session.step();
+    assert!(
+        silent(&mut wait).await,
+        "the wait ended at a line inserted: {inserted:?}"
+    );
+    session.step();
+    assert_eq!(waited(wait).await, (3, "after\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed() {
+    let host = Host::start("burst", &[]);
+    // One command has ended; then the marks of 300, in one write: more than the file keeps.
+    let one = r#"s="$s\r\n\033]133;C\007burst-$i\r\n\033]133;D;$((i % 100))\007\033]133;A\007\$ \033]133;B\007""#;
+    let burst = format!(r#"s=; {}; printf "$s""#, times(300, one));
+    let mut session = Stepped::start(&host, &["ran one 7", &burst]);
+    session.step();
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    let marks = session.step();
+    assert_eq!(marks.lines().count(), 1000);
+    let (code, text, said) = told(wait).await;
+    // The first that ended is not there any more. The wait gives the oldest that is, and says
+    // that it is not known to be the first; or, had it looked in the middle of the write,
+    // the first itself.
+    let kept = marks.lines().filter(|mark| mark.contains(" end")).count();
+    let oldest = 300 - kept;
+    if said.contains("unread") {
+        assert_eq!(
+            (code, text),
+            ((oldest % 100) as i32, format!("burst-{oldest}\n")),
+            "{said}"
+        );
+    } else {
+        assert_eq!((code, text), (0, "burst-0\n".to_string()), "{said}");
+    }
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_end_is_the_first_where_the_files_oldest_marks_are_alike() {
+    let host = Host::start("alike", &[]);
+    // Three commands and a clear, which puts their marks at one place; 247 more, and the file
+    // is full with those alike at its front. Then an empty line entered, whose `end` has the
+    // code of the command before, and a command that ends with 22: the first is the first.
+    let quiet = r"printf '\r\n'; m C; m 'D;0'; prompt";
+    let fill = format!(
+        "{quiet}; {quiet}; {quiet}; printf '\\r\\n'; m C; printf '\\033[H\\033[2J'; m 'D;0'; prompt; {}",
+        times(247, "ran fill 1")
+    );
+    let entered = r"printf '\r\n'; m 'D;1'; prompt; ran second 22";
+    let mut session = Stepped::start(&host, &[&fill, entered]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    session.step();
+    assert_eq!(waited(wait).await, (1, "fill\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_end_is_seen_where_a_prompt_drawn_again_left_a_full_file_short() {
+    let host = Host::start("short", &[]);
+    // A full file. A command ends with 77; a prompt with no `end` (Ctrl-C); a clear and the
+    // prompt anew, which takes two marks back: 998 lines, and six were dropped.
+    let after = r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt";
+    let mut session = Stepped::start(&host, &[&times(260, "ran fill 0"), after]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    assert_eq!(session.step().lines().count(), 998);
+    // (What it printed went with the clear, unless the wait looked before that.)
+    assert_eq!(waited(wait).await.0, 77);
+    client.close().await;
 }

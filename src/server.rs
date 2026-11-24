@@ -26,7 +26,7 @@ use crate::keys::{
 use crate::net::{bind_server, close_with, verify_client};
 use crate::proto::{
     CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
-    Request, SyncMsg, recv_msg, send_msg, spawn_msg_reader,
+    Request, SyncMsg, encode, recv_msg, send_msg, send_pieces, spawn_msg_reader,
 };
 use crate::session::Sessions;
 use crate::sync::{receive_tree, send_tree};
@@ -523,6 +523,26 @@ async fn dispatch(
             scope.check_full()?;
             let dir = resolve_cwd(asked.cwd.as_deref())?;
             state.sessions.attach(asked, &dir, send, recv).await
+        }
+        // The three that read a session's folder: a full key's, as an attach is.
+        Request::Sessions => {
+            scope.check_full()?;
+            let list = encode(&state.sessions.list().await?, usize::MAX)?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_pieces(send, &list).await
+        }
+        Request::Output { session, last } => {
+            scope.check_full()?;
+            let text = state.sessions.output(&session, last).await?;
+            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+            send_pieces(send, &text).await
+        }
+        Request::WaitSession {
+            session,
+            timeout_secs,
+        } => {
+            scope.check_full()?;
+            state.sessions.wait(&session, timeout_secs, send).await
         }
     }
 }

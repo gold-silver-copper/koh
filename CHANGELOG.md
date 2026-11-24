@@ -79,6 +79,68 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ### Changed
 
+- **A session is a `fux` pane on the server, kept by `fux`'s holder, and a client has a mirror of
+  its folder** (the README's "Sessions are `fux` panes", with its lines of don't and do). koh has
+  `fux` 0.43 in it: `koh fux …` is `fux …`, and `koh hold …` is the holder. `koh serve` keeps no
+  table of sessions: the folders are the sessions. Every break of it, in one place:
+  - **`koh/19`.** A client and a server of before and after do not talk: the handshake fails. Both
+    also say fux's pane format (1), and two that differ refuse each other before anything is
+    started (exit 1).
+  - **Sessions outlive `koh serve`.** They died with it. Stopped and started again it has them,
+    and a client dials again and attaches to the run it had. (Under systemd that takes
+    `KillMode=process`; on Linux a `koh` binary that was replaced starts no new session until `koh
+    serve` is started anew.)
+  - **Where they are:** `STATE/fux/koh-sessions/NAME`, which `koh serve` prints; it was
+    `STATE/sessions/sN`. An ended session's folder stays: `--session NAME` shows how it ended, and
+    ends the same, until the folder is removed. It counts against `--max-sessions`, where the
+    oldest ended one that no client has makes room for a new one.
+  - **`--session NAME` is a name:** letters, digits, `.`, `_` and `-`, 64 at the most, no dot
+    first, and none of the four `fux` keeps for itself (`-`, `colours`, `keyboard`, `layout`).
+    With none given a new session has fux's first free number, which is free again once its folder
+    is removed; it was a number counted up and never used twice. **A name that is not there is
+    started** (it was "no session", exit 127).
+  - **Exit codes.** `koh connect` exits 1, not 0, where nothing says how the session ended (its
+    holder was killed, the machine was restarted, its folder was moved). `koh mount` ends with the
+    session, with its program's status, as `koh connect` does (it was 0). Stopped by SIGINT,
+    SIGTERM or SIGHUP, both remove what they made and exit 0.
+  - **`koh mount`** keeps its mirror in a `fux` session of koh's own on the client,
+    `$XDG_RUNTIME_DIR/koh/fux/koh-mounts/SERVER.NAME` (else `~/.cache/koh/…`); it was
+    `main/koh-SERVER` of the user's own. It refuses a folder that is there (it wrote into it),
+    removes the mirror when it ends (the mirror stayed), and takes `--new`, `-C DIR` and `--
+    PROG`. A mirror has every file of the pane but `status` and `command`: `history`, `log`,
+    `cwd`, `modes` and `links` too.
+  - **`kill` written to a mirror's `ctl` hangs up the session's program,** for every client: a
+    mirror's `in` and `ctl` are the pane's. It ended the mount. Any key with no scope can.
+  - **Without a link** the mirror is left as it is, and koh says so in the viewer's corner (a
+    mount: on its standard error); the mirror's `state` said `reconnecting`. What is typed
+    meanwhile is held, 64 KiB and then whoever writes waits, and is typed once on return; past 64
+    KiB it was dropped.
+  - **Pictures** are sixel alone, as in `fux` 0.43, within fux's bounds on a pane: a program that
+    draws with the Kitty graphics protocol alone shows nothing.
+  - **`koh sessions`:** `id`, a number, is `name`. The list is the oldest first, by when each
+    pane's `status` was written (it was by number). `state` is what the pane's `state` says
+    (`exited N`, `killed N`, `hungup`): `running` only while its holder lives, and `ended` where
+    none does and nothing says how. A session is busy (`running_command`) while its shell's last
+    mark is `output`; it was `command` or `output`, which said busy at an idle prompt. `age_secs`
+    counts from when the pane's `status` was written. A list of any length comes, in pieces.
+  - **`koh output --last`** is selected by the marks' lines and bytes, as fux's own key for it
+    cuts, not by whole lines: a last line with no line break is there (a line break is added to
+    it), and the prompt after it is not. An `end` that has no `output` since the `end` before it
+    (an empty line entered) ends no command: it reached back to the output of the one before. A
+    text of any length comes, in pieces (past 8 MiB it failed).
+  - **`koh wait --session`** is for the first command that ends after it was asked: its code and
+    what it printed, read together. It goes by the numbers `fux` 0.43.2 gives a pane's marks
+    (`marks.dropped`): a command has ended when an `end` of a higher number than the last is
+    there, whatever the screen did meanwhile (it counted `end` marks, of which a pane keeps a
+    thousand, and so saw none once a session had some 250 commands). Where more marks came than a
+    pane keeps, it gives the oldest `end` still listed and says that it is not known to be the
+    first. A session whose holder is of an older `fux` has no numbers, and a wait for it is
+    refused. It exits 1, not 0, for a session that ended without saying how, or whose folder is
+    gone or another run's. It is no longer waited for once its client has left. `koh wait SERVER
+    JOB --session NAME`, and `--text` or `--tail` with `--session`, are a usage error (exit 2).
+  - **`koh help-agents`** prints the help and, after it, recipes: a session's files, and
+    `sessions`, `output` and `wait --session` as a script over them for `koh exec`. `koh help` is
+    as it was.
 - An entry more than 128 directories beneath its tree is not copied: the end that reads the
   tree says so before anything is sent or removed (exit 1). With `--delete` that holds for
   what the destination already has, so something deeper there fails the whole copy, even
@@ -92,7 +154,6 @@ binary, its tests and the fuzz targets share code, and any release may change it
   (it is still refused if group or others may write to it). `koh cp -p` sets a file's
   modification time and leaves its access time alone.
 - `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
-  process group of a job, a- `koh serve` needs `kill(1)` on its `PATH`, and does not start without it (exit 1): the
   process group of a job, and of a `koh exec` command the server hangs up, is signalled with
   it. `koh kill` waits for it without holding up other requests, for 5 s at most, and fails
   (exit 1) if a group that is still there was not signalled, whether or not the job's first
@@ -100,7 +161,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 - Where `XDG_RUNTIME_DIR` is not set, `koh serve` needs `id(1)` on its `PATH` too: the number
   in the state directory's name (`TMPDIR/koh-UID`) is what `id -u` says, and a server that is
   not told does not start (exit 1).
- holds fuzz targets for what a peer sends; `cargo test` runs the same entry
+- `SECURITY.md` names the files that exist, and `docs/THREAT_MODEL.md` is back, written against
+  this code. `fuzz/` holds fuzz targets for what a peer sends; `cargo test` runs the same entry
   points under a fixed-seed mutation run.
 
 ## [0.17.2] — 2026-11-16

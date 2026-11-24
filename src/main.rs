@@ -12,10 +12,14 @@ use koh::keys::{
     parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
     validate_peer_name,
 };
+use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
 const HELP: &str = include_str!("help.txt");
+/// What `koh help-agents` says after the help: a session's files, and the three commands
+/// that read them as a script for `koh exec`.
+const RECIPES: &str = include_str!("help-agents.txt");
 
 fn main() -> ExitCode {
     // fux's own command line, under two words: `koh fux …` is `fux …`, and `koh hold …` is how
@@ -71,7 +75,8 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         return Ok(Exit::OK);
     };
     if matches!(cmd, "-h" | "--help" | "help" | "help-agents") {
-        let _ = std::io::stdout().write_all(HELP.as_bytes());
+        let recipes = if cmd == "help-agents" { RECIPES } else { "" };
+        let _ = std::io::stdout().write_all([HELP, recipes].concat().as_bytes());
         return Ok(Exit::OK);
     }
     if matches!(cmd, "-V" | "--version" | "version") {
@@ -93,19 +98,13 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "kill" => cmd_kill(rest).await,
         "wait" => cmd_wait(rest).await,
         "cp" => cmd_cp(rest).await,
-        // (Answered from a session's files on the server, by the build that follows this one.)
-        "sessions" | "output" => Err(not_in_this_build(cmd)),
+        "sessions" | "output" => cmd_sessions(rest, cmd == "output").await,
         "connect" => cmd_session(rest, false).await,
         "mount" => cmd_session(rest, true).await,
         other => Err(KohError::usage(format!(
             "unknown command {other:?} (try `koh --help`)"
         ))),
     }
-}
-
-fn not_in_this_build(what: &str) -> KohError {
-    let now = "a session is a fux pane on the server: `koh exec` reads its files there";
-    KohError::failed(format!("`koh {what}` is not in this build ({now})"))
 }
 
 fn parse_role(s: &str) -> Result<Role> {
@@ -690,11 +689,12 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         relay: None,
         json: false,
     };
-    let (mut server, mut job, mut text, mut tail, mut timeout) = (
+    let (mut server, mut job, mut text, mut session, mut tail, mut timeout) = (
         None::<String>,
         None::<String>,
         None::<String>,
-        200usize,
+        None::<String>,
+        None::<usize>,
         None::<u64>,
     );
     let mut i = 0;
@@ -706,11 +706,10 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
             "--text" => text = Some(take_opt(args, &mut i, a)?),
-            "--session" => return Err(not_in_this_build("wait --session")),
+            "--session" => session = Some(take_opt(args, &mut i, a)?),
             "--tail" => {
-                tail = take_opt(args, &mut i, a)?
-                    .parse()
-                    .map_err(|_| KohError::usage("bad --tail"))?
+                let lines = take_opt(args, &mut i, a)?.parse();
+                tail = Some(lines.map_err(|_| KohError::usage("bad --tail"))?)
             }
             "--timeout" => {
                 timeout = Some(
@@ -725,11 +724,27 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let (Some(server), Some(name)) = (server, job) else {
-        return Err(KohError::usage("usage: koh wait SERVER JOB"));
-    };
+    let usage = "usage: koh wait SERVER (JOB | --session NAME)";
+    let server = server.ok_or_else(|| KohError::usage(usage))?;
+    if session.is_none() && job.is_none() {
+        return Err(KohError::usage(usage));
+    }
+    if session.is_some() && (job.is_some() || text.is_some() || tail.is_some()) {
+        let both = "a wait is for a job or for a session: JOB, --text and --tail are a job's";
+        return Err(KohError::usage(format!(
+            "{both}, and are not said with --session"
+        )));
+    }
     let client = Client::connect(&server, &opts, true).await?;
-    let res = client.wait_job(name, text, tail, timeout).await;
+    let res = match (session, job) {
+        (Some(session), _) => client.wait_session(session, timeout).await,
+        (None, Some(name)) => {
+            client
+                .wait_job(name, text, tail.unwrap_or(200), timeout)
+                .await
+        }
+        (None, None) => Err(KohError::usage(usage)),
+    };
     client.close().await;
     let res = res?;
 
@@ -878,6 +893,64 @@ fn split_remote(s: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((host, path))
+}
+
+/// `koh sessions SERVER`, and as `output` `koh output SERVER --session NAME [--last]`: what a
+/// session's folder on the server says.
+async fn cmd_sessions(args: &[String], output: bool) -> Result<Exit> {
+    let mut opts = DialOptions::default();
+    let (mut server, mut session, mut last) = (None::<String>, None::<String>, false);
+    let mut i = 0;
+    while i < args.len() {
+        if parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        match a {
+            "--session" if output => session = Some(take_opt(args, &mut i, a)?),
+            "--last" if output => last = true,
+            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
+            _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
+        }
+        i += 1;
+    }
+    let Some(server) = server.filter(|_| session.is_some() == output) else {
+        return Err(KohError::usage(match output {
+            true => "usage: koh output SERVER --session NAME [--last] [--json]",
+            false => "usage: koh sessions SERVER [--json]",
+        }));
+    };
+    let client = Client::connect(&server, &opts, false).await?;
+    let said = match &session {
+        Some(session) => client.output(session.clone(), last).await.map(|text| {
+            let json = || serde_json::json!({ "session": session, "output": text });
+            if opts.json {
+                format!("{}\n", json())
+            } else {
+                text
+            }
+        }),
+        None => client.sessions().await.map(|list| match opts.json {
+            true => serde_json::to_string(&list).unwrap_or_default() + "\n",
+            false => list.iter().map(listed).collect(),
+        }),
+    };
+    client.close().await;
+    let _ = std::io::stdout().write_all(said?.as_bytes());
+    Ok(Exit::OK)
+}
+
+/// A session as a line of `koh sessions`.
+fn listed(s: &SessionInfo) -> String {
+    let attached = if s.attached { "attached" } else { "detached" };
+    let busy = if s.running_command { "busy" } else { "idle" };
+    let last = s.last_exit.map_or("-".to_string(), |code| code.to_string());
+    let (name, state, title) = (&s.name, &s.state, &s.title);
+    format!(
+        "{name}\t{attached}\t{state}\t{busy}\texit={last}\t{}x{}\t{title}\n",
+        s.cols, s.rows
+    )
 }
 
 /// `koh connect` and `koh mount` name a session the same way; `mount` may name a directory too.

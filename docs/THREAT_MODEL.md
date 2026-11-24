@@ -42,7 +42,9 @@ a QUIC handshake: the transport does not know the allowlist.
 ## 2. A client with an allowed key and no scope
 
 It is the server's user: it runs any command (`koh exec`, `koh run`), reads and writes any file
-that user can (`koh cp`), and attaches to any session. There is nothing to escalate to. Its
+that user can (`koh cp`), and attaches to any session, lists them, reads their text and
+waits for their commands (`koh sessions`, `koh output`, `koh wait --session`, which read a
+session's folder as a script of that user would: `src/pane.rs`). There is nothing to escalate to. Its
 sessions are `fux` panes of the server's user, in a `fux` session of koh's own beneath the
 server's state (`src/session.rs`): it starts them, types into them, resizes them and hangs
 them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboard`.
@@ -51,7 +53,12 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
   bytes for a proof; 1 MiB for a request, the answer that it was taken, and the short answers
   (a list of jobs); 256 KiB for a piece of a file, of input or of output, and for every message
   of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
-  for a copy's manifest and what a wait returns. Of a session's client the server takes
+  for a copy's manifest and what a job's wait returns. A session's text (`koh output`, `koh
+  wait --session`) and the list of sessions are sent in pieces of 64 KiB and are as long as
+  the pane's files, and the folders kept, make them: for files that fux wrote, fux's bounds,
+  not a figure of koh's. A pane's files are read whole, whatever is in them (one that the
+  server's user wrote there himself, of any length, too), and what has a file's name and is
+  none (a FIFO, a link) is not read and not waited on. Of a session's client the server takes
   16 KiB a message of typed bytes, and stops taking messages while 64 KiB wait for one of a
   pane's two FIFOs: so up to 80 KiB can wait for a FIFO, and beside them the stream's reader
   holds up to seventeen messages it has read (256 KiB each at the most). It takes a list of
@@ -69,8 +76,11 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
   a client that comes back to the session that was chosen to go, while the new one starts,
   keeps it, and both stay until a later start finds an ended one without a client.
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
-  uses. A request that waits (`koh wait`, `koh logs -f`) is not stopped when its connection
-  goes; it ends with what it waits for.
+  uses. A request that waits for a job (`koh wait`, `koh logs -f`) is not stopped when its
+  connection goes; it ends with what it waits for. (`koh wait --session` looks at the pane ten
+  times a second, and between two looks sees that its client's stream has ended: it looks no
+  more. A look that has begun is finished; so is a read for `koh output` or `koh sessions`,
+  whose client is not looked for until the answer is sent.)
 - **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
   itself may come as slowly as its sender likes, and a connection that has proved a key may
   stay, asking nothing, for as long as it is kept alive. So a client with any allowed key, a
@@ -163,8 +173,11 @@ A wrong endpoint id, or a host someone else now controls.
   | `marks`, `history`, the main screen | | opened as text in the local editor |
   | `in`, `ctl` (the mirror's own FIFOs) | keys and `resize` go there, and so to the server | `kill` hangs up the session's program; removing the pane's folder ends the mount |
   | `status`, `command` | never in a mirror: `.here` and `.restore` pass it over | |
-- **A command's output from it** (`koh exec`, `koh logs`) is written to the client's stdout and
+- **A command's output from it** (`koh exec`, `koh logs`), and what it says a session shows
+  or printed (`koh output`, `koh wait --session`), is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
+  What is printed at the end (`koh output`, a `wait`, `koh logs` without `-f`) is held whole
+  until then, as much as the server sends.
 - **It learns** what is typed into a session and reaches it (what was typed while there
   was no link too, on return; not what was lost with a link), the client's terminal colours
   and keyboard flags where the files that say them are there and no longer than 16 KiB

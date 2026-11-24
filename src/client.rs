@@ -26,13 +26,14 @@ use crate::keys::{Role, load_or_create_key, resolve_server};
 use crate::net::{close_error, connect_server, dial, map_conn_err, open_authed_stream};
 use crate::proto::{
     Attach, Attached, ExecClientMsg, ExecServerMsg, FromMirror, JobInfo, LogMsg, MAX_CHUNK,
-    MAX_CTRL, MAX_FRAME, MAX_HELD, MAX_TYPED, Reply, Request, SyncSummary, ToMirror, WaitResult,
-    recv_msg, recv_msg_opt, send_msg, session_name, spawn_msg_reader,
+    MAX_CTRL, MAX_FRAME, MAX_HELD, MAX_TYPED, Reply, Request, SessionInfo, SyncSummary, ToMirror,
+    WaitResult, decode, recv_msg, recv_msg_opt, recv_pieces, send_msg, session_name,
+    spawn_msg_reader,
 };
 use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct DialOptions {
     pub key_file: Option<PathBuf>,
     pub direct: Option<SocketAddr>,
@@ -57,6 +58,12 @@ pub struct Client {
     /// Where the server is, for a connection made anew on the same endpoint.
     addr: EndpointAddr,
     conn: Connection,
+}
+
+/// A session's text as it was sent, in pieces: what of it is no UTF-8 is shown as U+FFFD.
+async fn text(recv: &mut RecvStream) -> Result<String> {
+    let text = recv_pieces(recv).await?;
+    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 impl Client {
@@ -286,6 +293,34 @@ impl Client {
             })
             .await?;
         recv_msg(&mut recv, MAX_FRAME).await
+    }
+
+    /// The server's sessions, each as its folder there says it is.
+    pub async fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        let (_, mut recv) = self.request(&Request::Sessions).await?;
+        decode(&recv_pieces(&mut recv).await?, usize::MAX)
+    }
+
+    /// What a session shows, or with `last` what its last command printed.
+    pub async fn output(&self, session: String, last: bool) -> Result<String> {
+        let (_, mut recv) = self.request(&Request::Output { session, last }).await?;
+        text(&mut recv).await
+    }
+
+    /// Waits until one more command of the session's shell has ended, or the session has.
+    pub async fn wait_session(
+        &self,
+        session: String,
+        timeout_secs: Option<u64>,
+    ) -> Result<WaitResult> {
+        let asked = Request::WaitSession {
+            session,
+            timeout_secs,
+        };
+        let (_, mut recv) = self.request(&asked).await?;
+        let mut waited: WaitResult = recv_msg(&mut recv, MAX_CTRL).await?;
+        waited.tail = text(&mut recv).await?;
+        Ok(waited)
     }
 
     pub async fn cp_push(
@@ -904,15 +939,8 @@ async fn carry(
                 let mut state = String::new();
                 let file = fuxix::open_regular(dir.join("state"));
                 let _ = file.map(|file| file.take(64).read_to_string(&mut state));
-                let mut words = state.split_whitespace();
-                let code = words
-                    .next()
-                    .zip(words.next().and_then(|n| n.parse::<u8>().ok()));
-                return match code {
-                    Some(("exited", code)) => Ok(i32::from(code)),
-                    Some(("killed", signal)) => Ok(128 + i32::from(signal)),
-                    _ => Err(KohError::failed("the session ended without saying how")),
-                };
+                let said = "the session ended without saying how";
+                return crate::pane::code(&state).ok_or_else(|| KohError::failed(said));
             }
         }
     }

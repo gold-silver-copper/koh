@@ -519,7 +519,9 @@ impl Client {
                 stopped,
             )
             .await;
-            client.close().await;
+            // (A server that is not there to hear of the end is not waited for: whoever left
+            // the viewer is at a terminal.)
+            let _ = tokio::time::timeout(Duration::from_millis(500), client.close()).await;
             carried
         });
         // The viewer starts once the mirror has a whole round: it finds a pane, with its FIFOs.
@@ -846,8 +848,8 @@ async fn carry(
     }
 }
 
-/// Without a link: tries again after today's delays (0.2, 0.5, 1, 2, then 5 s), and reads the
-/// mirror's FIFOs meanwhile. Typed bytes are held; of `ctl` only the last line that asks for
+/// Without a link: says so, tries again after today's delays (0.2, 0.5, 1, 2, then 5 s), and
+/// reads the mirror's FIFOs meanwhile. Typed bytes are held; of `ctl` only the last line that asks for
 /// a size is, and any other line is dropped, which is said. Gives the new link, or none if
 /// the client was stopped; the server's last word ends the client.
 async fn away(
@@ -859,12 +861,9 @@ async fn away(
     stop: &mut watch::Receiver<bool>,
 ) -> Result<Option<(SendStream, RecvStream)>> {
     let (since, fifos) = (Instant::now(), fifos_of(mirror));
+    // (Said again each second: a viewer's corner is cleared by the next key.)
+    let mut said = tokio::time::interval(Duration::from_secs(1));
     for tries in 0u32.. {
-        let held = "what is typed is held";
-        match since.elapsed().as_secs() {
-            0 => say(corner, &format!("no link: {held}")),
-            secs => say(corner, &format!("no link for {secs} s: {held}")),
-        }
         let attempt = async {
             tokio::time::sleep(reconnect_delay(tries)).await;
             client.attach_again(asks).await
@@ -874,6 +873,13 @@ async fn away(
             tokio::select! {
                 _ = stop.changed() => return Ok(None),
                 attached = &mut attempt => break attached,
+                _ = said.tick() => {
+                    let held = "what is typed is held";
+                    match since.elapsed().as_secs() {
+                        0 => say(corner, &format!("no link: {held}")),
+                        secs => say(corner, &format!("no link for {secs} s: {held}")),
+                    }
+                }
                 lines = typing(typed, &fifos) => for line in lines {
                     match line.starts_with(b"resize ") {
                         true => typed.asked = Some(line),

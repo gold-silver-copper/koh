@@ -78,11 +78,12 @@ ends() {
 await() { # until a command has ended since this was asked (its exit code is this one's), or the session has; 124 after SECONDS
   [ -s "$1/marks.dropped" ] || ! alive "$1" || { echo "$1 has no marks.dropped: its holder is of before fux 0.43.2 and does not number its marks. End that session and start it anew." >&2; exit 1; }
   # Asked: the number of the last `end`, or with none of the last mark that was dropped.
+  # (Of a session that ends as this is asked there may be no reading: then no `end` is waited for.)
   until asked=$(ends "$1") || ! alive "$1"; do sleep 0.02; done
-  asked=$(printf '%s\n' "$asked" | awk '{ e = $1 } END { print e + 0 }') began=$(date +%s)
+  asked=$(printf '%s\n' "$asked" | awk '{ e = $1; read = ($0 != "") } END { if (read) print e + 0 }') began=$(date +%s)
   while :; do
     # The first `end` of a higher number is the command, and how many marks came and went unread.
-    now=$(ends "$1" | awk -v e="$asked" 'NR == 1 { gone = $1 > e ? $1 - e : 0; next } $1 > e { print $2, gone; exit }')
+    now=; [ -z "$asked" ] || now=$(ends "$1" | awk -v e="$asked" 'NR == 1 { gone = $1 > e ? $1 - e : 0; next } $1 > e { print $2, gone; exit }')
     [ -z "$now" ] || {
       # (The code is that command's. If another has ended by now too, `last` prints that one's
       # output: `koh wait --session` gives the first's, read with its code.)

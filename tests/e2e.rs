@@ -3280,6 +3280,26 @@ fn a_mirror_is_made_by_koh_and_no_folder_that_is_there_is_taken() {
     signal(&mount.koh.id().to_string(), "-TERM");
     assert_eq!(mount.ends(), Some(0));
     assert_eq!(names_in(&mounts), [""; 0]);
+    // With no runtime directory, or an empty one, koh's own place is in the cache directory.
+    let mounts = host.tmp.0.join("home/.cache/koh/fux/koh-mounts");
+    for runtime in [Some(""), None] {
+        let mut koh = host.koh(&["mount", &host.id, "--direct", &host.addr()]);
+        match runtime {
+            Some(runtime) => koh.env("XDG_RUNTIME_DIR", runtime),
+            None => koh.env_remove("XDG_RUNTIME_DIR"),
+        };
+        let mut mount = Mount {
+            koh: koh.stderr(std::process::Stdio::null()).spawn().unwrap(),
+            dir: mounts.join(format!("{}.1", &host.id[..62])),
+            said: PathBuf::new(),
+        };
+        until("the mirror is in the cache directory", || {
+            mount.dir.join("generation").is_file()
+        });
+        signal(&mount.koh.id().to_string(), "-TERM");
+        assert_eq!(mount.ends(), Some(0));
+        assert_eq!(names_in(&mounts), [""; 0]);
+    }
 }
 
 #[tokio::test]

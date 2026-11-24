@@ -206,6 +206,12 @@ impl FaultNet {
         self.lock().outage = Some((Instant::now() + duration, None));
     }
 
+    /// Drops every packet sent towards `id` during the next `duration`: a link that is gone
+    /// one way. The other way it carries on.
+    pub fn black_hole_towards(&self, id: EndpointId, duration: Duration) {
+        self.lock().outage = Some((Instant::now() + duration, Some(id)));
+    }
+
     /// What became of the packets sent towards `id` so far.
     pub fn counts(&self, id: EndpointId) -> Counts {
         let state = self.lock();

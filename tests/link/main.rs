@@ -2,10 +2,12 @@
 //! other is the fault link of `net`, below QUIC, in this process.
 //!
 //! `faults` tests the link itself; `sessions` is what a user would notice of a session on it.
-//! `measure` is no test and is run by hand (`-- --ignored --nocapture`): it prints what a key's
-//! echo and a build cost on each link.
+//! Two more are no tests and are run by hand (`-- --ignored --nocapture`): `measure` prints
+//! what a key's echo and a build cost on each link, and `frozen` stops a real `koh mount` for
+//! forty seconds.
 
 mod faults;
+mod frozen;
 mod measure;
 mod net;
 mod rig;

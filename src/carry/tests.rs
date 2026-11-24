@@ -330,6 +330,26 @@ fn a_round_a_server_must_not_send_changes_nothing() {
             vec![],
             vec![put("status", b"holder 1\n")],
         ),
+        (
+            "a file written twice in a round",
+            vec![],
+            vec![put("title", b"one\n"), put("title", b"two\n")],
+        ),
+        (
+            "more messages than a round has",
+            vec![],
+            vec![folder("main"); 4096],
+        ),
+        (
+            "a later piece of added bytes out of its place",
+            vec![],
+            vec![add("title", 2, b"ab"), add("title", 5, b"cd")],
+        ),
+        (
+            "a name of 65 characters",
+            vec![],
+            vec![put(&"n".repeat(65), b"")],
+        ),
         // (The first has no `Round` before it; the last one's link ends before its `Done`.)
         ("a message outside a round", vec![], vec![]),
         ("an odd round", vec![], vec![]),
@@ -361,11 +381,14 @@ fn a_round_a_server_must_not_send_changes_nothing() {
                 .and_then(|message| mirror.take(message, Instant::now()))
                 .err()
         });
+        // (A refusal leaves nothing staged by itself; a link that ends is the caller's to say.)
         let refused = match what {
-            "a round that never ends" => refusal.is_none(),
+            "a round that never ends" => {
+                mirror.discard();
+                refusal.is_none()
+            }
             _ => matches!(refusal, Some(Fault::Refused(_))),
         };
-        mirror.discard();
         let staged = was.keys().any(|name| name.starts_with("mirror/.koh/"));
         if !refused || snapshot(&scratch.0, true) != was || staged {
             failed.push(format!("{what}: {refusal:?}"));
@@ -390,6 +413,10 @@ fn a_round_a_server_must_not_send_changes_nothing() {
     // first is gone.
     let capitals = vec![put("README", b""), remove("title"), put("Title", b"T\n")];
     give(&mut mirror, &round_of(6, capitals));
+    // What is at a bound is taken: a name of 64 characters, a round of 4,096 messages with its
+    // `Done`.
+    let at_bounds = [vec![put(&"n".repeat(64), b"")], vec![folder("main"); 4094]].concat();
+    give(&mut mirror, &round_of(8, at_bounds));
     let now = snapshot(&scratch.0.join("mirror"), true);
     assert!(now.contains_key("README") && now.contains_key("Title") && !now.contains_key("title"));
     // After `Ended` a mirror takes nothing more.
@@ -463,6 +490,7 @@ fn a_round_that_stands_still_or_takes_too_long_is_thrown_away() {
     give(&mut mirror, &first_round());
     let was = snapshot(&scratch.0, true);
     let (began, second) = (Instant::now(), Duration::from_secs(1));
+    assert_eq!((STILL, LONG), (30 * second, 600 * second));
     assert!(mirror.due().is_none(), "no round is open");
     // Thirty seconds between two whole messages of an open round, and no more.
     assert!(matches!(mirror.take(ToMirror::Round(4), began), Ok(false)));
@@ -821,6 +849,12 @@ fn every_change_a_holder_makes_is_carried() {
     let told = |message: &ToMirror| matches!(message, ToMirror::Folder(_) | ToMirror::Remove(_));
     assert!(!round.iter().any(told) && round.len() <= 3, "{round:?}");
     assert_eq!(line.differs(), NONE);
+    // A folder inside a folder is not carried, nor what is in it.
+    hand.round(|hand| {
+        fs::create_dir(hand.dir.join("main/deep")).unwrap();
+        hand.replace("main/deep/x", b"not a pane's\n");
+    });
+    assert_eq!(line.round(), vec![]);
 }
 
 #[test]
@@ -932,29 +966,34 @@ fn a_history_renamed_while_away_is_moved_and_added_to() {
     let mut hand = Hand::new(&scratch);
     hand.round(|hand| hand.append("history", &text(0, 20_000)));
     let mut line = Line::new(&scratch, &hand);
-    // The holder puts `history` aside where a line ends, and begins a new one: three times, the
-    // second and third over an older `history.1`; the client away, there, and away again.
+    // The holder puts `history` and `history.styled` aside in one round, where a line ends, and
+    // begins new ones: three times, the second and third over older ones; the client away,
+    // there, and away again.
+    hand.round(|hand| hand.append("history.styled", &text(0, 20_000)));
+    line.round();
     for (turn, away) in [true, false, true].into_iter().enumerate() {
         hand.round(|hand| {
-            hand.append("history", &text(30_000, 100));
-            hand.rename("history", "history.1");
-            hand.append("history", &text(40_000 + turn, 200));
+            for name in ["history", "history.styled"] {
+                hand.append(name, &text(30_000, 100));
+                hand.rename(name, &format!("{name}.1"));
+                hand.append(name, &text(40_000 + turn, 200));
+            }
         });
         if away {
             line.attach();
         }
         let round = line.round();
         assert_eq!(line.differs(), NONE, "turn {turn}");
-        let moves = round
-            .iter()
-            .filter(|message| matches!(message, ToMirror::Moved { .. }))
-            .count();
-        assert_eq!(
-            (moves, round.get(1)),
-            (1, Some(&moved("history", "history.1"))),
+        let moves = [
+            moved("history", "history.1"),
+            moved("history.styled", "history.styled.1"),
+        ];
+        assert_eq!(round.get(1..3), Some(&moves[..]), "turn {turn}");
+        assert!(
+            !matches!(round.get(3), Some(ToMirror::Moved { .. })),
             "turn {turn}"
         );
-        let added = text(0, 300).len();
+        let added = 2 * text(0, 300).len();
         assert!(
             wire(&round) < added + 1024,
             "turn {turn}: {} bytes for {added} added",

@@ -1372,6 +1372,13 @@ fn the_reader_rests_nine_times_as_long_as_its_round_took() {
         Some(round_of(hand.number, vec![put("main/screen", b"$ l\n")]))
     );
     assert_eq!(line.reader.rests, Some(rests));
+    // Nine times: also what the reads took that were thrown away before the look (here a
+    // hundred seconds, by the test's own hand).
+    line.reader.owed = Duration::from_secs(100);
+    hand.round(|hand| hand.append("history", b"and yet more\n"));
+    assert_eq!(line.reader.round(false, rests).unwrap().len(), 3);
+    let rest = line.reader.rests.unwrap() - rests;
+    assert!((900..901).contains(&rest.as_secs()), "{rest:?}");
 }
 
 #[test]
@@ -1392,7 +1399,14 @@ fn a_sum_is_of_its_bytes_however_they_come_and_of_its_readers_key() {
     }
     // Another key is another sum, and so is another byte anywhere: in each word of a block,
     // in another block, and after the last whole one.
-    assert!(sum([1, 2, 3, 4, 5, 6, 7, 9], &bytes, 64) != whole);
+    for word in 0..8 {
+        let mut key = KEY;
+        key[word] ^= 1;
+        assert!(
+            sum(key, &bytes, 64).lanes != whole.lanes,
+            "word {word} of the key"
+        );
+    }
     for at in (0..64)
         .step_by(8)
         .chain([63, 64, 127, bytes.len() - 70, bytes.len() - 1])

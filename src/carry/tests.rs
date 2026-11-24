@@ -282,6 +282,33 @@ fn a_round_a_server_must_not_send_changes_nothing() {
             vec![folder("alt"), link("shown", "alt")],
             vec![remove("alt"), put("alt", b"no folder\n")],
         ),
+        // One name has one spelling: another is refused, whatever the file system would do.
+        (
+            "a file's name spelled another way",
+            vec![],
+            vec![put("TITLE", b"t\n")],
+        ),
+        ("`IN` where `in` is", vec![], vec![put("IN", b"typed\n")]),
+        (
+            "a folder's name spelled another way",
+            vec![],
+            vec![folder("MAIN")],
+        ),
+        (
+            "a link's name spelled another way",
+            vec![],
+            vec![link("Shown", "main")],
+        ),
+        (
+            "a move to another spelling",
+            vec![],
+            vec![moved("title", "Title")],
+        ),
+        (
+            "one name made in two spellings",
+            vec![],
+            vec![put("x", b"x\n"), put("X", b"X\n")],
+        ),
         // (The first has no `Round` before it; the last one's link ends before its `Done`.)
         ("a message outside a round", vec![], vec![]),
         ("an odd round", vec![], vec![]),
@@ -338,6 +365,12 @@ fn a_round_a_server_must_not_send_changes_nothing() {
     );
     was.insert("mirror/generation".into(), b"4\n".to_vec());
     assert!(snapshot(&scratch.0, true) == was);
+    // A capital letter is carried all the same, and so is a name in another spelling once the
+    // first is gone.
+    let capitals = vec![put("README", b""), remove("title"), put("Title", b"T\n")];
+    give(&mut mirror, &round_of(6, capitals));
+    let now = snapshot(&scratch.0.join("mirror"), true);
+    assert!(now.contains_key("README") && now.contains_key("Title") && !now.contains_key("title"));
 }
 
 /// A second round that has every kind of message, for a mirror that had `first_round`.

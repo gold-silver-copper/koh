@@ -849,13 +849,21 @@ struct Round {
 }
 
 impl Round {
+    /// One name has one spelling. Two that differ only in the case of their letters are one name
+    /// to a mirror, whatever its file system would make of them: no message may name, in
+    /// another spelling, a thing the round has so far.
+    fn alone(&self, name: &str) -> bool {
+        let other = |had: &String| had != name && had.eq_ignore_ascii_case(name);
+        !self.will.keys().any(other)
+    }
+
     /// A name this round may write a file under: free or a file's, in a folder of the mirror if
     /// it has two parts, and not written in this round.
     fn writable(&self, name: &str) -> Result<(), Fault> {
         let free = matches!(self.will.get(name), None | Some(Thing::File(_)));
         let above = name.split_once('/').map(|(above, _)| above);
         let under = above.is_none_or(|above| self.will.get(above) == Some(&Thing::Folder));
-        match plain(name) && free && under && !self.written.contains(name) {
+        match plain(name) && self.alone(name) && free && under && !self.written.contains(name) {
             true => Ok(()),
             false => refused("no name for a file", name),
         }
@@ -902,7 +910,7 @@ impl Round {
     fn make(&mut self, name: String, thing: Thing) -> Result<(), Fault> {
         let fits = match thing {
             Thing::Fifo => name == "in" || name == "ctl",
-            _ => plain(&name) && !name.contains('/'),
+            _ => plain(&name) && !name.contains('/') && self.alone(&name),
         };
         let kind = discriminant(&thing);
         if !fits

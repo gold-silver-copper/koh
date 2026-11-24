@@ -113,6 +113,28 @@ pub(crate) fn after(from: tokio::time::Instant, long: std::time::Duration) -> to
     from.checked_add(long.min(NEVER)).unwrap_or(from)
 }
 
+/// A folder that goes, given another name beside where it was and removed when this is let go.
+/// (A name of its own that begins with a dot: nothing lists it as a session, and a folder that
+/// has the name already is not written over.) Giving it the name is one call however much the
+/// folder holds, and is what is done under a lock; the removing is done after, with nothing held.
+pub(crate) struct Aside(std::path::PathBuf);
+
+impl Aside {
+    /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
+    pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let aside = dir.with_file_name(format!(".gone.{}.{nth}", std::process::id()));
+        std::fs::rename(dir, &aside).ok().map(|()| Self(aside))
+    }
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Valid single path component (no slashes, no `.` or `..`, printable ASCII/UTF-8 without controls).
 pub fn is_safe_name(name: &str) -> bool {
     !name.is_empty()

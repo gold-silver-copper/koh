@@ -355,7 +355,11 @@ async fn dispatch(
         } => {
             let dir = resolve_cwd(cwd.as_deref())?;
             scope.check_exec(&dir)?;
-            let info = JobManager::start(&state.jobs, name, &argv, &dir, shell)?;
+            // (A start is file work and a process made: not on a thread that serves requests.)
+            let jobs = state.jobs.clone();
+            let start = move || JobManager::start(&jobs, name, &argv, &dir, shell);
+            let started = tokio::task::spawn_blocking(start).await;
+            let info = started.map_err(|_| KohError::internal("a job's start"))??;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }

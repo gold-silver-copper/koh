@@ -14,7 +14,7 @@ use tokio::sync::watch;
 use tokio::time::Instant as Timer;
 
 use crate::proto::{JobInfo, WaitResult};
-use crate::{Exit, KohError, Result, after, atomic_write, is_safe_name};
+use crate::{Aside, Exit, KohError, Result, after, atomic_write, is_safe_name};
 
 struct JobRecord {
     name: String,
@@ -58,6 +58,9 @@ impl JobManager {
         cwd: &Path,
         shell: bool,
     ) -> Result<JobInfo> {
+        // What an older job of the name left, to be removed with the lock let go: it is named
+        // here, before the lock, so it is dropped after it however this returns.
+        let mut _old = None;
         let mut guard = mgr
             .lock()
             .map_err(|_| KohError::internal("job lock poisoned"))?;
@@ -82,7 +85,7 @@ impl JobManager {
             },
         };
         let dir = guard.root.join(&job_name);
-        let _ = fs::remove_dir_all(&dir);
+        _old = Aside::of(&dir);
         fs::create_dir_all(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
 
         let log_path = dir.join("log");

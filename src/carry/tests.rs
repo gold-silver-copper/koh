@@ -1244,3 +1244,40 @@ fn the_reader_rests_nine_times_as_long_as_its_round_took() {
     );
     assert_eq!(line.reader.round(false, rests).unwrap().len(), 3);
 }
+
+#[test]
+fn a_sum_is_of_its_bytes_however_they_come_and_of_its_readers_key() {
+    const KEY: [u64; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let bytes = text(0, 40);
+    let sum = |key: [u64; 8], bytes: &[u8], pieces: usize| {
+        let mut sum = Sum {
+            key,
+            ..Sum::default()
+        };
+        bytes.chunks(pieces).for_each(|piece| sum.update(piece));
+        sum
+    };
+    let whole = sum(KEY, &bytes, bytes.len());
+    for pieces in [1, 7, 63, 64, 65, 128, 1000] {
+        assert!(sum(KEY, &bytes, pieces) == whole, "in pieces of {pieces}");
+    }
+    // Another key is another sum, and so is another byte anywhere: in each word of a block,
+    // in another block, and after the last whole one.
+    assert!(sum([1, 2, 3, 4, 5, 6, 7, 9], &bytes, 64) != whole);
+    for at in (0..64)
+        .step_by(8)
+        .chain([63, 64, 127, bytes.len() - 70, bytes.len() - 1])
+    {
+        let mut other = bytes.clone();
+        other[at] ^= 1;
+        assert!(sum(KEY, &other, 64) != whole, "byte {at}");
+    }
+    // A file's is read from the file, and is none where the file is shorter than was asked.
+    let scratch = Scratch::new("sum");
+    fs::write(scratch.0.join("file"), &bytes).unwrap();
+    let file = File::open(scratch.0.join("file")).unwrap();
+    assert!(Sum::of(KEY, &file, bytes.len() as u64) == Some(whole));
+    assert!(Sum::of(KEY, &file, bytes.len() as u64 + 1).is_none());
+    // Two readers have two keys.
+    assert_ne!(Reader::new(&scratch.0).key, Reader::new(&scratch.0).key);
+}

@@ -10,7 +10,8 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, DirBuilder, File};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::hash::{BuildHasher, RandomState};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::mem::discriminant;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, symlink};
 use std::path::{Path, PathBuf};
@@ -275,6 +276,68 @@ fn edits(old: &[u8], new: &[u8]) -> Option<Vec<Edit>> {
     (cost < new.len() && cost <= PIECE).then_some(out)
 }
 
+/// A sum of bytes this reader sent, by which it finds later that its own open file still begins
+/// with them. It never leaves the reader, so it need not be blake3: what must collide is other
+/// bytes of the same length under a key made with the reader that nothing shows, and whoever
+/// writes that file is the server's own side, which chooses what a mirror holds anyway.
+#[derive(Clone, Default, PartialEq)]
+struct Sum {
+    key: [u64; 8],
+    lanes: [u64; 4],
+    /// The bytes after the last whole block of 64.
+    rest: Vec<u8>,
+}
+
+impl Sum {
+    fn update(&mut self, bytes: &[u8]) {
+        let fill = (64 - self.rest.len()) % 64;
+        let (head, bytes) = bytes.split_at(fill.min(bytes.len()));
+        self.rest.extend_from_slice(head);
+        let held = std::mem::take(&mut self.rest);
+        match held.as_chunks() {
+            ([block], []) => self.mix(block),
+            _ => self.rest = held,
+        }
+        let (blocks, rest) = bytes.as_chunks();
+        blocks.iter().for_each(|block| self.mix(block));
+        self.rest.extend_from_slice(rest);
+    }
+
+    /// Four lanes, each the product of two keyed words folded to one word (as wyhash's are).
+    fn mix(&mut self, block: &[u8; 64]) {
+        let (words, keys) = (block.as_chunks::<16>().0, self.key.as_chunks::<2>().0);
+        for ((lane, pair), [k0, k1]) in self.lanes.iter_mut().zip(words).zip(keys) {
+            let (a, b) = pair.split_at(8);
+            let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().unwrap_or_default());
+            let wide = u128::from(word(a) ^ k0) * u128::from(word(b) ^ k1 ^ *lane);
+            *lane = wide as u64 ^ (wide >> 64) as u64;
+        }
+    }
+
+    /// The sum of the first `len` bytes of a file as they are now, if it has that many.
+    fn of(key: [u64; 8], mut file: &File, len: u64) -> Option<Sum> {
+        let (mut sum, mut read) = (
+            Sum {
+                key,
+                ..Sum::default()
+            },
+            0,
+        );
+        file.seek(SeekFrom::Start(0)).ok()?;
+        let mut file = BufReader::with_capacity(1 << 18, file.take(len));
+        loop {
+            let bytes = file.fill_buf().ok()?;
+            let more = bytes.len();
+            if more == 0 {
+                return (read == len).then_some(sum);
+            }
+            sum.update(bytes);
+            file.consume(more);
+            read += more as u64;
+        }
+    }
+}
+
 /// What a client has of a name, as the server knows it.
 struct Kept {
     /// What was read: of a file, with the length that was sent.
@@ -283,9 +346,9 @@ struct Kept {
     held: Option<File>,
     /// What was sent of a replaced file of few lines: the next one is told against it.
     content: Option<Vec<u8>>,
-    /// The last bytes sent of the file, and the hash of all that was sent before those.
+    /// The last bytes sent of the file, and the sum of all that was sent before those.
     end: Vec<u8>,
-    before: blake3::Hasher,
+    before: Sum,
 }
 
 impl Kept {
@@ -296,14 +359,17 @@ impl Kept {
             held: None,
             content: None,
             end: Vec::new(),
-            before: blake3::Hasher::new(),
+            before: Sum::default(),
         }
     }
 
     /// A file of which the client has these bytes: `whole` if they are all it has here now.
-    fn of(stamp: Stamp, held: File, bytes: &[u8], whole: bool) -> Kept {
+    fn of(key: [u64; 8], stamp: Stamp, held: File, bytes: &[u8], whole: bool) -> Kept {
         let (head, end) = bytes.split_at(bytes.len().saturating_sub(END));
-        let mut before = blake3::Hasher::new();
+        let mut before = Sum {
+            key,
+            ..Sum::default()
+        };
         before.update(head);
         let content =
             (whole && lines(bytes).take(LINES + 1).count() <= LINES).then(|| bytes.to_vec());
@@ -331,13 +397,11 @@ impl Kept {
     }
 
     /// Where the file as it is now parts from what was sent of it, if all before that place is
-    /// proved to be what was sent: the bytes before the kept end by their hash, the kept end by
+    /// proved to be what was sent: the bytes before the kept end by their sum, the kept end by
     /// itself. Not proved: nothing is said, and the file goes whole.
     fn parts_at(&self) -> Option<u64> {
-        let (mut held, mut hasher) = (self.held.as_ref()?, blake3::Hasher::new());
-        held.seek(SeekFrom::Start(0)).ok()?;
-        hasher.update_reader(held.take(self.from())).ok()?;
-        if hasher.count() != self.from() || hasher.finalize() != self.before.finalize() {
+        let held = self.held.as_ref()?;
+        if Sum::of(self.before.key, held, self.from())? != self.before {
             return None;
         }
         let there = read_at(held, self.from(), self.end.len() as u64).ok()?;
@@ -367,9 +431,10 @@ pub enum Look {
 /// What a server reads of a pane's folder for one client: the folder, and name by name what
 /// that client has. After every `Done` this record and the client's mirror are the same; it
 /// moves only with a round that was read whole.
-#[derive(Default)]
 pub struct Reader {
     root: PathBuf,
+    /// The key of this reader's sums: made with it, and never shown.
+    key: [u64; 8],
     kept: BTreeMap<String, Kept>,
     /// Files the client has under another name than they have here (`has` found them): moved first.
     moved: Vec<(String, String)>,
@@ -385,9 +450,16 @@ pub struct Reader {
 impl Reader {
     /// A reader of the pane's folder `root`, for a client that has not yet said what it has.
     pub fn new(root: &Path) -> Reader {
+        let random = RandomState::new();
         Reader {
             root: root.into(),
-            ..Reader::default()
+            key: [0u8, 1, 2, 3, 4, 5, 6, 7].map(|n| random.hash_one(n)),
+            kept: BTreeMap::new(),
+            moved: Vec::new(),
+            sent: false,
+            rests: None,
+            #[cfg(test)]
+            midway: None,
         }
     }
 
@@ -417,7 +489,7 @@ impl Reader {
         let bytes = read_at(&held, 0, had.len.min(FILE)).ok()?;
         let same = bytes.len() as u64 == had.len && *blake3::hash(&bytes).as_bytes() == had.hash;
         let whole = stamp.len == had.len && name == had.name;
-        same.then(|| Kept::of(stamp, held, &bytes, whole))
+        same.then(|| Kept::of(self.key, stamp, held, &bytes, whole))
     }
 
     /// What a client says its mirror has. Nothing of it is believed: a file counts as had only
@@ -647,7 +719,7 @@ impl Reader {
             let Some(at) = kept.parts_at() else {
                 let bytes = read_at(&held, 0, FILE).ok()?;
                 put(out, name, &bytes);
-                return Some(Kept::of(stamp.clone(), held, &bytes, false));
+                return Some(Kept::of(self.key, stamp.clone(), held, &bytes, false));
             };
             let bytes = read_at(&held, at, FILE.saturating_sub(at)).ok()?;
             if at < kept.stamp.len || !bytes.is_empty() {
@@ -692,7 +764,7 @@ impl Reader {
             }),
             None => put(out, name, &bytes),
         }
-        Some(Kept::of(stamp, held, &bytes, true))
+        Some(Kept::of(self.key, stamp, held, &bytes, true))
     }
 }
 

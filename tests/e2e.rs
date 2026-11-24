@@ -4088,3 +4088,40 @@ async fn a_client_that_says_what_no_client_says_loses_its_stream() {
     assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux", "jobs"]);
     client.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn koh_connect_told_to_end_before_its_first_round_ends_and_leaves_nothing() {
+    let host = Host::start("early", &[]);
+    let hostile = Hostile::start(&host).await;
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun2"));
+    fs::create_dir_all(&runtime).unwrap();
+    // A server that answers the attach and never sends a whole round: `koh connect` waits
+    // for its first round, with no viewer yet. Interrupted, terminated or hung up then, it
+    // ends as it does later, and its private folder goes.
+    for told in ["-HUP", "-INT", "-TERM"] {
+        let asks = ["--direct", &hostile.at.addr, &hostile.at.id];
+        let mut connect = InTerminal::connect(&config, &runtime, &asks);
+        let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv, _) = Hostile::asked(&conn).await;
+        let attached = Attached {
+            name: "1".into(),
+            run: RUNS[0],
+        };
+        send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
+        let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
+        send_msg(&mut send, &ToMirror::Round(2), MAX_CHUNK)
+            .await
+            .unwrap();
+        assert_eq!(names_in(&runtime).len(), 1);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        signal(&connect.koh.id().to_string(), told);
+        let began = Instant::now();
+        assert_eq!(connect.ends(), Some(0), "{told}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "{told}: after {:?}",
+            began.elapsed()
+        );
+        assert_eq!(names_in(&runtime), [""; 0], "{told}");
+    }
+}

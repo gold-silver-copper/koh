@@ -517,15 +517,20 @@ impl Client {
         // written there is said in its corner.)
         let corner = session.join(format!(".view.{}/ctl", std::process::id()));
         let (stop, stopped) = watch::channel(false);
+        let stop = Arc::new(stop);
         let (ready, first) = oneshot::channel();
         let says = Some(corner.clone());
         // Told to end (its terminal closed, as a rule), koh leaves as if its user had: the
-        // viewer is told to go, and the private folder goes with it.
+        // carrying is stopped, which also ends the wait for a first round that has not come;
+        // the viewer, if there is one yet, is told to go; and the private folder goes with
+        // them. (A signal in the moment before this task listens has its own way: koh dies
+        // of it, and a private folder made in that moment stays.)
         let left = Arc::new(AtomicBool::new(false));
-        let (leaves, viewer) = (left.clone(), corner.clone());
+        let (leaves, viewer, stops) = (left.clone(), corner.clone(), stop.clone());
         let signals = tokio::spawn(async move {
             told_to_end().await;
             leaves.store(true, Ordering::Relaxed);
+            let _ = stops.send(true);
             quit_viewer(&viewer).await;
         });
         let mut carried = tokio::spawn(async move {

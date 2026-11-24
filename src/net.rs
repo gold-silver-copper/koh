@@ -16,7 +16,9 @@ use crate::{KohError, Result};
 
 const PROOF_LABEL: &[u8] = b"koh/19 client proof";
 
-fn transport_config(interactive: bool) -> QuicTransportConfig {
+/// What koh asks of QUIC on every endpoint it binds. (Public for a test that binds an endpoint
+/// of its own, on a link of its own: it is then koh's in all but its transport.)
+pub fn transport_config(interactive: bool) -> QuicTransportConfig {
     let (idle_ms, keepalive) = if interactive {
         (30_000, Duration::from_secs(5))
     } else {

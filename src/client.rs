@@ -94,6 +94,22 @@ impl Client {
         })
     }
 
+    /// A client on an endpoint that is there, with the server dialled at `addr`: a test's, on
+    /// a link of its own. No command of koh's makes one so.
+    pub async fn connect_on(
+        secret: SecretKey,
+        endpoint: Endpoint,
+        addr: EndpointAddr,
+    ) -> Result<Self> {
+        let conn = dial(&endpoint, addr.clone()).await?;
+        Ok(Self {
+            secret,
+            endpoint,
+            addr,
+            conn,
+        })
+    }
+
     /// A new connection on the endpoint there is, after the one before was lost.
     pub async fn redial(&mut self) -> Result<()> {
         self.conn.close(0u32.into(), b"redial");

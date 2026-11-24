@@ -372,8 +372,10 @@ impl Kept {
             ..Sum::default()
         };
         before.update(head);
-        let content =
-            (whole && lines(bytes).take(LINES + 1).count() <= LINES).then(|| bytes.to_vec());
+        // (Kept for `Lines` only where that could ever be sent: few lines, and none that no
+        // message holds, as a picture's megabytes in one line are.)
+        let told = |(n, line): (usize, &[u8])| n < LINES && line.len() <= PIECE;
+        let content = (whole && lines(bytes).enumerate().all(told)).then(|| bytes.to_vec());
         let stamp = Stamp {
             len: bytes.len() as u64,
             ..stamp
@@ -473,7 +475,8 @@ impl Reader {
     fn number(&self, dead: bool) -> Option<(u64, u64)> {
         let there = number_in(&self.root)?;
         match (there % 2, dead) {
-            (0, _) => Some((there, there)),
+            // (A round's number is 2 at least: at 0 none was written yet.)
+            (0, _) => (there >= 2).then_some((there, there)),
             (_, true) => Some((there, there.checked_add(1)?)),
             _ => None,
         }
@@ -489,7 +492,7 @@ impl Reader {
     /// A file here of which the client has the first `had.len` bytes, if these hash as it says.
     /// (Its lines are kept only where it has the client's name for it and no more than those.)
     fn proved(&self, name: &str, had: &Had) -> Option<Kept> {
-        let (held, stamp) = opened(&self.root.join(name)).filter(|(_, now)| now.len >= had.len)?;
+        let (held, stamp) = opened(&self.root.join(name))?;
         let bytes = read_at(&held, 0, had.len.min(FILE)).ok()?;
         let same = bytes.len() as u64 == had.len && *blake3::hash(&bytes).as_bytes() == had.hash;
         let whole = stamp.len == had.len && name == had.name;
@@ -519,7 +522,10 @@ impl Reader {
                 .iter()
                 .find(|(name, _)| *name == had.name)
                 .map(|(_, stamp)| stamp);
-            let file = now.filter(|now| had.kind == Kind::File && now.kind == Kind::File);
+            // (A file that could be it: as long at least, and no longer than a mirror's may be.
+            // No other is opened.)
+            let fits = |now: &Stamp| now.kind == Kind::File && had.len <= now.len.min(FILE);
+            let file = now.filter(|now| had.kind == Kind::File && fits(now));
             let was = match (file.and_then(|_| self.proved(&had.name, had)), now) {
                 (Some(proved), _) => proved,
                 (None, Some(now))
@@ -528,7 +534,7 @@ impl Reader {
                     Kept::marker(now.clone())
                 }
                 _ => {
-                    if had.kind == Kind::File && had.len >= MOVED {
+                    if had.kind == Kind::File && (MOVED..=FILE).contains(&had.len) {
                         open.push(had);
                     }
                     // (No stamp that is read is this one: whatever is here is sent over it.)
@@ -550,11 +556,8 @@ impl Reader {
             let free = |name: &String, now: &Stamp| {
                 let unproved = kept.get(name).is_none_or(|kept| kept.held.is_none());
                 let taken = moved.iter().any(|(_, to, _)| *to == name);
-                now.kind == Kind::File
-                    && *name != had.name
-                    && !name.contains('/')
-                    && unproved
-                    && !taken
+                let fits = now.kind == Kind::File && had.len <= now.len;
+                fits && *name != had.name && !name.contains('/') && unproved && !taken
             };
             let mut others = here.iter().filter(|(name, now)| free(name, now));
             if let Some((to, was)) =
@@ -938,8 +941,8 @@ fn edited(old: &[u8], edits: &[Edit], most: u64) -> Result<Vec<u8>, Fault> {
     }
     let mut new = Vec::new();
     let mut grows = |bytes: &[u8]| {
-        new.extend_from_slice(bytes);
-        new.len() as u64 <= most
+        let fits = (new.len() as u64).saturating_add(bytes.len() as u64) <= most;
+        fits.then(|| new.extend_from_slice(bytes)).is_some()
     };
     for edit in edits {
         let fits = match edit {
@@ -970,6 +973,8 @@ pub struct Mirror {
     round: Option<Round>,
     /// How many files were staged: each has a name of its own in `.koh`.
     files: u64,
+    /// The server said that nothing follows: nothing more is taken.
+    ended: bool,
 }
 
 impl Mirror {
@@ -986,6 +991,7 @@ impl Mirror {
             fifos,
             round: None,
             files: 0,
+            ended: false,
         })
     }
 
@@ -1065,6 +1071,9 @@ impl Mirror {
         if self.due().is_some_and(|due| now > due) {
             return Err(Fault::Failed("a round stood still".into()));
         }
+        if self.ended {
+            return refused("a message after the end", "");
+        }
         let Some(mut round) = self.round.take() else {
             return match message {
                 ToMirror::Round(number) if number >= 2 && number % 2 == 0 => {
@@ -1083,7 +1092,10 @@ impl Mirror {
                     Ok(false)
                 }
                 ToMirror::Round(_) => refused("a round whose number is none", ""),
-                ToMirror::Ended => Ok(true),
+                ToMirror::Ended => {
+                    self.ended = true;
+                    Ok(true)
+                }
                 _ => refused("a message outside a round", ""),
             };
         };
@@ -1249,15 +1261,16 @@ impl Mirror {
                     fs::remove_file(staged)?;
                 }
                 Staged::Moved(from, to) => fs::rename(dir.join(from), dir.join(to))?,
+                // (A FIFO's handle is let go once the FIFO is gone, and not if it stays.)
                 Staged::Remove(name, folder) => {
-                    self.fifos.retain(|(known, _)| *known != name);
-                    let path = dir.join(name);
+                    let path = dir.join(&name);
                     let removed = if folder {
                         fs::remove_dir_all(path)
                     } else {
                         fs::remove_file(path)
                     };
                     absent(removed, ErrorKind::NotFound)?;
+                    self.fifos.retain(|(known, _)| *known != name);
                 }
             }
         }

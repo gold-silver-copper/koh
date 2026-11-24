@@ -392,6 +392,13 @@ fn a_round_a_server_must_not_send_changes_nothing() {
     give(&mut mirror, &round_of(6, capitals));
     let now = snapshot(&scratch.0.join("mirror"), true);
     assert!(now.contains_key("README") && now.contains_key("Title") && !now.contains_key("title"));
+    // After `Ended` a mirror takes nothing more.
+    assert!(matches!(
+        mirror.take(ToMirror::Ended, Instant::now()),
+        Ok(true)
+    ));
+    let after = mirror.take(ToMirror::Round(10), Instant::now());
+    assert!(matches!(after, Err(Fault::Refused(_))), "{after:?}");
 }
 
 /// A second round that has every kind of message, for a mirror that had `first_round`.
@@ -1099,6 +1106,10 @@ fn nothing_kept_changes_unless_the_round_is_one() {
     hand.turn();
     line.clock += Duration::from_secs(3600);
     assert_eq!(line.reader.look(false, line.clock), Look::Odd);
+    // Nor at the number 0, which no round has: a round's is 2 at least.
+    hand.replace("generation", b"0\n");
+    assert_eq!(line.reader.look(false, line.clock), Look::Odd);
+    assert!(matches!(line.reader.has(&[], false), Ok(false)));
 }
 
 #[test]
@@ -1270,6 +1281,11 @@ fn more_lines_than_the_gate_go_whole() {
             .iter()
             .any(|message| matches!(message, ToMirror::Lines { .. }))
     };
+    // A file with a line no message holds is not told as lines, and its bytes are not kept for
+    // it: a picture of megabytes in one line would be, for every client, and for nothing.
+    let picture = [vec![b'~'; PIECE + 1], b"\nand a line\n".repeat(20)].concat();
+    let changed = [&picture[..], b"one more\n"].concat();
+    assert!(!lines(&replaced("gate-long", &picture, &changed)));
     // 4,096 lines are told as lines; one more, of the file or of the one before it, and it goes whole.
     assert!(lines(&replaced(
         "gate-at",

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as Timer;
 
 use crate::carry::{Look, Reader};
 use crate::pane::{self, Marks};
@@ -25,7 +26,7 @@ use crate::proto::{
     Attach, Attached, FromMirror, Had, MAX_CHUNK, MAX_CTRL, MAX_HELD, MAX_TYPED, Reply, Run,
     SessionInfo, ToMirror, WaitResult, send_msg, send_pieces, session_name, spawn_msg_reader,
 };
-use crate::{Aside, Exit, KohError, Result};
+use crate::{Aside, Exit, KohError, Result, after};
 
 /// The most bytes a FIFO is given in one write: no other writer's bytes come between them.
 const PIECE: usize = 512;
@@ -306,14 +307,14 @@ impl Sessions {
             return Err(KohError::failed(format!("the session {name} {why}")));
         };
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-        // (A time too far off for the clock is no time.)
-        let until = seconds.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
+        // (More seconds than the clock has are no limit, as for a job: `after`.)
+        let until = seconds.map(|s| after(Timer::now(), Duration::from_secs(s)));
         let (timed_out, (exit, detail, text)) = loop {
             let look = dir.clone();
             if let Some(ended) = pooled(move || looked(&look, run, asked)).await? {
                 break (false, ended);
             }
-            if until.is_some_and(|until| Instant::now() >= until) {
+            if until.is_some_and(|until| Timer::now() >= until) {
                 let shown = dir.clone();
                 let ours = move || (run_of(&shown) == Some(run)).then(|| screen(&shown));
                 let shown = pooled(ours).await?.unwrap_or_default();
@@ -411,7 +412,7 @@ impl Sessions {
         // (Only now that the new one runs does the old one go; and what it held is removed
         // with nothing held, where no other request waits for it.)
         if let Some(gone) = goes.and_then(|gone| self.goes(&gone)) {
-            let _ = tokio::task::spawn_blocking(move || drop(gone)).await;
+            let _ = pooled(move || drop(gone)).await;
         }
         Ok(started)
     }
@@ -827,7 +828,7 @@ mod tests {
         let tmp = scratch("looked");
         let (dir, aside) = (tmp.join("s"), tmp.join("aside"));
         let lock = |dir: &Path| {
-            let held = File::open(dir).unwrap();
+            let held = fuxix::open(dir, false).unwrap();
             held.try_lock().unwrap();
             held
         };

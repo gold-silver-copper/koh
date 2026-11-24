@@ -666,6 +666,9 @@ async fn handle_exec(
         }
     }
 
+    // (What the command writes from here on is read by nobody: its two readers end at what
+    // they read next, and do not wait with it for room that will not come.)
+    drop(out_rx);
     // (Its client is gone, so that it could not be hung up is told to whoever reads what the
     // server says.)
     if disconnected

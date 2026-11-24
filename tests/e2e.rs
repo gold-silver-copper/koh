@@ -1167,6 +1167,14 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_se
     served().await;
     assert!(tmp.0.join("ended").exists(), "served beside the command");
 
+    // A command that goes on writing to a client that left is read no further, and so ends:
+    // it does not hold the place for the five seconds a command that does not end has.
+    let (client, streams) = left("sleep 0.2; head -c 2097152 /dev/zero").await;
+    drop(streams);
+    client.close().await;
+    let cut_off = tokio::time::timeout(Duration::from_secs(3), served()).await;
+    cut_off.expect("the place of a command that only writes came back within 3 s");
+
     // A command that does not end is let go of five seconds after its connection: the place
     // is not its to keep.
     let (client, streams) = left("echo $$ > pid; exec sleep 600").await;

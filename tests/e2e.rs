@@ -4472,6 +4472,15 @@ fn wait_session_returns_the_commands_code_or_124() {
         line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
         "{printed:?}"
     );
+    // A pane with no `marks.dropped` is kept by a holder of before there was one, whose marks
+    // have no numbers: a wait for it is refused, with what to do.
+    fs::remove_file(pane.join("marks.dropped")).unwrap();
+    let (code, _, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
+    assert_eq!(code, Some(1), "{said}");
+    assert!(
+        said.contains("marks.dropped") && said.contains("End that session"),
+        "{said}"
+    );
 }
 
 #[test]
@@ -4667,16 +4676,49 @@ const MOVES: [&str; 4] = [
 async fn waits(client: &Client, session: &str) -> RecvStream {
     let asked = Request::WaitSession {
         session: session.into(),
-        timeout_secs: Some(60),
+        timeout_secs: Some(8),
     };
     client.request(&asked).await.unwrap().1
 }
 
 /// What a wait was answered: its exit code and its text.
-async fn waited(mut wait: RecvStream) -> (i32, String) {
+async fn waited(wait: RecvStream) -> (i32, String) {
+    let (exit, text, _) = told(wait).await;
+    (exit, text)
+}
+
+/// The same, and the word it was answered with.
+async fn told(mut wait: RecvStream) -> (i32, String, String) {
     let ended: koh::proto::WaitResult = recv_msg(&mut wait, MAX_CTRL).await.unwrap();
     let text = koh::proto::recv_pieces(&mut wait).await.unwrap();
-    (ended.exit, String::from_utf8(text).unwrap())
+    (ended.exit, String::from_utf8(text).unwrap(), ended.detail)
+}
+
+/// Whether a wait has said nothing for four looks of the server's.
+async fn silent(wait: &mut RecvStream) -> bool {
+    let look = Duration::from_millis(400);
+    tokio::time::timeout(look, wait.read(&mut [0; 1]))
+        .await
+        .is_err()
+}
+
+/// A session of `marks_by_steps`, and how many of its steps are done.
+struct Stepped(PathBuf, u32);
+
+impl Stepped {
+    fn start(host: &Host, steps: &[&str]) -> Self {
+        Self(host.session("s", &marks_by_steps(steps), "$"), 0)
+    }
+
+    /// Has the next step done, and gives the pane's `marks` after it.
+    fn step(&mut self) -> String {
+        self.1 += 1;
+        fs::write(self.0.join("in"), "\n").unwrap();
+        let title = format!("done-{}\n", self.1);
+        let said = || fs::read_to_string(self.0.join("title")).unwrap_or_default();
+        until(&title, || said() == title);
+        fs::read_to_string(self.0.join("marks")).unwrap()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4807,4 +4849,154 @@ fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
             "{more:?}: {said}"
         );
     }
+}
+
+// The sequences of the second round of reviews, each against fux's holder: what a full `marks`
+// could not say, and its count of the marks it dropped does.
+
+/// So many times `body`, as one step of a session's program.
+fn times(n: u32, body: &str) -> String {
+    format!("i=0; while [ $i -lt {n} ]; do {body}; i=$((i + 1)); done")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_sees_a_commands_end_in_a_shell_that_clears_at_every_command() {
+    let host = Host::start("clears", &[]);
+    // `clear; echo hi N`, 255 times, in a pane of 80 by 24: the file is full, and every mark
+    // of it but the last few is at one place. Then a command that ends with 4, and 16 more.
+    let clears = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2Jhi %s\r\n' $i; m 'D;0'; prompt",
+    );
+    let more = times(16, "ran more $((i + 10))");
+    let mut session = Stepped::start(&host, &[&clears, "ran four 4", &more, "ran fresh 3"]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    session.step();
+    session.step();
+    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
+    // And a wait asked afresh after those.
+    let wait = waits(&client, "s").await;
+    session.step();
+    assert_eq!(waited(wait).await, (3, "fresh\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_screen_that_moves_ends_nothing_where_every_mark_is_on_it() {
+    let host = Host::start("on-screen", &[]);
+    // `clear` 255 times and `true`: a full file whose first mark is still on the screen. A
+    // command begins, scrolls the screen down, and ends with 5 only later.
+    let clears = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2J'; m 'D;0'; prompt",
+    );
+    let begun = r"printf '\r\n'; m C; printf '\033[1T'";
+    let steps = [
+        &clears,
+        r"printf '\r\n'; m C; m 'D;0'; prompt",
+        begun,
+        "m 'D;5'; prompt",
+    ];
+    let mut session = Stepped::start(&host, &steps);
+    session.step();
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let mut wait = waits(&client, "s").await;
+    let scrolled = session.step();
+    assert!(
+        silent(&mut wait).await,
+        "the wait ended at a scroll down: {scrolled:?}"
+    );
+    session.step();
+    assert_eq!(waited(wait).await.0, 5);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_line_inserted_ends_nothing_where_a_shell_clears_at_each_prompt() {
+    let host = Host::start("inserted", &[]);
+    // 260 commands, each at a prompt drawn on a cleared screen: a full file on three rows.
+    let cleared = r"printf '\033[H\033[2J'; prompt; printf '\r\n'; m C; printf 'x\r\n'; m 'D;7'";
+    let fill = times(260, cleared) + "; prompt";
+    let mut session = Stepped::start(&host, &[&fill, MOVES[0], "ran after 3"]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let mut wait = waits(&client, "s").await;
+    let inserted = session.step();
+    assert!(
+        silent(&mut wait).await,
+        "the wait ended at a line inserted: {inserted:?}"
+    );
+    session.step();
+    assert_eq!(waited(wait).await, (3, "after\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed() {
+    let host = Host::start("burst", &[]);
+    // One command has ended; then the marks of 300, in one write: more than the file keeps.
+    let one = r#"s="$s\r\n\033]133;C\007burst-$i\r\n\033]133;D;$((i % 100))\007\033]133;A\007\$ \033]133;B\007""#;
+    let burst = format!(r#"s=; {}; printf "$s""#, times(300, one));
+    let mut session = Stepped::start(&host, &["ran one 7", &burst]);
+    session.step();
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    let marks = session.step();
+    assert_eq!(marks.lines().count(), 1000);
+    let (code, text, said) = told(wait).await;
+    // The first that ended is not there any more. The wait gives the oldest that is, and says
+    // that it is not known to be the first; or, had it looked in the middle of the write,
+    // the first itself.
+    let kept = marks.lines().filter(|mark| mark.contains(" end")).count();
+    let oldest = 300 - kept;
+    if said.contains("unread") {
+        assert_eq!(
+            (code, text),
+            ((oldest % 100) as i32, format!("burst-{oldest}\n")),
+            "{said}"
+        );
+    } else {
+        assert_eq!((code, text), (0, "burst-0\n".to_string()), "{said}");
+    }
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_end_is_the_first_where_the_files_oldest_marks_are_alike() {
+    let host = Host::start("alike", &[]);
+    // Three commands and a clear, which puts their marks at one place; 247 more, and the file
+    // is full with those alike at its front. Then an empty line entered, whose `end` has the
+    // code of the command before, and a command that ends with 22: the first is the first.
+    let quiet = r"printf '\r\n'; m C; m 'D;0'; prompt";
+    let fill = format!(
+        "{quiet}; {quiet}; {quiet}; printf '\\r\\n'; m C; printf '\\033[H\\033[2J'; m 'D;0'; prompt; {}",
+        times(247, "ran fill 1")
+    );
+    let entered = r"printf '\r\n'; m 'D;1'; prompt; ran second 22";
+    let mut session = Stepped::start(&host, &[&fill, entered]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    session.step();
+    assert_eq!(waited(wait).await, (1, "fill\n".to_string()));
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_end_is_seen_where_a_prompt_drawn_again_left_a_full_file_short() {
+    let host = Host::start("short", &[]);
+    // A full file. A command ends with 77; a prompt with no `end` (Ctrl-C); a clear and the
+    // prompt anew, which takes two marks back: 998 lines, and six were dropped.
+    let after = r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt";
+    let mut session = Stepped::start(&host, &[&times(260, "ran fill 0"), after]);
+    assert_eq!(session.step().lines().count(), 1000);
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
+    assert_eq!(session.step().lines().count(), 998);
+    // (What it printed went with the clear, unless the wait looked before that.)
+    assert_eq!(waited(wait).await.0, 77);
+    client.close().await;
 }

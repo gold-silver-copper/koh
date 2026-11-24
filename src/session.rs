@@ -12,7 +12,7 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use iroh::endpoint::{RecvStream, SendStream};
@@ -101,7 +101,7 @@ fn state_of(said: Option<String>, alive: bool) -> String {
 
 /// A session as its folder says it is, read of one round of its holder's writing.
 fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
-    let (alive, state, size, title, marks) = pane::together(dir, lives, || {
+    let ((alive, state, size, title, marks), _) = pane::together(dir, lives, || {
         let line = |name| pane::line(dir, name);
         let size = line("size").unwrap_or_default();
         (
@@ -109,7 +109,7 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
             line("state"),
             size,
             line("title"),
-            Marks::read(dir),
+            Marks::read(dir, None),
         )
     });
     let mut size = size.split(' ').map(|cells| cells.parse().unwrap_or(0));
@@ -120,8 +120,8 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
         cols: size.next().unwrap_or(0),
         rows: size.next().unwrap_or(0),
         title: title.unwrap_or_default(),
-        running_command: alive && marks.busy(),
-        last_exit: marks.command(usize::MAX).0,
+        running_command: alive && marks.busy,
+        last_exit: marks.ended.and_then(|(_, code, _)| code),
         age_secs: written.elapsed().map_or(0, |age| age.as_secs()),
         pane_dir: dir.display().to_string(),
     }
@@ -130,7 +130,7 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
 /// What a session shows; or with `last` what its last command printed, which is what it
 /// shows where its shell has marked no command that ended.
 fn text(dir: &Path, last: bool) -> Vec<u8> {
-    let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)));
+    let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)).0);
     printed.flatten().unwrap_or_else(|| screen(dir))
 }
 
@@ -139,26 +139,39 @@ fn screen(dir: &Path) -> Vec<u8> {
     pane::read(dir, "shown/screen").unwrap_or_default()
 }
 
-/// What a wait finds when it looks: nothing while the session runs on and no command of its
-/// shell has ended since `was` was read; else the exit code, how it ended, and the text. The
-/// first command that ended, its code and what it printed read as one; or, of a session that
-/// ended, what `state` says and its last screen. A folder that is gone or another run's by
-/// then has ended, and nothing of it is given.
-fn looked(dir: &Path, run: Run, was: &Marks) -> Option<(i32, String, Vec<u8>)> {
-    // (The marks alone first, a file: the pane's text is read only once they say so.)
-    let ended = was.first_since(&Marks::read(dir)).is_some();
-    let ended = ended.then(|| pane::together(dir, lives, || pane::ended_since(was, dir)));
-    let (ended, alive) = (ended.flatten(), lives(dir));
-    if run_of(dir) != Some(run) {
-        return Some((1, "ended".into(), Vec::new()));
+/// What a wait finds when it looks: nothing while the session runs on and no `end` of its
+/// shell has a number above `asked`; else the exit code, how it ended, and the text. The
+/// first command that ended, its code and what it printed, of one round; or, of a session
+/// that ended, what `state` says and its last screen. A folder that is gone or another run's
+/// once all that was read has ended, and nothing of it is given.
+fn looked(dir: &Path, run: Run, asked: u64) -> Option<(i32, String, Vec<u8>)> {
+    // (What is not known to be of one round is not believed: the next look is.)
+    let (ended, whole) = pane::together(dir, lives, || pane::ended_since(asked, dir));
+    let answer = match (ended.filter(|_| whole), lives(dir)) {
+        (Some((code, printed, unread)), _) => {
+            let said = match unread {
+                0 => "command ended (OSC 133)".to_string(),
+                // (More marks came than the file keeps: what is left of them is not all.)
+                n => format!(
+                    "command ended (OSC 133): the oldest still kept, not known to be the first ({n} marks came and went unread)"
+                ),
+            };
+            Some((
+                code.map_or(0, i32::from),
+                said,
+                printed.unwrap_or_else(|| screen(dir)),
+            ))
+        }
+        (None, false) => {
+            let state = state_of(pane::line(dir, "state"), false);
+            Some((pane::code(&state).unwrap_or(1), state, screen(dir)))
+        }
+        (None, true) => None,
+    };
+    match run_of(dir) == Some(run) {
+        true => answer,
+        false => Some((1, "ended".into(), Vec::new())),
     }
-    if let Some((code, printed)) = ended {
-        let said = "command ended (OSC 133)".to_string();
-        let printed = printed.unwrap_or_else(|| screen(dir));
-        return Some((code.map_or(0, i32::from), said, printed));
-    }
-    let state = (!alive).then(|| state_of(pane::line(dir, "state"), false))?;
-    Some((pane::code(&state).unwrap_or(1), state, screen(dir)))
 }
 
 /// File work of the three commands, on the blocking pool: it reads megabytes of history, and
@@ -281,18 +294,29 @@ impl Sessions {
     ) -> Result<()> {
         let (dir, run) = self.named(name)?;
         let read = dir.clone();
-        let was = Arc::new(pooled(move || Marks::read(&read)).await?);
+        // No number to count from: an older holder's pane, or one whose two files were not
+        // read as of one round. No wait is taken for either.
+        let numbered = move || pane::together(&read, lives, || Marks::read(&read, None).asked());
+        let (asked, whole) = pooled(numbered).await?;
+        let Some(asked) = asked.filter(|_| whole) else {
+            let older = "is kept by a holder of before fux 0.43.2, which does not number its marks (it has no `marks.dropped`): a wait cannot tell its commands' ends. End that session and start it anew";
+            let moving =
+                "is written without a pause: its marks were not read as of one moment. Ask again";
+            let why = if whole { older } else { moving };
+            return Err(KohError::failed(format!("the session {name} {why}")));
+        };
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         // (A time too far off for the clock is no time.)
         let until = seconds.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
         let (timed_out, (exit, detail, text)) = loop {
-            let (look, was) = (dir.clone(), was.clone());
-            if let Some(ended) = pooled(move || looked(&look, run, &was)).await? {
+            let look = dir.clone();
+            if let Some(ended) = pooled(move || looked(&look, run, asked)).await? {
                 break (false, ended);
             }
             if until.is_some_and(|until| Instant::now() >= until) {
                 let shown = dir.clone();
-                let shown = pooled(move || screen(&shown)).await?;
+                let ours = move || (run_of(&shown) == Some(run)).then(|| screen(&shown));
+                let shown = pooled(ours).await?.unwrap_or_default();
                 break (
                     true,
                     (i32::from(Exit::TIMEOUT.0), "timed out".into(), shown),
@@ -809,30 +833,63 @@ mod tests {
         };
         // A session that runs (the test holds its lock), and has marked no command.
         let (_fifos, holder) = (pane(&dir, 7), lock(&dir));
-        let (run, was) = (run_of(&dir).unwrap(), Marks::read(&dir));
-        assert_eq!(looked(&dir, run, &was), None);
+        fs::write(dir.join("marks.dropped"), "0\n").unwrap();
+        let (run, asked) = (
+            run_of(&dir).unwrap(),
+            Marks::read(&dir, None).asked().unwrap(),
+        );
+        assert_eq!((asked, looked(&dir, run, asked)), (0, None));
         // Between two looks it ends, and another run has its name, whose shell has marked a
         // command's end with 7: that is not what was waited for. The session has ended.
         drop(holder);
         fs::rename(&dir, &aside).unwrap();
         let (_others, _holder) = (pane(&dir, 8), lock(&dir));
+        fs::write(dir.join("marks.dropped"), "0\n").unwrap();
         fs::write(dir.join("marks"), "0 0 output\n1 0 end 7\n").unwrap();
         assert_eq!(
-            looked(&dir, run, &was),
+            looked(&dir, run, asked),
             Some((1, "ended".to_string(), Vec::new()))
         );
         // The folder gone is the same; and the run itself, ended, says how.
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(
-            looked(&dir, run, &was),
+            looked(&dir, run, asked),
             Some((1, "ended".to_string(), Vec::new()))
         );
         fs::rename(&aside, &dir).unwrap();
         fs::write(dir.join("state"), "exited 3\n").unwrap();
         assert_eq!(
-            looked(&dir, run, &was),
+            looked(&dir, run, asked),
             Some((3, "exited 3".to_string(), Vec::new()))
         );
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn marks_that_came_and_went_unread_are_said_with_the_oldest_end_still_kept() {
+        let tmp = scratch("unread");
+        let dir = tmp.join("s");
+        let (_fifos, run) = (pane(&dir, 7), run_of(&tmp.join("s")));
+        // The last `end` was number 6 when the wait was asked. By its next look 1,200 marks
+        // have come, and the file has dropped 206: those up to 206 went unread, an `end` or
+        // more among them. The oldest it lists is given, with that said; never as the first.
+        let command = |n: usize| format!("{n} 0 output\n{n} 9 end {}\n", n % 100);
+        fs::write(
+            dir.join("marks"),
+            (50..550).map(command).collect::<String>(),
+        )
+        .unwrap();
+        fs::write(dir.join("marks.dropped"), "206\n").unwrap();
+        let (code, said, _) = looked(&dir, run.unwrap(), 6).unwrap();
+        let unread =
+            "the oldest still kept, not known to be the first (200 marks came and went unread)";
+        assert_eq!(
+            (code, said),
+            (50, format!("command ended (OSC 133): {unread}"))
+        );
+        // With the last `end` still listed nothing went unread, and the first is the first.
+        let (code, said, _) = looked(&dir, run.unwrap(), 208).unwrap();
+        assert_eq!((code, said.as_str()), (51, "command ended (OSC 133)"));
         let _ = fs::remove_dir_all(tmp);
     }
 

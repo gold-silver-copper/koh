@@ -428,17 +428,20 @@ impl Kept {
     }
 }
 
-/// What a look at a pane's folder gave.
+/// What a look at a pane's folder gave, and what its caller does then.
 #[derive(Debug, PartialEq)]
 pub enum Look {
-    /// What differs from what the client has, from `Round` to `Done`: to be sent. No message,
-    /// where nothing differs and a round was sent before.
+    /// What differs from what the client has, from `Round` to `Done`: send all of it, in its
+    /// order (the reader has taken it as sent). No message: nothing differs, send nothing.
     Round(Vec<ToMirror>),
     /// Nothing was read: the folder is being written (its number is odd), or has no number.
+    /// Look again when `generation` is another file, or after a while.
     Odd,
-    /// What was read is thrown away: the folder's number moved meanwhile.
+    /// What was read is thrown away: the folder's number moved meanwhile, or a file could not
+    /// be read. Look again at once, but let other work in between.
     Moved,
-    /// Nothing was read: a file must be proved, and the reader rests until then.
+    /// Nothing was read: a file must be proved, and the reader rests until then. Look again
+    /// then, and not before: what waits includes that file, and every look costs a walk.
     Rests(Instant),
 }
 
@@ -600,10 +603,14 @@ impl Reader {
     /// One look at the folder, at the moment `now`. A look that proves a file (one written in
     /// place, or one that has another name now) owes a rest: no file is proved again until
     /// nine times as long as that look took has passed, so whatever proving costs, it has a
-    /// tenth of a core at most. A look that proves nothing owes none, and is not held back.
+    /// tenth of a core at most. A look that proves nothing owes none, and is not held back:
+    /// after a round a caller looks again whenever `generation` is another file, rest or no.
     /// A read that is thrown away is not rested for then, or a holder that keeps writing
     /// would starve the mirror: the next look is at once, and the rest after it is for both
-    /// (`rest`).
+    /// (`rest`). A caller that looks again at each `Moved` relies on fux's bounds: its holder
+    /// leaves 8 ms between two rounds and a history file is some megabytes, which a look
+    /// proves in less. A folder that always moves under a look has the caller look without
+    /// end.
     pub fn look(&mut self, dead: bool, now: Instant) -> Look {
         let began = Instant::now();
         let Some(numbers) = self.number(dead) else {

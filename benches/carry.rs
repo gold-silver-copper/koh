@@ -76,8 +76,8 @@ struct Seen {
     waits: Vec<Duration>,
 }
 
-/// Rounds a holder wrote, each with its number and the moment it was whole: how long until
-/// the mirror has it.
+/// Rounds a holder writes, each with its number and the moment before it was written: how
+/// long until the mirror has it.
 type Awaited = Mutex<VecDeque<(u64, Instant)>>;
 
 struct Line {
@@ -246,11 +246,12 @@ fn main() -> io::Result<()> {
     // (Each round is written when the one before it is in the mirror.)
     line.part("a holder that waits to be read", false, |stop, awaited| {
         while !stop.load(Ordering::Relaxed) {
-            holder.round(true)?;
+            // (Said before it is written: the reader may have the round before the next line.)
             awaited
                 .lock()
                 .map_err(wrong)?
-                .push_back((holder.number, Instant::now()));
+                .push_back((holder.number + 2, Instant::now()));
+            holder.round(true)?;
             while !stop.load(Ordering::Relaxed) && !awaited.lock().map_err(wrong)?.is_empty() {
                 sleep(Duration::from_micros(200));
             }
@@ -278,11 +279,11 @@ fn main() -> io::Result<()> {
             while !stop.load(Ordering::Relaxed) {
                 holder.round(true)?;
                 sleep(Duration::from_millis(10));
-                holder.round(false)?;
                 awaited
                     .lock()
                     .map_err(wrong)?
-                    .push_back((holder.number, Instant::now()));
+                    .push_back((holder.number + 2, Instant::now()));
+                holder.round(false)?;
                 sleep(Duration::from_millis(90));
             }
             Ok(())

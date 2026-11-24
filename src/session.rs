@@ -73,14 +73,26 @@ fn number_of(dir: &Path) -> fux::Stamp {
     fs::metadata(dir.join("generation")).ok().map(fux::stamp)
 }
 
+/// The two FIFOs of a session's folder, `in` and `ctl`, and the run they are of: the run a
+/// client named, or with none the folder's. They are opened as fux's viewer opens them (no
+/// link is followed; a FIFO or nothing) and held from then on: typed bytes go into these two,
+/// whatever has their names later. The folder is that run after they were opened, or there
+/// is no answer: a name that another run took meanwhile gets nothing typed into it.
+fn held(dir: &Path, named: Option<Run>) -> Option<(Run, [Option<File>; 2])> {
+    let run = named.or_else(|| run_of(dir))?;
+    let fifos = ["in", "ctl"].map(|name| fuxix::open_fifo(dir.join(name)).ok());
+    (run_of(dir) == Some(run)).then_some((run, fifos))
+}
+
 fn not_found(what: String) -> KohError {
     KohError::new(Exit::NOT_FOUND, "not_found", what)
 }
 
 /// What the blocking pool read of a pane's folder for a stream.
 enum Read {
-    /// The client's list, and whether it was read while the folder stood still.
-    Listed(Vec<Had>, bool),
+    /// The client's list, whether it was read while the folder stood still, and whether a
+    /// holder lived just before.
+    Listed(Vec<Had>, bool, bool),
     /// A look, whether a holder lived just before it, the run the folder was just after, and
     /// what the folder's number was when the look began.
     Looked(Look, bool, Option<Run>, fux::Stamp),
@@ -219,9 +231,21 @@ impl Sessions {
         let started = self.start(asked, cwd).await?;
         // (Only now that the new one runs does the old one go.)
         if let Some(gone) = goes {
-            let _ = fs::remove_dir_all(gone);
+            self.goes(&gone);
         }
         Ok(started)
+    }
+
+    /// Removes an ended session's folder for a new one, unless a client has come to it since
+    /// it was chosen (one that comes again does not wait for a start). Looked at and removed
+    /// under the streams' lock, which a stream takes its place under: a client either has its
+    /// place before this looks, or finds no folder.
+    fn goes(&self, dir: &Path) {
+        let streams = self.streams();
+        let streamed = run_of(dir).is_some_and(|run| streams.keys().any(|(had, _)| *had == run));
+        if !streamed {
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     /// Serves one attach, from the request to the stream's end. Checked in this order before
@@ -261,8 +285,16 @@ impl Sessions {
             (Some(_), None) => return Err(KohError::usage("a run of no session")),
             (None, _) => self.find(&asked, cwd).await?,
         };
-        let gone = || not_found(format!("the session at {} is gone", dir.display()));
-        let run = run_of(&dir).ok_or_else(gone)?;
+        // The run is the one the client named, or with none the folder's as it is now; and
+        // the two FIFOs are that run's (`held`).
+        let gone = || match &asked.run {
+            Some(_) => not_found(format!(
+                "another run has the session's name {name}: nothing is typed into it",
+                name = dir.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            None => not_found(format!("the session at {} is gone", dir.display())),
+        };
+        let (run, fifos) = held(&dir, asked.run).ok_or_else(gone)?;
         // This client's older stream on the run ends first, and has stopped writing before
         // this one is answered: what it still held for the FIFOs is not typed after what
         // this one brings.
@@ -273,13 +305,6 @@ impl Sessions {
         if let Some((_, older)) = older {
             let _ = older.send(true);
             older.closed().await;
-        }
-        // The two FIFOs of the run that was checked, as fux's viewer opens them (no link is
-        // followed; a FIFO or nothing), held from here on: typed bytes go into these two,
-        // whatever has their names later. (Checked again, so the run is theirs.)
-        let fifos = ["in", "ctl"].map(|name| fuxix::open_fifo(dir.join(name)).ok());
-        if run_of(&dir) != Some(run) {
-            return Err(gone());
         }
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
@@ -329,9 +354,20 @@ impl Sessions {
         // What is sent goes through one writer, a message at a time: while the link takes a
         // round, typed bytes are still read and written.
         let (out, mut queue) = mpsc::channel::<ToMirror>(1);
+        // The writer is also where the stream's end is seen, whatever else waits: a client
+        // that left while typed bytes wait for a program that does not read is gone, and
+        // nothing of its stream is kept.
         let writer = async move {
-            while let Some(message) = queue.recv().await {
-                if send_msg(send, &message, MAX_CHUNK).await.is_err() {
+            loop {
+                let message = tokio::select! {
+                    message = queue.recv() => message,
+                    _ = send.stopped() => None,
+                };
+                let sent = match message {
+                    Some(message) => send_msg(send, &message, MAX_CHUNK).await.is_ok(),
+                    None => false,
+                };
+                if !sent {
                     break;
                 }
             }
@@ -349,7 +385,8 @@ impl Sessions {
         let began = Instant::now();
         let (mut looked, mut seen) = (began, None);
         let (mut again, mut rests, mut moved) = (true, began, 0u32);
-        let (mut keyed, mut active) = (began, began);
+        // When a key was last typed whose echo has not been read yet; and when anything happened.
+        let (mut keyed, mut active) = (None::<Instant>, began);
         loop {
             let now = Instant::now();
             // What waits for a FIFO is written as the FIFO takes it. One whose reader is gone
@@ -361,7 +398,7 @@ impl Sessions {
                     match fifo.as_ref().map(|mut fifo| fifo.write(piece)) {
                         Some(Ok(n @ 1..)) => {
                             waits.drain(..n);
-                            (keyed, active) = (now, now);
+                            (keyed, active) = (Some(now), now);
                         }
                         Some(Err(e))
                             if matches!(
@@ -394,7 +431,9 @@ impl Sessions {
                 };
                 // (Just after a key its echo is a millisecond or two away: the number is waited
                 // for with the look, on the blocking pool, where a wait is that short.)
-                let echo = Duration::from_millis(40).saturating_sub(keyed.elapsed());
+                let echo = keyed.map_or(Duration::ZERO, |keyed| {
+                    Duration::from_millis(40).saturating_sub(keyed.elapsed())
+                });
                 let changed = again || number != seen;
                 let due =
                     changed || !echo.is_zero() || looked.elapsed() >= Duration::from_millis(often);
@@ -402,8 +441,9 @@ impl Sessions {
                 let asked = reader.take_if(|_| list.is_some()).zip(list.take());
                 if let Some((mut reader, had)) = asked {
                     work = Some(tokio::task::spawn_blocking(move || {
-                        let listed = reader.has(&had, !lives(&dir)).ok();
-                        (reader, listed.map(|listed| Read::Listed(had, listed)))
+                        let dead = !lives(&dir);
+                        let listed = reader.has(&had, dead).ok();
+                        (reader, listed.map(|listed| Read::Listed(had, listed, dead)))
                     }));
                 } else if let Some(mut reader) = reader.take_if(|_| live && due) {
                     (again, looked) = (false, now);
@@ -420,7 +460,11 @@ impl Sessions {
             }
             let waiting = waits.iter().any(|waits| !waits.is_empty());
             let pace = match active.elapsed().as_millis() {
-                _ if waiting || keyed.elapsed() < Duration::from_millis(40) => 1,
+                _ if waiting
+                    || keyed.is_some_and(|keyed| keyed.elapsed() < Duration::from_millis(40)) =>
+                {
+                    1
+                }
                 0..3000 => 4,
                 _ => 16,
             };
@@ -439,16 +483,21 @@ impl Sessions {
                 }
                 read = done(&mut work) => {
                     let Some((back, read)) = read else { return };
-                    reader = Some(back);
+                    // (From when the work was done: it may have taken long.)
+                    let (reader_back, now) = (back, Instant::now());
+                    reader = Some(reader_back);
                     let mut last = |round: &mut VecDeque<ToMirror>| {
                         round.push_back(ToMirror::Ended);
                         ending = true;
                     };
                     match read {
-                        Read::Listed(_, true) => (live, again) = (true, true),
-                        // (Read again: the folder was being written. One with no holder that
-                        // has no number never will have.)
-                        Read::Listed(had, false) if lives(dir) => {
+                        Read::Listed(_, true, _) => (live, again) = (true, true),
+                        // Read again: the folder was being written, by a holder that lived
+                        // then. If that was its last round, the list is read once more with no
+                        // holder, and the last round follows: a session that ends as a
+                        // client comes is shown to its end. (Only a folder that was read with
+                        // no holder and has no number never will have one.)
+                        Read::Listed(had, false, false) => {
                             (list, rests) = (Some(had), now + Duration::from_millis(2));
                         }
                         Read::Listed(..) => last(&mut round),
@@ -457,7 +506,7 @@ impl Sessions {
                         Read::Looked(Look::Round(messages), dead, _, seeing) => {
                             (seen, moved) = (seeing, 0);
                             if !messages.is_empty() {
-                                active = now;
+                                (keyed, active) = (None, now);
                             }
                             round.extend(messages);
                             // No holder was left before it was read: it is the last there is.
@@ -496,9 +545,13 @@ impl Sessions {
                 () = tokio::time::sleep_until(wake.into()) => {}
             }
         }
-        // (The last round and `Ended` are sent before the stream is let go.)
+        // (The last round and `Ended` are sent before the stream is let go; but a newer attach
+        // of this client is not kept waiting for a link that takes them no more.)
         drop(out);
-        writer.await;
+        tokio::select! {
+            _ = stopped.changed() => {}
+            () = writer => {}
+        }
     }
 }
 
@@ -515,5 +568,66 @@ impl Drop for Place<'_> {
         {
             streams.remove(&self.1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder as a pane's is, as far as a run and its FIFOs go: held by `holder`.
+    fn pane(dir: &Path, holder: u32) -> [File; 2] {
+        fs::create_dir(dir).unwrap();
+        fs::write(dir.join("status"), format!("holder {holder}\npid 1\n")).unwrap();
+        ["in", "ctl"].map(|name| fuxix::fifo(dir.join(name)).unwrap())
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("koh-session-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_fifos_are_of_the_run_that_was_named() {
+        let tmp = scratch("held");
+        let (dir, aside) = (tmp.join("s"), tmp.join("aside"));
+        let _first = pane(&dir, 7);
+        let named = run_of(&dir).unwrap();
+        // With no run named the FIFOs are the folder's as it is; with its run named, that run's.
+        assert_eq!(held(&dir, None).map(|(run, _)| run), Some(named));
+        assert!(
+            held(&dir, Some(named)).is_some_and(|(_, fifos)| fifos.iter().all(Option::is_some))
+        );
+        // Another run takes the name, after a client that comes again was found to name the
+        // run that was there: its FIFOs are not given for the run that was named.
+        fs::rename(&dir, &aside).unwrap();
+        let _second = pane(&dir, 8);
+        assert!(run_of(&dir).is_some_and(|run| run != named));
+        assert!(held(&dir, Some(named)).is_none());
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(held(&dir, Some(named)).is_none() && held(&dir, None).is_none());
+        let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn a_session_a_client_came_to_since_it_was_chosen_does_not_go() {
+        let tmp = scratch("goes");
+        let sessions = Sessions::new(&tmp, 2, "sh".into()).unwrap();
+        let dir = sessions.dir().join("1");
+        let _fifos = pane(&dir, 7);
+        let place = (run_of(&dir).unwrap(), 1);
+        // Chosen to go for a new one, with no client; one came before it went: it stays.
+        sessions
+            .streams()
+            .insert(place, (0, watch::channel(false).0));
+        sessions.goes(&dir);
+        assert!(dir.is_dir());
+        // With no client it goes.
+        sessions.streams().remove(&place);
+        sessions.goes(&dir);
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(tmp);
     }
 }

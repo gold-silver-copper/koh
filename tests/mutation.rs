@@ -415,7 +415,7 @@ fn no_mutated_message_panics_a_decoder_or_takes_a_frame_out_of_bounds() {
 /// A server's messages for a mirror, built of a few names, fair ones and those a hostile server
 /// would try, and of every kind of message: rounds that are whole and rounds that are not.
 fn rounds(rng: &mut Rng) -> Vec<u8> {
-    const NAMES: [&str; 16] = [
+    const NAMES: [&str; 18] = [
         "main",
         "alt",
         "shown",
@@ -432,10 +432,12 @@ fn rounds(rng: &mut Rng) -> Vec<u8> {
         "generation",
         "COMMAND",
         "status",
+        "IN",
+        "Ctl",
     ];
     // (The first ten are names a mirror may have: most messages are of those.)
     let name = |rng: &mut Rng| {
-        let among = if rng.below(6) == 0 { 16 } else { 10 };
+        let among = if rng.below(6) == 0 { 18 } else { 10 };
         NAMES[rng.below(among)].to_string()
     };
     let data = |rng: &mut Rng| b"line\n".repeat(rng.below(40));
@@ -514,6 +516,18 @@ fn rounds(rng: &mut Rng) -> Vec<u8> {
 
 #[test]
 fn no_sequence_of_messages_leaves_a_mirror_that_no_whole_round_left() {
+    // One the built ones would take long to come to: `IN`, then the FIFO `in`.
+    let spelled = [
+        ToMirror::Round(2),
+        ToMirror::Put {
+            name: "IN".into(),
+            more: false,
+            bytes: b"typed\n".to_vec(),
+        },
+        ToMirror::Fifo("in".into()),
+        ToMirror::Done,
+    ];
+    entry::carry_sequence(&bytes(&spelled.to_vec()));
     let mut rng = Rng(0x6b6f_6820_6361_7272);
     for _ in 0..SEQUENCES {
         let mut data = rounds(&mut rng);

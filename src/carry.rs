@@ -914,7 +914,7 @@ impl Round {
     /// has so far, so none is ever made, even for a moment, that leads anywhere else.
     fn make(&mut self, name: String, thing: Thing) -> Result<(), Fault> {
         let fits = match &thing {
-            Thing::Fifo => name == "in" || name == "ctl",
+            Thing::Fifo => (name == "in" || name == "ctl") && self.alone(&name),
             Thing::Link(to) if self.will.get(to) != Some(&Thing::Folder) => false,
             _ => plain(&name) && !name.contains('/') && self.alone(&name),
         };

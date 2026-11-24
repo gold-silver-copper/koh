@@ -309,6 +309,37 @@ fn a_round_a_server_must_not_send_changes_nothing() {
             vec![],
             vec![put("x", b"x\n"), put("X", b"X\n")],
         ),
+        // A FIFO's name has one spelling too, whatever was made in another, and whenever.
+        (
+            "`IN` put, then the FIFO `in`",
+            vec![remove("in")],
+            vec![put("IN", b"typed\n"), fifo("in")],
+        ),
+        (
+            "`CTL` put, then the FIFO `ctl`",
+            vec![],
+            vec![put("CTL", b"x\n"), fifo("ctl")],
+        ),
+        (
+            "a folder `IN`, then the FIFO `in`",
+            vec![remove("in")],
+            vec![folder("IN"), fifo("in")],
+        ),
+        (
+            "a link `In`, then the FIFO `in`",
+            vec![remove("in")],
+            vec![link("In", "main"), fifo("in")],
+        ),
+        (
+            "the FIFO `in` a round after `IN`",
+            vec![remove("in"), put("IN", b"typed\n")],
+            vec![fifo("in")],
+        ),
+        (
+            "the FIFO `ctl` a round after `CTL`",
+            vec![put("CTL", b"x\n")],
+            vec![fifo("ctl")],
+        ),
         // A link is checked when it comes: one that is gone again by `Done` is never made.
         (
             "a link to no folder, removed again",

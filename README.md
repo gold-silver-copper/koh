@@ -50,8 +50,29 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
   - Sixel is the one picture format, as in `fux` 0.43. A program that draws with the Kitty
     graphics protocol alone (`kitten icat`) shows nothing in a session, and a picture is drawn
     only in a terminal that draws sixel.
-  - `koh sessions`, `koh output` and `koh wait --session` are not in this build: they answer
-    so and exit 1. A session's files are on the server, where `koh exec` reads them.
+  - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
+    --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
+    session's files, for a key with no scope. They read what a script there could, and as one
+    should: between two looks at the same even `generation`, and a session lives while its
+    holder has the lock on its folder.
+    - `sessions` lists each folder that has a `status`, the oldest first: its name, whether a
+      client is attached, what `state` says became of its program (`running` only while the
+      holder lives; `ended` where none does and nothing says how), whether a command runs,
+      the last command's exit code, the size and the title.
+    - `output` is the screen the session shows. With `--last` it is what the last command
+      that has ended printed: the text from where its output began to where it ended, out of
+      `history.1`, `history` and the main screen, each line whole however the screen wrapped
+      it, and also its last line where that has no line break. Where the shell has marked no
+      command that ended, it is the screen.
+    - `wait` returns when one more command has ended than when the server took the request:
+      it prints what that command printed and exits with its code. When the session has ended
+      instead, it prints the last screen and exits as `koh connect` does; after `SECS`, the
+      screen and 124.
+    - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
+      133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
+      the last mark is `output`. koh sets up no shell: `koh help-agents` has the lines for
+      bash, and the three commands as a script over the files, for `koh exec`. A shell that
+      marks an `end` at every prompt ends a `wait` also when an empty line is entered.
 
 ### Sessions: don't, and do
 
@@ -73,6 +94,16 @@ koh adds nothing to stop these. What happens instead is said.
 - Don't run `keys/.restore` on koh's `fux` session (it must be named for that: `.restore` alone
   does not look there): it starts every session that has ended anew, with whatever `fux` is on
   the path.
+- Don't make, in a session's folder, a FIFO other than `in` and `ctl`, a link that leads to
+  no folder of it, more than 256 names, or two names that differ only in the case of their
+  letters; and don't `mv` a file there into a folder, or rename one twice while a client is
+  away. Each ends every attached client with a line that says which.
+- Don't keep a file over 32 MiB in a session's folder: a mirror has its first 32 MiB, and one
+  that is replaced is sent again at every look.
+- Don't make a file in a session's folder unreadable: no client gets a round while it is.
+- Don't write into a mirror, but for its `in` and `ctl`: it is koh's alone to write. A client
+  whose mirror is not what koh left there (another folder's files, a file renamed after
+  another) is ended when it attaches next.
 - Don't write `kill` to a session's `ctl`, or a mirror's, unless you mean it: it hangs up the
   program for every client. Any key with no scope may; it may run any command.
 - Don't write to a mirror's `ctl` while it has no link: only the last `resize` written then is
@@ -112,6 +143,24 @@ koh adds nothing to stop these. What happens instead is said.
   that are not close-on-exec (a socket the unit was passed, say): pass `koh serve` nothing
   its sessions should not hold.
 - To see every session on the server as tabs: `koh fux view PATH`, the path `koh serve` printed.
+- For `koh output --last` and `koh wait --session`, have the session's shell mark its prompts
+  (OSC 133). Without marks `--last` is the screen, and a `wait` ends with the session or its
+  time. For bash from 4.4, in the server's `~/.bashrc` (fux's README has the same lines):
+
+  ```sh
+  PS1='\[\e]133;A\a\]'$PS1'\[\e]133;B\a\]'; PS0='\e]133;C\a'
+  PROMPT_COMMAND='printf "\e]133;D;%s\a" "$?"'
+  ```
+- Ask `koh wait --session` before the command ends that it is to wait for: it counts from
+  when the server took the request. The pane's `marks` keeps the last thousand, and a
+  cleared screen moves the marks on it up, so koh takes any one of three signs for a
+  command's end: one more `end`, the last `end` further down in the text, or an output that
+  ran when it was asked and has its `end`. In a session of more than some 250 commands, a
+  wait asked at an idle prompt does not see a command that clears the screen and ends no
+  further down than the last one did; it sees the next that does.
+- On a kernel before 6.13 a file's time is the clock's tick: a file of a session's folder
+  rewritten in place to the same length within one tick is not seen by a client until it
+  changes again. Replace it, or add to its end.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default
   session.
@@ -136,6 +185,10 @@ koh run box --name build -- make -j4 && koh wait box build
 koh cp -r --exclude target ./src box:proj/
 koh connect box
 koh mount box   # a mirror of the session, for `koh fux view`, `cat` or a script
+koh sessions box                       # each session: attached, running, busy, last exit code
+koh wait box --session 1 --timeout 600 # until the command there ends: its output, its code
+koh output box --session 1 --last      # what the last command printed
 ```
 
-Run `koh --help` (or `koh help-agents`) for the complete command reference and exit-code contract.
+Run `koh --help` for the complete command reference and exit-code contract; `koh help-agents`
+is the same and, after it, recipes: a session's files, and the three commands as a script.

@@ -66,20 +66,28 @@ last() { # what the last command that has ended printed: the lines from its `out
   rm -f "$f" "$m"
 }
 
+# ends PANE: how many marks the pane has dropped, and then each `end` it lists as NUMBER CODE: line n
+# of `marks` is the mark numbered `marks.dropped` + n, for as long as it is listed. Of one round
+# (`generation` the same even number before and after), or nothing: look again.
+ends() {
+  g=$(cat "$1/generation" 2> /dev/null) && [ $((${g:-1} % 2)) -eq 0 ] || return
+  e=$(awk 'NR == 1 { n = $1; print n; next } $3 == "end" { print n + FNR, $4 + 0 }' "$1/marks.dropped" "$1/marks" 2> /dev/null) || return
+  [ "$g" = "$(cat "$1/generation" 2> /dev/null)" ] && printf '%s\n' "$e"
+}
+
 await() { # until a command has ended since this was asked (its exit code is this one's), or the session has; 124 after SECONDS
-  w=$(mktemp); trap 'rm -f "$w"' EXIT; cat "$1/marks" > "$w" 2> /dev/null; began=$(date +%s)
+  [ -s "$1/marks.dropped" ] || ! alive "$1" || { echo "$1 has no marks.dropped: its holder is of before fux 0.43.2 and does not number its marks. End that session and start it anew." >&2; exit 1; }
+  # Asked: the number of the last `end`, or with none of the last mark that was dropped.
+  until asked=$(ends "$1") || ! alive "$1"; do sleep 0.02; done
+  asked=$(printf '%s\n' "$asked" | awk '{ e = $1 } END { print e + 0 }') began=$(date +%s)
   while :; do
-    # More `end`s than there were, counting those the file has dropped: full (a thousand marks) it
-    # drops one from its front for each it takes, and where its first mark stood in the file as it
-    # was says how many. No mark's place is asked: a screen that scrolls or is cleared moves them.
-    now=$(awk -v was="$w" 'BEGIN { while ((getline old < was) > 0) had[++n] = old }
-      NR == 1 { first = $0 } $3 == "end" { code[++ends] = $4 }
-      END { if (NR >= 1000) for (i = n; i >= 1; i--) if (had[i] == first) gone = i - 1
-        for (i = gone + 1; i <= n; i++) { split(had[i], word, " "); if (word[3] == "end") kept++ }
-        if (ends > kept) print code[kept + 1] + 0 }' "$1/marks" 2> /dev/null)
-    # (The code is the first such command's. If another has ended by now too, `last` prints that
-    # one's output: `koh wait --session` gives the first's, read with its code.)
-    [ -z "$now" ] || { last "$1"; exit "$now"; }
+    # The first `end` of a higher number is the command, and how many marks came and went unread.
+    now=$(ends "$1" | awk -v e="$asked" 'NR == 1 { gone = $1 > e ? $1 - e : 0; next } $1 > e { print $2, gone; exit }')
+    [ -z "$now" ] || {
+      # (The code is that command's. If another has ended by now too, `last` prints that one's
+      # output: `koh wait --session` gives the first's, read with its code.)
+      [ "${now#* }" = 0 ] || echo "the oldest end still kept, not known to be the first: ${now#* } marks came and went unread" >&2
+      last "$1"; exit "${now% *}"; }
     alive "$1" || { cat "$1/shown/screen"; s=$(cat "$1/state")
       case $s in "exited "*) exit "${s#exited }" ;; "killed "*) exit $((128 + ${s#killed })) ;; *) exit 1 ;; esac; }
     [ -z "${2:-}" ] || [ $(($(date +%s) - began)) -lt "$2" ] || { cat "$1/shown/screen"; exit 124; }

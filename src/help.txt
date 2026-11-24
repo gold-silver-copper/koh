@@ -21,7 +21,7 @@ Headless persistent jobs (raw append-only logs; outlive koh and network drops):
   koh run SERVER [--name NAME] [--sync DIR] [-C DIR] [--json] -- PROG ARG...
   koh jobs SERVER [NAME] [--json]
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
-  koh wait SERVER NAME [--text SUBSTR] [--tail N] [--timeout SECS] [--json]
+  koh wait SERVER NAME [--text SUBSTR] [--tail N] [--timeout SECS] [--json]   (a job; a session: below)
   koh kill SERVER NAME [--signal TERM|KILL|INT|HUP] [--json]
 
 Delta file sync (blake3 hashes, atomic replace):
@@ -43,8 +43,17 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             Removed when the session ends or koh is stopped (SIGINT, SIGTERM, SIGHUP: exit 0).
   koh fux ...                                    fux itself, the one that reads koh's panes
             (it and `koh hold` run on this machine, and ask no server)
-  koh sessions | output | wait --session         not in this build: a session's files are on
-            the server, where `koh exec` reads them
+  koh sessions SERVER [--json]
+            each session as its folder on the server says it is, the oldest first: name, attached
+            or detached, what became of its program (running, exited N, killed N, or ended where
+            nothing says how), busy while a command runs, the last command's exit code, size, title
+  koh output SERVER --session NAME [--last] [--json]
+            the screen it shows; with --last what its last command printed, to its last byte
+  koh wait SERVER --session NAME [--timeout SECS] [--json]
+            until one more command has ended there than when it was asked: prints what that
+            printed and exits with its code. Or until the session has: its screen, and its
+            program's status as `koh connect` gives it. After SECS: the screen, and 124.
+            (--last and wait go by a shell's marks of its prompts, OSC 133.)
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,

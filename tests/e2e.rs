@@ -4158,3 +4158,378 @@ async fn koh_connect_told_to_end_before_its_first_round_ends_and_leaves_nothing(
         assert_eq!(names_in(&runtime), [""; 0], "{told}");
     }
 }
+
+// ---- the three commands: `koh sessions`, `koh output`, `koh wait --session` ---------------------
+
+/// A shell for a session that marks its prompts and its commands as fux reads them (OSC 133):
+/// bash, as Linux and macOS have it (3.2 there, which has no `PS0`). Its prompt says how the
+/// command before it ended (`D;$?`), where the prompt begins (`A`) and where what is typed does
+/// (`B`); a `DEBUG` trap says where a command's output begins (`C`), once for each simple
+/// command, so a test types one at a time.
+fn marking_shell(host: &Host) -> Vec<String> {
+    let rc = host.tmp.0.join("marks.bashrc");
+    let prompt = r"PS1='\[\e]133;D;$?\a\e]133;A\a\]$ \[\e]133;B\a\]'";
+    let output = r#"trap 'printf "\033]133;C\007"' DEBUG"#;
+    fs::write(&rc, format!("{prompt}\n{output}\n")).unwrap();
+    [
+        "bash",
+        "--noprofile",
+        "--rcfile",
+        rc.to_str().unwrap(),
+        "-i",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn sh(script: &str) -> Vec<String> {
+    ["sh", "-c", script].map(String::from).to_vec()
+}
+
+impl Host {
+    /// One of the client's `koh` commands about this server, run to its end: how it ended,
+    /// what it printed and what it said.
+    fn asked(&self, command: &str, args: &[&str]) -> (Option<i32>, String, String) {
+        let mut koh = self.koh(&[command, &self.id, "--direct", &self.addr()]);
+        koh.args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let said = koh.output().unwrap();
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (said.status.code(), text(&said.stdout), text(&said.stderr))
+    }
+
+    /// `koh wait` for the session `s` of this server, started, with whatever else it is told.
+    fn waits(&self, more: &[&str]) -> Waits {
+        let mut koh = self.koh(&["wait", &self.id, "--direct", &self.addr()]);
+        koh.args(["--session", "s"])
+            .args(more)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        Waits(koh.spawn().unwrap())
+    }
+
+    /// A session of that name running `program`, with nobody attached once this returns: its
+    /// folder, when its screen shows `ready`.
+    fn session(&self, name: &str, program: &[String], ready: &str) -> PathBuf {
+        let mut mount = self.mount(name, None, &["--session", name], program);
+        let pane = self.pane(name);
+        until(&format!("the session {name} shows {ready:?}"), || {
+            screen(&pane).contains(ready)
+        });
+        signal(&mount.koh.id().to_string(), "-TERM");
+        assert_eq!(mount.ends(), Some(0), "{}", mount.said());
+        pane
+    }
+}
+
+/// A `koh wait` that runs. It is killed if the test lets go of it before it has ended.
+struct Waits(std::process::Child);
+
+impl Drop for Waits {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Waits {
+    fn ended(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_some()
+    }
+
+    /// Once it has ended: its exit code, what it printed and what it said.
+    fn said(&mut self) -> (Option<i32>, String, String) {
+        let (code, mut printed, mut said) =
+            (self.0.wait().unwrap().code(), String::new(), String::new());
+        let _ = self.0.stdout.take().unwrap().read_to_string(&mut printed);
+        let _ = self.0.stderr.take().unwrap().read_to_string(&mut said);
+        (code, printed, said)
+    }
+}
+
+#[test]
+fn sessions_lists_what_the_folders_say() {
+    let host = Host::start("list", &[]);
+    // Three sessions: one that lives, with a shell that marks its commands and a client; one
+    // whose program has ended; one whose holder was killed, so that nothing says how it ended.
+    let mut live = host.mount("a", None, &["--session", "live"], &marking_shell(&host));
+    let pane = host.pane("live");
+    until("the shell has its prompt", || screen(&pane).contains('$'));
+    let mut done = host.mount("b", None, &["--session", "done"], &sh("exit 7"));
+    assert_eq!(done.ends(), Some(7));
+    let mut dead = host.mount("c", None, &["--session", "dead"], &marking_shell(&host));
+    let killed = host.pane("dead");
+    until("the third has its prompt", || screen(&killed).contains('$'));
+    fs::write(killed.join("in"), "sleep 30\n").unwrap();
+    let marks = || fs::read_to_string(killed.join("marks")).unwrap_or_default();
+    until("its command runs", || marks().ends_with(" output\n"));
+    signal(&holder_of(&killed), "-KILL");
+    assert_eq!(dead.ends(), Some(1));
+    assert_eq!(
+        fs::read_to_string(host.pane("dead").join("state")).unwrap(),
+        "running\n"
+    );
+    let list = || -> Vec<serde_json::Value> {
+        let (code, list, said) = host.asked("sessions", &["--json"]);
+        assert_eq!(code, Some(0), "{said}");
+        serde_json::from_str(&list).unwrap()
+    };
+    let of = |name: &str, what: &str| {
+        let list = list();
+        let session = list.iter().find(|session| session["name"] == name);
+        session.unwrap_or_else(|| panic!("no {name} in {list:?}"))[what].clone()
+    };
+    // Each by its name, the oldest first; where it is, its size and whether a client has it.
+    let names: Vec<_> = list().iter().map(|s| s["name"].clone()).collect();
+    assert_eq!(names, ["live", "done", "dead"]);
+    assert_eq!(of("live", "pane_dir"), pane.to_str().unwrap());
+    assert_eq!(
+        (of("live", "cols"), of("live", "rows")),
+        (80.into(), 24.into())
+    );
+    assert_eq!(
+        (of("live", "attached"), of("done", "attached")),
+        (true.into(), false.into())
+    );
+    // What became of each program is what `state` says; but only a session whose holder lives
+    // runs: of the one that was killed nothing says how it ended.
+    let states = ["live", "done", "dead"].map(|name| of(name, "state"));
+    assert_eq!(states, ["running", "exited 7", "ended"]);
+    // At a prompt no command runs: the last mark is where what is typed begins. One runs from
+    // where its output begins (the last mark is `output`) to its end, which has its code.
+    assert_eq!(of("live", "running_command"), false);
+    let gate = host.tmp.0.join("gate");
+    let waits = format!(
+        "sh -c 'until [ -e {} ]; do sleep 0.1; done; exit 5'\n",
+        gate.display()
+    );
+    fs::write(pane.join("in"), waits).unwrap();
+    until("the command runs", || of("live", "running_command") == true);
+    assert!(
+        fs::read_to_string(pane.join("marks"))
+            .unwrap()
+            .ends_with(" output\n")
+    );
+    fs::write(&gate, "").unwrap();
+    until("the command has ended", || {
+        of("live", "running_command") == false
+    });
+    assert_eq!(of("live", "last_exit"), 5);
+    // A session whose holder is gone runs no command, whatever its marks say: the last mark
+    // of the one that was killed is still the `output` of the command it ran.
+    assert_eq!(
+        (of("done", "running_command"), of("dead", "running_command")),
+        (false.into(), false.into())
+    );
+    // The client leaves: the session is not attached. As a line for a person to read.
+    signal(&live.koh.id().to_string(), "-TERM");
+    assert_eq!(live.ends(), Some(0));
+    until("the session has no client", || {
+        of("live", "attached") == false
+    });
+    let (code, lines, said) = host.asked("sessions", &[]);
+    assert_eq!(code, Some(0), "{said}");
+    let lines: Vec<&str> = lines.lines().collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert!(
+        lines[0].starts_with("live\tdetached\trunning\tidle\texit=5\t80x24\t"),
+        "{lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("done\tdetached\texited 7\tidle\texit=-\t80x24\t"),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn output_last_is_the_last_commands_output_across_history() {
+    let host = Host::start("last", &[]);
+    let pane = host.session("1", &marking_shell(&host), "$");
+    // A pane of ten rows, forty wide; and so much output that `history` has become `history.1`.
+    fs::write(pane.join("ctl"), "resize 40 10\n").unwrap();
+    until("the pane takes the size", || {
+        fs::read_to_string(pane.join("size")).unwrap() == "40 10\n"
+    });
+    fs::write(pane.join("in"), "seq 1 800000\n").unwrap();
+    until(
+        "history has become history.1, and the command has ended",
+        || {
+            let marks = fs::read_to_string(pane.join("marks")).unwrap_or_default();
+            pane.join("history.1").is_file() && marks.ends_with(" command\n")
+        },
+    );
+    // That command's output began in `history.1`: all of it is there, in pieces.
+    let (code, flood, said) = host.asked("output", &["--session", "1", "--last"]);
+    let numbers: String = (1..=800_000).map(|n| format!("{n}\n")).collect();
+    assert_eq!((code, flood.len()), (Some(0), numbers.len()), "{said}");
+    assert!(flood == numbers);
+    // A command that prints 26 lines, one of them wider than the pane: 19 of them are in
+    // `history` by its end, and the wide one is three rows of the screen.
+    let lines: Vec<String> = (1..=26)
+        .map(|n| match n {
+            24 => "wide-".repeat(20),
+            n => format!("line-{n}"),
+        })
+        .collect();
+    fs::write(
+        pane.join("in"),
+        format!("printf '%s\\n' {}\n", lines.join(" ")),
+    )
+    .unwrap();
+    let printed = lines.join("\n") + "\n";
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let last = loop {
+        let last = host.asked("output", &["--session", "1", "--last"]);
+        if last.0 != Some(0) || last.1 == printed || Instant::now() > deadline {
+            break last;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // What it printed, each line whole, from where its output began to where it ended: not
+    // the command, not the prompt after it.
+    assert_eq!(
+        (last.0, last.1.as_str()),
+        (Some(0), printed.as_str()),
+        "{}",
+        last.2
+    );
+    let rows = screen(&pane);
+    assert!(
+        rows.contains(&format!("{}\n", "wide-".repeat(8))),
+        "{rows:?}"
+    );
+    let history = fs::read_to_string(pane.join("history")).unwrap();
+    assert!(history.ends_with("line-19\n") && rows.contains("line-20\n"));
+    // Without `--last` it is the screen that is shown; `--json` has it as one value.
+    let (code, shown, said) = host.asked("output", &["--session", "1"]);
+    assert_eq!((code, shown.as_str()), (Some(0), rows.as_str()), "{said}");
+    let (code, json, said) = host.asked("output", &["--session", "1", "--last", "--json"]);
+    assert_eq!(code, Some(0), "{said}");
+    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "session": "1", "output": printed })
+    );
+    // A name that is no session's is not found.
+    let (code, _, said) = host.asked("output", &["--session", "none"]);
+    assert_eq!(code, Some(127), "{said}");
+    assert!(said.contains("no session none"), "{said}");
+}
+
+#[test]
+fn wait_session_returns_the_commands_code_or_124() {
+    let host = Host::start("wait", &[]);
+    let pane = host.session("s", &marking_shell(&host), "$");
+    // No command ends: when the time given is over it is 124, with the screen as it is.
+    let began = Instant::now();
+    let (code, waited, said) = host.asked("wait", &["--session", "s", "--timeout", "1", "--json"]);
+    assert_eq!(code, Some(124), "{said}");
+    assert!(began.elapsed() >= Duration::from_secs(1));
+    let waited: serde_json::Value = serde_json::from_str(&waited).unwrap();
+    assert_eq!(
+        (&waited["timed_out"], &waited["exit"]),
+        (&true.into(), &124.into())
+    );
+    assert_eq!(waited["tail"], screen(&pane));
+    // A wait returns when one more command has ended than when it was asked, with that
+    // command's code and what it printed. (When the server takes the request the test cannot
+    // see: it types one command after the other until the wait has returned. Each prints a
+    // line of its own and ends with 42.)
+    let mut wait = host.waits(&["--timeout", "30"]);
+    let mut typed = 0;
+    until("koh wait returns", || {
+        typed += 1;
+        let command = format!("sh -c 'echo waited-{typed}; exit 42'\n");
+        fs::write(pane.join("in"), command).unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+        wait.ended()
+    });
+    let (code, printed, said) = wait.said();
+    assert_eq!(code, Some(42), "{said}");
+    let line = printed
+        .strip_prefix("waited-")
+        .and_then(|n| n.strip_suffix('\n'));
+    assert!(
+        line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
+        "{printed:?}"
+    );
+}
+
+#[test]
+fn wait_session_ends_when_the_session_does() {
+    let host = Host::start("wait-end", &[]);
+    let pane = host.session(
+        "s",
+        &sh("echo ready; read line; echo bye-$line; exit 3"),
+        "ready",
+    );
+    // A wait with no time given, of a program that marks nothing: it waits while that runs.
+    let mut wait = host.waits(&[]);
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(!wait.ended());
+    // The program ends: the wait ends with its status and its last screen.
+    fs::write(pane.join("in"), "now\n").unwrap();
+    until("koh wait ends", || wait.ended());
+    let (code, shown, said) = wait.said();
+    assert_eq!(code, Some(3), "{said}");
+    assert!(
+        shown.contains("bye-now") && said.contains("exited 3"),
+        "{shown:?} {said}"
+    );
+    // Asked of a session that has ended, it says the same at once.
+    let (code, shown, said) = host.asked("wait", &["--session", "s"]);
+    assert_eq!(code, Some(3), "{said}");
+    assert!(shown.contains("bye-now"), "{shown:?}");
+    // Of one whose holder was killed nothing says how it ended: that is 1, not 0.
+    let dead = host.session("dead", &sh("echo ready; sleep 30"), "ready");
+    signal(&holder_of(&dead), "-KILL");
+    until("the holder is gone", || {
+        fs::File::open(&dead).unwrap().try_lock_shared().is_ok()
+    });
+    let (code, _, said) = host.asked("wait", &["--session", "dead"]);
+    assert_eq!(code, Some(1), "{said}");
+    // And a name that is no session's is not found.
+    let (code, _, said) = host.asked("wait", &["--session", "none"]);
+    assert_eq!(code, Some(127), "{said}");
+}
+
+#[test]
+fn the_three_commands_are_a_full_keys() {
+    let host = Host::start("full-key", &[]);
+    host.session("s", &sh("echo ready; sleep 30"), "ready");
+    // A key with a scope, of either kind, beside the full key: it lists no session, reads
+    // none and waits for none, and is told so.
+    let bot = host.tmp.0.join("bot_cfg");
+    fs::create_dir_all(&bot).unwrap();
+    let id = load_or_create_key(Role::Client, Some(&bot.join("client.key")))
+        .unwrap()
+        .public();
+    let dir = host.tmp.0.join("home");
+    for scope in [Scope::Cp(dir.clone()), Scope::Exec(dir.clone())] {
+        let entry = ClientEntry {
+            name: "bot".into(),
+            id,
+            scope,
+        };
+        save_clients(Some(&host.tmp.0.join("srv_cfg/server.key")), &[entry]).unwrap();
+        let asks: [&[&str]; 4] = [
+            &["sessions"],
+            &["output", "--session", "s"],
+            &["output", "--session", "s", "--last"],
+            &["wait", "--session", "s", "--timeout", "1"],
+        ];
+        for asks in asks {
+            let mut koh = host.koh(&[asks[0], &host.id, "--direct", &host.addr()]);
+            koh.args(&asks[1..]).env("KOH_CONFIG_DIR", &bot);
+            let said = koh.stderr(std::process::Stdio::piped()).output().unwrap();
+            let why = String::from_utf8_lossy(&said.stderr);
+            assert_eq!(said.status.code(), Some(4), "{asks:?}: {why}");
+            assert!(why.contains("scope"), "{asks:?}: {why}");
+        }
+    }
+    // The full key is answered.
+    let (code, list, said) = host.asked("sessions", &[]);
+    assert_eq!(code, Some(0), "{said}");
+    assert!(list.starts_with("s\tdetached\trunning\t"), "{list:?}");
+}

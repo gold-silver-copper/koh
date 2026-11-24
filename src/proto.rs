@@ -98,6 +98,43 @@ pub enum Request {
         preserve_root: bool,
     },
     Attach(Attach),
+    /// The three that read a session's folder on the server (`pane`), after `Attach`, whose
+    /// number they leave as it was. `Sessions` is answered with a list of `SessionInfo`.
+    Sessions,
+    /// A session's screen, or with `last` what its last command printed: `Ok`, then the text
+    /// in pieces of bytes until the stream's end.
+    Output {
+        session: String,
+        last: bool,
+    },
+    /// Until one more command of the session's shell has ended, the session has, or so many
+    /// seconds have gone by: `Ok` once the request is taken, a `WaitResult` without its
+    /// `tail` when it is over, then the tail as `Output`'s text.
+    WaitSession {
+        session: String,
+        timeout_secs: Option<u64>,
+    },
+}
+
+/// A session as its folder says it is, for `koh sessions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub name: String,
+    /// A client has a stream of it.
+    pub attached: bool,
+    /// What `state` says became of the program; `running` only while a holder lives, and
+    /// `ended` where none does and nothing says how it ended.
+    pub state: String,
+    pub cols: usize,
+    pub rows: usize,
+    pub title: String,
+    /// The shell's last mark is `output`.
+    pub running_command: bool,
+    /// The code of the last `end` mark, if the shell gave one.
+    pub last_exit: Option<u8>,
+    /// Since `status` was written, which is when the session started.
+    pub age_secs: u64,
+    pub pane_dir: String,
 }
 
 /// Asks for a stream of a session, which is a fux pane on the server: answered `Ok`, then
@@ -217,7 +254,7 @@ pub enum LogMsg {
     },
 }
 
-/// Result of `WaitJob`.
+/// Result of `WaitJob` and of `WaitSession`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitResult {
     pub timed_out: bool,
@@ -492,6 +529,24 @@ pub async fn recv_msg_opt<T: DeserializeOwned>(
         .await
         .map_err(|e| KohError::unreachable(format!("read body: {e}")))?;
     decode(&buf, max).map(Some)
+}
+
+/// Sends a text in pieces, a message each: it has no bound of its own, and no message is
+/// over its bound.
+pub async fn send_text(stream: &mut SendStream, text: &[u8]) -> Result<()> {
+    for piece in text.chunks(64 << 10) {
+        send_msg(stream, &piece, MAX_CHUNK).await?;
+    }
+    Ok(())
+}
+
+/// Reads a text that was sent in pieces, to the stream's end.
+pub async fn recv_text(stream: &mut RecvStream) -> Result<String> {
+    let mut text = Vec::new();
+    while let Some(mut piece) = recv_msg_opt::<Vec<u8>>(stream, MAX_CHUNK).await? {
+        text.append(&mut piece);
+    }
+    Ok(String::from_utf8_lossy(&text).into_owned())
 }
 
 /// Read and decode one required frame.

@@ -20,9 +20,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::carry::{Look, Reader};
+use crate::pane::{self, Marks};
 use crate::proto::{
     Attach, Attached, FromMirror, Had, MAX_CHUNK, MAX_CTRL, MAX_HELD, MAX_TYPED, Reply, Run,
-    ToMirror, send_msg, session_name, spawn_msg_reader,
+    SessionInfo, ToMirror, WaitResult, send_msg, send_text, session_name, spawn_msg_reader,
 };
 use crate::{Exit, KohError, Result};
 
@@ -86,6 +87,53 @@ fn held(dir: &Path, named: Option<Run>) -> Option<(Run, [Option<File>; 2])> {
 
 fn not_found(what: String) -> KohError {
     KohError::new(Exit::NOT_FOUND, "not_found", what)
+}
+
+/// What `state` says became of a session's program. It runs only while a holder lives:
+/// where none does and the file says nothing else, nothing says how it ended.
+fn state_of(dir: &Path, alive: bool) -> String {
+    match pane::line(dir, "state") {
+        Some(state) if state != "running" => state,
+        _ if alive => "running".into(),
+        _ => "ended".into(),
+    }
+}
+
+/// A session as its folder says it is, read of one round of its holder's writing.
+fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
+    let (alive, size, title, marks) = pane::together(dir, lives, || {
+        let size = pane::line(dir, "size").unwrap_or_default();
+        (lives(dir), size, pane::line(dir, "title"), Marks::read(dir))
+    });
+    let mut size = size.split(' ').map(|cells| cells.parse().unwrap_or(0));
+    SessionInfo {
+        name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
+        attached,
+        state: state_of(dir, alive),
+        cols: size.next().unwrap_or(0),
+        rows: size.next().unwrap_or(0),
+        title: title.unwrap_or_default(),
+        running_command: alive && marks.busy,
+        last_exit: marks.code(),
+        age_secs: written.elapsed().map_or(0, |age| age.as_secs()),
+        pane_dir: dir.display().to_string(),
+    }
+}
+
+/// What a session shows; or with `last` what its last command printed, which is what it
+/// shows where its shell has marked no command that ended.
+fn text(dir: &Path, last: bool) -> Vec<u8> {
+    let printed = last.then(|| pane::together(dir, lives, || pane::last(dir)));
+    printed
+        .flatten()
+        .unwrap_or_else(|| fs::read(dir.join("shown/screen")).unwrap_or_default())
+}
+
+/// File work of the three commands, on the blocking pool: it reads megabytes of history, and
+/// waits where a holder is writing.
+async fn pooled<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let read = tokio::task::spawn_blocking(work).await;
+    read.map_err(|e| KohError::internal(format!("reading a session: {e}")))
 }
 
 /// What the blocking pool read of a pane's folder for a stream.
@@ -156,6 +204,87 @@ impl Sessions {
             .map(|dir| (pane(&dir), dir))
             .map(|(pane, dir)| (dir, pane))
             .collect()
+    }
+
+    /// The folder of the session `name`: a pane's, or there is no such session.
+    fn named(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.dir.join(name);
+        match session_name(name) && run_of(&dir).is_some() {
+            true => Ok(dir),
+            false => Err(not_found(format!("no session {name}"))),
+        }
+    }
+
+    /// `koh sessions`: every session as its folder says it is, the oldest first, and whether
+    /// a client has a stream of it.
+    pub async fn list(&self) -> Result<Vec<SessionInfo>> {
+        let panes = self.folders().into_iter().filter_map(|(dir, pane)| {
+            let (run, written) = pane?;
+            let attached = self.streams().keys().any(|(streamed, _)| *streamed == run);
+            Some((written, dir, attached))
+        });
+        let mut panes: Vec<_> = panes.collect();
+        panes.sort();
+        let info = |(written, dir, attached): (_, PathBuf, _)| info(&dir, written, attached);
+        pooled(move || panes.into_iter().map(info).collect()).await
+    }
+
+    /// `koh output`: what the session `name` shows, or with `last` what its last command
+    /// printed.
+    pub async fn output(&self, name: &str, last: bool) -> Result<Vec<u8>> {
+        let dir = self.named(name)?;
+        pooled(move || text(&dir, last)).await
+    }
+
+    /// `koh wait --session`: until the session has ended, one more command of its shell has
+    /// than when this was asked (`Ok` is sent once its marks were read), or `seconds` have
+    /// gone by; answered with how it ended and, in pieces, what that command printed or what
+    /// the session shows. A client that has left is waited for no longer.
+    pub async fn wait(
+        &self,
+        name: &str,
+        seconds: Option<u64>,
+        send: &mut SendStream,
+    ) -> Result<()> {
+        let dir = self.named(name)?;
+        let look = || {
+            let dir = dir.clone();
+            pooled(move || (Marks::read(&dir), lives(&dir)))
+        };
+        let (was, _) = look().await?;
+        send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+        // (A time too far off for the clock is no time.)
+        let until = seconds.and_then(|s| Instant::now().checked_add(Duration::from_secs(s)));
+        let waited = |exit: i32, detail: &str, timed_out: bool| WaitResult {
+            timed_out,
+            exit,
+            tail: String::new(),
+            detail: detail.to_string(),
+        };
+        // (Life first: of a folder that is gone nothing is read, and no mark says anything.)
+        let (waited, last) = loop {
+            let (now, alive) = look().await?;
+            if !alive {
+                let state = state_of(&dir, false);
+                break (
+                    waited(pane::code(&state).unwrap_or(1), &state, false),
+                    false,
+                );
+            }
+            if was.ended_by(&now) {
+                let code = now.code().map_or(0, i32::from);
+                break (waited(code, "command ended (OSC 133)", false), true);
+            }
+            if until.is_some_and(|until| Instant::now() >= until) {
+                break (waited(i32::from(Exit::TIMEOUT.0), "timed out", true), false);
+            }
+            tokio::select! {
+                _ = send.stopped() => return Ok(()),
+                () = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        };
+        send_msg(send, &waited, MAX_CTRL).await?;
+        send_text(send, &pooled(move || text(&dir, last)).await?).await
     }
 
     /// Starts a pane with this binary as fux, `koh fux start SESSIONS/NAME -- PROGRAM` (no

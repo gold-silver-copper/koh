@@ -81,8 +81,9 @@ fn not_found(what: String) -> KohError {
 enum Read {
     /// The client's list, and whether it was read while the folder stood still.
     Listed(Vec<Had>, bool),
-    /// A look, whether a holder lived just before it, and the run the folder was just after.
-    Looked(Look, bool, Option<Run>),
+    /// A look, whether a holder lived just before it, the run the folder was just after, and
+    /// what the folder's number was when the look began.
+    Looked(Look, bool, Option<Run>, fux::Stamp),
 }
 
 /// The work a stream has on the blocking pool, once it is done: none while there is none.
@@ -346,7 +347,7 @@ impl Sessions {
         // When the folder was looked at last and what its number was then; whether to look
         // whatever the number is; before when not to; and how many looks in a row moved.
         let began = Instant::now();
-        let (mut looked, mut seen, mut seeing) = (began, None, None);
+        let (mut looked, mut seen) = (began, None);
         let (mut again, mut rests, mut moved) = (true, began, 0u32);
         let (mut keyed, mut active) = (began, began);
         loop {
@@ -391,8 +392,12 @@ impl Sessions {
                 } else {
                     250
                 };
+                // (Just after a key its echo is a millisecond or two away: the number is waited
+                // for with the look, on the blocking pool, where a wait is that short.)
+                let echo = Duration::from_millis(40).saturating_sub(keyed.elapsed());
+                let changed = again || number != seen;
                 let due =
-                    again || number != seen || looked.elapsed() >= Duration::from_millis(often);
+                    changed || !echo.is_zero() || looked.elapsed() >= Duration::from_millis(often);
                 let dir = dir.to_path_buf();
                 let asked = reader.take_if(|_| list.is_some()).zip(list.take());
                 if let Some((mut reader, had)) = asked {
@@ -401,11 +406,15 @@ impl Sessions {
                         (reader, listed.map(|listed| Read::Listed(had, listed)))
                     }));
                 } else if let Some(mut reader) = reader.take_if(|_| live && due) {
-                    (again, looked, seeing) = (false, now, number);
+                    (again, looked) = (false, now);
+                    let until = now + if changed { Duration::ZERO } else { echo };
                     work = Some(tokio::task::spawn_blocking(move || {
-                        let dead = !lives(&dir);
+                        while number_of(&dir) == number && Instant::now() < until {
+                            std::thread::sleep(Duration::from_micros(200));
+                        }
+                        let (seeing, dead) = (number_of(&dir), !lives(&dir));
                         let look = reader.look(dead, Instant::now());
-                        (reader, Some(Read::Looked(look, dead, run_of(&dir))))
+                        (reader, Some(Read::Looked(look, dead, run_of(&dir), seeing)))
                     }));
                 }
             }
@@ -444,8 +453,8 @@ impl Sessions {
                         }
                         Read::Listed(..) => last(&mut round),
                         // The folder is gone, or another run has its name: nothing of it is sent.
-                        Read::Looked(_, _, there) if there != Some(run) => last(&mut round),
-                        Read::Looked(Look::Round(messages), dead, _) => {
+                        Read::Looked(_, _, there, _) if there != Some(run) => last(&mut round),
+                        Read::Looked(Look::Round(messages), dead, _, seeing) => {
                             (seen, moved) = (seeing, 0);
                             if !messages.is_empty() {
                                 active = now;
@@ -456,8 +465,8 @@ impl Sessions {
                                 last(&mut round);
                             }
                         }
-                        Read::Looked(Look::Odd, true, _) => last(&mut round),
-                        Read::Looked(Look::Odd, ..) => seen = seeing,
+                        Read::Looked(Look::Odd, true, ..) => last(&mut round),
+                        Read::Looked(Look::Odd, _, _, seeing) => seen = seeing,
                         // At once, but for a folder that keeps moving under the look: then
                         // after a while, which grows to 16 ms.
                         Read::Looked(Look::Moved, ..) => {

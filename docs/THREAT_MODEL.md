@@ -64,7 +64,9 @@ them up (a pane's `ctl`), and writes that `fux` session's `colours` and `keyboar
   file is written, even where the copy would have removed it. At most `--max-sessions`
   sessions (64) are kept: folders in the sessions' folder, whoever made them. The oldest that
   has ended and that no client is attached to makes room for a new one, once that has
-  started; with none such the client is told the server is busy.
+  started; with none such the client is told the server is busy. The cap can be over by one:
+  a client that comes back to the session that was chosen to go, while the new one starts,
+  keeps it, and both stay until a later start finds an ended one without a client.
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
   uses. A request that waits (`koh wait`, `koh logs -f`) is not stopped when its connection
   goes; it ends with what it waits for.
@@ -139,7 +141,7 @@ A wrong endpoint id, or a host someone else now controls.
   it), until the round is whole and every rule holds of what it would leave. Then it is
   done, under an odd `generation`. What the server sends can therefore change nothing or
   all of a round; a failure of the client's own disk in the middle can leave a round part
-  done, the number odd, and the next attach sends what puts it right. At most 256 names, 32 MiB a file,
+  done, the number odd, and the next attach that succeeds sends what puts it right. At most 256 names, 32 MiB a file,
   128 MiB a mirror and as much waiting, 4,096 messages a round, 256 KiB a message; thirty
   seconds between two messages of an open round and ten minutes for all of it. Past any of
   it, or at any message the rules refuse, the client ends, having changed nothing; a round
@@ -162,9 +164,11 @@ A wrong endpoint id, or a host someone else now controls.
   | `status`, `command` | never in a mirror: `.here` and `.restore` pass it over | |
 - **A command's output from it** (`koh exec`, `koh logs`) is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
-- **It learns** every key typed into a session (what was typed while there was no link too,
-  on return), the client's terminal colours and keyboard flags (from `koh connect`'s
-  viewer; from a mount, those of the `fux` session its mirror was put in, viewer or none),
+- **It learns** what is typed into a session and reaches it (what was typed while there
+  was no link too, on return; not what was lost with a link), the client's terminal colours
+  and keyboard flags where the files that say them are there and no longer than 16 KiB
+  (from `koh connect`'s viewer; from a mount, those of the `fux` session its mirror was
+  put in, viewer or none),
   what the client's mirror holds (names, lengths and hashes, at each attach), and every
   file sent to it.
 - **Not defended:** a server can mislead a user who chose to connect to it. The endpoint id is

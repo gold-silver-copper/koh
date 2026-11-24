@@ -26,7 +26,7 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     alone writes, brought up to date in rounds (`koh/19`). A round is checked whole before
     anything of it is done to the mirror, and what a server may not send changes nothing. (A
     disk that fails while a round is done can leave it part done, under an odd `generation`:
-    the next attach puts it right.) What is typed into the mirror's `in` and `ctl` is typed
+    the next attach that succeeds puts it right.) What is typed into the mirror's `in` and `ctl` is typed
     into the session's.
   - `koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG…]` shows a private mirror
     with `fux`'s viewer, in the same process. With a name it is that session, started if there is
@@ -85,11 +85,14 @@ koh adds nothing to stop these. What happens instead is said.
 **Do**
 
 - After a stall, look at the screen before you type on. What you type while koh says there is
-  no link is held (64 KiB of it; past that whoever writes waits) and typed on return; what
-  was on its way when a link died may be lost, so a line can arrive without its beginning. A
-  link that dies without a word, or a server that does (killed, its machine gone), is noticed
-  after thirty seconds: what was typed since may be lost with it. After a long cut the link
-  is back within some seconds of the path, not at once: koh dials again every five.
+  no link is held (64 KiB of what is written to `in`, beside what its pipe holds; past that
+  whoever writes waits) and typed on return; what was on its way when a link died may be
+  lost, so a line can arrive without its beginning. A link that dies without a word, or a
+  server that does (killed, its machine gone), is noticed when the connection has been
+  silent for the thirty seconds koh allows a session, which is not thirty seconds from the
+  moment it died: what was typed since may be lost with it. After a long cut the link is not
+  back at once with the path: koh gives each dial five seconds and waits five between two,
+  so a path whose handshake takes longer than that is not dialled with success.
 - To take a session's size back, resize your terminal. A session has the size of the terminal
   that last changed: a second client of another size, or one that left, leaves it as it is,
   and a smaller terminal shows the top left of a larger session.
@@ -105,8 +108,9 @@ koh adds nothing to stop these. What happens instead is said.
   anything is started.)
 - Under systemd, give `koh serve`'s unit `KillMode=process` and the user
   `loginctl enable-linger`: else stopping the service, or logging out, kills every session.
-  A session's holder and its program inherit what `koh serve` had open when it started them
-  (a socket the unit was passed, say): pass `koh serve` nothing its sessions should not hold.
+  A session's holder and its program inherit the descriptors `koh serve` was itself given
+  that are not close-on-exec (a socket the unit was passed, say): pass `koh serve` nothing
+  its sessions should not hold.
 - To see every session on the server as tabs: `koh fux view PATH`, the path `koh serve` printed.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default

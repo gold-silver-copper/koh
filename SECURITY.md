@@ -62,7 +62,8 @@ credit reporters who want it.
   can read or write, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
   session: such a key starts them, types into them, resizes them and hangs them up, and says
   what its terminal is like into that `fux` session's `colours` and `keyboard` (the two are
-  the session's, not a pane's: every session's program is answered from them). `koh fux …`
+  the session's, not a pane's: a program of any session that asks its terminal is answered
+  from them, where they are there). `koh fux …`
   and `koh hold …` are no requests: they are fux, run by whoever runs koh, on his machine.
 - A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
   the path begins with `DIR` and goes on with plain names (no `..`). **It is not a

@@ -28,7 +28,7 @@ Delta file sync (blake3 hashes, atomic replace):
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SRC... SERVER:DST
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SERVER:SRC... DST
 
-Interactive sessions (backed by v1 fux pane folders + embedded fux::view + OSC 133 marks):
+Interactive sessions (backed by fux pane folders + embedded fux::view + OSC 133 marks):
   koh connect SERVER [--new | --session N] [-C DIR] [-- PROG ARG...]
   koh sessions SERVER [--json]
   koh output SERVER --session N [--last] [--json]

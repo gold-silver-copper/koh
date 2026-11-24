@@ -1,11 +1,12 @@
 //! End-to-end integration tests over real loopback iroh QUIC connections.
 
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koh::Exit;
 use koh::client::Client;
@@ -574,14 +575,12 @@ async fn multi_source_cp_push_and_pull_files_and_dirs() {
 }
 
 #[tokio::test]
-async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures() {
+async fn session_forwards_clipboard_links_colours_bell_deltas_and_sixel_pictures() {
     let (tmp, srv, client, client_key, state_dir) = boot_pair("rich-session").await;
 
-    // Tiny valid 1x1 red PNG encoded by fux-vt itself, base64-encoded for Kitty graphics APC!
-    let tiny_png = fux_vt::png::encode_rgba(1, 1, &[255, 0, 0, 255], 4096).unwrap();
-    let png_b64 = fux_vt::base64_encode(&tiny_png);
-
-    let script = format!(
+    // A sixel picture, one red column six pixels high: the one picture format fux has. It goes
+    // when what it lies on is erased.
+    let script = String::from(
         "stty raw -echo; \
          printf 'READY\\r\\n'; \
          head -c 1 >/dev/null; \
@@ -592,12 +591,12 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
          printf '\\033]52;c;aGVsbG8gY2xpcA==\\007'; \
          printf '\\033]8;;https://koh.sh\\007click\\033]8;;\\007\\r\\n'; \
          printf '\\033]9;build done\\007'; \
-         printf '\\033_Ga=T,f=100,t=d,q=2;{png_b64}\\033\\\\\\r\\n'; \
+         printf '\\033Pq#0;2;100;0;0#0~\\033\\\\\\r\\n'; \
          head -c 1 >/dev/null; \
          printf 'ONE_LINE_EDIT\\r\\n'; \
          head -c 1 >/dev/null; \
-         printf '\\033_Ga=d,d=A,q=2\\033\\\\DELETED_PIC\\r\\n'; \
-         sleep 30"
+         printf '\\033[H\\033[2JDELETED_PIC\\r\\n'; \
+         sleep 30",
     );
 
     let (mut send, mut recv) = client
@@ -647,7 +646,7 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         .await
         .unwrap();
 
-    let mut pic_blobs = 0usize;
+    let mut pic_blobs = Vec::new();
     let mut saw_clip = false;
     let mut saw_notice = false;
     let mut saw_link = false;
@@ -657,9 +656,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         while !(saw_clip && saw_notice && saw_link && saw_pic_ref && saw_colour) {
             match recv_msg::<ServerEvent>(&mut recv, MAX_FRAME).await.unwrap() {
                 ServerEvent::Picture(blob) => {
-                    assert_eq!(blob.kind, PictureKind::Png);
-                    assert_eq!(blob.bytes, tiny_png);
-                    pic_blobs += 1;
+                    assert_eq!(blob.kind, PictureKind::Sixel);
+                    pic_blobs.push(blob.bytes);
                 }
                 ServerEvent::Full(f) => frame = f,
                 ServerEvent::Delta(d) => {
@@ -678,16 +676,20 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
             if frame.links.contains("https://koh.sh") {
                 saw_link = true;
             }
-            if frame.pictures.contains("pic-1.png") {
+            if frame.pictures.contains("pic-1.sixel") {
                 saw_pic_ref = true;
             }
         }
     })
     .await
     .expect("timed out waiting for clipboard/notice/link/picture/colour events");
-    assert_eq!(pic_blobs, 1, "picture payload must be sent once per ID");
+    assert_eq!(
+        pic_blobs.len(),
+        1,
+        "picture payload must be sent once per ID"
+    );
 
-    // Verify frozen v1 server pane folder also recorded clipboard, notice, links, cursor colour, and pic-1.png.
+    // Verify frozen v1 server pane folder also recorded clipboard, notice, links, cursor colour, and pic-1.sixel.
     let pane_dir = state_dir.join("sessions").join(format!("s{sid}"));
     assert_eq!(fs::read(pane_dir.join("clipboard")).unwrap(), b"hello clip");
     assert!(
@@ -706,9 +708,11 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
             .unwrap()
             .contains("https://koh.sh")
     );
-    assert!(pane_dir.join("pic-1.png").is_file());
+    let sixel = fs::read(pane_dir.join("pic-1.sixel")).unwrap();
+    assert_eq!(sixel, b"\x1bPq#0;2;100;0;0#0~\x1b\\");
+    assert_eq!(pic_blobs.concat(), sixel);
 
-    // Step 2: small 1-line edit MUST arrive as a compact Delta (NOT re-sending pic-1.png!).
+    // Step 2: small 1-line edit MUST arrive as a compact Delta (NOT re-sending pic-1.sixel!).
     send_msg(&mut send, &ClientEvent::Input(b"2".to_vec()), MAX_CHUNK)
         .await
         .unwrap();
@@ -734,8 +738,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
     .expect("timed out waiting for ONE_LINE_EDIT delta");
     assert!(got_small_delta, "expected compact row-level FrameDelta");
 
-    // Mount the same session locally and verify pic-1.png + pictures mirror into local pane folder,
-    // and that deleting the picture removes pic-1.png on BOTH server and local mirror!
+    // Mount the same session locally and verify pic-1.sixel + pictures mirror into local pane folder,
+    // and that erasing the picture removes pic-1.sixel on BOTH server and local mirror!
     let local_mirror = tmp.0.join("mirror_pics");
     let addr = srv.direct_addr.unwrap();
     let mut mclient =
@@ -749,33 +753,31 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         r
     });
     for _ in 0..80 {
-        if local_mirror.join("pic-1.png").is_file()
+        if local_mirror.join("pic-1.sixel").is_file()
             && fs::read_to_string(local_mirror.join("shown/pictures"))
                 .unwrap_or_default()
-                .contains("pic-1.png")
+                .contains("pic-1.sixel")
         {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(local_mirror.join("pic-1.png").is_file());
-    assert!(
-        fs::read_to_string(local_mirror.join("status"))
-            .unwrap()
-            .starts_with("pid ")
-    );
+    assert_eq!(fs::read(local_mirror.join("pic-1.sixel")).unwrap(), sixel);
+    // A mirror's program and its holder are on another machine: no `status` names a process of
+    // this one for them.
+    assert!(!local_mirror.join("status").exists());
     assert!(
         fs::read_to_string(local_mirror.join("cursor"))
             .unwrap()
             .contains("#445566")
     );
 
-    // Step 3: delete the Kitty image and verify cleanup on both server and mirror.
+    // Step 3: erase the picture and verify cleanup on both server and mirror.
     send_msg(&mut send, &ClientEvent::Input(b"3".to_vec()), MAX_CHUNK)
         .await
         .unwrap();
     for _ in 0..80 {
-        if !local_mirror.join("pic-1.png").exists()
+        if !local_mirror.join("pic-1.sixel").exists()
             && fs::read_to_string(local_mirror.join("shown/screen"))
                 .unwrap_or_default()
                 .contains("DELETED_PIC")
@@ -784,8 +786,8 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(!local_mirror.join("pic-1.png").exists());
-    assert!(!pane_dir.join("pic-1.png").exists());
+    assert!(!local_mirror.join("pic-1.sixel").exists());
+    assert!(!pane_dir.join("pic-1.sixel").exists());
 
     fs::write(local_mirror.join("ctl"), "kill\n").unwrap();
     tokio::time::timeout(Duration::from_secs(3), mtask)
@@ -794,6 +796,196 @@ async fn session_forwards_clipboard_links_colours_bell_deltas_and_kitty_pictures
         .expect("mount mirror task panicked")
         .expect("mount mirror returned error");
     let _ = send_msg(&mut send, &ClientEvent::Detach, MAX_CTRL).await;
+    client.close().await;
+    srv.shutdown().await;
+}
+
+/// `koh connect` as a person runs it, in a terminal of the test's own (a pty): what it drew there
+/// and how it ended. It is killed when the test lets go of it, however the test ends.
+struct InTerminal {
+    koh: std::process::Child,
+    tty: fs::File,
+    drawn: Vec<u8>,
+}
+
+impl Drop for InTerminal {
+    fn drop(&mut self) {
+        let _ = self.koh.kill();
+        let _ = self.koh.wait();
+    }
+}
+
+impl InTerminal {
+    fn connect(config: &Path, runtime: &Path, args: &[&str]) -> Self {
+        let size = fuxix::Winsize {
+            rows: 24,
+            cols: 80,
+            xpixel: 800,
+            ypixel: 480,
+        };
+        let (tty, theirs) = fuxix::pty(size).unwrap();
+        let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
+        koh.env("KOH_CONFIG_DIR", config)
+            .env("XDG_RUNTIME_DIR", runtime)
+            .arg("connect")
+            .args(args)
+            .stdin(theirs.try_clone().unwrap())
+            .stdout(theirs.try_clone().unwrap())
+            .stderr(theirs);
+        fuxix::new_session(&mut koh, true);
+        Self {
+            koh: koh.spawn().unwrap(),
+            tty,
+            drawn: Vec::new(),
+        }
+    }
+
+    /// Waits until `done` says so, reading meanwhile what koh draws (a terminal nobody reads
+    /// holds its program up). Twenty seconds is the most any of it may take.
+    async fn until(&mut self, what: &str, mut done: impl AsyncFnMut(&mut Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let mut some = [0u8; 4096];
+            while let Ok(n @ 1..) = (&self.tty).read(&mut some) {
+                self.drawn.extend_from_slice(&some[..n]);
+            }
+            if done(self).await {
+                return;
+            }
+            let last = self.drawn.len().saturating_sub(400);
+            let drawn = String::from_utf8_lossy(&self.drawn[last..]);
+            assert!(
+                Instant::now() < deadline,
+                "{what}: not in 20 s. The last it drew: {drawn:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn shows(&mut self, text: &str) {
+        let has = async |me: &mut Self| me.drawn.windows(text.len()).any(|w| w == text.as_bytes());
+        self.until(&format!("the terminal shows {text:?}"), has)
+            .await;
+    }
+
+    fn types(&mut self, keys: &[u8]) {
+        (&self.tty).write_all(keys).unwrap();
+    }
+
+    /// The exit code koh ended with.
+    async fn ends(&mut self) -> Option<i32> {
+        let mut code = None;
+        let ended = async |me: &mut Self| {
+            code = me.koh.try_wait().unwrap().map(|status| status.code());
+            code.is_some()
+        };
+        self.until("koh connect ends", ended).await;
+        code.flatten()
+    }
+}
+
+#[tokio::test]
+async fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
+    let (tmp, srv, client, _, _) = boot_pair("connect-tty").await;
+    let (config, runtime) = (tmp.0.join("cli_cfg"), tmp.0.join("run"));
+    fs::create_dir_all(&runtime).unwrap();
+    let (id, addr) = (
+        srv.endpoint_id.to_string(),
+        srv.direct_addr.unwrap().to_string(),
+    );
+    let program = "stty -icanon -echo; echo READY; od -An -tx1 -N2; head -c 1 >/dev/null; exit 7";
+
+    // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
+    let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
+    let mut first = InTerminal::connect(&config, &runtime, &started);
+    first.shows("READY").await;
+    first.types(b"\x1d.");
+    assert_eq!(first.ends().await, Some(0));
+    let sessions = client.sessions().await.unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].state, "running");
+
+    // Each of koh's two prefix keys typed twice is the key's own byte, typed to the program.
+    let session = sessions[0].id;
+    let again = ["--direct", &addr, &id, "--session", &session.to_string()];
+    let mut second = InTerminal::connect(&config, &runtime, &again);
+    second.shows("READY").await;
+    second.types(b"\x1d\x1d\x02\x02");
+    let typed = async |_: &mut InTerminal| {
+        let screen = client.output(session, false).await.unwrap();
+        screen.split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
+    };
+    second.until("the program reads the two bytes", typed).await;
+
+    // The terminal's size is the session's, also when it changes: the viewer asks koh's pane to
+    // take it, as it asks any pane.
+    let size = fuxix::Winsize {
+        rows: 30,
+        cols: 100,
+        xpixel: 1000,
+        ypixel: 600,
+    };
+    fuxix::set_winsize(&second.tty, size).unwrap();
+    let resized = async |_: &mut InTerminal| {
+        let sessions = client.sessions().await.unwrap();
+        (sessions[0].cols, sessions[0].rows) == (100, 30)
+    };
+    second
+        .until("the session takes the terminal's size", resized)
+        .await;
+
+    // The program's end is the end of `koh connect`, with the program's status: nobody has to
+    // type the detach key at a session that is over.
+    second.types(b"x");
+    assert_eq!(second.ends().await, Some(7));
+
+    // What koh made for its viewer is gone with it.
+    assert_eq!(names_in(&runtime), [""; 0]);
+
+    client.close().await;
+    srv.shutdown().await;
+}
+
+#[tokio::test]
+async fn koh_mount_with_no_directory_mirrors_into_the_default_fux_session() {
+    let (tmp, srv, client, _, _) = boot_pair("mount-default").await;
+    let (id, addr) = (srv.endpoint_id.to_string(), srv.direct_addr.unwrap());
+    let (home, runtime) = (tmp.0.join("home"), tmp.0.join("run"));
+    // The session is where fux has its default one: `$XDG_RUNTIME_DIR/fux`, and `~/.cache/fux`
+    // where that variable is not set or is empty. A `FUX_DIR` is nothing fux reads, nor koh.
+    let places = [
+        (runtime.as_os_str(), runtime.join("fux")),
+        ("".as_ref(), home.join(".cache/fux")),
+    ];
+    for (runtime, session) in places {
+        let mut koh = tokio::process::Command::new(env!("CARGO_BIN_EXE_koh"));
+        koh.env("KOH_CONFIG_DIR", tmp.0.join("cli_cfg"))
+            .env("XDG_RUNTIME_DIR", runtime)
+            .env("HOME", &home)
+            .env("FUX_DIR", tmp.0.join("elsewhere"))
+            .current_dir(&tmp.0)
+            .args(["mount", &id, "--direct", &addr.to_string()])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let mut koh = koh.spawn().unwrap();
+        let pane = session.join("main").join(format!("koh-{id}"));
+        let mirrored = async {
+            while !pane.join("shown/screen").is_file() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), mirrored)
+            .await
+            .unwrap_or_else(|_| panic!("no mirror at {} in 20 s", pane.display()));
+        fs::write(pane.join("ctl"), "kill\n").unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(20), koh.wait()).await;
+        assert_eq!(ended.unwrap().unwrap().code(), Some(0));
+    }
+    assert_eq!(
+        names_in(&tmp.0),
+        ["cli_cfg", "home", "run", "srv_cfg", "state"]
+    );
+
     client.close().await;
     srv.shutdown().await;
 }

@@ -316,7 +316,9 @@ pub struct SessionInfo {
     pub pane_dir: String,
 }
 
-/// Image wire format matching frozen v1 `fux` pane folders (`pic-N.sixel` / `pic-N.png`).
+/// A picture's format on the wire. A session's pictures are sixel (`pic-N.sixel`), the one format
+/// `fux` has. `Png` is what a `koh/18` server built on `fux` 0.42 may still send: a client keeps
+/// the file, and its viewer draws none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PictureKind {
     Sixel,
@@ -328,13 +330,6 @@ impl PictureKind {
         match self {
             Self::Sixel => "sixel",
             Self::Png => "png",
-        }
-    }
-
-    pub fn from_vt(fmt: fux_vt::PictureFormat) -> Self {
-        match fmt {
-            fux_vt::PictureFormat::Sixel => Self::Sixel,
-            fux_vt::PictureFormat::Png => Self::Png,
         }
     }
 }

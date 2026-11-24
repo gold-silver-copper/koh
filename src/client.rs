@@ -547,7 +547,10 @@ impl Client {
             }
         };
 
-        let view_ctl = session_dir.join(format!(".view.{}", std::process::id()));
+        // (The viewer's FIFO, in the folder it makes for itself in the session.)
+        let view_ctl = session_dir
+            .join(format!(".view.{}", std::process::id()))
+            .join("ctl");
         let view_exited = Arc::new(AtomicBool::new(false));
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mount_pane = pane_dir.clone();
@@ -1151,17 +1154,19 @@ impl Drop for TempConnectDir {
     }
 }
 
+/// koh's keys for its viewer. A key's script runs in a folder the viewer makes for it, where `pane`
+/// is a link to the pane that has the keys.
 fn install_detach_keys(keys_dir: &Path) -> Result<()> {
     const SCRIPTS: [(&str, &[u8]); 4] = [
         ("C-]/dot", b"#!/bin/sh\n# detach\necho quit\n"),
         (
             "C-]/C-]",
-            b"#!/bin/sh\n# send C-]\n[ -p \"$FUX_PANE/in\" ] && printf '\\035' 1<>\"$FUX_PANE/in\"\n",
+            b"#!/bin/sh\n# send C-]\n[ -p pane/in ] && printf '\\035' 1<>pane/in\n",
         ),
         ("C-b/d", b"#!/bin/sh\n# detach\necho quit\n"),
         (
             "C-b/C-b",
-            b"#!/bin/sh\n# send C-b\n[ -p \"$FUX_PANE/in\" ] && printf '\\002' 1<>\"$FUX_PANE/in\"\n",
+            b"#!/bin/sh\n# send C-b\n[ -p pane/in ] && printf '\\002' 1<>pane/in\n",
         ),
     ];
     for (rel, body) in SCRIPTS {
@@ -1191,7 +1196,6 @@ fn seed_initial_pane(pane_dir: &Path, cols: u16, rows: u16) -> std::io::Result<(
     let _ = fs::remove_file(&tmp_link);
     symlink("main", &tmp_link)?;
     fs::rename(&tmp_link, pane_dir.join("shown"))?;
-    atomic_write(&pane_dir.join("status"), b"pid 1\n")?;
     atomic_write(
         &pane_dir.join("size"),
         format!("{cols} {rows}\n").as_bytes(),
@@ -1369,11 +1373,8 @@ fn write_mirrored_pane(
     if !frame.alt {
         let _ = fs::remove_dir_all(dir.join("alt"));
     }
-    // Stable nonzero pid enables `fux::view` Kitty keyboard flag-2 repeats/releases and resize tracking.
-    let _ = atomic_write(
-        &dir.join("status"),
-        format!("pid {}\n", frame.session_id.max(1)).as_bytes(),
-    );
+    // (No `status`: it names a pane's holder and its program by their numbers on this machine,
+    // and a mirror has neither here. The viewer knows a pane by its folder.)
     write_v1_metadata(dir, frame);
     if let Some(bytes) = &frame.clipboard {
         let _ = atomic_write(&dir.join("clipboard"), bytes);

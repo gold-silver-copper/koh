@@ -2420,8 +2420,11 @@ struct Host {
 
 impl Drop for Host {
     fn drop(&mut self) {
+        // The holders of the sessions that live are ended: each keeps its folder locked. (A
+        // pane a test wrote by hand names a holder that is none, or is some other process.)
         for pane in fs::read_dir(&self.sessions).into_iter().flatten().flatten() {
-            if pane.path().join("status").is_file() {
+            let folder = fuxix::open(pane.path(), false).map(|folder| folder.try_lock_shared());
+            if matches!(folder, Ok(Err(fs::TryLockError::WouldBlock))) {
                 signal(&holder_of(&pane.path()), "-KILL");
             }
         }

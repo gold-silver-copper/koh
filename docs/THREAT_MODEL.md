@@ -23,7 +23,8 @@ a QUIC handshake: the transport does not know the allowlist.
 - **What it can make the server hold:** a connection takes one of `--max-connections` places
   (64) from when the server takes it up until it is gone: closed by either end, or silent for
   its idle timeout (15 s for a command or a copy, 30 s for a session; a client that is killed
-  goes that way). The server takes a connection up when it comes to it, after its first packet
+  goes that way), and its requests have ended, which those still going 5 s after it are made
+  to. The server takes a connection up when it comes to it, after its first packet
   has arrived: the time the packet waited for that is not counted. A connection has 10 s from
   when it was taken up to finish its handshake and prove a key the server allows: one that has
   not by then is closed and its place given back, wherever it got to. With no place free, as

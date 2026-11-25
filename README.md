@@ -187,7 +187,8 @@ koh adds nothing to stop these. What happens instead is said.
   reads the end of its terminal and leaves by itself, and the folder of one that was killed
   too (`STATE/fux/.view.PID`) is removed when `koh serve` starts.
 - Under systemd, give `koh serve`'s unit `KillMode=process` and the user
-  `loginctl enable-linger`: else stopping the service, or logging out, kills every session.
+  `loginctl enable-linger`: else stopping the service, or logging out, kills every session
+  ("`koh serve` under systemd", below, has a unit to copy).
   A session's holder and its program inherit the descriptors `koh serve` was itself given
   that are not close-on-exec (a socket the unit was passed, say): pass `koh serve` nothing
   its sessions should not hold.
@@ -237,6 +238,40 @@ koh sessions box                       # each session: attached, running, busy, 
 koh wait box --session 1 --timeout 600 # until the command there ends: its output, its code
 koh output box --session 1 --last      # what the last command printed
 ```
+
+## `koh serve` under systemd
+
+koh has no unit of its own and no word of systemd in its code: a unit is yours to write. Write
+it with `KillMode=process`. A session lives on when `koh serve` is stopped, but systemd's
+default ends every process a service started when the service stops or is restarted, its
+sessions with it, whether you asked for the restart (an upgrade) or `koh serve` died.
+
+```ini
+# ~/.config/systemd/user/koh.service
+[Unit]
+Description=koh serve
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/koh serve
+Restart=always
+RestartSec=5
+# Stopping or restarting the service ends `koh serve` alone: its sessions go on.
+KillMode=process
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now koh
+loginctl enable-linger        # else logging out of the server ends the service and every session
+```
+
+After `systemctl --user restart koh` the sessions that ran are listed and attached to as
+before (systemd's log says of each that a process was left over: that is the session).
 
 Run `koh --help` for the complete command reference and exit-code contract; `koh help-agents`
 is the same and, after it, recipes: a session's files, and the three commands as a script.

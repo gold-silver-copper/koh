@@ -2566,11 +2566,16 @@ fn one_session_draws_to_two_terminals_and_survives_hangup() {
         fs::read_link(host.pane("s").join("shown")).unwrap(),
         Path::new("alt")
     );
-    let mut b = host.attach(&["--session", "s"], &[]);
-    b.until("second viewer draws the current screen", |tty| {
-        has(tty, b"fullscreen-42")
+    // A second terminal comes to the session: it is shown the screen as it is now. (This one is
+    // a terminal that draws what it is sent, a pane of fux's: a viewer sends the cells that
+    // changed, and a line of text is not one run of bytes.)
+    let b = InPane::connect(&host, "second", &[], &["--session", "s"]);
+    let shows = |what: &str| b.says("shown/screen").contains(what);
+    until("the second terminal shows the current screen", || {
+        shows("fullscreen-42")
     });
-    let id = a.koh.id();
+    // The first is closed: its koh ends, and the second goes on, through a flood, to the
+    // session's end.
     drop(std::mem::replace(
         &mut a.tty,
         fs::File::open("/dev/null").unwrap(),
@@ -2578,15 +2583,16 @@ fn one_session_draws_to_two_terminals_and_survives_hangup() {
     until("closed terminal exits", || {
         a.koh.try_wait().unwrap().is_some()
     });
-    assert_ne!(id, b.koh.id());
-    b.types(b"printf '\\033[?1049l'; seq 1 2000000; echo flood-$((6*7))\n");
-    b.until("flood end is drawn", |tty| has(tty, b"flood-42"));
+    b.types(b"printf '\\033[?1049l'; seq 1 300000; echo flood-$((6*7))\n");
+    until("the flood's end is drawn", || {
+        shows("300000") && shows("flood-42")
+    });
     assert_eq!(
         fs::read_link(host.pane("s").join("shown")).unwrap(),
         Path::new("main")
     );
     b.types(b"exit 9\n");
-    assert_eq!(b.ends(), Some(9));
+    assert_eq!(b.ends(), "exited 9");
 }
 
 /// An attach as a test asks it: of the session `name`, or of a new one running `program`.

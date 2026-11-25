@@ -322,6 +322,8 @@ impl Sessions {
     async fn start(&self, asked: &Attach, cwd: &Path) -> Result<PathBuf> {
         let cannot = |why: String| KohError::new(Exit::CANNOT_START, "cannot_start", why);
         let me = &self.exe;
+        // (Before the program is started: it may ask for a colour as its first act.)
+        self.told(asked);
         let pane = self.dir.join(asked.name.as_deref().unwrap_or(""));
         let mut fux = tokio::process::Command::new(me);
         fux.args(["fux", "start"]).arg(pane).arg("--");
@@ -339,6 +341,13 @@ impl Sessions {
         if !said.status.success() {
             let why = String::from_utf8_lossy(&said.stderr);
             let why = why.trim().trim_start_matches("fux: ");
+            // (fux names the folder it made for a program it could not start: that is no
+            // session, has no name of one and no place among them.)
+            let made = why.split_once(": cannot start ");
+            let made = made.map(|(folder, _)| PathBuf::from(folder));
+            if let Some(made) = made.filter(|made| made.parent() == Some(&self.dir)) {
+                let _ = fs::remove_dir_all(made);
+            }
             return Err(cannot(format!("no session was started: {why}")));
         }
         let dir = PathBuf::from(String::from_utf8_lossy(&said.stdout).trim_end());
@@ -367,6 +376,7 @@ impl Sessions {
             None => newest(),
         };
         if let Some(found) = found {
+            self.told(asked);
             return Ok(found);
         }
         let goes = if folders.len() >= self.max {
@@ -427,7 +437,9 @@ impl Sessions {
 
     /// What a client says its terminal is like goes where fux's viewer would have written it:
     /// into koh's own fux session, where its panes' holders read it and answer their programs
-    /// from it. `keyboard` always, `colours` if the terminal told of any. Each under a name of
+    /// from it: once this attach will be shown a session, and no sooner (one that is refused
+    /// changes nothing), and before a new session's program is started.
+    /// `keyboard` always, `colours` if the terminal told of any. Each under a name of
     /// the writer's own and then given its name, as fux's viewer writes them: of two at once the
     /// last is believed and neither fails.
     fn told(&self, asked: &Attach) {
@@ -473,18 +485,20 @@ impl Sessions {
             matches!(line.split_once(" #"), Some(("foreground" | "background" | "cursor", value)) if hex(value))
         };
         let term = asked.term.len() <= 64 && asked.term.bytes().all(|b| b.is_ascii_graphic());
-        if !term || asked.colours.len() > 64 || !asked.colours.lines().all(colour) {
+        let colours = asked.colours.split_terminator('\n');
+        if !term || colours.clone().count() > 3 || !colours.clone().all(colour) {
             return Err(KohError::usage(
                 "what a client says of its terminal is its TERM (printable, at most 64 bytes) and its foreground, background and cursor colours",
             ));
         }
-        // (Before a session is started: its program may ask for a colour as its first act.)
-        self.told(&asked);
         let dir = match (&asked.run, &asked.name) {
             (Some(run), Some(name)) => {
                 let dir = self.dir.join(name);
                 match run_of(&dir) {
-                    Some(there) if there == *run => dir,
+                    Some(there) if there == *run => {
+                        self.told(&asked);
+                        dir
+                    }
                     Some(_) => {
                         let why = "another run has the session's name";
                         return Err(not_found(format!("{why} {name}: nothing is typed into it")));

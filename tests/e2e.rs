@@ -2951,12 +2951,20 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
         run: Some(attached.run ^ 1),
         ..again.clone()
     };
+    let session = host.sessions.parent().unwrap();
+    let told = || fs::read_to_string(session.join("keyboard")).unwrap();
+    let before = told();
+    let other = Attach {
+        keyboard: 9,
+        ..other
+    };
     let err = attach(&client, other).await.unwrap_err();
     assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
     assert!(
         err.message.contains("another run has the session's name 1"),
         "{err:?}"
     );
+    assert_eq!((before.as_str(), told().as_str()), ("0\n", "0\n"));
     let nameless = Attach {
         name: None,
         ..again
@@ -2977,12 +2985,14 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
     let sleeps = ["sleep".to_string(), "100".into()];
     // What a client says of its terminal is a name and three colours: anything else is refused
     // before a session is started or a file written.
-    let not_said: [fn(&mut Attach); 5] = [
+    let not_said: [fn(&mut Attach); 7] = [
         |asks| asks.term = "xterm\n256".into(),
         |asks| asks.term = "x".repeat(65),
         |asks| asks.colours = "layout #000000\n".into(),
         |asks| asks.colours = "background #1c1c1c\n../../told #000000\n".into(),
         |asks| asks.colours = "background #1c1c1c\n".repeat(4),
+        |asks| asks.colours = "cursor #000000\n".repeat(4),
+        |asks| asks.colours = "cursor #000000\r\n".into(),
     ];
     for not_said in not_said {
         let mut asks = asks(None, &sleeps);
@@ -2990,10 +3000,45 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
         let err = attach(&client, asks.clone()).await.unwrap_err();
         assert_eq!(err.code, Exit::USAGE, "{asks:?}");
     }
+    // And an attach that is refused for another reason changes nothing: what it says of its
+    // terminal is written once it will be shown a session, and not before. A run of no
+    // session, a name there is no session of; and a program that cannot be started leaves no
+    // session's name behind, with a name or without one.
+    let told = Attach {
+        keyboard: 9,
+        colours: "foreground #aabbcc\n".into(),
+        ..asks(None, &sleeps)
+    };
+    let refused = [
+        (Some(1), None, &sleeps[..], Exit::USAGE),
+        (Some(1), Some("nosuch"), &sleeps[..], Exit::NOT_FOUND),
+    ];
+    for (run, name, program, code) in refused {
+        let asks = Attach {
+            run,
+            name: name.map(String::from),
+            new: false,
+            argv: program.to_vec(),
+            ..told.clone()
+        };
+        let err = attach(&client, asks.clone()).await.unwrap_err();
+        assert_eq!(err.code, code, "{asks:?}: {err:?}");
+    }
     assert_eq!(
         (names_in(&session), names_in(&host.sessions)),
         (vec!["koh-sessions".to_string()], vec![])
     );
+    let none = ["/no/such/koh-test-program".to_string()];
+    for name in [Some("dead"), None] {
+        let asks = Attach {
+            name: name.map(String::from),
+            argv: none.to_vec(),
+            ..told.clone()
+        };
+        let err = attach(&client, asks).await.unwrap_err();
+        assert_eq!(err.code, Exit::CANNOT_START, "{err:?}");
+        assert_eq!(names_in(&host.sessions), [""; 0], "{err:?}");
+    }
     // What it may say is written where the session's programs are answered from.
     let said = Attach {
         keyboard: 5,

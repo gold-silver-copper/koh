@@ -457,7 +457,8 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
     client.types(b"\x1d.");
     assert_eq!(client.ends(Duration::from_secs(10)).await.unwrap(), 0);
     assert_eq!(rig::state(&pane), "running");
-    // What the session had taken by then is the paste's start, in its order; a client that
+    // What the session had taken by then is the paste's start, in its order (all of it, where
+    // the viewer that was left had the time to hand it on: it has a second); a client that
     // comes then and pastes it again, into a program that reads, has it typed whole.
     fs::write(rig.file("out.go"), "").unwrap();
     // (All that waited for it in the session: until half a second brings no more.)
@@ -474,11 +475,7 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
         },
     );
     let before = fs::read(&out).unwrap();
-    assert!(
-        before.len() < pasted.len() && pasted.starts_with(&before),
-        "{} bytes",
-        before.len()
-    );
+    assert!(pasted.starts_with(&before), "{} bytes", before.len());
     let client = rig.connect("s", "a").await;
     client.types(&pasted);
     rig::until(

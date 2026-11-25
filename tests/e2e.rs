@@ -1145,16 +1145,21 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_se
     };
     let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
     let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-    // A command, which hanging up does not end, of a client that then leaves.
+    // A command, which hanging up does not end, of a client that then leaves. (It says when
+    // it is that: a client that left before, on a slow machine, hung up a shell that had not
+    // yet read its first word.)
     let left = |script: &str| {
         let exec = Request::Exec {
-            argv: vec![format!("trap '' HUP; {script}")],
+            argv: vec![format!("trap '' HUP; : > deaf; {script}")],
             cwd: Some(tmp.0.display().to_string()),
             shell: true,
         };
+        let deaf = tmp.0.join("deaf");
         async move {
             let client = dial().await.unwrap();
             let streams = client.request(&exec).await.unwrap();
+            until("the command is deaf to a hangup", || deaf.exists());
+            fs::remove_file(&deaf).unwrap();
             (client, streams)
         }
     };

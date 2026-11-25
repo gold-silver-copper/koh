@@ -15,6 +15,30 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Security
+
+- **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
+  with spaces is read back as it was written.** In 0.18.0–0.18.1, any third word on a line in
+  `clients` that was not `cp=DIR` or `exec=DIR` (a typo such as `copy=/srv`, `cp:/srv`, or
+  `cp`) was read as an unscoped key that could run anything; an empty `cp=` or `exec=` expanded
+  to `$HOME`; and a `DIR` containing a space (`koh clients add NAME ID --cp "/a b"`) was split
+  at the first space and enforced as `/a` instead of `/a b`. Now the scope is everything after
+  the endpoint id to the end of the line: a line whose scope is neither empty nor a non-empty
+  `cp=DIR` or `exec=DIR` is skipped (giving that client nothing, without locking out valid
+  entries) and warned on stderr with the file, line number, and client name wherever `clients`
+  is read (`koh serve` and `koh clients`). `koh clients add` refuses an empty scope `DIR` or
+  one containing a newline or NUL (exit 2). The on-disk format is unchanged for every line
+  0.18.1 wrote correctly.
+
+### Fixed
+
+- **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
+  rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
+  parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started
+  at once, one could end with `cannot reach server: timed out`, and parallel `koh wait` calls
+  lost their connections. Each client process now dials from a fresh key of its own and proves
+  `client.key` on each stream (`KeyProof`), and the server authorizes solely by that proved key.
+
 ## [0.18.1] — 2026-11-25
 
 The protocol is 0.18.0's (`koh/20`): only a server needs this one.

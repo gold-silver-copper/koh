@@ -8,9 +8,11 @@ not a multi-user service.
 ## What koh is
 
 A server (`koh serve`) is reached by its Ed25519 endpoint id over [iroh](https://iroh.computer)
-QUIC, directly or through relays. Every request is one QUIC stream that begins with a proof of
-the client's key: a signature over keying material exported from that TLS session, so a proof
-cannot be replayed on another connection (`src/net.rs`). The server then looks the key up in
+QUIC, directly or through relays. Each client process dials from a fresh endpoint key of its
+own, so parallel processes of one client do not collide on a relay or at the server. Every
+request is one QUIC stream that begins with a proof of the client's key: a signature over keying
+material exported from that TLS session, so a proof cannot be replayed on another connection
+(`src/net.rs`). The server ignores the connection's own endpoint id, looks the proved key up in
 its `clients` file, read anew for each request, or among `--allow` (`src/server.rs`,
 `authorize`), and only then reads the request.
 
@@ -128,6 +130,10 @@ have it show another pane, another workspace, or run a script.
   that cannot open a terminal.
 - A scope is read with each request, so narrowing or removing a key takes effect on its next
   request; what it already started goes on.
+- In `clients`, the scope is everything after the endpoint id to the end of the line (so spaces
+  in `DIR` are preserved; `koh clients add` refuses an empty `DIR` or one with a newline or NUL).
+  A line with an unrecognized or empty scope is skipped and warned on stderr, giving that client
+  nothing rather than falling back to an unscoped key.
 
 ## 4. A server a client dials
 

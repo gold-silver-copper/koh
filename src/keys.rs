@@ -360,7 +360,7 @@ pub fn load_clients(
     };
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = line.trim_end_matches('\r');
         let rest = line.trim_start();
         if rest.is_empty() || rest.starts_with('#') {
             continue;

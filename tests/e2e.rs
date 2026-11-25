@@ -4504,8 +4504,8 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
     assert_eq!(bad_json.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
     assert!(bad_json.stderr.is_empty());
-    // A trailing CR on the last line without LF is line ending, not DIR, and survives a rename.
-    fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r")).unwrap();
+    // Trailing CRs on the last line without LF are line endings, not DIR, and survive a rename.
+    fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r\r")).unwrap();
     assert_eq!(
         koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
         cp("/x")

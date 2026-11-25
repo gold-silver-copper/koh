@@ -3327,10 +3327,19 @@ fn what_was_typed_before_the_key_that_leaves_is_typed() {
             tty.drawn.windows(5).any(|drawn| drawn == b"READY")
         });
         tty.types(&[typed, b"\x1d."].concat());
+        let typing = Instant::now();
         assert_eq!(tty.ends(), Some(0));
-        until("what was typed before the key is typed", || {
-            fs::read(&out).unwrap_or_default() == typed
-        });
+        let left = typing.elapsed();
+        let has = || fs::read(&out).unwrap_or_default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while has() != typed {
+            let (read, whole) = (has().len(), typed.len());
+            let said = format!(
+                "{name}: the program read {read} of {whole} bytes; koh left after {left:?}"
+            );
+            assert!(Instant::now() < deadline, "{said}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         until("the viewer is gone", || viewers(&host).is_empty());
     }
 }

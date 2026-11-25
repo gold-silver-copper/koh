@@ -8,9 +8,9 @@ use std::process::ExitCode;
 
 use koh::client::{Client, ConnectOptions, DialOptions, parse_signal, sync_before_command};
 use koh::keys::{
-    ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
-    parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
-    validate_peer_name,
+    ClientEntry, Role, Route, Scope, ServerEntry, load_or_create_key, load_servers,
+    parse_endpoint_id, parse_relay_url, read_clients, render_qr, reset_key, save_clients,
+    save_servers, validate_peer_name,
 };
 use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
@@ -43,8 +43,17 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let json = args.iter().any(|a| a == "--json");
+    let raw: Vec<_> = words.collect();
+    let json = raw.iter().any(|a| a == "--json");
+    let Ok(args) = raw
+        .into_iter()
+        .map(std::ffi::OsString::into_string)
+        .collect::<std::result::Result<Vec<String>, _>>()
+    else {
+        let err = KohError::usage("arguments must be valid UTF-8");
+        report_err(&err, json);
+        return ExitCode::from(err.code.0);
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -278,7 +287,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let mut list = load_clients(key_file.as_deref())?;
+    let (mut list, skipped) = read_clients(key_file.as_deref())?;
     match clean.first().map(String::as_str) {
         None => {
             for e in &list {
@@ -288,6 +297,9 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
                     Scope::Exec(d) => format!(" exec={}", d.display()),
                 };
                 let _ = writeln!(std::io::stdout(), "{} {}{scope}", e.name, e.id);
+            }
+            for (n, line) in skipped {
+                let _ = writeln!(std::io::stderr(), "koh: clients:{n}: ignored: {line}");
             }
         }
         Some("add") => {
@@ -303,8 +315,19 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             let mut j = 3;
             while let Some(a) = clean.get(j).map(String::as_str) {
                 match a {
-                    "--cp" => scope = Scope::Cp(PathBuf::from(take_opt(&clean, &mut j, a)?)),
-                    "--exec" => scope = Scope::Exec(PathBuf::from(take_opt(&clean, &mut j, a)?)),
+                    "--cp" | "--exec" => {
+                        let dir = take_opt(&clean, &mut j, a)?;
+                        if dir.is_empty() || dir.contains(['\n', '\r']) {
+                            return Err(KohError::usage(format!(
+                                "{a} directory cannot be empty or contain a line break"
+                            )));
+                        }
+                        scope = if a == "--cp" {
+                            Scope::Cp(PathBuf::from(dir))
+                        } else {
+                            Scope::Exec(PathBuf::from(dir))
+                        };
+                    }
                     _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
                 }
                 j += 1;

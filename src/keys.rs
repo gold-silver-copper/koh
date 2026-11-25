@@ -2,7 +2,7 @@
 //! and QR rendering — compatible with existing `~/.config/koh/` files.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -346,43 +346,49 @@ pub fn save_servers(key_file: Option<&Path>, entries: &[ServerEntry]) -> Result<
         .map_err(|e| KohError::failed(format!("write servers: {e}")))
 }
 
+/// A non-blank, non-comment line in `clients` that could not be parsed: `(1-based line number, text)`.
+pub type SkippedLine = (usize, String);
+
 /// Loads allowed `clients` list beside `server.key`.
 pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
+    Ok(read_clients(key_file)?.0)
+}
+
+/// Reads `clients` beside `server.key`, returning valid entries and any lines that were skipped.
+pub fn read_clients(key_file: Option<&Path>) -> Result<(Vec<ClientEntry>, Vec<SkippedLine>)> {
     let path = config_dir(key_file)?.join(Role::Server.list_file());
     let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
     };
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let rest = line.trim_start();
         if rest.is_empty() || rest.starts_with('#') {
             continue;
         }
         let Some((name, rest)) = rest.split_once(char::is_whitespace) else {
+            skipped.push((i + 1, line.to_string()));
             continue;
         };
         let rest = rest.trim_start();
         let (id_str, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let Ok(id) = id_str.parse::<EndpointId>() else {
+            skipped.push((i + 1, line.to_string()));
             continue;
         };
-        let rest = rest.trim_start();
-        let scope = if rest.is_empty() {
-            Scope::Full
-        } else if let Some(dir) = rest.strip_prefix("cp=").filter(|d| !d.is_empty()) {
-            Scope::Cp(PathBuf::from(dir))
-        } else if let Some(dir) = rest.strip_prefix("exec=").filter(|d| !d.is_empty()) {
-            Scope::Exec(PathBuf::from(dir))
-        } else {
-            let _ = writeln!(
-                std::io::stderr(),
-                "koh: {}:{}: ignoring client {name:?} with unrecognized scope {rest:?}",
-                path.display(),
-                i + 1,
-            );
-            continue;
+        let scope = match rest.trim_start() {
+            "" => Scope::Full,
+            field => match field.split_once('=') {
+                Some(("cp", dir)) if !dir.is_empty() => Scope::Cp(PathBuf::from(dir)),
+                Some(("exec", dir)) if !dir.is_empty() => Scope::Exec(PathBuf::from(dir)),
+                _ => {
+                    skipped.push((i + 1, line.to_string()));
+                    continue;
+                }
+            },
         };
         out.push(ClientEntry {
             name: name.to_string(),
@@ -390,7 +396,7 @@ pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
             scope,
         });
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<()> {
@@ -401,19 +407,10 @@ pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<
         text.push_str(&e.name);
         text.push(' ');
         text.push_str(&e.id.to_string());
-        let scoped = match &e.scope {
-            Scope::Full => None,
-            Scope::Cp(dir) => Some(("cp", dir)),
-            Scope::Exec(dir) => Some(("exec", dir)),
-        };
-        if let Some((kind, dir)) = scoped {
-            let s = dir
-                .to_str()
-                .filter(|s| !s.is_empty() && !s.contains(['\n', '\r', '\0']))
-                .ok_or_else(|| {
-                    KohError::usage(format!("invalid scope directory {:?}", dir.display()))
-                })?;
-            text.push_str(&format!(" {kind}={s}"));
+        match &e.scope {
+            Scope::Full => {}
+            Scope::Cp(dir) => text.push_str(&format!(" cp={}", dir.display())),
+            Scope::Exec(dir) => text.push_str(&format!(" exec={}", dir.display())),
         }
         text.push('\n');
     }

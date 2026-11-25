@@ -3361,6 +3361,38 @@ fn what_was_typed_before_the_key_that_leaves_is_typed() {
 }
 
 #[test]
+fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
+    let host = Host::start("unread", &[]);
+    // A program that reads nothing and ends after a second, with megabytes typed meanwhile:
+    // more than its pane takes, so that the viewer's own terminal holds what the viewer has
+    // not read. The viewer has left when the server looks for that, and nothing waits a
+    // second for a viewer that is gone to read it: the client has the program's status then.
+    let ends = ["sh", "-c", "stty -echo; echo READY; sleep 1; exit 42"].map(String::from);
+    let mut tty = host.attach(&["--session", "s"], &ends);
+    tty.until("the program is ready", |tty| {
+        tty.drawn.windows(5).any(|drawn| drawn == b"READY")
+    });
+    let (ready, burst) = (Instant::now(), vec![b'x'; 64 << 10]);
+    let ended = loop {
+        // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
+        let _ = (&tty.tty).write(&burst);
+        let mut drawn = [0; 4096];
+        while let Ok(1..) = (&tty.tty).read(&mut drawn) {}
+        match tty.koh.try_wait().unwrap() {
+            Some(ended) => break ended.code(),
+            None => assert!(ready.elapsed() < Duration::from_secs(10), "still there"),
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(ended, Some(42));
+    assert!(
+        ready.elapsed() < Duration::from_millis(1700),
+        "{:?}",
+        ready.elapsed()
+    );
+}
+
+#[test]
 fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to() {
     let host = Host::start("stalled-first", &[]);
     let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));

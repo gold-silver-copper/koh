@@ -978,8 +978,10 @@ impl Console {
                         Err(code) => return Ok(Some(code)),
                     }
                 };
+                // (A stream that takes no more has ended: how, is for what is read of it to say.
+                // It may be the session's end, whose word is still to be read.)
                 if send_msg(send, &message, VIEW_FRAME).await.is_err() {
-                    return Ok(None);
+                    return std::future::pending().await;
                 }
             }
         };

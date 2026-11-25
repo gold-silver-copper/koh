@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, delta file sync, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (6,157 lines of `src/` without its tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src/` without its tests, down from ~22,000):
 
 - **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/20`) with TLS-bound Ed25519 client proofs,
   compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files, QR codes

@@ -5,7 +5,7 @@ Ultra-minimal peer-to-peer remote shell, headless jobs, delta file sync, and int
 
 Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~22,000):
 
-- **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/19`) with TLS-bound Ed25519 client proofs,
+- **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/20`) with TLS-bound Ed25519 client proofs,
   compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files, QR codes
   on `koh serve` / `koh id --qr`, and `--cp`/`--exec` path-scoped keys.
 - **Layer 2 — Raw Streams & Delta Sync (no PTY):**
@@ -22,34 +22,45 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     holder (the process `koh hold …`), not by `koh serve`: sessions live on when `koh serve`
     is stopped, and are there when it is started again. `koh fux …` is `fux …`, and it and
     `koh hold …` are words of this machine: they ask no server anything.
-  - A client has a **mirror** of the session: a copy of the pane's folder that koh makes and
-    alone writes, brought up to date in rounds (`koh/19`). A round is checked whole before
-    anything of it is done to the mirror, and what a server may not send changes nothing. (A
-    disk that fails while a round is done can leave it part done, under an odd `generation`:
-    the next attach that succeeds puts it right.) What is typed into the mirror's `in` and `ctl` is typed
-    into the session's.
-  - `koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG…]` shows a private mirror
-    with `fux`'s viewer, in the same process. With a name it is that session, started if there is
-    none; with none, the newest that lives, or a new one. Leave it with `Ctrl-] .` or `C-b d`
-    (`Ctrl-] Ctrl-]` and `C-b C-b` type the key itself). It ends with the session's program:
-    with its status, with 128 + N if signal N ended it, and with 1 if nothing says how it
-    ended (its holder was killed, the machine was restarted, its folder was moved).
-  - `koh mount SERVER [--session NAME | --new] [-C DIR] [MIRROR] [-- PROG…]` keeps a mirror
-    for any `fux view`, `cat` or script: in `MIRROR`, which koh makes (a folder that is there
-    is not taken), or with none in a `fux` session of koh's own on the client,
-    `K/fux/koh-mounts/SERVER.NAME` (`K` is `$XDG_RUNTIME_DIR/koh`, else `~/.cache/koh`; the
-    server's part is cut to fit a pane's name, 64 characters). Nothing of koh's is in your own
-    `fux` session unless you name a folder there. It ends as `koh connect` does, with the
-    session's program and its status. The mirror is removed when the session ends or koh is
-    stopped: SIGINT, SIGTERM, or SIGHUP, which a terminal that is closed sends (`koh connect`
-    removes its private folder then, too). Stopped so, both end with 0. A mirror has no `status` and no `command`: its program
-    and its holder are on the server.
-  - **Without a link** koh says so (in the viewer's corner; `koh mount` on its standard error)
-    and dials again. What you type while it says so is held and typed when the link is back.
-    What was on its way when a link died may be lost. Nothing is ever typed twice.
-  - Sixel is the one picture format, as in `fux` 0.43. A program that draws with the Kitty
-    graphics protocol alone (`kitten icat`) shows nothing in a session, and a picture is drawn
-    only in a terminal that draws sixel.
+  - A session is shown by its **viewer, which runs on the server**: `fux`'s viewer, this
+    binary again, on a terminal of the client's size that `koh serve` makes for it. What it
+    draws is sent as it draws it, and what is typed at the client is typed into it (`koh/20`):
+    the client's terminal shows the bytes, as with ssh. Nothing of the session's folder
+    leaves the server, and the client keeps nothing: no copy, no file, no viewer of its own.
+    Each `koh connect` has a viewer to itself, started when it attaches and gone when it
+    leaves; a session nobody looks at costs its holder and its program, and nothing more.
+  - `koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG…]` shows a session in
+    your terminal. With a name it is that session, started if there is none; with none, the
+    newest that lives, or a new one. Leave it with `Ctrl-] .` (`Ctrl-] Ctrl-]` types one
+    Ctrl-]; any other key after it is typed after it). That is koh's one key, as `~.` is
+    ssh's: `koh connect` reads it where you type it, in whatever form your terminal sends
+    it, so it leaves with a link or without one, and also while the session's program reads
+    nothing. Every other key is the session's: `C-b` reaches a `tmux` or a `fux` there as it
+    is typed. It ends with the session's program: with its status, with 128 + N if signal N
+    ended it, and with 1 if nothing says how it ended (its holder was killed, the machine was
+    restarted, its folder was moved). Left, hung up (a terminal that is closed) or told to
+    end (SIGTERM), it ends with 0 and the session runs on.
+  - **Nothing is asked of your terminal**, by `koh connect` or by the session's viewer: an
+    answer that crosses a link may come late and be taken for typing, so none is asked for.
+    Your terminal is taken to draw sixel pictures and 24-bit colours (one that does not shows
+    nothing where the picture is). Two things are not known for want of asking. Your
+    terminal's own colours: a program that asks them (vim, to choose a light or a dark
+    theme) gets no answer, unless you write them on the server once (below). And whether it
+    speaks the kitty keyboard protocol: a program that asks for it is told that no flag is in
+    force, and keys reach it in their old form. With the attach go `TERM` and the size, in
+    cells and pixels.
+  - **Without a link** koh says so and dials again: `koh: no link; reconnecting`, on your
+    terminal's own screen, which is put back the moment the link is lost (nothing of the
+    viewer's stays on: not the mouse, not the alternate screen). What you type while it says
+    so is held and typed when the link is back, and `Ctrl-] .` leaves at once. A
+    link that is silent is known to be lost after eight seconds. What was on its way when a
+    link died may be lost. Nothing is ever typed twice. When the link is back a new viewer
+    draws the whole screen as it is then: nothing of the old one is gone on from.
+  - Sixel is the one picture format, as in `fux` 0.43, and your terminal is taken to draw it:
+    one that does not shows nothing where the picture is. A picture is scaled by the size of
+    a cell in pixels, which your terminal's window says (one that says none gets a line in
+    the corner instead). A program that draws with the Kitty graphics protocol alone
+    (`kitten icat`) shows nothing in a session.
   - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
     --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
     session's files, for a key with no scope. They read what a script there could. What is
@@ -91,13 +102,20 @@ koh adds nothing to stop these. What happens instead is said.
 
 **Don't**
 
-- Don't `mv` a session's folder while clients are attached: they are told the session ended.
-  It lives on, and is a session of its new name.
-- Don't change a session's folder by hand and expect clients to follow. A file rewritten in
-  its middle in place goes whole each time, or is not seen if its length and time did not
-  change (replace it, or add to its end). A file made a folder, or a folder a file, ends every
-  attached client with "no name for it". A name with a dot first, a folder inside a folder,
-  and anything that is no file, folder, link or FIFO are not carried.
+- Don't `mv` a session's folder while clients are attached: they are told the session ended
+  (1). It lives on, and is a session of its new name.
+- Don't `kill -9` a `koh connect`: nothing is left to put your terminal back, which stays
+  raw, on the alternate screen, with whatever the session's program had turned on. Type
+  `reset` and Enter (you will not see it typed). Every other end puts it back.
+- Don't look for the session's past in your terminal's own scrollback: the viewer draws on
+  the alternate screen, which has none. `koh output SERVER --session NAME --last` prints what
+  the last command printed, the session's `history` file on the server has all of it, and a
+  `tmux` or a pager in the session scrolls as it does anywhere.
+- Don't paste megabytes into a program that reads nothing and expect the rest of what you
+  type to arrive: what is typed is typed as the program reads, in its order, and nothing of
+  it is dropped, so it waits, as on any terminal. About a megabyte and a half waits on its
+  way; past that your terminal itself waits with the paste, and takes no key, `Ctrl-] .`
+  neither. Close the terminal then (koh is hung up and ends), or let the program read.
 - Don't start panes of your own in the sessions workspace: they are sessions to koh, counted
   against `--max-sessions`, attached to by a `koh connect` that names none, and the oldest
   ended one is removed to make room. A `fux view` of that workspace invites it: its keys for a
@@ -105,49 +123,42 @@ koh adds nothing to stop these. What happens instead is said.
 - Don't run `keys/.restore` on koh's `fux` session (it must be named for that: `.restore` alone
   does not look there): it starts every session that has ended anew, with whatever `fux` is on
   the path.
-- Don't make, in a session's folder, a FIFO other than `in` and `ctl`, a link that leads to
-  no folder of it, more than 256 names, or two names that differ only in the case of their
-  letters; and don't `mv` a file there into a folder, or rename one twice while a client is
-  away. Each ends every attached client with a line that says which.
-- Don't keep a file over 32 MiB in a session's folder: a mirror has its first 32 MiB, and one
-  that is replaced is sent again at every look.
-- Don't make a file in a session's folder unreadable: no client gets a round while it is.
-- Don't write into a mirror, but for its `in` and `ctl`: it is koh's alone to write. A client
-  whose mirror is not what koh left there (another folder's files, a file renamed after
-  another) is ended when it attaches next.
-- Don't write `kill` to a session's `ctl`, or a mirror's, unless you mean it: it hangs up the
-  program for every client. Any key with no scope may; it may run any command.
-- Don't write to a mirror's `ctl` while it has no link: only the last `resize` written then is
-  sent, and koh says that the other lines were dropped.
-- Don't keep a mirror after a `koh mount` that was killed: it is a still picture. Remove it; a
-  mount does not take a folder that is there.
-- Don't look at a session or a mirror with a `fux` of another version than koh was built with:
+- Don't write `kill` to a session's `ctl` unless you mean it: it hangs up the program for
+  every client. Any key with no scope may; it may run any command.
+- Don't look at a session's folder with a `fux` of another version than koh was built with:
   `koh fux view` is the one that reads what koh's holders write.
 
 **Do**
 
 - After a stall, look at the screen before you type on. What you type while koh says there is
-  no link is held (64 KiB of what is written to `in`, beside what its pipe holds; past that
-  whoever writes waits) and typed on return; what was on its way when a link died may be
-  lost, so a line can arrive without its beginning. A link that dies without a word, or a
-  server that does (killed, its machine gone), is noticed when the connection has been
-  silent for the thirty seconds koh allows a session, which is not thirty seconds from the
-  moment it died: what was typed since may be lost with it. After a long cut the link is not
-  back at once with the path: koh gives each dial five seconds and waits five between two,
-  so a path whose handshake takes longer than that is not dialled with success.
+  no link is held (64 KiB; what is typed past that is lost) and typed on return; what was on
+  its way when a link died may be lost, so a line can arrive without its beginning. A link
+  that dies without a word, or a server that does (killed, its machine gone), is noticed when
+  the connection has been silent for the eight seconds koh allows a session: what was typed
+  in those seconds is lost with it. After a long cut the link is not back at once with the
+  path: koh gives each dial five seconds and waits five between two, so a path whose
+  handshake takes longer than that is not dialled with success.
+- To have a session's programs know your terminal's colours, write them on the server, in
+  koh's `fux` session (the folder above the one `koh serve` printed): `koh exec box -- sh -c
+  "printf 'foreground #d0d0d0\nbackground #1c1c1c\n' > PATH/../colours"`. Every session is
+  answered from that file (`fux`'s README has its lines).
 - To take a session's size back, resize your terminal. A session has the size of the terminal
   that last changed: a second client of another size, or one that left, leaves it as it is,
-  and a smaller terminal shows the top left of a larger session.
+  and a smaller terminal shows the top left of a larger session. A terminal resized while
+  there was no link has its size taken when the link is back.
 - To start a name again that has ended, remove its folder on the server (`koh exec box -- rm
   -r PATH/NAME`, the path `koh serve` printed). Until then `--session NAME` shows how it
   ended, and ends the same.
 - On Linux, restart `koh serve` after you replace the `koh` binary. Until then no new session
   starts: koh runs itself by its own path, which is gone, and says "cannot run PATH (deleted):
   No such file or directory". Sessions that run go on.
-- After an upgrade that changes the pane format (the release notes say when), end the sessions
-  started before it: a holder keeps the code it was started with, and nothing in a pane says
-  which format it writes. (A client and a server of two formats refuse each other, before
-  anything is started.)
+- After the upgrade to this koh, end the sessions an older one started: a session is known
+  by its `run`, which holders write since `fux` 0.43.3, and a pane without one is no session
+  to koh (not listed, not attached to; its name cannot be started until its folder is
+  removed). A holder keeps the code it was started with.
+- If `koh serve` was killed outright, start it again before you count what is left: a viewer
+  reads the end of its terminal and leaves by itself, and the folder of one that was killed
+  too (`STATE/fux/.view.PID`) is removed when `koh serve` starts.
 - Under systemd, give `koh serve`'s unit `KillMode=process` and the user
   `loginctl enable-linger`: else stopping the service, or logging out, kills every session.
   A session's holder and its program inherit the descriptors `koh serve` was itself given
@@ -174,14 +185,9 @@ koh adds nothing to stop these. What happens instead is said.
   them: such a session's holder does not number its marks (its folder has no
   `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh
   sessions`, `koh output` and `koh connect` go on with it as it is.
-- On a kernel before 6.13 a file's time is the clock's tick: a file of a session's folder
-  rewritten in place to the same length within one tick is not seen by a client until it
-  changes again. Replace it, or add to its end.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default
   session.
-- To have a session beside your local panes, name a folder in your own `fux` session:
-  `koh mount box "$(fux dir)/main/box"`. koh makes it; it must not be there.
 
 ## Quick start
 
@@ -200,7 +206,6 @@ koh exec box --sync proj -- cargo test
 koh run box --name build -- make -j4 && koh wait box build
 koh cp -r --exclude target ./src box:proj/
 koh connect box
-koh mount box   # a mirror of the session, for `koh fux view`, `cat` or a script
 koh sessions box                       # each session: attached, running, busy, last exit code
 koh wait box --session 1 --timeout 600 # until the command there ends: its output, its code
 koh output box --session 1 --last      # what the last command printed

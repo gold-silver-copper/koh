@@ -71,21 +71,42 @@ binary, its tests and the fuzz targets share code, and any release may change it
   time the hashing took (it grows with the tree, towards the 15 s and 30 s a silent connection
   is allowed). Nor is the folder of a session that goes for a new one removed while every
   attach waits, nor a job started on a thread that serves other requests.
-- After a redial, `koh connect` and `koh mount` give the server five seconds to answer, as on
-  the connection they had. A server that took the new connection and did not answer held them
-  for as long as it lived.
+- After a redial, `koh connect` gives the server five seconds to answer, as on the connection
+  it had. A server that took the new connection and did not answer held it for as long as it
+  lived.
 - A FIFO where a key, `clients`, `servers` or a job's log is expected holds no reader. `koh
   serve` reads `clients` at every request, and one there held it for good.
 
 ### Changed
 
-- **A session is a `fux` pane on the server, kept by `fux`'s holder, and a client has a mirror of
-  its folder** (the README's "Sessions are `fux` panes", with its lines of don't and do). koh has
+- **A session is a `fux` pane on the server, kept by `fux`'s holder and shown by a viewer
+  there** (the README's "Sessions are `fux` panes", with its lines of don't and do). koh has
   `fux` 0.43 in it: `koh fux …` is `fux …`, and `koh hold …` is the holder. `koh serve` keeps no
   table of sessions: the folders are the sessions. Every break of it, in one place:
-  - **`koh/19`.** A client and a server of before and after do not talk: the handshake fails. Both
-    also say fux's pane format (1), and two that differ refuse each other before anything is
-    started (exit 1).
+  - **`koh/20`.** A client and a server of before and after do not talk: the handshake fails.
+    Both ends are to be this koh.
+  - **The session's viewer runs on the server**, one for each `koh connect`, on a terminal of
+    the client's size: what it draws is sent as it comes and written to your terminal, and
+    what you type is sent to it. The client keeps nothing of a session. A first screen is a
+    screen's worth of bytes, whatever history the session has.
+  - **`koh mount` is removed.** Nothing of a session is a file on the client, and a local key
+    script cannot act on a remote pane. `koh output`, `koh wait --session` and `koh sessions`
+    read the session's files on the server.
+  - **Nothing is asked of your terminal**: an answer across a link may come late and be
+    taken for typing. So a session's programs are not told your terminal's colours (write
+    them on the server once: the README's "do") and are not offered the kitty keyboard
+    protocol: keys reach them in their old form. Both worked with the mirror.
+  - **Without a link** your terminal is put back at once (its own screen, no mouse reports)
+    and says `koh: no link; reconnecting`; `Ctrl-] .` leaves then too. What is
+    typed meanwhile is held, 64 KiB of it, and typed once on return; what was on its way when
+    the link died may be lost. A silent link is known to be lost after 8 s (it was 30). A
+    terminal resized meanwhile has its size taken on return, and a link that goes during
+    the first attach is dialled again.
+  - **Every end of `koh connect` but `kill -9` puts the terminal back**; after that one, type
+    `reset`.
+  - **koh has one key, `Ctrl-] .`**, read by `koh connect` where it is typed (`Ctrl-] Ctrl-]`
+    types one Ctrl-]). **`C-b d` and `C-b C-b` are no keys of koh's any more**: `C-b` is the
+    session's, so a `tmux` there has its prefix as it is typed.
   - **Sessions outlive `koh serve`.** They died with it. Stopped and started again it has them,
     and a client dials again and attaches to the run it had. (Under systemd that takes
     `KillMode=process`; on Linux a `koh` binary that was replaced starts no new session until `koh
@@ -100,23 +121,14 @@ binary, its tests and the fuzz targets share code, and any release may change it
     is removed; it was a number counted up and never used twice. **A name that is not there is
     started** (it was "no session", exit 127).
   - **Exit codes.** `koh connect` exits 1, not 0, where nothing says how the session ended (its
-    holder was killed, the machine was restarted, its folder was moved). `koh mount` ends with the
-    session, with its program's status, as `koh connect` does (it was 0). Stopped by SIGINT,
-    SIGTERM or SIGHUP, both remove what they made and exit 0.
-  - **`koh mount`** keeps its mirror in a `fux` session of koh's own on the client,
-    `$XDG_RUNTIME_DIR/koh/fux/koh-mounts/SERVER.NAME` (else `~/.cache/koh/…`); it was
-    `main/koh-SERVER` of the user's own. It refuses a folder that is there (it wrote into it),
-    removes the mirror when it ends (the mirror stayed), and takes `--new`, `-C DIR` and `--
-    PROG`. A mirror has every file of the pane but `status` and `command`: `history`, `log`,
-    `cwd`, `modes` and `links` too.
-  - **`kill` written to a mirror's `ctl` hangs up the session's program,** for every client: a
-    mirror's `in` and `ctl` are the pane's. It ended the mount. Any key with no scope can.
-  - **Without a link** the mirror is left as it is, and koh says so in the viewer's corner (a
-    mount: on its standard error); the mirror's `state` said `reconnecting`. What is typed
-    meanwhile is held, 64 KiB and then whoever writes waits, and is typed once on return; past 64
-    KiB it was dropped.
+    holder was killed, the machine was restarted, its folder was moved). Left by its keys,
+    hung up or told to end (SIGTERM), it exits 0 and the session runs on.
   - **Pictures** are sixel alone, as in `fux` 0.43, within fux's bounds on a pane: a program that
-    draws with the Kitty graphics protocol alone shows nothing.
+    draws with the Kitty graphics protocol alone shows nothing. Your terminal is taken to draw
+    sixel: one that does not shows nothing where the picture is.
+  - **A megabyte pasted into a session is typed whole**, as fast as its program reads.
+  - **`koh serve` removes at its start** the folders of viewers that were killed with a
+    server before it (`STATE/fux/.view.PID`).
   - **`koh sessions`:** `id`, a number, is `name`. The list is the oldest first, by when each
     pane's `status` was written (it was by number). `state` is what the pane's `state` says
     (`exited N`, `killed N`, `hungup`): `running` only while its holder lives, and `ended` where

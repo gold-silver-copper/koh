@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """What a session costs a person at a terminal, measured on the real binary beside a plain fux pane.
 
-    cargo build --release && tools/timing.py target/release/koh [echo] [scroll] [full] [flood] [again]
+    cargo build --release && tools/timing.py target/release/koh [echo] [scroll] [full] [flood] [again] [fullscreen]
 
-Each step runs once through `koh connect` (a `koh serve` on loopback, a session, koh's viewer in a
-200x60 pty this script owns) and once as a plain pane seen through `koh fux view` in such a pty: the
+Each step runs once through `koh connect` (a `koh serve` on loopback, a session, a client in a 200x60 pty this script owns) and once as a plain pane seen through `koh fux view` in such a pty: the
 same holder and viewer without koh between them. It prints a table and leaves nothing behind. Linux
 (it reads /proc for the processors' time); python3 and nothing else.
 
   echo    a key until its echo is on the terminal, typed slowly (100 ms apart) and fast (10 ms)
   scroll  the same while the program prints a line every 5, 20 and 50 ms; how many rounds a second
-          the pane's holder wrote and how many reached the client's mirror; what the server and
-          the client cost meanwhile
-  full    the same after `seq 1 560000`: 3.8 MB in each history file, which the server proves
-          each time a line is added to them
+          the pane's holder wrote; what the server, remote viewer and client cost
+  full    the same after `seq 1 560000`: 3.8 MB in each history file
   flood   `seq 1 2000000`, until its end is on the terminal; then a client that comes anew
-  again   a `koh mount` whose server is stopped and started: until its mirror is the pane again,
-          after nothing changed and after the history was put aside meanwhile (`history.1`)
+  again   a `koh connect` whose server is stopped and started; time to see the current screen
+  fullscreen  open a test file in vi and quit
 """
 import fcntl, os, pty, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, time
 
@@ -40,7 +37,8 @@ class Tty:
     def __init__(self, argv, **more):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 60, 200, 0, 0))
-        self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env(**more), start_new_session=True)
+        self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env(**more), start_new_session=True,
+                                     preexec_fn=lambda: fcntl.ioctl(0, termios.TIOCSCTTY, 0))
         os.close(slave)
         os.set_blocking(self.master, False)
         STARTED.append(self.proc)
@@ -53,6 +51,9 @@ class Tty:
             except OSError:
                 some = b''
             self.drawn += some
+            # (A terminal says what it is when it is asked: `koh connect` and the viewer wait for that.)
+            if b'\x1b[c' in some:
+                os.write(self.master, b'\x1b[?62c')
             return some
         return b''
 
@@ -76,7 +77,7 @@ class Tty:
         return (time.monotonic() - began) * 1000
 
     def end(self):
-        self.proc.kill()
+        self.proc.terminate()
         self.proc.wait()
         os.close(self.master)
 
@@ -103,7 +104,7 @@ def serve():
 def stats(ms):
     ms = sorted(ms)
     at = lambda share: ms[min(len(ms) - 1, int(len(ms) * share))]
-    return f'{at(0.5):7.2f} {at(0.99):7.2f} {ms[-1]:7.2f}'
+    return f'{at(0.5):7.2f} {at(0.90):7.2f} {at(0.99):7.2f} {ms[-1]:7.2f}'
 
 
 def keys(tty, count, gap):
@@ -150,9 +151,23 @@ def main():
         os.makedirs(f'{ROOT}/{folder}')
     start, addr = serve()
     server, server_id, sessions = start()
-    connect = lambda *asks: Tty([KOH, 'connect', server_id, '--direct', addr, *asks])
-    mirror_of = lambda tty: next((f'{ROOT}/run-c/{d}/session/connect/remote' for d in os.listdir(f'{ROOT}/run-c') if d.startswith(f'koh-connect-{tty.proc.pid}-')), None)
-    print(f'koh {subprocess.run([KOH, "--version"], capture_output=True, text=True).stdout.strip()}, load {os.getloadavg()[0]:.1f}; milliseconds: median, p99, most')
+    def connect(*asks):
+        # (Until the viewer's first bytes: `koh connect` has asked its terminal, dialled and attached.)
+        tty = Tty([KOH, 'connect', server_id, '--direct', addr, *asks])
+        tty.until(b'\x1b[?1049h')
+        return tty
+    print(f'koh {subprocess.run([KOH, "--version"], capture_output=True, text=True).stdout.strip()}, load {os.getloadavg()[0]:.1f}; milliseconds: median, p90, p99, most')
+
+    if 'fullscreen' in WHAT:
+        path = f'{ROOT}/vi-input'
+        with open(path, 'w') as out:
+            out.write('FULL-SCREEN-TEST\n')
+        tty = connect('--new', '--', 'vi', path)
+        tty.until(b'FULL-SCREEN-TEST', 10)
+        os.write(tty.master, b':q!\r')
+        assert tty.proc.wait(timeout=10) == 0
+        print('vi: file drawn, :q! returned 0')
+        tty.end()
 
     if 'echo' in WHAT:
         runs = {'koh connect': [[], []], 'plain fux view': [[], []]}
@@ -178,29 +193,31 @@ def main():
                     tty = connect('--new', '--', 'sh', '-c', program)
                     time.sleep(3.0 if fill else 1.0)
                     pane = f'{sessions}/{(set(os.listdir(sessions)) - before).pop()}'
-                    watched = [pane, mirror_of(tty)]
+                    viewers = os.path.dirname(sessions)
+                    viewer = max((int(entry[6:]) for entry in os.listdir(viewers) if entry.startswith('.view.')), default=0)
                 else:
                     tty, pane = plain(f's{filled}{every}', program)
                     time.sleep(3.0 if fill else 1.0)
-                    watched = [pane]
-                seen, rounds, cost = [number(w) for w in watched], [0] * len(watched), (ticks(server.pid), ticks(tty.proc.pid))
+                    viewer = 0
+                seen, rounds = number(pane), 0
+                cost = [ticks(pid) for pid in [server.pid, tty.proc.pid, viewer]]
                 began, echoes, next_key = time.monotonic(), [], time.monotonic() + 0.2
                 while time.monotonic() - began < 6:
                     # (The folders' numbers are looked at each millisecond; a key every 150 ms.)
-                    for at, folder in enumerate(watched):
-                        now = number(folder)
-                        if now != seen[at]:
-                            seen[at], rounds[at] = now, rounds[at] + 1
+                    now = number(pane)
+                    if now != seen:
+                        seen, rounds = now, rounds + 1
                     if time.monotonic() >= next_key:
                         echoes.append(tty.key(KEYS[len(echoes) % len(KEYS)]))
                         next_key = time.monotonic() + 0.15
                     tty.read(0.001)
                 took = time.monotonic() - began
                 # (`generation` is replaced twice a round: odd, then even.)
-                per = ' '.join(f'{r / 2 / took:5.1f}' for r in rounds)
-                cpu = f'server {100 * (ticks(server.pid) - cost[0]) / took:4.1f}% client {100 * (ticks(tty.proc.pid) - cost[1]) / took:4.1f}%' if name == 'koh connect' else f'viewer {100 * (ticks(tty.proc.pid) - cost[1]) / took:4.1f}%'
+                per = rounds / 2 / took
+                server_cpu, client_cpu, viewer_cpu = [100 * (ticks(pid) - was) / took for pid, was in zip([server.pid, tty.proc.pid, viewer], cost)]
+                cpu = f'server {server_cpu:4.1f}% remote viewer {viewer_cpu:4.1f}% client {client_cpu:4.1f}%' if name == 'koh connect' else f'viewer {client_cpu:4.1f}%'
                 history = f', {os.path.getsize(pane + "/history") / 1e6:.1f} MB of history' if fill else ''
-                print(f'a line every {float(every) * 1000:2.0f} ms{history}: a key\'s echo    {name:15} {stats(echoes)}   rounds a second (holder{", mirror" if len(rounds) > 1 else ""}): {per}   {cpu}')
+                print(f'a line every {float(every) * 1000:2.0f} ms{history}: a key\'s echo    {name:15} {stats(echoes)}   holder rounds/s {per:5.1f}   {cpu}')
                 tty.end()
 
     if 'flood' in WHAT or 'again' in WHAT:
@@ -230,35 +247,18 @@ def main():
         tty.end()
 
     if 'again' in WHAT:
-        mirror, said = f'{ROOT}/mounted', f'{ROOT}/mount.said'
-        mount = subprocess.Popen([KOH, 'mount', server_id, '--direct', addr, '--session', flooded, mirror], env=env(), stdin=subprocess.DEVNULL, stderr=open(said, 'w'))
-        STARTED.append(mount)
-        size = lambda folder: sum(os.path.getsize(f'{folder}/{f}') for f in ['history', 'history.styled'])
-        same = lambda: open(f'{mirror}/generation').read() == open(f'{pane}/generation').read() and size(mirror) == size(pane)
-        backs = lambda: open(said).read().count('the link is back')
-        while not (os.path.exists(f'{mirror}/generation') and same()):
-            time.sleep(0.01)
-        for what, typed in [('nothing changed', b''), ('a line printed', b'echo one-line\n'), ('the history put aside meanwhile', b'seq 1 700000\n')]:
-            server.send_signal(signal.SIGINT)
-            server.wait()
-            aside = os.stat(f'{pane}/history.1').st_ino if os.path.exists(f'{pane}/history.1') else 0
-            had, round_before, came = size(pane), number(mirror), backs()
-            with open(f'{pane}/in', 'wb') as keys_in:
-                keys_in.write(typed)
-            time.sleep(4 if typed.startswith(b'seq') else 0.5)
-            moved = os.path.exists(f'{pane}/history.1') and os.stat(f'{pane}/history.1').st_ino != aside
-            server, _, _ = start()
-            # From the server's answer to the attach (koh says the link is back) until the first
-            # round has been applied: the mirror's list, the server's reading of it, the round.
-            while backs() == came:
-                time.sleep(0.0005)
-            began = time.monotonic()
-            while number(mirror) == round_before or not same():
-                time.sleep(0.0005)
-                assert time.monotonic() - began < 60, 'the mirror did not become the pane'
-            grew = (size(pane) - had) / 1e6 if not moved else float('nan')
-            print(f'a mount whose server came back, {what}{" (history.1 is another file)" if moved else ""}: from the answer to its attach until its mirror is the pane again {(time.monotonic() - began) * 1000:.0f} ms' + (f' ({grew:.2f} MB added)' if grew == grew else ''))
-        mount.kill()
+        tty = connect('--session', flooded)
+        tty.until(b'THE-END')
+        server.send_signal(signal.SIGINT)
+        server.wait()
+        tty.until(b'no link')
+        with open(f'{pane}/in', 'wb') as keys_in:
+            keys_in.write(b"echo RESTART-''OK\n")
+        began = time.monotonic()
+        server, _, _ = start()
+        tty.until(b'RESTART-OK', 20)
+        print(f'after restarting serve: current screen on the terminal after {(time.monotonic() - began) * 1000:.0f} ms')
+        tty.end()
 
 try:
     main()
@@ -271,4 +271,5 @@ finally:
     for proc in STARTED:
         if proc.poll() is None:
             proc.kill()
+        proc.wait()
     shutil.rmtree(ROOT, ignore_errors=True)

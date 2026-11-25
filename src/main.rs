@@ -28,6 +28,17 @@ fn main() -> ExitCode {
     // thread but fux's own, and no runtime.
     let mut words = std::env::args_os().skip(1).peekable();
     match words.peek().and_then(|word| word.to_str()) {
+        // A session's viewer, as `koh serve` runs it on a pty for a client's terminal: the pane,
+        // and the keyboard's flags that terminal takes.
+        Some("view-session") => {
+            let words: Vec<_> = words.skip(1).collect();
+            let [pane, keyboard] = words.as_slice() else {
+                return ExitCode::from(Exit::USAGE.0);
+            };
+            let keyboard = keyboard.to_str().and_then(|flags| flags.parse().ok());
+            let viewed = fux::view_pane(pane.into(), keyboard.unwrap_or(0));
+            return viewed.map_or(ExitCode::FAILURE, |()| ExitCode::SUCCESS);
+        }
         Some("fux") => return fux::command(words.skip(1)),
         Some("hold") => return fux::command(words),
         _ => {}
@@ -99,8 +110,7 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "wait" => cmd_wait(rest).await,
         "cp" => cmd_cp(rest).await,
         "sessions" | "output" => cmd_sessions(rest, cmd == "output").await,
-        "connect" => cmd_session(rest, false).await,
-        "mount" => cmd_session(rest, true).await,
+        "connect" => cmd_session(rest).await,
         other => Err(KohError::usage(format!(
             "unknown command {other:?} (try `koh --help`)"
         ))),
@@ -953,15 +963,15 @@ fn listed(s: &SessionInfo) -> String {
     )
 }
 
-/// `koh connect` and `koh mount` name a session the same way; `mount` may name a directory too.
-async fn cmd_session(args: &[String], mount: bool) -> Result<Exit> {
+/// `koh connect`.
+async fn cmd_session(args: &[String]) -> Result<Exit> {
     let mut opts = DialOptions {
         key_file: None,
         direct: None,
         relay: None,
         json: false,
     };
-    let (mut server, mut place) = (None::<String>, None::<PathBuf>);
+    let mut server = None::<String>;
     let mut asks = ConnectOptions::default();
     let mut i = 0;
     while i < args.len() {
@@ -980,25 +990,14 @@ async fn cmd_session(args: &[String], mount: bool) -> Result<Exit> {
             "--session" => asks.session = Some(take_opt(args, &mut i, a)?),
             "-C" | "--cwd" => asks.cwd = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
-            _ if mount && place.is_none() && !a.starts_with('-') => place = Some(a.into()),
             _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
         }
         i += 1;
     }
     let server = server.ok_or_else(|| {
-        let (what, place) = if mount {
-            ("mount", " [MIRROR]")
-        } else {
-            ("connect", "")
-        };
-        KohError::usage(format!(
-            "usage: koh {what} SERVER [--session NAME | --new] [-C DIR]{place} [-- PROG...]"
-        ))
+        KohError::usage("usage: koh connect SERVER [--session NAME | --new] [-C DIR] [-- PROG...]")
     })?;
-    let client = Client::connect(&server, &opts, true).await?;
-    let code = match mount {
-        true => client.mount(asks, place, &server).await?,
-        false => client.connect_interactive(asks).await?,
-    };
+    let client = Client::connect_view(&server, &opts).await?;
+    let code = client.connect_interactive(asks).await?;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
 }

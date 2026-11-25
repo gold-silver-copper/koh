@@ -2,7 +2,6 @@
 //! and interactive fux sessions over iroh QUIC.
 #![forbid(unsafe_code)]
 
-pub mod carry;
 pub mod client;
 pub mod jobs;
 pub mod keys;

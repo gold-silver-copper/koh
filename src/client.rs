@@ -731,6 +731,12 @@ impl Terminal {
             term: if named { term } else { String::new() },
             ..Terminal::default()
         };
+        // (Of each colour what was said of it last: a terminal may say one twice.)
+        let mut colours = [
+            ("10", "foreground", None),
+            ("11", "background", None),
+            ("12", "cursor", None),
+        ];
         for part in String::from_utf8_lossy(answers).split('\x1b') {
             let flags = part
                 .strip_prefix("[?")
@@ -744,10 +750,14 @@ impl Terminal {
             let Some((which, value)) = colour else {
                 continue;
             };
-            let names = [("10", "foreground"), ("11", "background"), ("12", "cursor")];
-            let name = names.into_iter().find(|(number, _)| *number == which);
+            let said = colours.iter_mut().find(|(number, ..)| *number == which);
             let value = fux_vt::colour(value.trim_end_matches('\x07'));
-            if let (Some((_, name)), Some([r, g, b])) = (name, value) {
+            if let (Some((.., said)), Some(value)) = (said, value) {
+                *said = Some(value);
+            }
+        }
+        for (_, name, said) in colours {
+            if let Some([r, g, b]) = said {
                 terminal.colours += &format!("{name} #{r:02x}{g:02x}{b:02x}\n");
             }
         }
@@ -1262,6 +1272,13 @@ mod tests {
         assert_eq!(
             terminal.colours,
             "foreground #d0d0d0\nbackground #12ab00\ncursor #ff007f\n"
+        );
+        // A colour said twice (an answer that was on its way before koh asked) is told as it
+        // was said last: of each of the three one line, three lines at most, in their order.
+        let twice: &[u8] = b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b]12;rgb:00/00/00\x07\x1b]10;rgb:d0/d0/d0\x07\x1b]11;rgb:1c/1c/1c\x07\x1b[?6c";
+        assert_eq!(
+            Terminal::said(twice).colours,
+            "foreground #d0d0d0\nbackground #1c1c1c\ncursor #000000\n"
         );
         // Its last answer in pieces is none until it is whole, wherever it is cut.
         for cut in 0..end {

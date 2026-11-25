@@ -3301,6 +3301,30 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
 }
 
 #[test]
+fn what_was_typed_before_the_key_that_leaves_is_typed() {
+    let host = Host::start("before", &[]);
+    // What is typed right before `Ctrl-] .`, in one write with it (a paste and the key, a
+    // fast hand): koh leaves, and the session has it, all of it and in its order. One byte,
+    // and some thousands.
+    let lines: Vec<u8> = (0..400)
+        .flat_map(|n| format!("{n:07}\n").into_bytes())
+        .collect();
+    for (name, typed) in [("one", &b"q"[..]), ("many", &lines[..])] {
+        let out = host.tmp.0.join(name);
+        let mut tty = host.attach(&["--session", name], &reads_into(&out));
+        tty.until("the program is ready", |tty| {
+            tty.drawn.windows(5).any(|drawn| drawn == b"READY")
+        });
+        tty.types(&[typed, b"\x1d."].concat());
+        assert_eq!(tty.ends(), Some(0));
+        until("what was typed before the key is typed", || {
+            fs::read(&out).unwrap_or_default() == typed
+        });
+        until("the viewer is gone", || viewers(&host).is_empty());
+    }
+}
+
+#[test]
 fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
     let host = Host::start("stalled", &[]);
     // A terminal that takes nothing more (one behind a path that is stuck), under a program

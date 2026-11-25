@@ -981,7 +981,17 @@ impl Console {
                 }
             }
         };
-        tokio::select! { ended = draws => ended, ended = types => ended }
+        let (ended, left) = tokio::select! {
+            ended = draws => (ended, false),
+            ended = types => (ended, true),
+        };
+        // koh leaves on a link that lives (its key was typed, or the terminal is closed): what
+        // was typed before that is sent first, and nothing the link says meanwhile undoes the
+        // leaving.
+        if let (Ok(Some(_)), true) = (&ended, left) {
+            keys.last(send).await;
+        }
+        ended
     }
 }
 
@@ -1121,6 +1131,22 @@ impl Keys {
                 _ => self.ready.push_back(piece.to_vec()),
             }
         }
+    }
+
+    /// Sends what was typed and is not sent, and ends the stream, as koh leaves: the session
+    /// has what was typed before the key that leaves. A quarter of a second for the link to
+    /// take it: one that takes nothing does not hold the leaving.
+    async fn last(&mut self, send: &mut SendStream) {
+        let sent = async {
+            for bytes in std::mem::take(&mut self.ready) {
+                send_msg(send, &ViewInput::Bytes(bytes), VIEW_FRAME).await?;
+            }
+            let _ = send.finish();
+            send.stopped()
+                .await
+                .map_err(|e| KohError::failed(e.to_string()))
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(250), sent).await;
     }
 
     /// The next message of what was typed: read of the terminal when none waits. What is no

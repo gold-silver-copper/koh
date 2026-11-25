@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, DirBuilder, TryLockError};
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -555,7 +556,8 @@ impl Sessions {
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| KohError::failed(format!("cannot run {}: {e}", self.exe.display())))?;
-        drop(slave);
+        // (The viewer's end of the pty is kept open here too, to see what the viewer has not
+        // read of it. So the pty does not say when the viewer has left: the viewer does.)
         let session = self.dir.parent().zip(viewer.id());
         _folder = session.map(|(session, id)| Folder(session.join(format!(".view.{id}"))));
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
@@ -571,8 +573,16 @@ impl Sessions {
         let unread = send.stopped();
         let drawn = async {
             let mut piece = vec![0; 8 << 10];
-            // (The pty's other end is closed when the viewer has left: Linux says so with an error.)
-            while let Ok(n @ 1..) = reads.read(&mut piece).await {
+            loop {
+                // (Once the viewer has left, what it drew last is all there to be read.)
+                let read = tokio::select! {
+                    biased;
+                    read = reads.read(&mut piece) => read,
+                    _ = viewer.wait() => reads.try_read(&mut piece),
+                };
+                let Ok(n @ 1..) = read else {
+                    break;
+                };
                 let bytes = piece.get(..n).unwrap_or_default().to_vec();
                 send_msg(send, &ViewOutput::Bytes(bytes), VIEW_FRAME).await?;
             }
@@ -600,10 +610,20 @@ impl Sessions {
             // A client that reads its stream no further: nothing is drawn for it.
             _ = unread => false,
         };
+        // What was typed is the viewer's to read before its terminal goes: a pty that is closed
+        // drops what its other end has not read, and a client that leaves has typed what it
+        // typed. A quarter of a second for it: a viewer that reads nothing holds nothing up.
+        let unread = || fuxix::wait([(Some(slave.as_fd()), fuxix::POLLIN)], 0);
+        let read = async {
+            while unread().is_ok_and(|[typed]| typed != 0) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(250), read).await;
         // The viewer leaves by itself: its pane ended and it drew the last screen, its user
         // left it, or its terminal is gone now. One that has not in a second is killed, and
         // waited for: it is gone when this is over.
-        drop((master, reads, writes));
+        drop((master, reads, writes, slave));
         let gone = tokio::time::timeout(Duration::from_secs(1), viewer.wait()).await;
         if gone.is_err() {
             let _ = viewer.kill().await;

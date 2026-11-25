@@ -11,9 +11,21 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2 and 0.18.0 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0 and 0.18.1 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.18.1] — 2026-11-25
+
+The protocol is 0.18.0's (`koh/20`): only a server needs this one.
+
+### Fixed
+
+- **A bell is not written over the session's last row.** When a session's program rang the bell
+  (vim, on Escape in normal mode), `NAME: bell` stood in the bottom right corner of the client's
+  screen until the next key, over the program's own row; a notice's words (OSC 9) likewise. The
+  bell and the notice are passed on to your terminal, as before, and nothing is drawn. This is
+  fux 0.43.5, which koh now has in it.
 
 ## [0.18.0] — 2026-11-25
 
@@ -760,7 +772,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/gold-silver-copper/koh/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gold-silver-copper/koh/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/gold-silver-copper/koh/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/gold-silver-copper/koh/compare/v0.17.0...v0.17.1

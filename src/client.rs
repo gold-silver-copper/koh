@@ -102,8 +102,7 @@ impl Client {
         route: Option<crate::keys::Route>,
         config: QuicTransportConfig,
     ) -> Result<Self> {
-        let (endpoint, addr, conn) =
-            connect_server(secret.clone(), server_id, route, config).await?;
+        let (endpoint, addr, conn) = connect_server(server_id, route, config).await?;
         Ok(Self {
             secret,
             endpoint,

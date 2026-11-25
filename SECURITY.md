@@ -57,7 +57,7 @@ credit reporters who want it.
   a terminal; and the system-call layer **`fuxix`** (PTYs, sessions, signals). What a pane's
   files mean and what a viewer does with them is fux's: a parse or drawing bug there belongs
   to the [fux](https://github.com/gold-silver-copper/fux) project. Which pane a viewer is
-  started on, with which keys, and who may ask, is koh's.
+  started on, and who may ask, is koh's.
 - **The user's terminal emulator.** What it does with the bytes a session sends is its own:
   a server reaches its parser as `ssh` to that server would.
 

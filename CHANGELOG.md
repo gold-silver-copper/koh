@@ -81,7 +81,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 - **A session is a `fux` pane on the server, kept by `fux`'s holder and shown by a viewer
   there** (the README's "Sessions are `fux` panes", with its lines of don't and do). koh has
-  `fux` 0.43 in it: `koh fux …` is `fux …`, and `koh hold …` is the holder. `koh serve` keeps no
+  `fux` 0.43.4 in it: `koh fux …` is `fux …`, and `koh hold …` is the holder. `koh serve` keeps no
   table of sessions: the folders are the sessions. Every break of it, in one place:
   - **`koh/20`.** A client and a server of before and after do not talk: the handshake fails.
     Both ends are to be this koh.
@@ -105,7 +105,10 @@ binary, its tests and the fuzz targets share code, and any release may change it
     terminal resized meanwhile has its size taken on return, and a link that goes during
     the first attach is dialled again.
   - **Every end of `koh connect` but `kill -9` puts the terminal back**; after that one, type
-    `reset`.
+    `reset`. Told to end (SIGTERM, SIGHUP, SIGINT) it ends within a quarter of a second also
+    when its terminal takes nothing more.
+  - **`koh serve` told to end (SIGTERM) closes as on Ctrl-C**: a service that is stopped or
+    restarted tells its clients at once, and they say `no link` then and not ten seconds on.
   - **koh has one key, `Ctrl-] .`**, read by `koh connect` where it is typed (`Ctrl-] Ctrl-]`
     types one Ctrl-]). **`C-b d` and `C-b C-b` are no keys of koh's any more**: `C-b` is the
     session's, so a `tmux` there has its prefix as it is typed.

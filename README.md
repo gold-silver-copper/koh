@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, delta file sync, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~22,000):
+Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (6,157 lines of `src/` without its tests, down from ~22,000):
 
 - **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/20`) with TLS-bound Ed25519 client proofs,
   compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files, QR codes
@@ -45,7 +45,8 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     it has dialled, before its first attach, koh asks which of the kitty keyboard protocol's
     flags the terminal takes, its foreground, background and cursor colours, and last what
     it is, which every terminal answers and which ends the asking: the first screen waits
-    for that answer, a millisecond or so. The answers go with every attach, with `TERM` and
+    for that answer, a millisecond or so. (What you typed before koh asked, while it
+    dialled, is typed: it is read first.) The answers go with every attach, with `TERM` and
     the size, cells and pixels, and the server writes them where the session's programs are
     answered from (`colours` and `keyboard` in koh's `fux` session: they are the server's,
     not one session's, and of two clients the last to attach is believed). So vim is told

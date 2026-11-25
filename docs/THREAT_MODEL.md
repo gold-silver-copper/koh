@@ -54,8 +54,8 @@ have it show another pane, another workspace, or run a script.
 
 - **Bounds:** a message is refused before it is read past its length (`src/proto.rs`): 512
   bytes for a proof; 1 MiB for a request, the answer that it was taken, and the short answers
-  (a list of jobs); 256 KiB for a piece of a file, of input or of output, and for every message
-  of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
+  (a list of jobs); 256 KiB for a piece of a file, of input or of output; 16 KiB for every
+  message of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
   for a copy's manifest and what a job's wait returns. A session's text (`koh output`, `koh
   wait --session`) and the list of sessions are sent in pieces of 64 KiB and are as long as
   the pane's files, and the folders kept, make them: for files that fux wrote, fux's bounds,
@@ -64,7 +64,10 @@ have it show another pane, another workspace, or run a script.
   none (a FIFO, a link) is not read and not waited on. An attach says of the client's terminal
   its size, its `TERM` (printable, 64 bytes at most), a number for its keyboard and at most
   three lines of colours (`foreground`, `background`, `cursor`, each `#` and six hex
-  digits): what is anything else is refused before a session is started or a file written.
+  digits): what is anything else is refused before a session is started or a file written,
+  and the two files are written once the attach will be shown a session, not before (one
+  that is refused for its run, its name or the server's cap changes nothing; one whose
+  program then cannot be started has written them).
   The two files are the server's and not one session's: a client with an unscoped key
   chooses what the programs of every session there are told of their terminal's colours and
   keyboard, until the next attach says otherwise. For each attach
@@ -85,8 +88,8 @@ have it show another pane, another workspace, or run a script.
   a client that comes back to the session that was chosen to go, while the new one starts,
   keeps it, and both stay until a later start finds an ended one without a client.
 - **Not bounded:** how many jobs it starts, the size of a job's log, and what a command it runs
-  uses. A request that waits for a job (`koh wait`, `koh logs -f`) is not stopped when its
-  connection goes; it ends with what it waits for. (`koh wait --session` looks at the pane ten
+  uses. A request that waits for a job (`koh wait`, `koh logs -f`) ends with what it waits
+  for, or when its client's stream has ended. (`koh wait --session` looks at the pane ten
   times a second, and between two looks sees that its client's stream has ended: it looks no
   more. A look that has begun is finished; so is a read for `koh output` or `koh sessions`,
   whose client is not looked for until the answer is sent.)
@@ -201,5 +204,5 @@ pane's folder 0700 by fux. Anything that runs as the server's user can type into
 resize it, hang it up and remove it, and start a pane there that koh takes for a session:
 the files are the interface. A session's holder is no child of `koh serve` and is not ended
 with it; nor is a session's viewer when `koh serve` is killed outright: it reads the end of
-its terminal and leaves. A viewer's folder (`fux/.view.PID`) and the viewers' keys (`keys`) are
-in the server's state. On a client a session leaves nothing.
+its terminal and leaves. A viewer's folder (`fux/.view.PID`) is in the server's state; a
+viewer has no keys there. On a client a session leaves nothing.

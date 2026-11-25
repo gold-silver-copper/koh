@@ -241,7 +241,13 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
 pub async fn run_serve(opts: ServeOptions) -> Result<()> {
     fuxix::own_children();
     let running = start_server(opts).await?;
-    let _ = tokio::signal::ctrl_c().await;
+    // (Told to end as a service is, it closes as on Ctrl-C: its clients hear of it at once.)
+    let told = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let mut told = told.map_err(|e| KohError::failed(format!("SIGTERM: {e}")))?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = told.recv() => {}
+    }
     running.shutdown().await;
     Ok(())
 }

@@ -2460,8 +2460,12 @@ impl Host {
 
     /// Stops the server as Ctrl-C does, and waits until it is gone.
     fn stop(&mut self) {
+        self.stop_by("-INT");
+    }
+
+    fn stop_by(&mut self, how: &str) {
         let mut served = self.served.take().unwrap();
-        signal(&served.server.id().to_string(), "-INT");
+        signal(&served.server.id().to_string(), how);
         served.server.wait().unwrap();
     }
 
@@ -2569,6 +2573,20 @@ fn viewer_reconnects_after_serve_restarts() {
         tty.drawn.windows(7).any(|s| s == b"back-42")
     });
     assert_eq!(holder_of(&pane), holder);
+    // Told to end as a service is (`systemctl restart`), the server closes as it does on
+    // Ctrl-C: its clients hear of it at once, and not after the eight seconds of silence.
+    let drawn = tty.drawn.len();
+    host.stop_by("-TERM");
+    let told = Instant::now();
+    tty.until("link down again", |tty| {
+        tty.drawn[drawn..].windows(7).any(|s| s == b"no link")
+    });
+    assert!(
+        told.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        told.elapsed()
+    );
+    host.serve();
     tty.types(b"exit 7\n");
     assert_eq!(tty.ends(), Some(7));
 }

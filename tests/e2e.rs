@@ -4384,431 +4384,146 @@ async fn an_end_is_seen_where_a_prompt_drawn_again_left_a_full_file_short() {
     client.close().await;
 }
 
-/// Several clients of one key dial from distinct ephemeral endpoint ids and prove the client key on
-/// the connection; a real server authorizes both by the proved key alone.
 #[tokio::test]
-async fn each_client_dials_from_its_own_endpoint_id_and_proves_the_client_key() {
+async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
     let tmp = TempDir::new("ephemeral-dial");
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    fs::create_dir_all(&srv_cfg).unwrap();
-    fs::create_dir_all(&cli_cfg).unwrap();
+    let key = new_key(&tmp, "client.key");
+    let (srv, route) = boot_server(&tmp, vec![key.public()], ServeOptions::default()).await;
+    let dial = || Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false);
 
-    let client_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
-    let probe_key = load_or_create_key(Role::Server, Some(&tmp.0.join("probe.key"))).unwrap();
-    let probe_ep = koh::net::bind_server(
-        probe_key.clone(),
-        Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        true,
-    )
-    .await
-    .unwrap();
-    let probe_addr = probe_ep.bound_sockets().into_iter().next().unwrap();
-
-    let expected_id = client_key.public();
-    let accept = tokio::spawn({
-        let ep = probe_ep.clone();
-        async move {
-            let mut tasks = tokio::task::JoinSet::new();
-            for _ in 0..2 {
-                let incoming = ep.accept().await.unwrap();
-                tasks.spawn(async move {
-                    let conn = incoming.await.unwrap();
-                    let peer_ep = conn.remote_id();
-                    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-                    let proved = koh::net::verify_client(&conn, &mut recv).await.unwrap();
-                    assert_eq!(proved, expected_id);
-                    let _req: Request = recv_msg(&mut recv, MAX_CTRL).await.unwrap();
-                    send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL)
-                        .await
-                        .unwrap();
-                    send_msg(&mut send, &Vec::<koh::proto::JobInfo>::new(), MAX_CTRL)
-                        .await
-                        .unwrap();
-                    let _ = send.finish();
-                    (peer_ep, conn)
-                });
-            }
-            let mut seen = Vec::new();
-            while let Some(res) = tasks.join_next().await {
-                seen.push(res.unwrap());
-            }
-            seen
-        }
-    });
-
-    let c1 = Client::connect_direct(
-        client_key.clone(),
-        probe_key.public(),
-        Some(Route::Direct(probe_addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    let c2 = Client::connect_direct(
-        client_key.clone(),
-        probe_key.public(),
-        Some(Route::Direct(probe_addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    assert!(c1.jobs(None).await.unwrap().is_empty());
-    assert!(c2.jobs(None).await.unwrap().is_empty());
-
-    let seen = accept.await.unwrap();
-    let ep1 = seen[0].0;
-    let ep2 = seen[1].0;
-    c1.close().await;
-    c2.close().await;
-    drop(seen);
-    probe_ep.close().await;
-
-    assert_ne!(
-        ep1, expected_id,
-        "client 1 dialed using the client identity key instead of a fresh ephemeral key"
-    );
-    assert_ne!(
-        ep2, expected_id,
-        "client 2 dialed using the client identity key instead of a fresh ephemeral key"
-    );
-    assert_ne!(
-        ep1, ep2,
-        "two clients of the same key shared one endpoint id"
-    );
-
-    // Real server whose `clients` file contains only `client_key.public()` authorizes both
-    // concurrent connections by their proved key.
-    save_clients(
-        Some(&srv_cfg.join("server.key")),
-        &[ClientEntry {
-            name: "laptop".into(),
-            id: expected_id,
-            scope: Scope::Full,
-        }],
-    )
-    .unwrap();
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_cfg.join("server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: Vec::new(),
-        shell: Some("/bin/sh".into()),
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.unwrap();
-
-    let a = Client::connect_direct(
-        client_key.clone(),
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    let b = Client::connect_direct(
-        client_key,
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    let (r1, r2) = tokio::join!(
-        a.exec(
-            vec!["printf one".into()],
-            Some("/tmp".into()),
-            true,
-            None,
-            true
-        ),
-        b.exec(
-            vec!["printf two".into()],
-            Some("/tmp".into()),
-            true,
-            None,
-            true
-        ),
-    );
-    assert_eq!(r1.unwrap(), (0, b"one".to_vec(), Vec::new()));
-    assert_eq!(r2.unwrap(), (0, b"two".to_vec(), Vec::new()));
+    let (a, b) = (dial().await.unwrap(), dial().await.unwrap());
+    assert!(srv.endpoint.remote_info(key.public()).await.is_none());
+    let (r1, r2) = tokio::join!(a.jobs(None), b.jobs(None));
+    assert!(r1.unwrap().is_empty() && r2.unwrap().is_empty());
     a.close().await;
     b.close().await;
-    srv.shutdown().await;
-}
 
-/// A line in `clients` whose scope is malformed (a typo like `copy=/srv`, `cp:/srv`, `cp`, `cp=`,
-/// `exec=`, `--cp /srv`) is skipped and warned on stderr rather than read as `Scope::Full`, while
-/// valid entries in the same file keep working.
-#[tokio::test]
-async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
-    let tmp = TempDir::new("clients-fail-closed");
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    fs::create_dir_all(&srv_cfg).unwrap();
-    fs::create_dir_all(&cli_cfg).unwrap();
-    let srv_key = srv_cfg.join("server.key");
-
-    let valid_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("valid.key"))).unwrap();
-    let cases = [
-        ("typo_copy", "copy=/srv"),
-        ("typo_colon", "cp:/srv"),
-        ("typo_bare", "cp"),
-        ("typo_empty_cp", "cp="),
-        ("typo_empty_exec", "exec="),
-        ("typo_flag", "--cp /srv"),
-    ];
-    let mut bad_keys = Vec::new();
-    let mut text = format!("# comment\n\nvalid {}\n", valid_key.public());
-    for (name, bad_scope) in cases {
-        let key =
-            load_or_create_key(Role::Client, Some(&cli_cfg.join(format!("{name}.key")))).unwrap();
-        text.push_str(&format!("{name} {} {bad_scope}\n", key.public()));
-        bad_keys.push((name, key));
-    }
-    fs::write(srv_cfg.join("clients"), &text).unwrap();
-
-    let loaded = koh::keys::load_clients(Some(&srv_key)).unwrap();
-    assert_eq!(loaded.len(), 1, "only valid entry should load: {loaded:?}");
-    assert_eq!(loaded[0].name, "valid");
-    assert_eq!(loaded[0].scope, Scope::Full);
-
-    // `koh clients` lists only valid entries and warns about each bad line on stderr.
-    let bin = env!("CARGO_BIN_EXE_koh");
-    let cli = Command::new(bin)
-        .args(["clients", "--key-file", srv_key.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(cli.status.success());
-    let stdout = String::from_utf8_lossy(&cli.stdout);
-    let stderr = String::from_utf8_lossy(&cli.stderr);
-    assert!(stdout.contains("valid "), "stdout: {stdout}");
-    for (name, _) in &bad_keys {
-        assert!(
-            !stdout.contains(name),
-            "bad entry listed in stdout: {stdout}"
-        );
-        assert!(
-            stderr.contains(name),
-            "missing stderr warning for {name}: {stderr}"
-        );
-    }
-
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_key),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: Vec::new(),
-        shell: Some("/bin/sh".into()),
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.unwrap();
-
-    // Valid client still has full access.
-    let ok_client =
-        Client::connect_direct(valid_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
-            .await
-            .unwrap();
-    let (code, out, _) = ok_client
-        .exec(
-            vec!["printf ok".into()],
-            Some("/tmp".into()),
-            true,
-            None,
-            true,
-        )
+    let cfg = koh::net::transport_config(false);
+    let (e1, _, _) = koh::net::connect_server(srv.endpoint_id, route.clone(), cfg.clone())
         .await
         .unwrap();
-    assert_eq!((code, out), (0, b"ok".to_vec()));
-    ok_client.close().await;
-
-    // Every malformed-scope client is refused (exit 4).
-    for (name, key) in bad_keys {
-        let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
-            .await
-            .unwrap();
-        let err = client.jobs(None).await.unwrap_err();
-        assert_eq!(
-            err.code,
-            Exit::REFUSED,
-            "malformed client {name} was not refused: {err:?}"
-        );
-        client.close().await;
-    }
+    let (e2, _, _) = koh::net::connect_server(srv.endpoint_id, route, cfg)
+        .await
+        .unwrap();
+    assert_ne!(e1.id(), key.public());
+    assert_ne!(e2.id(), key.public());
+    assert_ne!(e1.id(), e2.id());
+    e1.close().await;
+    e2.close().await;
     srv.shutdown().await;
 }
 
-/// A scope DIR containing spaces is written whole by `koh clients add`, read back whole by
-/// `load_clients`, and enforced as that exact directory (not truncated at the first space).
+#[test]
+fn clients_file_scopes_fail_closed_and_preserve_spaces() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let tmp = TempDir::new("clients-parse");
+    let (key, file) = (tmp.0.join("server.key"), tmp.0.join("clients"));
+    let k = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    let cp = |p: &str| Scope::Cp(p.into());
+    let ex = |p: &str| Scope::Exec(p.into());
+    let rows = [
+        ("# comment".into(), None),
+        (String::new(), None),
+        (format!("full {k}"), Some(("full", Scope::Full))),
+        (format!("ws {k}   "), Some(("ws", Scope::Full))),
+        (format!("cp {k} cp=/srv"), Some(("cp", cp("/srv")))),
+        (format!("sp {k}\tcp=/a  b "), Some(("sp", cp("/a  b ")))),
+        (format!("ex {k} exec=~/a b"), Some(("ex", ex("~/a b")))),
+        (format!("h {k} cp=/a # n"), Some(("h", cp("/a # n")))),
+        (format!("cr {k} cp=/c d\r"), Some(("cr", cp("/c d")))),
+        (format!("t1 {k} copy=/srv"), None),
+        (format!("t2 {k} cp:/srv"), None),
+        (format!("t3 {k} cp"), None),
+        (format!("t4 {k} cp="), None),
+        (format!("t5 {k} exec="), None),
+        (format!("t6 {k} --cp /srv"), None),
+        ("bad_id notakey cp=/srv".into(), None),
+    ];
+    let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
+    fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
+
+    let (entries, skipped) = koh::keys::read_clients(Some(&key)).unwrap();
+    let want: Vec<_> = rows.iter().filter_map(|(_, w)| w.clone()).collect();
+    let got: Vec<_> = entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.scope.clone()))
+        .collect();
+    assert_eq!(got, want);
+    let bad_lines: Vec<_> = skipped.iter().map(|s| s.0).collect();
+    assert_eq!(bad_lines, [10, 11, 12, 13, 14, 15, 16]);
+
+    let cli = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_koh"));
+        c.arg("clients").arg("--key-file").arg(&key).args(args);
+        c
+    };
+    let out = cli(&[]).output().unwrap();
+    assert!(out.status.success());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for (name, _) in &want {
+        assert!(stdout.contains(&format!("{name} ")), "{stdout}");
+    }
+    for n in 10..=16 {
+        assert!(stderr.contains(&format!("clients:{n}:")), "{stderr}");
+    }
+    assert!(!stderr.contains("# comment"));
+
+    let injected = format!("/a\nevil {k}");
+    for bad in [b"".as_slice(), injected.as_bytes(), b"/a\rb", b"/a\xffb"] {
+        let res = cli(&["add", "bad", &k.to_string(), "--cp"])
+            .arg(OsStr::from_bytes(bad))
+            .output()
+            .unwrap();
+        assert_eq!(res.status.code(), Some(2), "{bad:?}");
+    }
+    // Hand-written bare CR in another line does not block `koh clients rm`.
+    fs::write(&file, format!("raw {k} cp=/a\rb\nother {k}\n")).unwrap();
+    assert!(cli(&["rm", "other"]).status().unwrap().success());
+}
+
 #[tokio::test]
-async fn scoped_client_dir_with_spaces_round_trips_and_enforces_exact_dir() {
-    let tmp = TempDir::new("clients-spaces");
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    let dir_trunc = tmp.0.join("a");
-    let dir_space = tmp.0.join("a b");
-    let dir_weird = tmp.0.join("c  d ");
-    for d in [&srv_cfg, &cli_cfg, &dir_trunc, &dir_space, &dir_weird] {
+async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
+    let tmp = TempDir::new("clients-enforce");
+    let (dir_a, dir_ab) = (tmp.0.join("a"), tmp.0.join("a b"));
+    for d in [&tmp.0.join("srv_cfg"), &dir_a, &dir_ab] {
         fs::create_dir_all(d).unwrap();
     }
-    let srv_key = srv_cfg.join("server.key");
-    let cp_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("cp.key"))).unwrap();
-    let exec_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("exec.key"))).unwrap();
-    let weird_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("weird.key"))).unwrap();
+    let srv_key = tmp.0.join("srv_cfg/server.key");
+    let valid = new_key(&tmp, "v.key");
+    let typo = new_key(&tmp, "t.key");
+    let cp_key = new_key(&tmp, "c.key");
+    let mut add = Command::new(env!("CARGO_BIN_EXE_koh"));
+    add.args(["clients", "--key-file"]).arg(&srv_key);
+    add.args(["add", "cpbot", &cp_key.public().to_string(), "--cp"])
+        .arg(&dir_ab);
+    assert!(add.status().unwrap().success());
+    let mut text = fs::read_to_string(tmp.0.join("srv_cfg/clients")).unwrap();
+    text.push_str(&format!(
+        "typo {} copy=/srv\nvalid {}\n",
+        typo.public(),
+        valid.public()
+    ));
+    fs::write(tmp.0.join("srv_cfg/clients"), text).unwrap();
 
-    let bin = env!("CARGO_BIN_EXE_koh");
-    for (name, id, flag, dir) in [
-        ("cpbot", cp_key.public().to_string(), "--cp", &dir_space),
-        (
-            "execbot",
-            exec_key.public().to_string(),
-            "--exec",
-            &dir_space,
-        ),
-        (
-            "weirdbot",
-            weird_key.public().to_string(),
-            "--cp",
-            &dir_weird,
-        ),
-    ] {
-        let out = Command::new(bin)
-            .args([
-                "clients",
-                "--key-file",
-                srv_key.to_str().unwrap(),
-                "add",
-                name,
-                &id,
-                flag,
-                dir.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "clients add {name} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
+    let t = dial(typo).await.unwrap();
+    let v = dial(valid).await.unwrap();
+    let c = dial(cp_key).await.unwrap();
+    assert_eq!(t.jobs(None).await.unwrap_err().code, Exit::REFUSED);
+    assert!(v.jobs(None).await.unwrap().is_empty());
+    let f = tmp.0.join("f.txt");
+    fs::write(&f, "hi").unwrap();
+    let push = |d: &Path| c.cp_push(&f, d.display().to_string(), vec![], false, false, false);
+    assert_eq!(push(&dir_a).await.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(push(&dir_ab).await.unwrap().added, vec!["f.txt"]);
+    for cl in [t, v, c] {
+        cl.close().await;
     }
-
-    let loaded = koh::keys::load_clients(Some(&srv_key)).unwrap();
-    assert_eq!(loaded.len(), 3);
-    assert_eq!(loaded[0].scope, Scope::Cp(dir_space.clone()));
-    assert_eq!(loaded[1].scope, Scope::Exec(dir_space.clone()));
-    assert_eq!(loaded[2].scope, Scope::Cp(dir_weird.clone()));
-
-    // Empty or newline-bearing scope directories are refused at `clients add` (exit 2).
-    for bad in ["", "/a\nb", "/a\rb"] {
-        let out = Command::new(bin)
-            .args([
-                "clients",
-                "--key-file",
-                srv_key.to_str().unwrap(),
-                "add",
-                "bad",
-                &cp_key.public().to_string(),
-                "--cp",
-                bad,
-            ])
-            .output()
-            .unwrap();
-        assert_eq!(
-            out.status.code(),
-            Some(2),
-            "expected usage error for scope dir {bad:?}, got {:?}",
-            out.status
-        );
-    }
-
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_key),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: Vec::new(),
-        shell: Some("/bin/sh".into()),
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.unwrap();
-
-    // cpbot: allowed in `a b`, refused in `a`.
-    let cpbot = Client::connect_direct(cp_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
-        .await
-        .unwrap();
-    let payload = tmp.0.join("hi.txt");
-    fs::write(&payload, "hello").unwrap();
-    let trunc_err = cpbot
-        .cp_push(
-            &payload,
-            dir_trunc.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(trunc_err.code, Exit::REFUSED);
-
-    let ok = cpbot
-        .cp_push(
-            &payload,
-            dir_space.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(ok.added, vec!["hi.txt".to_string()]);
-    assert_eq!(
-        fs::read_to_string(dir_space.join("hi.txt")).unwrap(),
-        "hello"
-    );
-    cpbot.close().await;
-
-    // execbot: allowed in `a b`, refused in `a`.
-    let execbot =
-        Client::connect_direct(exec_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
-            .await
-            .unwrap();
-    let exec_trunc = execbot
-        .exec(
-            vec!["true".into()],
-            Some(dir_trunc.display().to_string()),
-            false,
-            None,
-            true,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(exec_trunc.code, Exit::REFUSED);
-
-    let (code, out, _) = execbot
-        .exec(
-            vec!["printf ok".into()],
-            Some(dir_space.display().to_string()),
-            true,
-            None,
-            true,
-        )
-        .await
-        .unwrap();
-    assert_eq!((code, out), (0, b"ok".to_vec()));
-    execbot.close().await;
-
     srv.shutdown().await;
 }

@@ -125,9 +125,10 @@ koh adds nothing to stop these. What happens instead is said.
   way; past that your terminal itself waits with the paste, and takes no key, `Ctrl-] .`
   neither. Close the terminal then (koh is hung up and ends), or let the program read.
 - Don't expect a key's echo at once while a program floods the screen over a very slow link:
-  at 64 kbit/s it was five to six seconds (measured: some 44 KiB of the flood's frames wait
-  ahead of the link, in the server's pty and the stream's window, and the echo is drawn
-  behind them); at 256 kbit/s under a tenth of a second. Typing with no flood is not held up.
+  at 64 kbit/s it was about five seconds and at most seven (measured: some 44 KiB of the
+  flood's frames wait ahead of the link, in the server's pty and the stream's window, and the
+  echo is drawn behind them); at 256 kbit/s under a tenth of a second. Typing with no flood
+  is not held up.
 - Don't start panes of your own in the sessions workspace: they are sessions to koh, counted
   against `--max-sessions`, attached to by a `koh connect` that names none, and the oldest
   ended one is removed to make room. A `fux view` of that workspace invites it: its keys for a

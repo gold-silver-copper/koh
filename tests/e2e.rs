@@ -4481,6 +4481,23 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
             .unwrap();
         assert_eq!(res.status.code(), Some(2), "{bad:?}");
     }
+    // A trailing CR on the last line without LF is line ending, not DIR, and survives a rename.
+    fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r")).unwrap();
+    assert_eq!(
+        koh::keys::load_clients(Some(&key)).unwrap()[1].scope,
+        cp("/x")
+    );
+    assert!(
+        cli(&["rename", "lead", "renamed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        koh::keys::load_clients(Some(&key)).unwrap()[1].scope,
+        cp("/x")
+    );
+
     // Hand-written bare CR in another line does not block `koh clients rm`.
     fs::write(&file, format!("raw {k} cp=/a\rb\nother {k}\n")).unwrap();
     assert!(cli(&["rm", "other"]).status().unwrap().success());

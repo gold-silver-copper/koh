@@ -425,7 +425,9 @@ async fn the_terminal_is_put_back_however_koh_ends_and_its_key_leaves_with_no_li
         assert_eq!(client.ends(Duration::from_secs(5)).await.unwrap(), 0);
         the_terminal_is_put_back(&client, "after it left with no link");
         // (What it said of the link is wiped from the line it was on.)
-        assert!(!client.screen().contains("no link"), "{}", client.screen());
+        rig::until("what it said is wiped", Duration::from_secs(5), || {
+            !client.screen().contains("no link")
+        });
         rig.net.black_hole(Duration::ZERO);
     }
     // The program ends: its status, and the terminal as it was.
@@ -670,11 +672,11 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
         );
         // No byte of the cut sequence was taken for text: the terminal's own screen has koh's
         // line on it, and nothing else.
-        let screen = client.screen();
-        assert!(
-            screen.trim().starts_with("koh: no link") && screen.trim().lines().count() == 1,
-            "{cut}: {screen:?}"
-        );
+        let alone = |screen: String| {
+            screen.trim().starts_with("koh: no link") && screen.trim().lines().count() == 1
+        };
+        let said = format!("after a cut at byte {cut}, the screen is koh's line and no more");
+        rig::until(&said, Duration::from_secs(5), || alone(client.screen()));
         // The client comes again, to the run it was shown.
         let (again, asked);
         (conn, again, typed, asked) = server.0.attached(7).await;
@@ -697,7 +699,9 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
     send_msg(&mut send, &ended, VIEW_FRAME).await.unwrap();
     assert_eq!(client.ends(Duration::from_secs(5)).await.unwrap(), 9);
     the_terminal_is_put_back(&client, "after the server's last word");
-    assert!(!client.screen().contains("no link"), "{}", client.screen());
+    rig::until("what it said is wiped", Duration::from_secs(5), || {
+        !client.screen().contains("no link")
+    });
     // A server that answers a client that comes again with another run: nothing is typed
     // there, and koh ends. One that sends what is no message: koh ends, saying so.
     for other in [true, false] {

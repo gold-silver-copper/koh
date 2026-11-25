@@ -2835,6 +2835,10 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
     send_msg(&mut older, &typed(b"aaaa"), VIEW_FRAME)
         .await
         .unwrap();
+    // (Typed, and not on its way: what a stream has not typed when it is ended may be lost.)
+    until("the program has read the older stream's bytes", || {
+        fs::read(&out).unwrap_or_default() == b"aaaa"
+    });
     // The same client attaches anew to the run. Once it is answered the older stream's viewer
     // has left, and its stream has ended without a last word: it was cut, not ended.
     let again = Attach {
@@ -2977,17 +2981,17 @@ fn koh_connect_asks_its_terminal_nothing_and_puts_it_back_however_it_ends() {
     // up, as by a terminal that is closed, it ends the same way; and so when its user leaves.
     signal(&first.pid(), "-TERM");
     assert_eq!(first.ends(), "exited 0");
-    assert!(first.is_put_back(), "{:?}", first.says("modes"));
+    until("the terminal is put back", || first.is_put_back());
     let second = InPane::connect(&host, "t2", &[], &["--session", "s"]);
     on(&second);
     signal(&second.pid(), "-HUP");
     assert_eq!(second.ends(), "exited 0");
-    assert!(second.is_put_back(), "{:?}", second.says("modes"));
+    until("the terminal is put back", || second.is_put_back());
     let third = InPane::connect(&host, "t3", &[], &["--session", "s"]);
     on(&third);
     third.types(b"\x1d.");
     assert_eq!(third.ends(), "exited 0");
-    assert!(third.is_put_back(), "{:?}", third.says("modes"));
+    until("the terminal is put back", || third.is_put_back());
     // The session's program was typed nothing, by any of the three, and no viewer is left.
     assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
     until("the viewers are gone", || viewers(&host).is_empty());

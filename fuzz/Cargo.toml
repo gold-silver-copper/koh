@@ -42,17 +42,3 @@ path = "fuzz_targets/paths.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "carry_decode"
-path = "fuzz_targets/carry_decode.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "carry_sequence"
-path = "fuzz_targets/carry_sequence.rs"
-test = false
-doc = false
-bench = false

@@ -42,6 +42,9 @@ pub struct ServeOptions {
     /// An endpoint that is there, of the server's key, in place of one bound here: a test's,
     /// on a link of its own. `koh serve` gives none.
     pub endpoint: Option<iroh::Endpoint>,
+    /// This binary, where the process that serves is another: a test's. It is run as fux, as a
+    /// session's holder and as its viewer. `koh serve` gives none.
+    pub session_exe: Option<PathBuf>,
     pub quiet: bool,
     /// Most connections held at once, each counted from when the server takes it up, before it
     /// proves a key.
@@ -88,6 +91,7 @@ impl Default for ServeOptions {
             state_dir: None,
             disable_relay: false,
             endpoint: None,
+            session_exe: None,
             quiet: false,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -166,7 +170,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_string());
-    let sessions = Sessions::new(&base, max_sessions, default_shell)?;
+    let sessions = Sessions::new(&base, max_sessions, default_shell, opts.session_exe)?;
     let sessions_dir = sessions.dir().to_path_buf();
 
     let state = Arc::new(ServerState {

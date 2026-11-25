@@ -1,4 +1,4 @@
-//! Wire protocol for koh/19 over iroh QUIC bidirectional streams.
+//! Wire protocol for koh/20 over iroh QUIC bidirectional streams.
 //! Every message is length-prefixed (`u32` big-endian) postcard with strict byte bounds.
 
 use iroh::endpoint::{RecvStream, SendStream};
@@ -8,17 +8,15 @@ use serde::{Deserialize, Serialize};
 use crate::{Exit, KohError, Result};
 
 /// ALPN for koh v2 (fux-backed) protocol.
-pub const ALPN: &[u8] = b"koh/19";
+pub const ALPN: &[u8] = b"koh/20";
 
 pub const MAX_PROOF: usize = 512;
 pub const MAX_CTRL: usize = 1 << 20; // 1 MiB
 pub const MAX_FRAME: usize = 8 << 20; // 8 MiB
 pub const MAX_CHUNK: usize = 256 << 10; // 256 KiB
-/// The most bytes a session's client sends in one message: typed bytes, a line, what its terminal is like.
-pub const MAX_TYPED: usize = 16 << 10;
-/// The most typed bytes that wait at either end of a session: for a FIFO to take them on the
-/// server, for a link on a client. With that many waiting no more are read, so a writer waits.
-pub const MAX_HELD: usize = 64 << 10;
+/// The most bytes of one message on a session's stream, either way: a piece of what a viewer
+/// drew, or of what was typed.
+pub const VIEW_FRAME: usize = 16 << 10;
 
 /// TLS-bound client authentication proof sent first on every connection's first stream.
 #[derive(Debug, Serialize, Deserialize)]
@@ -139,34 +137,28 @@ pub struct SessionInfo {
 }
 
 /// Asks for a stream of a session, which is a fux pane on the server: answered `Ok`, then
-/// `Attached`, then the pane's folder in rounds (`ToMirror`) against what is typed (`FromMirror`).
+/// `Attached`, then what the session's viewer draws (`ViewOutput`) against what is typed
+/// (`ViewInput`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attach {
-    /// The asker's `fux::FORMAT`: another than the server's is refused before anything is made.
-    pub format: u32,
     /// The session. One that is not there is started under the name; with no name it is the
     /// newest that lives, or a new one (always, with `new` or a program).
     pub name: Option<String>,
     pub new: bool,
-    pub cols: u16,
-    pub rows: u16,
+    /// The client's terminal: its size now, on every attach.
+    pub size: ViewSize,
     pub argv: Vec<String>,
     pub cwd: Option<String>,
-    /// The run this client mirrors, on every attach but its first: the session's folder is
-    /// that run or the attach is refused, and nothing is started.
-    pub run: Option<Run>,
+    /// The run this client views, on every attach but its first: the session's folder is
+    /// that run or the attach is refused, and nothing is started. (A pane's `run`, as fux
+    /// reads it: `fux::run_of`.)
+    pub run: Option<u128>,
     /// A number the client chose when it started: its older stream on the run is ended first.
     pub client: u64,
-}
-
-/// Which run of a session's name a folder is: the folder (its device and its number there) and
-/// its holder's process number, which the first line of the pane's `status` has from the run's
-/// start to its end. A name started anew is another run, also where it is given the old folder's number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Run {
-    pub device: u64,
-    pub folder: u64,
-    pub holder: u64,
+    /// The client's `TERM`, for the viewer's environment: printable, 64 bytes at most, or none.
+    /// (Nothing else is said of the terminal, and nothing is asked of it: pictures are drawn
+    /// as on one that draws sixel, and its keys come in their old form.)
+    pub term: String,
 }
 
 /// A name a session may have: one of fux's names (letters, digits, `.`, `_` and `-`, at most 64,
@@ -184,7 +176,7 @@ pub fn session_name(name: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attached {
     pub name: String,
-    pub run: Run,
+    pub run: u128,
 }
 
 /// Initial server status reply to any `Request`.
@@ -374,83 +366,43 @@ impl SyncSummary {
     }
 }
 
-/// What a name in a pane's folder is the name of. Nothing else is carried.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Kind {
-    File,
-    Folder,
-    Link,
-    Fifo,
+/// A terminal's size: in cells, and in pixels where the terminal says (pictures are scaled by
+/// the cell's size; 0 is not said).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
 }
 
-/// One thing a client's mirror has: its name, its kind, and of a file its length and its hash
-/// (blake3). A server believes none of it that its own bytes do not bear out.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Had {
-    pub name: String,
-    pub kind: Kind,
-    pub len: u64,
-    pub hash: [u8; 32],
+impl ViewSize {
+    /// As a pty takes it: a size fux would refuse is the nearest it takes (1 to 500 each way).
+    pub fn tty(self) -> fuxix::Winsize {
+        fuxix::Winsize {
+            cols: self.cols.clamp(1, 500),
+            rows: self.rows.clamp(1, 500),
+            xpixel: self.xpixel,
+            ypixel: self.ypixel,
+        }
+    }
 }
 
-/// A stretch of a file that is told as lines of the file before it: `count` of that file's lines
-/// from its line `from` (a line is bytes up to and with its `\n`), or bytes it has not.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Edit {
-    Run { from: u32, count: u32 },
-    New(Vec<u8>),
+/// What a client sends on a session's stream: what was typed at its terminal, as it was typed;
+/// and its terminal's size when that changes.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ViewInput {
+    Bytes(Vec<u8>),
+    Resize(ViewSize),
 }
 
-/// What a server sends of a pane's folder. Everything from `Round` to `Done` is one round: a
-/// client's mirror takes it whole or not at all (`carry`, which has each message's rule).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ToMirror {
-    /// A round begins: the number `generation` has once it is applied.
-    Round(u64),
-    Folder(String),
-    Fifo(String),
-    Link {
-        name: String,
-        to: String,
-    },
-    /// A file, whole: in pieces that follow each other while `more`.
-    Put {
-        name: String,
-        more: bool,
-        bytes: Vec<u8>,
-    },
-    /// A file as lines of the one the mirror has under that name.
-    Lines {
-        name: String,
-        edits: Vec<Edit>,
-    },
-    /// A file keeps its first `at` bytes and these follow; further pieces carry the place of
-    /// their own first byte.
-    Add {
-        name: String,
-        at: u64,
-        bytes: Vec<u8>,
-    },
-    /// The file `from` is `to`.
-    Moved {
-        from: String,
-        to: String,
-    },
-    /// It is gone: a folder with what is in it.
-    Remove(String),
-    /// The round is whole: now it is applied.
-    Done,
-    /// No holder is left: nothing follows.
-    Ended,
-}
-
-/// What a client sends of its mirror: once, first, what the mirror has; then what was written to
-/// the mirror's `in` and `ctl`, and what its viewer wrote of its terminal (`colours`, `keyboard`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FromMirror {
-    Has(Vec<Had>),
-    Write { name: String, bytes: Vec<u8> },
-    Told { name: String, bytes: Vec<u8> },
+/// What a server sends on a session's stream: what the session's viewer wrote to its terminal,
+/// as it wrote it; and at the end the exit code, if the session ended (its program's) or its
+/// user left it (0). A stream that ends without `Exit` was cut: the client comes again.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ViewOutput {
+    Bytes(Vec<u8>),
+    Exit(i32),
 }
 
 /// A message as it is sent, without its length: refused when it is longer than `max`.

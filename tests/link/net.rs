@@ -241,7 +241,12 @@ impl FaultNet {
         });
         let mut builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret)
-            .transport_config(koh::net::transport_config(true))
+            // (A server's endpoint as `koh serve` binds it, and a client's as `koh connect` does.)
+            .transport_config(if accept {
+                koh::net::transport_config(true)
+            } else {
+                koh::net::view_transport_config()
+            })
             .clear_ip_transports()
             .add_custom_transport(transport);
         if accept {

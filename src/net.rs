@@ -14,18 +14,35 @@ use crate::keys::Route;
 use crate::proto::{ALPN, CloseCode, KeyProof, MAX_PROOF, recv_msg, send_msg};
 use crate::{KohError, Result};
 
-const PROOF_LABEL: &[u8] = b"koh/19 client proof";
+const PROOF_LABEL: &[u8] = b"koh/20 client proof";
 
-/// What koh asks of QUIC on every endpoint it binds. (Public for a test that binds an endpoint
-/// of its own, on a link of its own: it is then koh's in all but its transport.)
-pub fn transport_config(interactive: bool) -> QuicTransportConfig {
-    let (idle_ms, keepalive) = if interactive {
-        (30_000, Duration::from_secs(5))
-    } else {
-        (15_000, Duration::from_secs(2))
-    };
-    QuicTransportConfig::builder()
-        .keep_alive_interval(keepalive)
+/// What koh asks of QUIC on every endpoint it binds but a session's client's: a connection that
+/// waits long (`waiting`: a server's, a `wait`'s) may be silent for 30 s, any other for 15.
+/// (Public for a test that binds an endpoint of its own, on a link of its own: it is then
+/// koh's in all but its transport.)
+pub fn transport_config(waiting: bool) -> QuicTransportConfig {
+    let (idle_ms, keepalive) = if waiting { (30_000, 5) } else { (15_000, 2) };
+    transport(QuicTransportConfig::builder(), idle_ms, keepalive)
+}
+
+/// What `koh connect` asks of QUIC. A link that is silent for eight seconds is lost: koh says
+/// so in seconds, and dials again. And a stream is read 16 KiB ahead and no further: while the
+/// link is slow, what a viewer draws waits on the server, where the viewer sees it wait and
+/// draws its next frame of what the session shows by then. That window is QUIC's own flow
+/// control: koh acknowledges nothing itself.
+pub fn view_transport_config() -> QuicTransportConfig {
+    let window = VarInt::from_u32(16 << 10);
+    let config = QuicTransportConfig::builder().stream_receive_window(window);
+    transport(config, 8_000, 2)
+}
+
+fn transport(
+    config: iroh::endpoint::QuicTransportConfigBuilder,
+    idle_ms: u32,
+    keepalive_secs: u64,
+) -> QuicTransportConfig {
+    config
+        .keep_alive_interval(Duration::from_secs(keepalive_secs))
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(idle_ms))))
         .max_concurrent_bidi_streams(VarInt::from_u32(16))
         // (Nothing reads a unidirectional stream: a peer is given none to fill.)
@@ -62,11 +79,11 @@ pub async fn connect_server(
     secret: SecretKey,
     server_id: EndpointId,
     route: Option<Route>,
-    interactive: bool,
+    config: QuicTransportConfig,
 ) -> Result<(Endpoint, EndpointAddr, Connection)> {
     let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret.clone())
-        .transport_config(transport_config(interactive));
+        .transport_config(config);
     let mut addr = EndpointAddr::new(server_id);
     match route {
         Some(Route::Direct(sock)) => {

@@ -8,12 +8,21 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering::SeqCst},
+};
+
+use iroh::endpoint::{RecvStream, SendStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koh::Exit;
 use koh::client::Client;
 use koh::keys::{ClientEntry, Role, Route, Scope, load_or_create_key, save_clients};
-use koh::proto::{MAX_CHUNK, MAX_CTRL, Request, recv_msg, send_msg};
+use koh::proto::{
+    Attach, Attached, MAX_CHUNK, MAX_CTRL, Request, VIEW_FRAME, ViewInput, ViewOutput, ViewSize,
+    recv_msg, send_msg,
+};
 use koh::server::{ServeOptions, start_server};
 
 struct TempDir(PathBuf);
@@ -481,6 +490,12 @@ impl Drop for InTerminal {
 
 impl InTerminal {
     fn connect(config: &Path, runtime: &Path, args: &[&str]) -> Self {
+        Self::connect_in(config, runtime, args, true)
+    }
+
+    /// In a terminal that is koh's controlling terminal (`its`), as a shell's is; or one that
+    /// is only its standard input and output.
+    fn connect_in(config: &Path, runtime: &Path, args: &[&str], its: bool) -> Self {
         let size = fuxix::Winsize {
             rows: 24,
             cols: 80,
@@ -496,7 +511,7 @@ impl InTerminal {
             .stdin(theirs.try_clone().unwrap())
             .stdout(theirs.try_clone().unwrap())
             .stderr(theirs);
-        fuxix::new_session(&mut koh, true);
+        fuxix::new_session(&mut koh, its);
         Self {
             koh: koh.spawn().unwrap(),
             tty,
@@ -660,7 +675,7 @@ fn cli_help_keys_and_peer_lists() {
 
     let help = Command::new(bin).arg("--help").output().unwrap();
     assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("koh mount"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("koh connect"));
 
     let id_out = Command::new(bin)
         .env("KOH_CONFIG_DIR", &tmp.0)
@@ -1867,7 +1882,7 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
     assert!(!outside.join("payload").exists());
 
     // And it asks for nothing else: no look at jobs, its own among them. (Nor a session:
-    // `a_scoped_key_cannot_attach`.)
+    // `the_three_commands_are_a_full_keys`.)
     assert_eq!(client.jobs(None).await.unwrap_err().code, Exit::REFUSED);
     let waited = client.wait_job("j".into(), None, 10, Some(1)).await;
     assert_eq!(waited.unwrap_err().code, Exit::REFUSED);
@@ -2320,7 +2335,7 @@ async fn a_message_with_more_after_it_is_no_message() {
     srv.shutdown().await;
 }
 
-// ---- sessions: a real `koh serve`, real `koh mount` and `koh connect` ---------------------------
+// ---- sessions: a real `koh serve`, real `koh connect` ---------------------------
 
 /// Waits, twenty seconds at most, until `done` says so.
 fn until(what: &str, mut done: impl FnMut() -> bool) {
@@ -2335,84 +2350,8 @@ fn signal(pid: &str, signal: &str) {
     let _ = Command::new("kill").args([signal, pid]).status();
 }
 
-/// What a pane's folder holds that a mirror of it holds too: all but `generation` (a mirror's is
-/// the last round's that changed it), the two names that are not carried and names with a dot
-/// first. A file by its length and its hash, a link by where it leads.
-fn held(dir: &Path) -> std::collections::BTreeMap<String, String> {
-    let (mut held, mut folders) = (std::collections::BTreeMap::new(), vec![String::new()]);
-    while let Some(folder) = folders.pop() {
-        for entry in fs::read_dir(dir.join(&folder))
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let own = ["generation", "status", "command"].contains(&name.as_str());
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if name.starts_with('.') || (folder.is_empty() && own) {
-                continue;
-            }
-            let (path, name) = (entry.path(), format!("{folder}{name}"));
-            let what = if kind.is_symlink() {
-                format!("to {}", fs::read_link(&path).unwrap_or_default().display())
-            } else if kind.is_dir() {
-                folders.push(format!("{name}/"));
-                "a folder".to_string()
-            } else if kind.is_file() {
-                let bytes = fs::read(&path).unwrap_or_default();
-                format!("{} bytes {}", bytes.len(), blake3::hash(&bytes).to_hex())
-            } else {
-                "a FIFO".to_string()
-            };
-            held.insert(name, what);
-        }
-    }
-    held
-}
-
-/// Waits until a mirror is its pane: the same names, each the same thing, and an even number.
-fn agrees(pane: &Path, mirror: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let (theirs, ours) = (held(pane), held(mirror));
-        let number = fs::read_to_string(mirror.join("generation")).unwrap_or_default();
-        let even = number
-            .trim()
-            .parse::<u64>()
-            .is_ok_and(|number| number % 2 == 0);
-        if theirs == ours && even && !ours.is_empty() {
-            return;
-        }
-        let differ = |(name, what): (&String, &String)| ours.get(name) != Some(what);
-        let differ: Vec<&String> = theirs
-            .iter()
-            .filter(|at| differ(*at))
-            .map(|at| at.0)
-            .collect();
-        let over: Vec<&String> = ours
-            .keys()
-            .filter(|name| !theirs.contains_key(*name))
-            .collect();
-        assert!(
-            Instant::now() < deadline,
-            "the mirror is not the pane: {differ:?} differ, {over:?} are left over, generation {number:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// The screen a pane's folder, or a mirror, shows.
 fn screen(dir: &Path) -> String {
     fs::read_to_string(dir.join("shown/screen")).unwrap_or_default()
-}
-
-/// A program for a session that takes what is typed as it is typed, into the file `out`: it
-/// says READY once its terminal is raw, waits so many seconds, and then reads.
-fn reads_into(out: &Path, wait: u32) -> Vec<String> {
-    let script = format!("stty raw -echo; echo READY; sleep {wait}; exec cat > \"$0\"");
-    vec!["sh".into(), "-c".into(), script, out.display().to_string()]
 }
 
 /// A real `koh serve`, its sessions in the test's folder, and two keys it allows: a client's
@@ -2512,25 +2451,15 @@ impl Host {
         self.sessions.join(name)
     }
 
-    /// `koh mount` of this server (or of a relay to it), with `asks` for which session and
-    /// `program` for a new one: its mirror is `AT/ws/m` in the test's folder, so `AT` is where
-    /// a viewer there would say what its terminal is like.
-    fn mount(&self, at: &str, via: Option<&Tap>, asks: &[&str], program: &[String]) -> Mount {
-        let root = self.tmp.0.join(at);
-        fs::create_dir_all(root.join("ws")).unwrap();
-        let (dir, said) = (root.join("ws/m"), root.join("said"));
-        let (id, addr) = match via {
-            Some(tap) => (tap.id.clone(), tap.addr.clone()),
-            None => (self.id.clone(), self.addr()),
-        };
-        let mut koh = self.koh(&["mount", &id, "--direct", &addr]);
-        koh.args(asks).arg(&dir);
+    fn attach(&self, asks: &[&str], program: &[String]) -> InTerminal {
+        let addr = self.addr();
+        let mut args = vec![self.id.as_str(), "--direct", &addr];
+        args.extend_from_slice(asks);
         if !program.is_empty() {
-            koh.arg("--").args(program);
+            args.push("--");
+            args.extend(program.iter().map(String::as_str));
         }
-        koh.stderr(fs::File::create(&said).unwrap());
-        let koh = koh.spawn().unwrap();
-        Mount { koh, dir, said }
+        InTerminal::connect(&self.tmp.0.join("cli_cfg"), &self.tmp.0.join("crun"), &args)
     }
 
     /// A `koh` of the client's, with its key and a runtime directory of its own.
@@ -2555,264 +2484,126 @@ impl Host {
     }
 }
 
-/// A `koh mount` and its mirror. It is killed when the test lets go of it: its session lives on.
-struct Mount {
-    koh: std::process::Child,
-    dir: PathBuf,
-    said: PathBuf,
-}
+#[test]
+fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
+    let host = Host::start("connect-tty", &[]);
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
+    let (id, addr, pane) = (host.id.clone(), host.addr(), host.pane("1"));
+    let program = "stty -icanon -echo; echo READY; od -An -tx1 -N2; head -c 1 >/dev/null; exit 7";
+    let shown = |tty: &mut InTerminal| tty.drawn.windows(5).any(|drawn| drawn == b"READY");
 
-impl Drop for Mount {
-    fn drop(&mut self) {
-        let _ = self.koh.kill();
-        let _ = self.koh.wait();
-    }
-}
+    // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
+    let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
+    let mut first = InTerminal::connect(&config, &runtime, &started);
+    first.until("the terminal shows READY", shown);
+    first.types(b"\x1d.");
+    assert_eq!(first.ends(), Some(0));
+    assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
 
-impl Mount {
-    /// What it said on its standard error so far.
-    fn said(&self) -> String {
-        fs::read_to_string(&self.said).unwrap_or_default()
-    }
-
-    fn says(&self, line: &str, times: usize) {
-        until(&format!("koh mount says {line:?} {times} times"), || {
-            self.said().matches(line).count() >= times
-        });
-    }
-
-    fn shows(&self, text: &str) {
-        until(
-            &format!("the mirror shows {text:?}: {}", self.said()),
-            || screen(&self.dir).contains(text),
-        );
-    }
-
-    /// Writes to the mirror's `in`, as a viewer of it would type.
-    fn types(&self, bytes: &[u8]) {
-        let mut keys = fs::OpenOptions::new()
-            .write(true)
-            .open(self.dir.join("in"))
-            .unwrap();
-        keys.write_all(bytes).unwrap();
-    }
-
-    /// The exit code it ended with.
-    fn ends(&mut self) -> Option<i32> {
-        until("koh mount ends", || self.koh.try_wait().unwrap().is_some());
-        self.koh.wait().unwrap().code()
-    }
-}
-
-use iroh::endpoint::{Connection, RecvStream, SendStream};
-use koh::net::{bind_server, connect_server, open_authed_stream, verify_client};
-use koh::proto::{Attach, Attached, FromMirror, KeyProof, MAX_PROOF, Reply, Run, ToMirror};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, Mutex};
-
-/// A relay of the test's own between a client and the server: each stream of the client is a
-/// stream of the relay's on the server, byte for byte, until the test cuts it. It is the
-/// link, and where a test breaks it: after so many bytes, at once, or for a while.
-struct Tap {
-    id: String,
-    addr: String,
-    wire: Arc<Wire>,
-}
-
-struct Wire {
-    /// How many more of the client's bytes pass before its stream is cut.
-    left: AtomicUsize,
-    /// While set there is no link: a stream is cut as soon as it comes.
-    down: AtomicBool,
-    cut: tokio::sync::Notify,
-    cuts: AtomicUsize,
-    /// Tells the streams that are open to take no more of the client's bytes.
-    deaf: tokio::sync::Notify,
-    /// Tells them to say no more to the client, and to carry what it sends a moment longer.
-    half: tokio::sync::Notify,
-    client: Mutex<Option<Connection>>,
-}
-
-impl Wire {
-    fn new() -> Arc<Wire> {
-        Arc::new(Wire {
-            left: AtomicUsize::new(usize::MAX),
-            down: AtomicBool::new(false),
-            cut: tokio::sync::Notify::new(),
-            cuts: AtomicUsize::new(0),
-            deaf: tokio::sync::Notify::new(),
-            half: tokio::sync::Notify::new(),
-            client: Mutex::new(None),
-        })
-    }
-}
-
-impl Tap {
-    async fn start(host: &Host) -> Self {
-        let dir = host.tmp.0.join("tap_cfg");
-        let secret = load_or_create_key(Role::Server, Some(&dir.join("server.key"))).unwrap();
-        let id = secret.public().to_string();
-        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let endpoint = bind_server(secret, Some(local), true).await.unwrap();
-        let addr = endpoint
-            .bound_sockets()
-            .into_iter()
-            .next()
-            .unwrap()
-            .to_string();
-        let key = host.key("tap_cfg");
-        let server = koh::keys::parse_endpoint_id(&host.id).unwrap();
-        let route = Some(Route::Direct(host.addr().parse().unwrap()));
-        let (kept, _, upstream) = connect_server(key.clone(), server, route, true)
-            .await
-            .unwrap();
-        let wire = Wire::new();
-        let relayed = wire.clone();
-        tokio::spawn(async move {
-            let _kept = kept;
-            while let Some(incoming) = endpoint.accept().await {
-                let Ok(conn) = incoming.await else { continue };
-                *relayed.client.lock().unwrap() = Some(conn.clone());
-                let (wire, upstream, key) = (relayed.clone(), upstream.clone(), key.clone());
-                tokio::spawn(async move {
-                    while let Ok((send, recv)) = conn.accept_bi().await {
-                        let (wire, upstream, key) = (wire.clone(), upstream.clone(), key.clone());
-                        tokio::spawn(relay(wire, upstream, key, send, recv));
-                    }
-                });
-            }
-        });
-        Self { id, addr, wire }
-    }
-
-    /// The stream that carries the client's next `bytes` bytes is cut after them.
-    fn cut_after(&self, bytes: usize) {
-        self.wire.left.store(bytes, SeqCst);
-    }
-
-    /// No link (every stream is cut, and each new one as it comes), or a link again.
-    fn down(&self, down: bool) {
-        self.wire.down.store(down, SeqCst);
-        if down {
-            self.wire.cut.notify_waiters();
-        }
-    }
-
-    /// The stream that is open takes no more of what the client sends: the client's next
-    /// message is one its stream does not take.
-    fn deafen(&self) {
-        self.wire.deaf.notify_waiters();
-    }
-
-    /// The client hears no more of its stream, at once, while what it has sent and sends for
-    /// a moment yet still reaches the server: a link that breaks one way first.
-    fn half(&self) {
-        self.wire.half.notify_waiters();
-    }
-
-    /// Closes the client's connection: its next stream needs a new one.
-    fn close(&self) {
-        if let Some(conn) = self.wire.client.lock().unwrap().take() {
-            conn.close(0u32.into(), b"cut");
-        }
-    }
-}
-
-/// One stream of a client through the relay.
-async fn relay(
-    wire: Arc<Wire>,
-    upstream: Connection,
-    key: iroh::SecretKey,
-    mut down: SendStream,
-    mut from: RecvStream,
-) {
-    let carried = async {
-        if wire.down.load(SeqCst) {
-            return false;
-        }
-        // (The client's proof is for the relay, which asks the server in its own name.)
-        let Ok(_proof) = recv_msg::<KeyProof>(&mut from, MAX_PROOF).await else {
-            return false;
-        };
-        let Ok((mut up, mut back)) = open_authed_stream(&upstream, &key).await else {
-            return false;
-        };
-        let to_client = async {
-            let mut some = vec![0u8; 64 << 10];
-            while let Ok(Some(n)) = back.read(&mut some).await {
-                if down.write_all(&some[..n]).await.is_err() {
-                    return false;
-                }
-            }
-            down.finish().is_ok()
-        };
-        let to_server = async {
-            let mut some = vec![0u8; 4096];
-            loop {
-                let read = tokio::select! {
-                    read = from.read(&mut some) => read,
-                    () = wire.deaf.notified() => {
-                        let _ = from.stop(0u32.into());
-                        return std::future::pending().await;
-                    }
-                };
-                let Ok(Some(n)) = read else { return };
-                let left = wire.left.load(SeqCst);
-                let pass = n.min(left);
-                if up.write_all(&some[..pass]).await.is_err() {
-                    return;
-                }
-                if left != usize::MAX {
-                    wire.left.store(left - pass, SeqCst);
-                }
-                if left <= n {
-                    wire.left.store(usize::MAX, SeqCst);
-                    wire.cuts.fetch_add(1, SeqCst);
-                    return;
-                }
-            }
-        };
-        let (whole, half) = {
-            tokio::pin!(to_server);
-            tokio::select! {
-                whole = to_client => (whole, false),
-                () = &mut to_server => (false, false),
-                () = wire.cut.notified() => (false, false),
-                () = wire.half.notified() => {
-                    let _ = down.reset(0u32.into());
-                    let _ = tokio::time::timeout(Duration::from_millis(50), &mut to_server).await;
-                    (false, true)
-                }
-            }
-        };
-        // (Broken one way first, the server is left to read what the client had sent.)
-        if half {
-            let _ = up.finish();
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        let _ = up.reset(0u32.into());
-        let _ = back.stop(0u32.into());
-        whole
+    // koh's key typed twice is the key's own byte, typed to the program; and C-b is no key of
+    // koh's: it is the session's as it is typed.
+    let again = ["--direct", &addr, &id, "--session", "1"];
+    let mut second = InTerminal::connect(&config, &runtime, &again);
+    second.until("the terminal shows READY", shown);
+    second.types(b"\x1d\x1d\x02");
+    let typed = |_: &mut InTerminal| {
+        screen(&pane).split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
     };
-    // (A stream the server ended is ended, with all it said; any other is cut.)
-    if !carried.await {
-        let _ = down.reset(0u32.into());
-    }
-    let _ = from.stop(0u32.into());
+    second.until("the program reads the two bytes", typed);
+
+    // The terminal's size is the session's, also when it changes.
+    let size = fuxix::Winsize {
+        rows: 30,
+        cols: 100,
+        xpixel: 1000,
+        ypixel: 600,
+    };
+    fuxix::set_winsize(&second.tty, size).unwrap();
+    let resized = |_: &mut InTerminal| fs::read_to_string(pane.join("size")).unwrap() == "100 30\n";
+    second.until("the session takes the terminal's size", resized);
+
+    // The program's end is the end of `koh connect`, with the program's status: nobody has to
+    // type the detach key at a session that is over.
+    second.types(b"x");
+    assert_eq!(second.ends(), Some(7));
+
+    // No local session files were created.
+    assert_eq!(names_in(&runtime), [""; 0]);
+}
+
+#[test]
+fn viewer_reconnects_after_serve_restarts() {
+    let mut host = Host::start("view-restart", &[]);
+    let mut tty = host.attach(&["--session", "s"], &[]);
+    let pane = host.pane("s");
+    tty.types(b"echo shell-$((20+22))\n");
+    tty.until("shell echo", |tty| {
+        tty.drawn.windows(8).any(|s| s == b"shell-42")
+    });
+    let holder = holder_of(&pane);
+    host.stop();
+    tty.until("link down", |tty| {
+        tty.drawn.windows(7).any(|s| s == b"no link")
+    });
+    tty.types(b"echo back-$((6*7))\n");
+    host.serve();
+    tty.until("held input after reconnect", |tty| {
+        tty.drawn.windows(7).any(|s| s == b"back-42")
+    });
+    assert_eq!(holder_of(&pane), holder);
+    tty.types(b"exit 7\n");
+    assert_eq!(tty.ends(), Some(7));
+}
+
+#[test]
+fn one_session_draws_to_two_terminals_and_survives_hangup() {
+    let host = Host::start("view-two", &[]);
+    let mut a = host.attach(&["--session", "s"], &[]);
+    let has = |tty: &mut InTerminal, what: &[u8]| tty.drawn.windows(what.len()).any(|s| s == what);
+    a.types(b"printf '\\033[?1049h'; echo fullscreen-$((6*7))\n");
+    a.until("alternate screen", |tty| has(tty, b"fullscreen-42"));
+    assert_eq!(
+        fs::read_link(host.pane("s").join("shown")).unwrap(),
+        Path::new("alt")
+    );
+    let mut b = host.attach(&["--session", "s"], &[]);
+    b.until("second viewer draws the current screen", |tty| {
+        has(tty, b"fullscreen-42")
+    });
+    let id = a.koh.id();
+    drop(std::mem::replace(
+        &mut a.tty,
+        fs::File::open("/dev/null").unwrap(),
+    ));
+    until("closed terminal exits", || {
+        a.koh.try_wait().unwrap().is_some()
+    });
+    assert_ne!(id, b.koh.id());
+    b.types(b"printf '\\033[?1049l'; seq 1 2000000; echo flood-$((6*7))\n");
+    b.until("flood end is drawn", |tty| has(tty, b"flood-42"));
+    assert_eq!(
+        fs::read_link(host.pane("s").join("shown")).unwrap(),
+        Path::new("main")
+    );
+    b.types(b"exit 9\n");
+    assert_eq!(b.ends(), Some(9));
 }
 
 /// An attach as a test asks it: of the session `name`, or of a new one running `program`.
 fn asks(name: Option<&str>, program: &[String]) -> Attach {
     Attach {
-        format: fux::FORMAT,
         name: name.map(String::from),
         new: name.is_none(),
-        cols: 80,
-        rows: 24,
+        size: ViewSize {
+            cols: 80,
+            rows: 24,
+            ..ViewSize::default()
+        },
         argv: program.to_vec(),
         cwd: None,
         run: None,
         client: 7,
+        term: "xterm-256color".into(),
     }
 }
 
@@ -2823,730 +2614,93 @@ async fn attach(client: &Client, asks: Attach) -> koh::Result<(SendStream, RecvS
     Ok((send, recv, attached))
 }
 
-async fn tell(send: &mut SendStream, message: FromMirror) {
-    send_msg(send, &message, MAX_CHUNK).await.unwrap();
-}
-
-fn typed(bytes: &[u8]) -> FromMirror {
-    FromMirror::Write {
-        name: "in".into(),
-        bytes: bytes.to_vec(),
-    }
-}
-
-#[test]
-fn a_session_is_a_fux_pane_kept_by_koh_hold() {
-    let host = Host::start("pane", &[]);
-    let mut mount = host.mount("a", None, &["--new"], &["sleep".into(), "30".into()]);
-    until("the mirror has a round", || {
-        mount.dir.join("generation").is_file()
-    });
-    // The session is a folder in koh's own fux session, beneath its state, which it printed.
-    let state = fs::canonicalize(host.tmp.0.join("run/koh")).unwrap();
-    assert_eq!(host.sessions, state.join("fux/koh-sessions"));
-    assert_eq!(names_in(&host.sessions), ["1"]);
-    assert!(!state.join("sessions").exists());
-    // Its holder is this binary under the word `hold`, with the lock on the folder: fux's proof
-    // that it lives. It is no child of `koh serve`, and lives on when that is stopped.
-    let (pane, server) = (host.pane("1"), host.served.as_ref().unwrap().server.id());
-    let holder = holder_of(&pane);
-    let args = ps(&holder, "args=");
-    assert_eq!(
-        args.split_whitespace().take(2).collect::<Vec<_>>(),
-        [env!("CARGO_BIN_EXE_koh"), "hold"]
-    );
-    assert_ne!(ps(&holder, "ppid="), server.to_string());
-    let locked = || fs::File::open(&pane).unwrap().try_lock_shared().is_err();
-    assert!(locked());
-    assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
-    // Nothing of the session is the client's to keep: the mirror goes with the mount.
-    signal(&mount.koh.id().to_string(), "-TERM");
-    assert_eq!(mount.ends(), Some(0));
-    assert!(!mount.dir.exists() && locked());
-}
-
-#[test]
-fn the_mirror_is_the_pane() {
-    let host = Host::start("mirror", &[]);
-    // (Where a viewer would say what its terminal is like there is a FIFO nobody writes to:
-    // koh reads a file there when one changes, and waits at nothing else.)
-    fs::create_dir_all(host.tmp.0.join("a")).unwrap();
-    drop(fuxix::fifo(host.tmp.0.join("a/colours")).unwrap());
-    let mut mount = host.mount("a", None, &[], &[]);
-    let pane = host.pane("1");
-    agrees(&pane, &mount.dir);
-    // A mirror has the pane's FIFOs and never its `status` or `command`.
-    let fifo =
-        |name: &str| fs::symlink_metadata(mount.dir.join(name)).is_ok_and(|file| !file.is_file());
-    assert!(fifo("in") && fifo("ctl"));
-    assert!(pane.join("status").is_file() && pane.join("command").is_file());
-    assert!(!mount.dir.join("status").exists() && !mount.dir.join("command").exists());
-    // A shell; output that scrolls into history. (Each is waited for by what the program
-    // printed, which the command as it was typed does not have.)
-    mount.types(b"echo typed-$((6 * 7)); seq 1 3000\n");
-    let history = || fs::read_to_string(mount.dir.join("history")).unwrap_or_default();
-    until("the mirror's history has what scrolled", || {
-        history().contains("typed-42\n") && history().contains("\n2900\n")
-    });
-    agrees(&pane, &mount.dir);
-    // What a program puts on the clipboard, and a picture it draws, are files of the pane: the
-    // mirror has them.
-    mount.types(b"printf '\\033]52;c;aGVsbG8=\\007\\033Pq#0;2;100;0;0#0~~~~~~-~~~~~~\\033\\\\'\n");
-    until("the mirror has the clipboard and the picture", || {
-        let listed = fs::read_to_string(mount.dir.join("main/pictures")).unwrap_or_default();
-        fs::read(mount.dir.join("clipboard")).is_ok_and(|bytes| bytes == b"hello")
-            && listed.starts_with("pic-1.sixel ")
-            && mount.dir.join("pic-1.sixel").is_file()
-    });
-    agrees(&pane, &mount.dir);
-    // The alternate screen comes, `shown` turns to it; and goes again.
-    mount.types(b"printf '\\033[?1049hALTERNATE'\n");
-    let shown = || fs::read_link(mount.dir.join("shown")).unwrap_or_default();
-    until("the mirror shows the alternate screen", || {
-        shown() == Path::new("alt") && screen(&mount.dir).contains("ALTERNATE")
-    });
-    agrees(&pane, &mount.dir);
-    mount.types(b"printf '\\033[?1049l'; echo back\n");
-    until("the mirror shows the main screen again", || {
-        shown() == Path::new("main") && !mount.dir.join("alt").exists()
-    });
-    agrees(&pane, &mount.dir);
-    // A size asked through the mirror's `ctl` is the pane's.
-    fs::write(mount.dir.join("ctl"), "resize 100 30\n").unwrap();
-    until("the pane takes the size", || {
-        fs::read_to_string(pane.join("size")).unwrap() == "100 30\n"
-    });
-    agrees(&pane, &mount.dir);
-    // The program's end is the mount's, with its status; the mirror goes, the session's folder stays.
-    mount.types(b"exit 7\n");
-    assert_eq!(mount.ends(), Some(7));
-    assert!(!mount.dir.exists());
-    assert_eq!(
-        fs::read_to_string(pane.join("state")).unwrap(),
-        "exited 7\n"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_link_cut_and_back_leaves_the_mirror_the_pane() {
-    let host = Host::start("cut", &[]);
-    let tap = Tap::start(&host).await;
-    let mount = host.mount("a", Some(&tap), &[], &[]);
-    let pane = host.pane("1");
-    agrees(&pane, &mount.dir);
-    let write = |line: &str| fs::write(pane.join("in"), line).unwrap();
-    // The stream is cut, the connection stands: the pane changes while there is no link, and
-    // the mirror is as its last round left it. On return it is the pane again.
-    tap.down(true);
-    mount.says("no link", 1);
-    // (Of what is written to the mirror's `ctl` meanwhile, the last size asked for is asked
-    // on return; a line that hangs the program up is dropped, and koh says so.)
-    fs::write(mount.dir.join("ctl"), "resize 90 20\nkill\nresize 100 30\n").unwrap();
-    mount.says("a line written to ctl was dropped", 1);
-    let before = held(&mount.dir);
-    write("echo while-away; seq 1 2000\n");
-    until("the pane has changed", || screen(&pane).contains("2000"));
-    assert_eq!(held(&mount.dir), before);
-    tap.down(false);
-    mount.says("the link is back", 1);
-    mount.shows("2000");
-    until("the pane takes the size asked for while away", || {
-        fs::read_to_string(pane.join("size")).unwrap() == "100 30\n"
-    });
-    agrees(&pane, &mount.dir);
-    assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
-    // The connection is closed: the next attach is on a new one.
-    tap.close();
-    mount.says("no link", 2);
-    write("echo after-the-connection\n");
-    mount.says("the link is back", 2);
-    mount.shows("after-the-connection");
-    agrees(&pane, &mount.dir);
-    assert_eq!(names_in(&host.sessions), ["1"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn what_is_typed_without_a_link_is_typed_on_return() {
-    let host = Host::start("typed-away", &[]);
-    let tap = Tap::start(&host).await;
-    let out = host.tmp.0.join("out");
-    let mount = host.mount("a", Some(&tap), &["--new"], &reads_into(&out, 0));
-    mount.shows("READY");
+/// Reads a session's stream to its end: what its viewer drew, and its last word if it had one.
+async fn drawn(from: &mut RecvStream) -> (Vec<u8>, Option<i32>) {
     let mut all = Vec::new();
-    let arrived = |all: &[u8]| {
-        until("the program has read what was typed", || {
-            fs::read(&out).unwrap_or_default().len() >= all.len()
-        })
-    };
-    for away in 0..10u32 {
-        tap.down(true);
-        mount.says("no link", away as usize + 1);
-        let some: Vec<u8> = (0..18)
-            .flat_map(|n| format!("{:07}\n", away * 18 + n).into_bytes())
-            .collect();
-        mount.types(&some);
-        all.extend(some);
-        tap.down(false);
-        mount.says("the link is back", away as usize + 1);
-        // (Read by the program before the link is cut again: what is on its way when a link
-        // dies may be lost, and that is not what this asks.)
-        arrived(&all);
-    }
-    // And a message the stream does not take is kept for the next link: the link is found
-    // broken by it, and what was typed is typed on the next.
-    for deaf in 0..5u32 {
-        tap.deafen();
-        std::thread::sleep(Duration::from_millis(500));
-        let some = format!("{:07}\n", 180 + deaf).into_bytes();
-        mount.types(&some);
-        all.extend(some);
-        mount.says("the link is back", 11 + deaf as usize);
-        arrived(&all);
-    }
-    // All of it, once, in order.
-    assert_eq!(all.len(), 1480);
-    until("the program has read what was typed", || {
-        fs::read(&out).unwrap().len() >= all.len()
-    });
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        String::from_utf8_lossy(&fs::read(&out).unwrap()),
-        String::from_utf8_lossy(&all)
-    );
-}
-
-/// The fewest stretches that, left out of `typed`, leave `read`; none if no leaving out does.
-fn stretches_left_out(read: &[u8], typed: &[u8]) -> Option<usize> {
-    const NONE: usize = usize::MAX / 2;
-    // (`at[j]`: the fewest, for what was read so far with its last byte the typed byte `j`.)
-    let mut at = vec![NONE; typed.len()];
-    for (i, byte) in read.iter().enumerate() {
-        let (mut next, mut before) = (vec![NONE; typed.len()], NONE);
-        for j in 0..typed.len() {
-            if typed[j] == *byte {
-                let on = if j > 0 { at[j - 1] } else { NONE };
-                next[j] = if i == 0 {
-                    usize::from(j > 0)
-                } else {
-                    on.min(before + 1)
-                };
-            }
-            if j > 0 {
-                before = before.min(at[j - 1]);
-            }
+    loop {
+        match koh::proto::recv_msg_opt::<ViewOutput>(from, VIEW_FRAME).await {
+            Ok(Some(ViewOutput::Bytes(bytes))) => all.extend(bytes),
+            Ok(Some(ViewOutput::Exit(code))) => return (all, Some(code)),
+            _ => return (all, None),
         }
-        at = next;
     }
-    let ends = |(j, fewest): (usize, &usize)| fewest + usize::from(j + 1 < typed.len());
-    let fewest = at.iter().enumerate().map(ends).min().unwrap_or(0);
-    (fewest < NONE).then_some(fewest)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn typed_bytes_never_arrive_twice_or_out_of_order() {
-    let host = Host::start("typed-cut", &[]);
-    let tap = Tap::start(&host).await;
-    let out = host.tmp.0.join("out");
-    let mount = host.mount("a", Some(&tap), &["--new"], &reads_into(&out, 0));
-    mount.shows("READY");
-    // Numbered lines are typed without a pause, while ten links in turn are cut some bytes into
-    // what the client sends on them: in the middle of a message, with more on its way.
-    let (dir, typing) = (mount.dir.clone(), Arc::new(AtomicBool::new(true)));
-    let goes_on = typing.clone();
-    let typist = std::thread::spawn(move || {
-        let mut keys = fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("in"))
-            .unwrap();
-        let mut all = Vec::new();
-        for n in 0.. {
-            if !goes_on.load(SeqCst) {
-                break;
-            }
-            let line = format!("{n:07}\n");
-            keys.write_all(line.as_bytes()).unwrap();
-            all.extend(line.into_bytes());
-            std::thread::sleep(Duration::from_millis(3));
-        }
-        all
-    });
-    for cut in 0..10usize {
-        tap.cut_after(40 + cut * 86);
-        until("the link is cut", || tap.wire.cuts.load(SeqCst) > cut);
-        mount.says("the link is back", cut + 1);
+/// The viewers of a server's sessions that run now: the folders they have in koh's fux session.
+fn viewers(host: &Host) -> Vec<String> {
+    let all = names_in(host.sessions.parent().unwrap());
+    let viewers = all.into_iter().filter(|name| name.starts_with(".view."));
+    viewers.collect()
+}
+
+/// A program for a session that takes what is typed as it is typed, into the file `out`: it
+/// says READY once its terminal is raw, and then reads.
+fn reads_into(out: &Path) -> Vec<String> {
+    let script = "stty raw -echo; echo READY; exec cat > \"$0\"";
+    ["sh", "-c", script, out.to_str().unwrap()]
+        .map(String::from)
+        .to_vec()
+}
+
+/// `koh connect` in a terminal that answers what it is asked: a pane of fux's, in a session of
+/// the test's own, whose program `koh connect` is. The pane is the terminal, and its files say
+/// what a terminal would show: `screen`, `modes`, `cursor`, and which screen (`shown`).
+struct InPane(PathBuf);
+
+impl Drop for InPane {
+    fn drop(&mut self) {
+        signal(&holder_of(&self.0), "-KILL");
     }
-    std::thread::sleep(Duration::from_millis(200));
-    typing.store(false, SeqCst);
-    let all = typist.join().unwrap();
-    // What was typed after the last link came back arrives whole, so the end is the same.
-    let tail = &all[all.len() - 64..];
-    until("the program has read to the end", || {
-        fs::read(&out).unwrap().ends_with(tail)
-    });
-    let read = fs::read(&out).unwrap();
-    // What arrived is what was typed with stretches left out: nothing twice, nothing out of
-    // its order. A stretch for each link that ended, at the most.
-    let left_out = stretches_left_out(&read, &all);
-    assert!(
-        left_out.is_some_and(|stretches| stretches <= 10),
-        "{left_out:?} stretches"
-    );
-    assert!(read.len() <= all.len());
-    println!(
-        "typed {} bytes, {} arrived, {left_out:?} stretches left out",
-        all.len(),
-        read.len()
-    );
 }
 
-#[test]
-fn a_paste_larger_than_the_pipe_waits_and_is_not_cut() {
-    let host = Host::start("paste", &[]);
-    let out = host.tmp.0.join("out");
-    let mount = host.mount("a", None, &["--new"], &reads_into(&out, 3));
-    mount.shows("READY");
-    // Three megabytes written to the mirror's `in` while the program reads nothing: more than
-    // every pipe and queue on the way holds, so the writer is made to wait.
-    let paste: Vec<u8> = (0..300_000u32)
-        .flat_map(|n| format!("{n:09}\n").into_bytes())
-        .collect();
-    let (dir, pasted, done) = (
-        mount.dir.clone(),
-        paste.clone(),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let wrote = done.clone();
-    let writer = std::thread::spawn(move || {
-        let mut keys = fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("in"))
-            .unwrap();
-        keys.write_all(&pasted).unwrap();
-        wrote.store(true, SeqCst);
-    });
-    std::thread::sleep(Duration::from_secs(1));
-    assert!(!done.load(SeqCst), "the writer was not made to wait");
-    // All of it reaches the program, in order: nothing was dropped to make room. (A terminal
-    // takes typed bytes slowly on some systems: two minutes, and it must keep coming.)
-    let (began, mut read) = (Instant::now(), 0);
-    while read < paste.len() {
-        std::thread::sleep(Duration::from_millis(50));
-        read = fs::metadata(&out).map_or(0, |out| out.len() as usize);
-        let of = paste.len();
-        assert!(
-            began.elapsed() < Duration::from_secs(120),
-            "the program read {read} of {of} bytes in two minutes; koh said: {}",
-            mount.said()
-        );
+impl InPane {
+    /// A terminal `tag` of the colours and the keyboard's flags its session's files say, and
+    /// `koh connect` to the host in it.
+    fn connect(host: &Host, tag: &str, like: &[(&str, &str)], asks: &[&str]) -> Self {
+        let root = host.tmp.0.join(tag);
+        let pane = root.join("fux/main/terminal");
+        fs::create_dir_all(root.join("fux")).unwrap();
+        for (name, text) in like {
+            fs::write(root.join("fux").join(name), text).unwrap();
+        }
+        let mut start = host.koh(&["fux", "start", pane.to_str().unwrap(), "--"]);
+        start.args([env!("CARGO_BIN_EXE_koh"), "connect", &host.id]);
+        start.args(["--direct", &host.addr()]).args(asks);
+        start.env("XDG_RUNTIME_DIR", &root).env("COLUMNS", "80");
+        let started = start.env("LINES", "24").output().unwrap();
+        assert!(started.status.success(), "{started:?}");
+        InPane(pane)
     }
-    writer.join().unwrap();
-    assert!(fs::read(&out).unwrap() == paste);
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_new_attach_ends_the_clients_older_stream_first() {
-    let host = Host::start("older", &[]);
-    let client = host.client().await;
-    let out = host.tmp.0.join("out");
-    // The older stream brings two megabytes the program does not read yet: the FIFO takes some
-    // of them, and the rest wait on the server and on their way to it.
-    let (mut older, _from, attached) = attach(&client, asks(None, &reads_into(&out, 3)))
-        .await
-        .unwrap();
-    let pane = host.pane(&attached.name);
-    until("the program is ready", || screen(&pane).contains("READY"));
-    tell(&mut older, FromMirror::Has(Vec::new())).await;
-    let paste = tokio::spawn(async move {
-        for _ in 0..128 {
-            let piece = typed(&[b'a'; 16 << 10]);
-            if send_msg(&mut older, &piece, MAX_CHUNK).await.is_err() {
-                break;
-            }
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    // The same client attaches anew to the run. Once it is answered, nothing of the older
-    // stream's is written: what the newer brings is not typed before the rest of that paste.
-    let again = Attach {
-        run: Some(attached.run),
-        ..asks(Some(&attached.name), &[])
-    };
-    let (mut newer, _from, _) = attach(&client, again).await.unwrap();
-    tell(&mut newer, FromMirror::Has(Vec::new())).await;
-    tell(&mut newer, typed(b"bbbb")).await;
-    until("the program has read the newer stream's bytes", || {
-        fs::read(&out).unwrap_or_default().ends_with(b"bbbb")
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let read = fs::read(&out).unwrap();
-    let pasted = read.iter().take_while(|byte| **byte == b'a').count();
-    assert_eq!(
-        read[pasted..],
-        *b"bbbb",
-        "{} bytes after the paste",
-        read.len() - pasted
-    );
-    assert!(
-        (1..2 << 20).contains(&pasted),
-        "{pasted} of the paste arrived"
-    );
-    paste.abort();
-    client.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn typed_bytes_go_to_the_run_that_was_checked() {
-    let host = Host::start("run", &[]);
-    let tap = Tap::start(&host).await;
-    let outs = ["o1", "o2", "o3", "o4"].map(|name| host.tmp.0.join(name));
-    // The name is given to another run, by hand: one started beside it takes its place in one
-    // step, and the folder that had the name is removed (which ends its holder).
-    let anew = |name: &str, out: &Path| {
-        let (pane, beside, old) = (host.pane(name), host.pane("beside"), host.pane("old"));
-        let holder = holder_of(&pane);
-        let mut start = vec!["fux".to_string(), "start".into()];
-        start.extend([beside.display().to_string(), "--".into()]);
-        start.extend(reads_into(out, 0));
-        let start: Vec<&str> = start.iter().map(String::as_str).collect();
-        let (code, _, said) = koh(&host.tmp.0.join("run"), &start);
-        assert_eq!(code, Some(0), "{said}");
-        until("the new run is ready", || screen(&beside).contains("READY"));
-        fs::rename(&pane, &old).unwrap();
-        fs::rename(&beside, &pane).unwrap();
-        assert_ne!(holder_of(&pane), holder);
-        move || _ = fs::remove_dir_all(&old).or_else(|_| fs::remove_dir_all(&old))
-    };
-    // While the client is away: what it typed meanwhile is typed nowhere, and it ends.
-    let mut away = host.mount(
-        "a",
-        Some(&tap),
-        &["--session", "s"],
-        &reads_into(&outs[0], 0),
-    );
-    away.shows("READY");
-    tap.down(true);
-    away.says("no link", 1);
-    away.types(b"typed while away\n");
-    anew("s", &outs[1])();
-    tap.down(false);
-    assert_eq!(away.ends(), Some(127));
-    let said = away.said();
-    assert!(
-        said.contains("another run has the session's name s"),
-        "{said}"
-    );
-    assert!(said.contains("17 typed bytes were not sent"), "{said}");
-    // (That is the server's word as well as the client's: asked for a run the name has not,
-    // by a client that would take any answer, it answers none.)
-    let client = host.client().await;
-    let asks = Attach {
-        run: Some(RUNS[0]),
-        ..asks(Some("s"), &[])
-    };
-    let err = attach(&client, asks).await.unwrap_err();
-    assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
-    assert!(
-        err.message.contains("another run has the session's name s"),
-        "{err:?}"
-    );
-    client.close().await;
-    // While the stream lives: what is typed then goes into the FIFOs of the run that was
-    // checked, and the client is told that its session ended.
-    let mut live = host.mount("b", None, &["--session", "t"], &reads_into(&outs[2], 0));
-    live.shows("READY");
-    let remove = anew("t", &outs[3]);
-    let _ = fs::OpenOptions::new()
-        .write(true)
-        .open(live.dir.join("in"))
-        .map(|mut keys| keys.write_all(b"typed at once\n"));
-    assert_eq!(live.ends(), Some(1));
-    remove();
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(fs::read(&outs[1]).unwrap(), b"");
-    assert_eq!(fs::read(&outs[3]).unwrap(), b"");
-}
-
-#[test]
-fn a_client_that_attached_as_status_was_written_is_not_told_it_ended() {
-    let host = Host::start("status", &[]);
-    let mut mount = host.mount("a", None, &[], &[]);
-    let pane = host.pane("1");
-    agrees(&pane, &mount.dir);
-    // fux writes `status` twice at a start: another file of another time, with the same holder
-    // in its first line. The run is the same, and the client follows it on.
-    let status = fs::read_to_string(pane.join("status")).unwrap();
-    for _ in 0..3 {
-        std::thread::sleep(Duration::from_millis(300));
-        fux::replace(
-            pane.join("status"),
-            format!("{status}command sh\n").as_bytes(),
-        )
-        .unwrap();
+    fn says(&self, what: &str) -> String {
+        fs::read_to_string(self.0.join(what)).unwrap_or_default()
     }
-    mount.types(b"echo still-$((40 + 2))\n");
-    mount.shows("still-42");
-    assert_eq!(mount.koh.try_wait().unwrap(), None, "{}", mount.said());
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_holder_killed_as_it_wrote_is_shown_and_ended() {
-    let host = Host::start("killed", &[]);
-    let client = host.client().await;
-    let flood = ["sh", "-c", "while :; do seq 1 100000; done"].map(String::from);
-    let (mut send, mut from, attached) = attach(&client, asks(None, &flood)).await.unwrap();
-    let pane = host.pane(&attached.name);
-    let mut second = host.mount("a", None, &["--session", &attached.name], &[]);
-    // A mirror of the test's own, kept after the session's end.
-    let kept = host.tmp.0.join("kept");
-    let mut mirror = koh::carry::Mirror::make(&kept).unwrap();
-    tell(&mut send, FromMirror::Has(mirror.has().unwrap())).await;
-    let (holder, wrote) = (holder_of(&pane), pane.clone());
-    let killer = tokio::task::spawn_blocking(move || {
-        // In the middle of a round: its number is odd then. The holder is stopped when it is
-        // seen odd, and killed if it stopped so.
-        std::thread::sleep(Duration::from_millis(700));
-        let odd = || {
-            let number = fs::read_to_string(wrote.join("generation")).unwrap_or_default();
-            number
-                .trim()
-                .parse::<u64>()
-                .is_ok_and(|number| number % 2 == 1)
-        };
-        for _ in 0..200_000 {
-            if odd() {
-                signal(&holder, "-STOP");
-                if odd() {
-                    break;
-                }
-                signal(&holder, "-CONT");
-            }
-        }
-        signal(&holder, "-KILL");
-    });
-    let mut rounds = 0;
-    let carried = async {
-        loop {
-            let message: ToMirror = recv_msg(&mut from, MAX_CHUNK).await.unwrap();
-            rounds += usize::from(message == ToMirror::Done);
-            if mirror.take(message, Instant::now()).unwrap() {
-                break;
-            }
-        }
-    };
-    let ended = tokio::time::timeout(Duration::from_secs(20), carried).await;
-    assert!(
-        ended.is_ok(),
-        "the client was not told that the session ended"
-    );
-    killer.await.unwrap();
-    // The last round is the folder as the holder left it, under an even number; then `Ended`.
-    let left: u64 = fs::read_to_string(pane.join("generation"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    let ours: u64 = fs::read_to_string(kept.join("generation"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!((left % 2, ours), (1, left + 1), "after {rounds} rounds");
-    assert_eq!(held(&kept), held(&pane));
-    assert_eq!(fs::read_to_string(kept.join("state")).unwrap(), "running\n");
-    // A client is not told that all is well: nothing says how the program ended.
-    assert_eq!(second.ends(), Some(1));
-    assert!(
-        second
-            .said()
-            .contains("the session ended without saying how"),
-        "{}",
-        second.said()
-    );
-    client.close().await;
-}
-
-#[test]
-fn the_exit_code_is_the_programs_and_not_zero_without_one() {
-    let host = Host::start("code", &[]);
-    let run = |asks: &[&str], program: &[&str]| {
-        let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
-        host.mount("a", None, asks, &program).ends()
-    };
-    // The program's status; of one a signal ended, 128 and the signal.
-    assert_eq!(run(&["--new"], &["sh", "-c", "exit 7"]), Some(7));
-    assert_eq!(run(&["--new"], &["sh", "-c", "kill -9 $$"]), Some(137));
-    // An ended session stays, and a later client is shown the same and ends the same.
-    assert_eq!(run(&["--session", "1"], &[]), Some(7));
-    assert_eq!(run(&["--session", "2"], &[]), Some(137));
-    // A holder that was killed left `state` at `running`, with no lock: that is no 0.
-    let mut mount = host.mount("b", None, &["--new"], &["sleep".into(), "30".into()]);
-    until("the mirror has a round", || {
-        mount.dir.join("generation").is_file()
-    });
-    signal(&holder_of(&host.pane("3")), "-KILL");
-    assert_eq!(mount.ends(), Some(1));
-    assert_eq!(run(&["--session", "3"], &[]), Some(1));
-    assert_eq!(names_in(&host.sessions), ["1", "2", "3"]);
-}
-
-#[test]
-fn koh_serve_started_anew_keeps_the_session() {
-    let mut host = Host::start("anew", &[]);
-    let mount = host.mount("a", None, &[], &[]);
-    let pane = host.pane("1");
-    agrees(&pane, &mount.dir);
-    let holder = holder_of(&pane);
-    // The server is stopped: the session lives, with nobody to carry it.
-    host.stop();
-    mount.says("no link", 1);
-    fs::write(pane.join("in"), "echo while-stopped\n").unwrap();
-    until("the session runs on", || {
-        screen(&pane).contains("while-stopped")
-    });
-    // Started anew, it has the same key (no holder kept its lock) and the same sessions: the
-    // client attaches to the run it had, by its name.
-    host.serve();
-    mount.says("the link is back", 1);
-    mount.shows("while-stopped");
-    mount.types(b"echo after-$((1 + 1))\n");
-    mount.shows("after-2");
-    agrees(&pane, &mount.dir);
-    assert_eq!(
-        (holder_of(&pane), names_in(&host.sessions)),
-        (holder, vec!["1".to_string()])
-    );
-}
-
-#[test]
-fn two_clients_see_one_session() {
-    let host = Host::start("two", &[]);
-    let first = host.mount("a", None, &[], &[]);
-    let pane = host.pane("1");
-    agrees(&pane, &first.dir);
-    // With no session named, a second client is given the newest that lives: the same one.
-    let second = host.mount("b", None, &[], &[]);
-    agrees(&pane, &second.dir);
-    // What either types, both see.
-    first.types(b"echo from-the-first\n");
-    second.shows("from-the-first");
-    second.types(b"echo from-the-second\n");
-    first.shows("from-the-second");
-    agrees(&pane, &first.dir);
-    agrees(&pane, &second.dir);
-    assert_eq!(names_in(&host.sessions), ["1"]);
-}
-
-#[test]
-fn two_clients_tell_their_terminals_at_once() {
-    let host = Host::start("told", &[]);
-    let mounts = [
-        host.mount("a", None, &[], &[]),
-        host.mount("b", None, &[], &[]),
-    ];
-    agrees(&host.pane("1"), &mounts[1].dir);
-    // Each client's viewer writes what its terminal is like into its own fux session; koh's
-    // fux session on the server has what the last of them said, whole.
-    let session = host.sessions.parent().unwrap().to_path_buf();
-    let says = |who: &str, turn: u32| format!("foreground #{turn:06x}\n# {who}\n");
-    for turn in 0..20 {
-        for (who, name) in [
-            ("a", "colours"),
-            ("b", "colours"),
-            ("a", "keyboard"),
-            ("b", "keyboard"),
-        ] {
-            fux::replace(host.tmp.0.join(who).join(name), says(who, turn).as_bytes()).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(60));
+    /// Whether the terminal is as a program finds one: the main screen, nothing asked of it
+    /// (no mouse, no pastes marked), the cursor shown.
+    fn is_put_back(&self) -> bool {
+        let main =
+            fs::read_link(self.0.join("shown")).is_ok_and(|shown| shown == Path::new("main"));
+        main && self.says("modes").trim().is_empty() && self.says("cursor").contains("shown")
     }
-    for name in ["colours", "keyboard"] {
-        let last = [says("a", 19), says("b", 19)];
-        until(&format!("the server has the last {name}"), || {
-            fs::read_to_string(session.join(name)).is_ok_and(|told| last.contains(&told))
+
+    fn types(&self, keys: &[u8]) {
+        let mut typed = fuxix::open(self.0.join("in"), true).unwrap();
+        typed.write_all(keys).unwrap();
+    }
+
+    /// `koh connect`'s process number, and how it ended once it has (`state`).
+    fn pid(&self) -> String {
+        let status = self.says("status");
+        let pid = status.lines().find_map(|line| line.strip_prefix("pid "));
+        pid.unwrap().to_string()
+    }
+
+    fn ends(&self) -> String {
+        until("koh connect ends", || {
+            self.says("state").trim() != "running"
         });
-    }
-    // Neither failed, and nothing is left of the writing.
-    assert_eq!(names_in(&session), ["colours", "keyboard", "koh-sessions"]);
-    for mount in mounts {
-        assert!(mount.said().lines().count() == 1, "{}", mount.said());
-    }
-}
-
-#[tokio::test]
-async fn a_client_of_another_format_starts_nothing() {
-    let host = Host::start("format", &[]);
-    let client = host.client().await;
-    for (format, older) in [(fux::FORMAT + 1, "server"), (fux::FORMAT - 1, "client")] {
-        let asks = Attach {
-            format,
-            ..asks(None, &["sleep".into(), "30".into()])
-        };
-        let err = attach(&client, asks).await.unwrap_err();
-        assert_eq!(err.code, Exit::FAILED);
-        assert!(
-            err.message
-                .contains(&format!("the {older}'s koh is the older one")),
-            "{err:?}"
-        );
-    }
-    // No folder, and no program.
-    assert_eq!(names_in(&host.sessions), [""; 0]);
-    client.close().await;
-}
-
-#[test]
-fn a_mirror_is_made_by_koh_and_no_folder_that_is_there_is_taken() {
-    let host = Host::start("made", &[]);
-    // A folder that is there is not taken, cleared or written into; and nothing is started.
-    let there = host.tmp.0.join("a/ws/m");
-    fs::create_dir_all(&there).unwrap();
-    fs::write(there.join("mine"), "kept").unwrap();
-    let mut refused = host.mount("a", None, &[], &[]);
-    assert_eq!(refused.ends(), Some(1));
-    assert!(
-        refused.said().contains("takes none that is there"),
-        "{}",
-        refused.said()
-    );
-    assert_eq!(names_in(&there), ["mine"]);
-    assert_eq!(names_in(&host.sessions), [""; 0]);
-    // With no place named, the mirror is in a fux session of koh's own on the client, under
-    // the server's name and the session's: nothing is put into the user's fux session.
-    let mounts = host.tmp.0.join("crun/koh/fux/koh-mounts");
-    let mut koh = host.koh(&["mount", &host.id, "--direct", &host.addr()]);
-    let mut mount = Mount {
-        koh: koh.stderr(std::process::Stdio::null()).spawn().unwrap(),
-        dir: mounts.join(format!("{}.1", &host.id[..62])),
-        said: PathBuf::new(),
-    };
-    until("the mirror is in koh's own folder", || {
-        mount.dir.join("generation").is_file()
-    });
-    assert_eq!(fs::metadata(&mount.dir).unwrap().mode() & 0o777, 0o700);
-    assert!(!host.tmp.0.join("crun/fux").exists() && !host.tmp.0.join("home/.cache").exists());
-    // Stopped, the mount removes its mirror.
-    signal(&mount.koh.id().to_string(), "-TERM");
-    assert_eq!(mount.ends(), Some(0));
-    assert_eq!(names_in(&mounts), [""; 0]);
-    // With no runtime directory, or an empty one, koh's own place is in the cache directory.
-    let mounts = host.tmp.0.join("home/.cache/koh/fux/koh-mounts");
-    for runtime in [Some(""), None] {
-        let mut koh = host.koh(&["mount", &host.id, "--direct", &host.addr()]);
-        match runtime {
-            Some(runtime) => koh.env("XDG_RUNTIME_DIR", runtime),
-            None => koh.env_remove("XDG_RUNTIME_DIR"),
-        };
-        let mut mount = Mount {
-            koh: koh.stderr(std::process::Stdio::null()).spawn().unwrap(),
-            dir: mounts.join(format!("{}.1", &host.id[..62])),
-            said: PathBuf::new(),
-        };
-        until("the mirror is in the cache directory", || {
-            mount.dir.join("generation").is_file()
-        });
-        signal(&mount.koh.id().to_string(), "-TERM");
-        assert_eq!(mount.ends(), Some(0));
-        assert_eq!(names_in(&mounts), [""; 0]);
+        self.says("state").trim().to_string()
     }
 }
 
@@ -3575,860 +2729,308 @@ async fn a_scoped_key_cannot_attach() {
     srv.shutdown().await;
 }
 
-#[test]
-fn sessions_are_capped_and_the_oldest_ended_one_makes_room() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_a_pane_kept_by_koh_hold_and_shown_by_a_viewer_on_the_server() {
+    let host = Host::start("pane", &[]);
+    let client = host.client().await;
+    let sleeps = ["sleep".to_string(), "30".into()];
+    let (send, mut from, attached) = attach(&client, asks(None, &sleeps)).await.unwrap();
+    // The session is a folder in koh's own fux session, beneath its state, which it printed;
+    // its run is the one its holder wrote there.
+    let state = fs::canonicalize(host.tmp.0.join("run/koh")).unwrap();
+    assert_eq!(host.sessions, state.join("fux/koh-sessions"));
+    assert_eq!(
+        (names_in(&host.sessions), attached.name.as_str()),
+        (vec!["1".to_string()], "1")
+    );
+    let (pane, server) = (host.pane("1"), host.served.as_ref().unwrap().server.id());
+    assert_eq!(fux::run_of(&pane), Some(attached.run));
+    // Its holder is this binary under the word `hold`, with the lock on the folder: fux's proof
+    // that it lives. It is no child of `koh serve`, and lives on when that is stopped.
+    let holder = holder_of(&pane);
+    let words = |pid: &str| {
+        let args = ps(pid, "args=");
+        let words = args.split_whitespace().take(2).map(String::from);
+        words.collect::<Vec<_>>()
+    };
+    assert_eq!(words(&holder), [env!("CARGO_BIN_EXE_koh"), "hold"]);
+    assert_ne!(ps(&holder, "ppid="), server.to_string());
+    let locked = || fs::File::open(&pane).unwrap().try_lock_shared().is_err();
+    assert!(locked());
+    // Its viewer is this binary too, a child of `koh serve`, with a folder of its own in the
+    // session; what it draws is what the stream carries.
+    until("the viewer is there", || viewers(&host).len() == 1);
+    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
+    assert_eq!(words(&viewer), [env!("CARGO_BIN_EXE_koh"), "view-session"]);
+    assert_eq!(ps(&viewer, "ppid="), server.to_string());
+    let first: ViewOutput = recv_msg(&mut from, VIEW_FRAME).await.unwrap();
+    assert!(
+        matches!(first, ViewOutput::Bytes(bytes) if bytes.starts_with(b"\x1b]8;;\x1b\\\x1b[22;2t\x1b[?1049h"))
+    );
+    // The client leaves: the viewer does, and its folder; the session runs on. Nothing of the
+    // session was ever the client's to keep.
+    drop((send, from));
+    client.close().await;
+    until("the viewer is gone", || {
+        viewers(&host).is_empty() && ps(&viewer, "pid=").is_empty()
+    });
+    assert!(locked() && fs::read_to_string(pane.join("state")).unwrap() == "running\n");
+    assert_eq!(names_in(&host.tmp.0.join("crun")), [""; 0]);
+    assert_eq!(names_in(&state), ["fux", "jobs"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sessions_are_capped_and_the_oldest_ended_one_makes_room() {
     let host = Host::start("capped", &["--max-sessions", "2"]);
-    let run = |at: &str, program: &[&str]| {
+    let client = host.client().await;
+    let run = |who: u64, program: &[&str]| {
         let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
-        host.mount(at, None, &["--new"], &program)
+        let asks = Attach {
+            client: who,
+            ..asks(None, &program)
+        };
+        attach(&client, asks)
     };
     // Two sessions: one that runs, and one that has ended.
-    let first = run("a", &["sleep", "30"]);
-    until("the first runs", || first.dir.join("generation").is_file());
-    assert_eq!(run("b", &["sh", "-c", "exit 0"]).ends(), Some(0));
+    let _first = run(1, &["sleep", "30"]).await.unwrap();
+    let (_send, mut from, _) = run(2, &["sh", "-c", "exit 0"]).await.unwrap();
+    assert_eq!(drawn(&mut from).await.1, Some(0));
     assert_eq!(names_in(&host.sessions), ["1", "2"]);
     // A third takes the place of the one that ended, once it has started.
-    let third = run("c", &["sleep", "30"]);
+    let _third = run(3, &["sleep", "30"]).await.unwrap();
     until("the third runs, and the ended one is gone", || {
         names_in(&host.sessions) == ["1", "3"]
     });
-    until("the third is mirrored", || {
-        third.dir.join("generation").is_file()
-    });
     // With both running there is no room: the client is told the server is busy, and nothing starts.
-    let mut fourth = run("d", &["sleep", "30"]);
-    assert_eq!(fourth.ends(), Some(75));
+    let err = run(4, &["sleep", "30"]).await.unwrap_err();
     assert!(
-        fourth.said().contains("--max-sessions"),
-        "{}",
-        fourth.said()
+        err.code == Exit::BUSY && err.message.contains("--max-sessions"),
+        "{err:?}"
     );
     assert_eq!(names_in(&host.sessions), ["1", "3"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_message_ends_the_client_and_a_broken_link_does_not() {
-    let host = Host::start("refused", &[]);
-    // A server of the test's own, which the client dials: it may send anything.
-    let secret =
-        load_or_create_key(Role::Server, Some(&host.tmp.0.join("tap_cfg/server.key"))).unwrap();
-    let id = secret.public().to_string();
-    let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-    let endpoint = bind_server(secret, Some(local), true).await.unwrap();
-    let addr = endpoint
-        .bound_sockets()
-        .into_iter()
-        .next()
-        .unwrap()
-        .to_string();
-    let hostile = Tap {
-        id,
-        addr,
-        wire: Wire::new(),
-    };
-    let mut mount = host.mount("a", Some(&hostile), &[], &[]);
-    let conn = endpoint.accept().await.unwrap().await.unwrap();
-    let run = Run {
-        device: 1,
-        folder: 2,
-        holder: 3,
-    };
-    let mut asked = Vec::new();
-    for link in 0..2 {
-        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-        verify_client(&conn, &mut recv).await.unwrap();
-        let Request::Attach(asks) = recv_msg(&mut recv, MAX_CTRL).await.unwrap() else {
-            panic!("no attach")
-        };
-        asked.push(asks.run);
-        send_msg(&mut send, &Reply::Ok, MAX_CTRL).await.unwrap();
-        let attached = Attached {
-            name: "1".into(),
-            run,
-        };
-        send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
-        let FromMirror::Has(has) = recv_msg(&mut recv, MAX_CHUNK).await.unwrap() else {
-            panic!("no list")
-        };
-        let put = |name: &str| ToMirror::Put {
-            name: name.into(),
-            more: false,
-            bytes: b"a screen\n".to_vec(),
-        };
-        let round = match link {
-            // A whole round, and then the stream breaks: the client keeps its mirror and attaches anew.
-            0 => vec![
-                ToMirror::Round(2),
-                ToMirror::Folder("main".into()),
-                put("main/screen"),
-                ToMirror::Done,
-            ],
-            // A round no server may send: a name that climbs out of the mirror.
-            _ => {
-                assert_eq!(
-                    has.iter().map(|had| had.name.as_str()).collect::<Vec<_>>(),
-                    ["main", "main/screen"]
-                );
-                vec![ToMirror::Round(4), put("../escaped"), ToMirror::Done]
-            }
-        };
-        for message in round {
-            send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
-        }
-        if link == 0 {
-            until("the mirror has the round", || {
-                mount.dir.join("main/screen").is_file()
-            });
-            let _ = send.reset(0u32.into());
-        } else {
-            // (The stream is kept until the client has read it.)
-            assert_eq!(mount.ends(), Some(1));
-        }
-    }
-    assert_eq!(asked, [None, Some(run)]);
-    let said = mount.said();
-    assert!(
-        said.contains("the server sent what a mirror does not take"),
-        "{said}"
-    );
-    // Nothing was changed by it, in the mirror or outside it; and the mount took its mirror with it.
-    assert_eq!(names_in(&host.tmp.0.join("a")), ["said", "ws"]);
-    assert_eq!(names_in(&host.tmp.0.join("a/ws")), [""; 0]);
-
-    // A session's name is the server's to say, and a mirror with no place named is put under
-    // it: a name that is a path, past a folder that is there, makes no folder anywhere.
-    let mounts = host.tmp.0.join("crun/koh/fux/koh-mounts");
-    fs::create_dir_all(mounts.join(format!("{}.1", &hostile.id[..48]))).unwrap();
-    let mut koh = host.koh(&["mount", &hostile.id, "--direct", &hostile.addr]);
-    let said = host.tmp.0.join("said");
-    let mut climbing = Mount {
-        koh: koh
-            .stderr(fs::File::create(&said).unwrap())
-            .spawn()
-            .unwrap(),
-        dir: mounts.clone(),
-        said,
-    };
-    let conn = endpoint.accept().await.unwrap().await.unwrap();
-    let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-    verify_client(&conn, &mut recv).await.unwrap();
-    let _: Request = recv_msg(&mut recv, MAX_CTRL).await.unwrap();
-    send_msg(&mut send, &Reply::Ok, MAX_CTRL).await.unwrap();
-    let attached = Attached {
-        name: "1/../../escaped".into(),
-        run,
-    };
-    send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
-    assert_eq!(climbing.ends(), Some(1));
-    assert!(
-        climbing.said().contains("a session's name that is none"),
-        "{}",
-        climbing.said()
-    );
-    assert_eq!(names_in(&host.tmp.0.join("crun/koh/fux")), ["koh-mounts"]);
-}
-
-#[test]
-fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
-    let host = Host::start("connect-tty", &[]);
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
-    let (id, addr, pane) = (host.id.clone(), host.addr(), host.pane("1"));
-    let program = "stty -icanon -echo; echo READY; od -An -tx1 -N2; head -c 1 >/dev/null; exit 7";
-    let shown = |tty: &mut InTerminal| tty.drawn.windows(5).any(|drawn| drawn == b"READY");
-
-    // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
-    let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
-    let mut first = InTerminal::connect(&config, &runtime, &started);
-    first.until("the terminal shows READY", shown);
-    first.types(b"\x1d.");
-    assert_eq!(first.ends(), Some(0));
-    assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
-
-    // Each of koh's two prefix keys typed twice is the key's own byte, typed to the program.
-    let again = ["--direct", &addr, &id, "--session", "1"];
-    let mut second = InTerminal::connect(&config, &runtime, &again);
-    second.until("the terminal shows READY", shown);
-    second.types(b"\x1d\x1d\x02\x02");
-    let typed = |_: &mut InTerminal| {
-        screen(&pane).split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
-    };
-    second.until("the program reads the two bytes", typed);
-
-    // The terminal's size is the session's, also when it changes: the viewer asks koh's
-    // mirror to take it, as it asks any pane, and koh carries that to the session.
-    let size = fuxix::Winsize {
-        rows: 30,
-        cols: 100,
-        xpixel: 1000,
-        ypixel: 600,
-    };
-    fuxix::set_winsize(&second.tty, size).unwrap();
-    let resized = |_: &mut InTerminal| fs::read_to_string(pane.join("size")).unwrap() == "100 30\n";
-    second.until("the session takes the terminal's size", resized);
-
-    // The program's end is the end of `koh connect`, with the program's status: nobody has to
-    // type the detach key at a session that is over.
-    second.types(b"x");
-    assert_eq!(second.ends(), Some(7));
-
-    // What koh made for its viewer, and its mirror, are gone with it.
-    assert_eq!(names_in(&runtime), [""; 0]);
-}
-
-// ---- what the reviews of the switch asked for ---------------------------------------------------
-
-/// The last `n` bytes of a file.
-fn tail(path: &Path, n: u64) -> Vec<u8> {
-    use std::io::{Seek as _, SeekFrom};
-    let Ok(mut file) = fs::File::open(path) else {
-        return Vec::new();
-    };
-    let len = file.metadata().map_or(0, |file| file.len());
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(n)));
-    let mut end = Vec::new();
-    let _ = file.read_to_end(&mut end);
-    end
-}
-
-/// What was read of numbered lines of 16 bytes that were typed (line N at byte 16 N): how
-/// many stretches of them are left out, or where a byte came twice or out of its order.
-fn stretches(read: &[u8], typed: &[u8]) -> Result<usize, String> {
-    let (mut at, mut i, mut left_out) = (0, 0, 0);
-    while i < read.len() {
-        // Where what was read from here on is in what was typed: by the first whole line in it.
-        let rest = &read[i..];
-        let before = rest
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map_or(rest.len(), |end| end + 1);
-        let place = match rest
-            .get(before..before + 15)
-            .map(|line| String::from_utf8_lossy(line).parse::<usize>())
-        {
-            Some(Ok(line)) => (line * 16)
-                .checked_sub(before)
-                .ok_or(format!("byte {i}: before the first line"))?,
-            // (The last bytes, with no whole line among them: they are the end of what was typed.)
-            _ => typed
-                .len()
-                .checked_sub(rest.len())
-                .ok_or(format!("byte {i}: more than was typed"))?,
-        };
-        if place < at {
-            return Err(format!(
-                "byte {i} of what was read was typed at {place}: before {at}, which was read already"
-            ));
-        }
-        left_out += usize::from(place > at);
-        let same = rest
-            .iter()
-            .zip(&typed[place..])
-            .take_while(|(read, typed)| read == typed)
-            .count();
-        if same == 0 {
-            return Err(format!(
-                "byte {i} of what was read is not what was typed at {place}"
-            ));
-        }
-        (i, at) = (i + same, place + same);
-    }
-    Ok(left_out)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_paste_through_links_that_break_is_never_typed_twice() {
-    let host = Host::start("twice", &[]);
-    let tap = Tap::start(&host).await;
-    let out = host.tmp.0.join("out");
-    let mount = host.mount("a", Some(&tap), &["--new"], &reads_into(&out, 0));
-    mount.shows("READY");
-    // Numbered lines are pasted as fast as they are taken, while forty links in turn break:
-    // the client hears no more, and the server still takes what the client had sent.
-    let (pasting, ended) = (
-        Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let (dir, goes_on, ends) = (mount.dir.clone(), pasting.clone(), ended.clone());
-    let typist = std::thread::spawn(move || {
-        let mut keys = fs::OpenOptions::new()
-            .write(true)
-            .open(dir.join("in"))
-            .unwrap();
-        let (mut all, mut line) = (Vec::new(), 0u64);
-        while !ends.load(SeqCst) {
-            if !goes_on.load(SeqCst) {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-            let block: Vec<u8> = (line..line + 256)
-                .flat_map(|n| format!("{n:015}\n").into_bytes())
-                .collect();
-            keys.write_all(&block).unwrap();
-            all.extend(block);
-            line += 256;
-        }
-        all
-    });
-    for broken in 0..40 {
-        std::thread::sleep(Duration::from_millis(40));
-        tap.half();
-        pasting.store(false, SeqCst);
-        mount.says("the link is back", broken + 1);
-        pasting.store(true, SeqCst);
-    }
-    std::thread::sleep(Duration::from_millis(100));
-    ended.store(true, SeqCst);
-    let all = typist.join().unwrap();
-    let end = &all[all.len() - 64..];
-    until("the program has read to the paste's end", || {
-        tail(&out, 64) == end
-    });
-    // A byte may be missing; none is there twice, and the order holds.
-    let read = fs::read(&out).unwrap();
-    let left_out = stretches(&read, &all);
-    println!(
-        "pasted {} bytes, {} arrived: {left_out:?}",
-        all.len(),
-        read.len()
-    );
-    assert!(
-        left_out.as_ref().is_ok_and(|stretches| *stretches <= 40),
-        "{left_out:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_stream_ends_with_its_client() {
-    // (What `koh serve` holds is counted in /proc.)
-    if !cfg!(target_os = "linux") {
-        return;
-    }
-    let host = Host::start("ends", &[]);
-    let server = host.served.as_ref().unwrap().server.id();
-    let holds = || {
-        let count = |what: &str| {
-            fs::read_dir(format!("/proc/{server}/{what}"))
-                .unwrap()
-                .count()
-        };
-        (count("fd"), count("task"))
-    };
-    let client = host.client().await;
-    // One client comes and goes: what the server holds then is what it holds with none.
-    let comes_and_goes = async |number: u64| {
-        let asks = Attach {
-            client: number,
-            ..asks(Some("quiet"), &reads_into(&host.tmp.0.join("out"), 100))
-        };
-        let (mut send, mut from, _) = attach(&client, asks).await.unwrap();
-        tell(&mut send, FromMirror::Has(Vec::new())).await;
-        while recv_msg::<ToMirror>(&mut from, MAX_CHUNK).await.unwrap() != ToMirror::Done {}
-    };
-    comes_and_goes(0).await;
-    let mut rest = holds();
-    until("the server is at rest", || {
-        std::thread::sleep(Duration::from_millis(500));
-        std::mem::replace(&mut rest, holds()) == holds()
-    });
-    // A client that leaves in the middle of a paste the program does not read: its stream's
-    // end is seen though typed bytes wait, and nothing of it is kept.
-    for left in 0..3 {
-        let mut mount = host.mount(&format!("m{left}"), None, &["--session", "quiet"], &[]);
-        mount.shows("READY");
-        let keys = mount.dir.join("in");
-        let paste = std::thread::spawn(move || {
-            let mut keys = fs::OpenOptions::new().write(true).open(keys).unwrap();
-            let _ = keys.write_all(&vec![b'x'; 4 << 20]);
-        });
-        std::thread::sleep(Duration::from_secs(1));
-        signal(&mount.koh.id().to_string(), "-TERM");
-        assert_eq!(mount.ends(), Some(0));
-        drop(mount);
-        paste.join().unwrap();
-    }
-    until(
-        &format!("the server holds {rest:?} again, not {:?}", holds()),
-        || holds().0 <= rest.0 && holds().1 <= rest.1,
-    );
-    // And after a hundred clients that came and went.
-    for number in 1..=100 {
-        comes_and_goes(number).await;
-    }
-    until(
-        &format!("the server holds {rest:?} again, not {:?}", holds()),
-        || holds().0 <= rest.0 && holds().1 <= rest.1,
-    );
     client.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_session_that_ends_as_a_clients_list_is_read_is_shown_to_its_end() {
-    let host = Host::start("listed", &[]);
+async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_names() {
+    let host = Host::start("older", &[]);
     let client = host.client().await;
-    let program = [
-        "sh",
-        "-c",
-        "echo READY; read go; echo THE-LAST-WORD; exit 7",
-    ]
-    .map(String::from);
-    let (mut send, mut from, attached) = attach(&client, asks(None, &program)).await.unwrap();
-    let pane = host.pane(&attached.name);
-    until("the program is ready", || screen(&pane).contains("READY"));
-    // A list that takes the server a while to read (a file of 8 MB it has, under a hash it
-    // has not), and the program's end while it reads.
-    fs::write(pane.join("large"), vec![b'.'; 8 << 20]).unwrap();
-    let had = koh::proto::Had {
-        name: "large".into(),
-        kind: koh::proto::Kind::File,
-        len: 8 << 20,
-        hash: [0; 32],
-    };
-    tell(&mut send, FromMirror::Has(vec![had])).await;
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    fs::write(pane.join("in"), "go\n").unwrap();
-    // The client is given the last round before it is told of the end: the last screen, and
-    // how the program ended.
-    let kept = host.tmp.0.join("kept");
-    let mut mirror = koh::carry::Mirror::make(&kept).unwrap();
-    let _ = mirror.has().unwrap();
-    let carried = async {
-        while !mirror
-            .take(
-                recv_msg(&mut from, MAX_CHUNK).await.unwrap(),
-                Instant::now(),
-            )
-            .unwrap()
-        {}
-    };
-    tokio::time::timeout(Duration::from_secs(60), carried)
+    let out = host.tmp.0.join("out");
+    let (mut older, mut old, attached) = attach(&client, asks(None, &reads_into(&out)))
         .await
         .unwrap();
-    assert_eq!(
-        fs::read_to_string(kept.join("state")).unwrap_or_default(),
-        "exited 7\n"
+    let pane = host.pane(&attached.name);
+    until("the program is ready", || screen(&pane).contains("READY"));
+    until("the older stream's viewer is there", || {
+        viewers(&host).len() == 1
+    });
+    let viewer = viewers(&host);
+    let typed = |keys: &[u8]| ViewInput::Bytes(keys.to_vec());
+    send_msg(&mut older, &typed(b"aaaa"), VIEW_FRAME)
+        .await
+        .unwrap();
+    // The same client attaches anew to the run. Once it is answered the older stream's viewer
+    // has left, and its stream has ended without a last word: it was cut, not ended.
+    let again = Attach {
+        run: Some(attached.run),
+        ..asks(Some(&attached.name), &[])
+    };
+    let (mut newer, _from, _) = attach(&client, again.clone()).await.unwrap();
+    assert!(
+        viewers(&host).iter().all(|now| !viewer.contains(now)),
+        "{:?}",
+        viewers(&host)
     );
-    assert!(screen(&kept).contains("THE-LAST-WORD"));
+    assert_eq!(drawn(&mut old).await.1, None);
+    send_msg(&mut newer, &typed(b"bbbb"), VIEW_FRAME)
+        .await
+        .unwrap();
+    until("the program has read both", || {
+        fs::read(&out).unwrap_or_default() == b"aaaabbbb"
+    });
+    // Asked for a run the name has not, a client is answered with none: nothing is typed into
+    // a session that only has the name. And one that names no session names no run.
+    let other = Attach {
+        run: Some(attached.run ^ 1),
+        ..again.clone()
+    };
+    let err = attach(&client, other).await.unwrap_err();
+    assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
+    assert!(
+        err.message.contains("another run has the session's name 1"),
+        "{err:?}"
+    );
+    let nameless = Attach {
+        name: None,
+        ..again
+    };
+    assert_eq!(
+        attach(&client, nameless).await.unwrap_err().code,
+        Exit::USAGE
+    );
+    assert_eq!(names_in(&host.sessions), ["1"]);
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream() {
+    let host = Host::start("says", &[]);
+    let client = host.client().await;
+    let session = host.sessions.parent().unwrap().to_path_buf();
+    let sleeps = ["sleep".to_string(), "100".into()];
+    // What a client says of its terminal is its name: one that is none is refused before a
+    // session is started, and nothing of a terminal is written anywhere.
+    let not_said: [fn(&mut Attach); 2] = [
+        |asks| asks.term = "xterm\n256".into(),
+        |asks| asks.term = "x".repeat(65),
+    ];
+    for not_said in not_said {
+        let mut asks = asks(None, &sleeps);
+        not_said(&mut asks);
+        let err = attach(&client, asks.clone()).await.unwrap_err();
+        assert_eq!(err.code, Exit::USAGE, "{asks:?}");
+    }
+    assert_eq!(
+        (names_in(&session), names_in(&host.sessions)),
+        (vec!["koh-sessions".to_string()], vec![])
+    );
+    let (mut send, mut from, _) = attach(&client, asks(None, &sleeps)).await.unwrap();
+    let written = names_in(&session);
+    let written = written.iter().filter(|name| !name.starts_with(".view."));
+    assert_eq!(written.collect::<Vec<_>>(), ["koh-sessions"]);
+    // On the stream a client types and tells its terminal's size, a message of 16 KiB at most:
+    // one that is longer ends the stream, with nothing of it typed.
+    let size = ViewSize {
+        cols: 100,
+        rows: 30,
+        ..ViewSize::default()
+    };
+    send_msg(&mut send, &ViewInput::Resize(size), VIEW_FRAME)
+        .await
+        .unwrap();
+    until("the session takes the size", || {
+        fs::read_to_string(host.pane("1").join("size")).unwrap_or_default() == "100 30\n"
+    });
+    let long = ViewInput::Bytes(vec![b'x'; VIEW_FRAME + 1]);
+    send_msg(&mut send, &long, MAX_CHUNK).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), drawn(&mut from)).await;
+    assert_eq!(ended.expect("the stream lived on").1, None);
+    until("its viewer is gone", || viewers(&host).is_empty());
+    assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux", "jobs"]);
     client.close().await;
 }
 
 #[test]
-fn a_terminal_that_is_closed_ends_koh_and_what_it_made() {
-    let host = Host::start("hangup", &[]);
-    // `koh mount`, hung up as a closed terminal hangs it up: it ends as if stopped, and its
-    // mirror goes, so the next mount of that session is not refused by what koh itself left.
-    let mounts = host.tmp.0.join("crun/koh/fux/koh-mounts");
-    for _ in 0..2 {
-        let mut koh = host.koh(&[
-            "mount",
-            &host.id,
-            "--direct",
-            &host.addr(),
-            "--session",
-            "s",
-        ]);
-        let mut mount = Mount {
-            koh: koh.stderr(std::process::Stdio::null()).spawn().unwrap(),
-            dir: mounts.join(format!("{}.s", &host.id[..62])),
-            said: PathBuf::new(),
-        };
-        until("the mirror is there", || {
-            mount.dir.join("generation").is_file()
-        });
-        signal(&mount.koh.id().to_string(), "-HUP");
-        assert_eq!(mount.ends(), Some(0));
-        assert_eq!(names_in(&mounts), [""; 0]);
-    }
-    // `koh connect`, its terminal closed: it ends, and its private folder goes with it.
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun2"));
-    fs::create_dir_all(&runtime).unwrap();
-    let asks = ["--direct", &host.addr(), &host.id, "--session", "s"];
-    let mut connect = InTerminal::connect(&config, &runtime, &asks);
-    connect.until("the terminal shows the session", |tty| {
-        !tty.drawn.is_empty() && names_in(&runtime).len() == 1
+fn the_exit_code_is_the_programs_and_not_zero_without_one() {
+    let host = Host::start("code", &[]);
+    let run = |asks: &[&str], program: &[&str]| {
+        let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
+        host.attach(asks, &program).ends()
+    };
+    // The program's status; of one a signal ended, 128 and the signal.
+    assert_eq!(run(&["--new"], &["sh", "-c", "exit 7"]), Some(7));
+    assert_eq!(run(&["--new"], &["sh", "-c", "kill -9 $$"]), Some(137));
+    // An ended session stays, and a later client is shown the same and ends the same.
+    assert_eq!(run(&["--session", "1"], &[]), Some(7));
+    assert_eq!(run(&["--session", "2"], &[]), Some(137));
+    // A holder that was killed left `state` at `running`, with no lock: that is no 0.
+    let mut shown = host.attach(&["--new"], &sh("echo SHOWN; exec sleep 30"));
+    shown.until("the session is shown", |tty| {
+        tty.drawn.windows(5).any(|drawn| drawn == b"SHOWN")
     });
+    signal(&holder_of(&host.pane("3")), "-KILL");
+    assert_eq!(shown.ends(), Some(1));
+    assert_eq!(run(&["--session", "3"], &[]), Some(1));
+    assert_eq!(names_in(&host.sessions), ["1", "2", "3"]);
+    assert_eq!(viewers(&host), [""; 0]);
+}
+
+#[test]
+fn koh_connect_asks_its_terminal_nothing_and_puts_it_back_however_it_ends() {
+    let host = Host::start("terminal", &[]);
+    let session = host.sessions.parent().unwrap().to_path_buf();
+    // A program that takes the alternate screen, the mouse and pastes marked, and hides the cursor.
+    let modes = r"printf '\033[?1049h\033[?1002h\033[?1006h\033[?2004h\033[?25l\033[5;5HMODES-%s' ON; exec sleep 600";
+    let on = |terminal: &InPane| {
+        until("the terminal shows the program, its modes on", || {
+            terminal.says("shown/screen").contains("MODES-ON")
+                && terminal.says("modes").contains("mouse")
+        });
+        assert!(!terminal.is_put_back());
+    };
+    // A terminal that answers whatever it is asked (a pane of fux's does: what it is, its
+    // colours, its keyboard). It was asked nothing, by koh or by the session's viewer: no answer
+    // was typed into the session, and nothing of a terminal is written on the server.
+    let asks = ["--session", "s", "--", "sh", "-c", modes];
+    let first = InPane::connect(&host, "t1", &[("keyboard", "5\n")], &asks);
+    on(&first);
     std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
+    assert!(!session.join("colours").exists() && !session.join("keyboard").exists());
+    // Told to end, it puts the terminal back before it goes, and the session runs on. Hung
+    // up, as by a terminal that is closed, it ends the same way; and so when its user leaves.
+    signal(&first.pid(), "-TERM");
+    assert_eq!(first.ends(), "exited 0");
+    assert!(first.is_put_back(), "{:?}", first.says("modes"));
+    let second = InPane::connect(&host, "t2", &[], &["--session", "s"]);
+    on(&second);
+    signal(&second.pid(), "-HUP");
+    assert_eq!(second.ends(), "exited 0");
+    assert!(second.is_put_back(), "{:?}", second.says("modes"));
+    let third = InPane::connect(&host, "t3", &[], &["--session", "s"]);
+    on(&third);
+    third.types(b"\x1d.");
+    assert_eq!(third.ends(), "exited 0");
+    assert!(third.is_put_back(), "{:?}", third.says("modes"));
+    // The session's program was typed nothing, by any of the three, and no viewer is left.
+    assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
+    until("the viewers are gone", || viewers(&host).is_empty());
+}
+
+#[test]
+fn a_terminal_that_is_closed_ends_koh_and_a_server_that_was_killed_leaves_no_viewer() {
+    let mut host = Host::start("hangup", &[]);
+    // `koh connect` on a pty that is no controlling terminal of its own, which is then closed:
+    // it ends, its viewer on the server with it, and nothing was made on the client.
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
+    let asks = ["--direct", &host.addr(), &host.id, "--session", "s"];
+    let mut connect = InTerminal::connect_in(&config, &runtime, &asks, false);
+    connect.until("the terminal shows the session", |tty| {
+        tty.drawn.windows(8).any(|drawn| drawn == b"\x1b[?1049h") && viewers(&host).len() == 1
+    });
     drop(std::mem::replace(
         &mut connect.tty,
         fs::File::open("/dev/null").unwrap(),
     ));
     assert_eq!(connect.ends(), Some(0));
+    until("its viewer is gone", || viewers(&host).is_empty());
     assert_eq!(names_in(&runtime), [""; 0]);
+    // The server is killed outright while a client is attached: the viewer reads the end of
+    // its terminal and leaves by itself. One that was killed with it left its folder: the
+    // server that starts next removes it, and the client is shown the session again.
+    let mut connect = host.attach(&["--session", "s"], &[]);
+    connect.until("the session is shown", |_| viewers(&host).len() == 1);
+    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
+    // (The server is stopped first: it removes the folder of a viewer it sees end.)
+    let server = host.served.as_ref().unwrap().server.id().to_string();
+    for (pid, how) in [(&server, "-STOP"), (&viewer, "-KILL"), (&server, "-KILL")] {
+        signal(pid, how);
+    }
+    connect.until("koh says there is no link", |tty| {
+        tty.drawn.windows(7).any(|drawn| drawn == b"no link")
+    });
+    assert_eq!(viewers(&host).len(), 1);
+    host.served = None;
+    host.serve();
+    connect.types(b"echo back-$((6*7))\n");
+    connect.until("the session is shown again", |tty| {
+        tty.drawn.windows(7).any(|drawn| drawn == b"back-42")
+    });
+    assert!(viewers(&host).len() == 1 && !viewers(&host).contains(&format!(".view.{viewer}")));
     assert_eq!(
         fs::read_to_string(host.pane("s").join("state")).unwrap(),
         "running\n"
     );
-}
-
-/// A server of the test's own, which a client dials: it may answer anything.
-struct Hostile {
-    endpoint: iroh::Endpoint,
-    at: Tap,
-}
-
-impl Hostile {
-    async fn start(host: &Host) -> Self {
-        let key = host.tmp.0.join("tap_cfg/server.key");
-        let secret = load_or_create_key(Role::Server, Some(&key)).unwrap();
-        let id = secret.public().to_string();
-        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
-        let endpoint = bind_server(secret, Some(local), true).await.unwrap();
-        let addr = endpoint
-            .bound_sockets()
-            .into_iter()
-            .next()
-            .unwrap()
-            .to_string();
-        let at = Tap {
-            id,
-            addr,
-            wire: Wire::new(),
-        };
-        Self { endpoint, at }
-    }
-
-    /// The next attach on a connection, answered `Ok`: its stream, and what it asked.
-    async fn asked(conn: &Connection) -> (SendStream, RecvStream, Attach) {
-        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-        verify_client(conn, &mut recv).await.unwrap();
-        let Request::Attach(asks) = recv_msg(&mut recv, MAX_CTRL).await.unwrap() else {
-            panic!("no attach")
-        };
-        send_msg(&mut send, &Reply::Ok, MAX_CTRL).await.unwrap();
-        (send, recv, asks)
-    }
-}
-
-const RUNS: [Run; 2] = [
-    Run {
-        device: 1,
-        folder: 2,
-        holder: 3,
-    },
-    Run {
-        device: 1,
-        folder: 2,
-        holder: 4,
-    },
-];
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_reconnect_answered_with_another_run_types_nothing() {
-    let host = Host::start("answered", &[]);
-    let hostile = Hostile::start(&host).await;
-    let mut mount = host.mount("a", Some(&hostile.at), &[], &[]);
-    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-    // A first link, with a round that gives the mirror its `in`; then it breaks.
-    let (mut send, mut recv, _) = Hostile::asked(&conn).await;
-    let attached = |run| Attached {
-        name: "1".into(),
-        run,
-    };
-    send_msg(&mut send, &attached(RUNS[0]), MAX_CTRL)
-        .await
-        .unwrap();
-    let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
-    for message in [
-        ToMirror::Round(2),
-        ToMirror::Fifo("in".into()),
-        ToMirror::Done,
-    ] {
-        send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
-    }
-    until("the mirror has its FIFO", || mount.dir.join("in").exists());
-    let _ = send.reset(0u32.into());
-    mount.says("no link", 1);
-    mount.types(b"typed for the run that was\n");
-    // The client asks for the run it had, and is answered with another: it says so and ends,
-    // and what it held is typed nowhere.
-    let (mut send, mut recv, asks) = Hostile::asked(&conn).await;
-    assert_eq!(asks.run, Some(RUNS[0]));
-    send_msg(&mut send, &attached(RUNS[1]), MAX_CTRL)
-        .await
-        .unwrap();
-    assert_eq!(mount.ends(), Some(127));
-    let said = mount.said();
-    assert!(
-        said.contains("another run has the session's name"),
-        "{said}"
-    );
-    assert!(said.contains("27 typed bytes were not sent"), "{said}");
-    let mut sent = Vec::new();
-    while let Ok(Some(message)) = koh::proto::recv_msg_opt::<FromMirror>(&mut recv, MAX_CHUNK).await
-    {
-        sent.push(message);
-    }
-    assert!(
-        !sent
-            .iter()
-            .any(|message| matches!(message, FromMirror::Write { .. })),
-        "{sent:?}"
-    );
-
-    // An answer that is no answer (more than the name and the run a session has) is a
-    // refusal too: the client ends, and does not ask again.
-    let mut mount = host.mount("b", Some(&hostile.at), &[], &[]);
-    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-    let (mut send, _recv, _) = Hostile::asked(&conn).await;
-    send_msg(&mut send, &(attached(RUNS[0]), 7u8), MAX_CTRL)
-        .await
-        .unwrap();
-    assert_eq!(mount.ends(), Some(1));
-    assert!(
-        mount
-            .said()
-            .contains("the server sent what a mirror does not take"),
-        "{}",
-        mount.said()
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_open_round_that_stands_still_is_a_broken_link() {
-    let host = Host::start("still", &[]);
-    let hostile = Hostile::start(&host).await;
-    let mount = host.mount("a", Some(&hostile.at), &[], &[]);
-    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-    // A round is begun, and nothing follows it: no message, and no end of the stream.
-    let (mut send, mut recv, _) = Hostile::asked(&conn).await;
-    let attached = Attached {
-        name: "1".into(),
-        run: RUNS[0],
-    };
-    send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
-    let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
-    for message in [ToMirror::Round(2), ToMirror::Folder("main".into())] {
-        send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
-    }
-    let began = Instant::now();
-    // After thirty seconds the client throws the round away and attaches anew, to the run it had.
-    let again = tokio::time::timeout(Duration::from_secs(50), Hostile::asked(&conn)).await;
-    let (_send, _recv, asks) = again.expect("the client did not come again");
-    assert!(
-        began.elapsed() >= Duration::from_secs(29),
-        "after {:?}",
-        began.elapsed()
-    );
-    assert_eq!(asks.run, Some(RUNS[0]));
-    // (Nothing of the round was done to the mirror, and nothing of it is left beside it.)
-    assert_eq!(names_in(&mount.dir), [".koh"]);
-    assert_eq!(names_in(&mount.dir.join(".koh")), [""; 0]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_attach_on_a_new_connection_has_five_seconds_to_be_answered_too() {
-    let host = Host::start("unanswered", &[]);
-    let hostile = Hostile::start(&host).await;
-    let mount = host.mount("a", Some(&hostile.at), &[], &[]);
-    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-    // A first link, with a whole round; then its connection goes.
-    let (mut send, mut recv, _) = Hostile::asked(&conn).await;
-    let attached = Attached {
-        name: "1".into(),
-        run: RUNS[0],
-    };
-    send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
-    let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
-    for message in [
-        ToMirror::Round(2),
-        ToMirror::Fifo("in".into()),
-        ToMirror::Done,
-    ] {
-        send_msg(&mut send, &message, MAX_CHUNK).await.unwrap();
-    }
-    until("the mirror has its FIFO", || mount.dir.join("in").exists());
-    conn.close(0u32.into(), b"");
-    // The client dials anew and asks, and is not answered: the connection lives, and its
-    // request is read no further.
-    let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-    let _unanswered = conn.accept_bi().await.unwrap();
-    // It does not wait for that answer for ever: it asks again, on the connection it has.
-    let again = tokio::time::timeout(Duration::from_secs(15), Hostile::asked(&conn)).await;
-    let (_send, _recv, asks) = again.expect("the client did not ask again");
-    assert_eq!(asks.run, Some(RUNS[0]));
-}
-
-#[test]
-fn an_ended_session_with_a_client_is_not_removed_and_a_start_that_fails_removes_none() {
-    let host = Host::start("kept", &["--max-sessions", "1"]);
-    let run = |at: &str, asks: &[&str], program: &[&str]| {
-        let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
-        host.mount(at, None, asks, &program)
-    };
-    // One session, which has ended, with megabytes of text.
-    assert_eq!(
-        run("a", &["--new"], &["sh", "-c", "seq 1 400000"]).ends(),
-        Some(0)
-    );
-    // A session that cannot start takes the place of none: the ended one is still there.
-    let mut fails = run("b", &["--new"], &["/no/such/program"]);
-    assert_eq!(fails.ends(), Some(126));
-    assert!(
-        fails.said().contains("no session was started"),
-        "{}",
-        fails.said()
-    );
-    until(
-        "the folder of the start that failed is all that came",
-        || names_in(&host.sessions).len() == 2,
-    );
-    assert!(host.pane("1").join("state").is_file());
-    fs::remove_dir_all(host.pane("2")).unwrap();
-    // A client is given the ended session and does not read what it is sent: its stream lives.
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let (client, stream) = runtime.block_on(async {
-        let client = host.client().await;
-        let (mut send, from, _) = attach(&client, asks(Some("1"), &[])).await.unwrap();
-        tell(&mut send, FromMirror::Has(Vec::new())).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        (client, (send, from))
-    });
-    // While it does, the session does not go to make room: the server is busy.
-    let mut third = run("c", &["--new"], &["sleep", "30"]);
-    assert_eq!(third.ends(), Some(75));
-    assert_eq!(names_in(&host.sessions), ["1"]);
-    // Once the client has left it goes for a new one.
-    drop(stream);
-    runtime.block_on(client.close());
-    let fourth = run("d", &["--new"], &["sleep", "30"]);
-    until("the ended session made room", || {
-        names_in(&host.sessions) == ["2"]
-    });
-    until("the new one is mirrored", || {
-        fourth.dir.join("generation").is_file()
-    });
-}
-
-#[test]
-fn a_default_mirror_has_a_name_fux_shows_and_fuxs_own_names_are_no_sessions() {
-    let host = Host::start("names", &[]);
-    let mounts = host.tmp.0.join("crun/koh/fux/koh-mounts");
-    // A session's name may be all of the 64 characters a name has: with no place named, its
-    // mirror still has a pane's kind of name, cut to fit.
-    for len in [3, 62, 63, 64] {
-        let name = "n".repeat(len);
-        let mut koh = host.koh(&[
-            "mount",
-            &host.id,
-            "--direct",
-            &host.addr(),
-            "--session",
-            &name,
-        ]);
-        let mut mount = Mount {
-            koh: koh
-                .args(["--", "sleep", "100"])
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-            dir: mounts.clone(),
-            said: PathBuf::new(),
-        };
-        let mirrors = || fs::read_dir(&mounts).map_or(0, |mirrors| mirrors.count());
-        until("the mirror is there", || mirrors() == 1);
-        let mirror = names_in(&mounts).remove(0);
-        assert!(
-            mirror.len() <= 64 && !mirror.starts_with('.') && mirror.ends_with(&name),
-            "{mirror}"
-        );
-        assert_eq!(mirror.len() == len, len > 62, "{mirror}");
-        signal(&mount.koh.id().to_string(), "-TERM");
-        assert_eq!(mount.ends(), Some(0));
-    }
-    // The names fux keeps for itself are refused as any other that is no name, before a
-    // session is started for them.
-    for name in ["layout", "-", "keyboard", "colours", ".hidden", "a/b"] {
-        let mut mount = host.mount("r", None, &["--session", name], &[]);
-        assert_eq!(mount.ends(), Some(2), "{name}");
-    }
-    assert_eq!(names_in(&host.sessions).len(), 4);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_client_that_says_what_no_client_says_loses_its_stream() {
-    let host = Host::start("says", &[]);
-    let client = host.client().await;
-    let session = host.sessions.parent().unwrap().to_path_buf();
-    let sleeps = ["sleep".to_string(), "100".into()];
-    let told = |name: &str| FromMirror::Told {
-        name: name.into(),
-        bytes: b"told\n".to_vec(),
-    };
-    let not_said = [
-        // A second list: the first is what the server's record of the mirror is made of.
-        FromMirror::Has(Vec::new()),
-        // What a terminal is like, under any name but the two that are that.
-        told("layout"),
-        told("../../told"),
-        told("koh-sessions/1/command"),
-        // Typed bytes for anything but the two FIFOs.
-        FromMirror::Write {
-            name: "command".into(),
-            bytes: b"typed\n".to_vec(),
-        },
-    ];
-    for (number, message) in not_said.into_iter().enumerate() {
-        let asks = Attach {
-            client: number as u64,
-            ..asks(Some("1"), &sleeps)
-        };
-        let (mut send, mut from, _) = attach(&client, asks).await.unwrap();
-        tell(&mut send, FromMirror::Has(Vec::new())).await;
-        tell(&mut send, told("keyboard")).await;
-        tell(&mut send, message.clone()).await;
-        // The stream ends: what follows is read by nobody.
-        let ended = async {
-            while let Ok(Some(_)) = koh::proto::recv_msg_opt::<ToMirror>(&mut from, MAX_CHUNK).await
-            {
-            }
-        };
-        let ended = tokio::time::timeout(Duration::from_secs(10), ended).await;
-        assert!(ended.is_ok(), "the stream lived on after {message:?}");
-    }
-    // Nothing was written but what a client may say, where it may say it.
-    assert_eq!(names_in(&session), ["keyboard", "koh-sessions"]);
-    assert_eq!(
-        fs::read_to_string(session.join("keyboard")).unwrap(),
-        "told\n"
-    );
-    assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux", "jobs"]);
-    client.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn koh_connect_told_to_end_before_its_first_round_ends_and_leaves_nothing() {
-    let host = Host::start("early", &[]);
-    let hostile = Hostile::start(&host).await;
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun2"));
-    fs::create_dir_all(&runtime).unwrap();
-    // A server that answers the attach and never sends a whole round: `koh connect` waits
-    // for its first round, with no viewer yet. Interrupted, terminated or hung up then, it
-    // ends as it does later, and its private folder goes.
-    for told in ["-HUP", "-INT", "-TERM"] {
-        let asks = ["--direct", &hostile.at.addr, &hostile.at.id];
-        let mut connect = InTerminal::connect(&config, &runtime, &asks);
-        let conn = hostile.endpoint.accept().await.unwrap().await.unwrap();
-        let (mut send, mut recv, _) = Hostile::asked(&conn).await;
-        let attached = Attached {
-            name: "1".into(),
-            run: RUNS[0],
-        };
-        send_msg(&mut send, &attached, MAX_CTRL).await.unwrap();
-        let _: FromMirror = recv_msg(&mut recv, MAX_CHUNK).await.unwrap();
-        send_msg(&mut send, &ToMirror::Round(2), MAX_CHUNK)
-            .await
-            .unwrap();
-        assert_eq!(names_in(&runtime).len(), 1);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        signal(&connect.koh.id().to_string(), told);
-        let began = Instant::now();
-        assert_eq!(connect.ends(), Some(0), "{told}");
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "{told}: after {:?}",
-            began.elapsed()
-        );
-        assert_eq!(names_in(&runtime), [""; 0], "{told}");
-    }
 }
 
 // ---- the three commands: `koh sessions`, `koh output`, `koh wait --session` ---------------------
@@ -4481,16 +3083,12 @@ impl Host {
         Waits(koh.spawn().unwrap())
     }
 
-    /// A session of that name running `program`, with nobody attached once this returns: its
-    /// folder, when its screen shows `ready`. That is read in the mount's own mirror, and the
-    /// mount told to end only then: the session's pane shows it before `koh mount` has been
-    /// answered, and a `koh mount` that does not listen yet dies of the signal.
     fn session(&self, name: &str, program: &[String], ready: &str) -> PathBuf {
-        let mut mount = self.mount(name, None, &["--session", name], program);
+        let mut tty = self.attach(&["--session", name], program);
         let pane = self.pane(name);
-        mount.shows(ready);
-        signal(&mount.koh.id().to_string(), "-TERM");
-        assert_eq!(mount.ends(), Some(0), "{}", mount.said());
+        tty.until(ready, |_| screen(&pane).contains(ready));
+        tty.types(b"\x1d.");
+        assert_eq!(tty.ends(), Some(0));
         pane
     }
 }
@@ -4525,12 +3123,12 @@ fn sessions_lists_what_the_folders_say() {
     let host = Host::start("list", &[]);
     // Three sessions: one that lives, with a shell that marks its commands and a client; one
     // whose program has ended; one whose holder was killed, so that nothing says how it ended.
-    let mut live = host.mount("a", None, &["--session", "live"], &marking_shell(&host));
+    let mut live = host.attach(&["--session", "live"], &marking_shell(&host));
     let pane = host.pane("live");
     until("the shell has its prompt", || screen(&pane).contains('$'));
-    let mut done = host.mount("b", None, &["--session", "done"], &sh("exit 7"));
+    let mut done = host.attach(&["--session", "done"], &sh("exit 7"));
     assert_eq!(done.ends(), Some(7));
-    let mut dead = host.mount("c", None, &["--session", "dead"], &marking_shell(&host));
+    let mut dead = host.attach(&["--session", "dead"], &marking_shell(&host));
     let killed = host.pane("dead");
     until("the third has its prompt", || screen(&killed).contains('$'));
     fs::write(killed.join("in"), "sleep 30\n").unwrap();
@@ -4692,6 +3290,7 @@ fn output_last_is_the_last_commands_output_across_history() {
     let above = host.sessions.parent().unwrap();
     fs::create_dir_all(above.join("shown")).unwrap();
     fs::write(above.join("status"), "holder 1\n").unwrap();
+    fs::write(above.join("run"), format!("{:032x}\n", 1)).unwrap();
     fs::write(above.join("shown/screen"), "not a session's\n").unwrap();
     let (code, shown, said) = host.asked("output", &["--session", ".."]);
     assert_eq!((code, shown.as_str()), (Some(127), ""), "{said}");
@@ -4802,6 +3401,12 @@ fn the_three_commands_are_a_full_keys() {
             scope,
         };
         save_clients(Some(&host.tmp.0.join("srv_cfg/server.key")), &[entry]).unwrap();
+        let mut terminal = InTerminal::connect(
+            &bot,
+            &host.tmp.0.join("crun"),
+            &[&host.id, "--direct", &host.addr(), "--session", "s"],
+        );
+        assert_eq!(terminal.ends(), Some(4), "scoped key attached");
         let asks: [&[&str]; 4] = [
             &["sessions"],
             &["output", "--session", "s"],
@@ -5096,6 +3701,7 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
         let pane = sessions.join(n.to_string());
         fs::create_dir(&pane).unwrap();
         fs::write(pane.join("status"), "holder 1\npid 1\n").unwrap();
+        fs::write(pane.join("run"), format!("{n:032x}\n")).unwrap();
         fs::write(pane.join("title"), "t".repeat(256) + "\n").unwrap();
     }
     let list = client.sessions().await.unwrap();

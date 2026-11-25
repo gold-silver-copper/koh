@@ -19,12 +19,13 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 - **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
   with spaces is read back as it was written.** In 0.18.0–0.18.1, any third word on a line in
-  `clients` that was not `cp=DIR` or `exec=DIR` (a typo such as `copy=/srv`, `cp:/srv`, or
-  `cp`) was read as an unscoped key that could run anything; and a `DIR` containing a space
-  (`koh clients add NAME ID --cp "/a b"`) was split at the first space and enforced as `/a`
-  instead of `/a b`. Now the scope is everything after the endpoint id to the end of the line
-  verbatim (no trim at its end and no `#` comment after it): only an absent scope grants full
-  access, and a line whose scope is unrecognized or has no `DIR` (`cp=` or `exec=`, which
+  `clients` that was not `cp=DIR` or `exec=DIR` (a typo such as `copy=/srv`, `cp:/srv`, `cp`,
+  or an inline comment like `laptop ID # my laptop`, which was a full key in 0.18.1 and is now
+  a line not taken) was read as an unscoped key that could run anything; and a `DIR` containing
+  a space (`koh clients add NAME ID --cp "/a b"`) was split at the first space and enforced as
+  `/a` instead of `/a b`. Now the scope is everything after the endpoint id to the end of the
+  line verbatim (no trim at its end and no `#` comment after it): only an absent scope grants
+  full access, and a line whose scope is unrecognized or has no `DIR` (`cp=` or `exec=`, which
   0.18.1 read as the home directory) is skipped and gives that client nothing without locking
   out valid entries. `koh clients` names each skipped line on stderr with its line number, and
   the next `koh clients add`, `rm`, or `rename` rewrites the file without it; `koh serve` logs

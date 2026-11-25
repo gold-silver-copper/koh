@@ -2111,7 +2111,6 @@ impl Served {
 #[tokio::test]
 async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job_was_not_signalled()
 {
-    use std::os::unix::fs::PermissionsExt as _;
     let tmp = TempDir::new("kill-helper");
     let key = new_key(&tmp, "client.key");
     let bin = tmp.0.join("bin");
@@ -2143,8 +2142,7 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
     let fake = |then: &str| {
         format!("#!/bin/sh\n[ \"$1\" = -0 ] && exec /bin/kill \"$@\"\n{then}exit 42\n")
     };
-    fs::write(bin.join("kill"), fake("/bin/sleep 2\n")).unwrap();
-    fs::set_permissions(bin.join("kill"), fs::Permissions::from_mode(0o755)).unwrap();
+    script(&bin.join("kill"), &fake("/bin/sleep 2\n"));
     let mut served = Served::start(&tmp, &bin, key.public(), true);
     let id: iroh::EndpointId = served.says("koh server id:").unwrap().parse().unwrap();
     let addr: SocketAddr = served.says("listening:").unwrap().parse().unwrap();
@@ -2176,7 +2174,7 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
     // A job whose first process has ended and left another behind in its group: the job says
     // it has ended, and the group is what `koh kill` is for. Not signalled, it is not reported
     // as signalled; once it has gone, there is nothing to signal and nothing to report.
-    fs::write(bin.join("kill"), fake("")).unwrap();
+    script(&bin.join("kill"), &fake(""));
     let left = tmp.0.join("left.pid");
     let line = format!("/bin/sleep 300 & echo $! > {}", left.display());
     client
@@ -2222,15 +2220,13 @@ fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
 
 #[tokio::test]
 async fn koh_serve_does_not_take_its_user_from_an_id_that_failed() {
-    use std::os::unix::fs::PermissionsExt as _;
     // With no runtime directory the server asks id(1) whose state it keeps. An id(1) that says
     // a number and then that it failed has told nothing: the server says so and does not start.
     let tmp = TempDir::new("id-failed");
     let key = new_key(&tmp, "client.key");
     let bin = tmp.0.join("bin");
     fs::create_dir_all(&bin).unwrap();
-    fs::write(bin.join("id"), "#!/bin/sh\necho 42424\nexit 42\n").unwrap();
-    fs::set_permissions(bin.join("id"), fs::Permissions::from_mode(0o755)).unwrap();
+    script(&bin.join("id"), "#!/bin/sh\necho 42424\nexit 42\n");
     let mut path = bin.into_os_string();
     path.push(":");
     path.push(std::env::var_os("PATH").unwrap());
@@ -2249,6 +2245,16 @@ fn koh(runtime: &Path, args: &[&str]) -> (Option<i32>, String, String) {
     let said = koh.stdin(std::process::Stdio::null()).output().unwrap();
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
     (said.status.code(), text(&said.stdout), text(&said.stderr))
+}
+
+/// Writes a script that is then run. A shell of its own writes it: written by the test itself,
+/// the file is open for writing in whatever another test starts at that moment, until that
+/// runs its own program, and a script that is open for writing is not run ("Text file busy").
+fn script(path: &Path, text: &str) {
+    let writes = "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\"";
+    let mut shell = Command::new("sh");
+    let written = shell.args(["-c", writes]).arg(path).arg(text).status();
+    assert!(written.unwrap().success(), "{}", path.display());
 }
 
 /// What `ps` says of a process under one of its headings.

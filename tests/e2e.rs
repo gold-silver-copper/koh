@@ -3171,6 +3171,38 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
 }
 
 #[test]
+fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
+    let host = Host::start("stalled", &[]);
+    // A terminal that takes nothing more (one behind a path that is stuck), under a program
+    // that goes on printing: koh's writing to it waits, and so would putting it back. Told to
+    // end, koh ends all the same, each of the three ways, and soon.
+    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
+        // (Every cell of another colour than the one before it: a screen of it is many bytes.)
+        let draws = r"while :; do printf '\033[31mfl\033[32moo\033[33md-\033[34mof\033[35m-l\033[36min\033[37mes'; done";
+        let flood = ["sh", "-c", draws].map(String::from);
+        let mut tty = host.attach(&["--session", how.trim_start_matches('-')], &flood);
+        tty.until("the flood is drawn", |tty| {
+            tty.drawn.windows(2).any(|drawn| drawn == b"es")
+        });
+        // (Not read from here on: what koh writes fills the terminal, and waits.)
+        std::thread::sleep(Duration::from_secs(3));
+        let told = Instant::now();
+        signal(&tty.koh.id().to_string(), how);
+        let ended = loop {
+            match tty.koh.try_wait().unwrap() {
+                Some(ended) => break ended.code(),
+                None => assert!(
+                    told.elapsed() < Duration::from_secs(5),
+                    "{how}: still there"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(ended, Some(code), "{how}");
+    }
+}
+
+#[test]
 fn a_terminal_that_is_closed_ends_koh_and_a_server_that_was_killed_leaves_no_viewer() {
     let mut host = Host::start("hangup", &[]);
     // `koh connect` on a pty that is no controlling terminal of its own, which is then closed:

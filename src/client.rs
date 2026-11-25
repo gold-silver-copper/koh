@@ -872,18 +872,21 @@ impl Console {
         self.write(words.to_vec()).await;
     }
 
-    /// Lets the terminal go: put back, what it said of the link wiped, all of that written
-    /// (a terminal that takes nothing is given a quarter of a second), and then its mode.
+    /// Lets the terminal go: put back, what it said of the link wiped, all of that written,
+    /// and then its mode. A terminal that takes nothing is given a quarter of a second for
+    /// all of it: koh ends when it is told to, whatever its terminal does.
     async fn close(mut self) {
-        self.reset().await;
-        if self.said {
-            self.write(b"\r\x1b[K".to_vec()).await;
-        }
-        self.out = None;
-        if let Some(writer) = self.writer.take() {
-            let written = tokio::task::spawn_blocking(move || writer.join());
-            let _ = tokio::time::timeout(Duration::from_millis(250), written).await;
-        }
+        let written = async {
+            self.reset().await;
+            if self.said {
+                self.write(b"\r\x1b[K".to_vec()).await;
+            }
+            self.out = None;
+            if let Some(writer) = self.writer.take() {
+                let _ = tokio::task::spawn_blocking(move || writer.join()).await;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_millis(250), written).await;
         drop(self.raw);
     }
 

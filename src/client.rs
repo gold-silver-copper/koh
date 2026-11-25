@@ -590,8 +590,8 @@ impl Client {
     /// is its own again and says so; what is typed then is held for the return, but the key
     /// that leaves, which leaves at once.
     async fn session(&mut self, opts: ConnectOptions, console: &mut Console) -> Result<i32> {
-        // The terminal is asked what it is like, once, before the first attach, which says it;
-        // what is typed meanwhile is the session's first keys.
+        // The terminal was asked what it is like as it was opened, once; what it says goes
+        // with every attach. What was typed before the question is the session's first keys.
         let mut keys = Keys::default();
         let terminal = match Terminal::ask(console, &mut keys).await {
             Ok(terminal) => terminal,
@@ -809,7 +809,7 @@ fn reset(flags: bool) -> Vec<u8> {
 
 impl Console {
     /// Makes the terminal raw, reads what was typed before now (it was there before anything
-    /// is asked, and is no answer), and asks it what it is like: in that order, before
+    /// is asked, and is no answer), and has it asked what it is like: in that order, before
     /// anything else reads it.
     fn open(input: File, mut output: File) -> Result<Console> {
         let tty = input.try_clone().map_err(terminal_error)?;
@@ -823,9 +823,11 @@ impl Console {
                 _ => break,
             }
         }
-        let asked = output.write_all(ASKS).is_ok();
         let (keys, typed) = mpsc::channel(4);
         let (out, mut written) = mpsc::channel::<Vec<u8>>(1);
+        // (The question is the writer's first piece, as all that is written is: a terminal
+        // that takes nothing holds the writer, and not koh, which ends when it is told to.)
+        let asked = out.try_send(ASKS.to_vec()).is_ok();
         std::thread::spawn(move || {
             let (mut input, mut piece) = (input, [0; 4096]);
             loop {

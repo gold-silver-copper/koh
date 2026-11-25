@@ -498,13 +498,28 @@ impl InTerminal {
     /// In a terminal that is koh's controlling terminal (`its`), as a shell's is; or one that
     /// is only its standard input and output.
     fn connect_in(config: &Path, runtime: &Path, args: &[&str], its: bool) -> Self {
+        Self::connect_on(Self::pty(), config, runtime, args, its)
+    }
+
+    /// A terminal of 80 by 24: its end here, and the end a program has.
+    fn pty() -> (fs::File, fs::File) {
         let size = fuxix::Winsize {
             rows: 24,
             cols: 80,
             xpixel: 800,
             ypixel: 480,
         };
-        let (tty, theirs) = fuxix::pty(size).unwrap();
+        fuxix::pty(size).unwrap()
+    }
+
+    /// `koh connect` on this terminal.
+    fn connect_on(
+        (tty, theirs): (fs::File, fs::File),
+        config: &Path,
+        runtime: &Path,
+        args: &[&str],
+        its: bool,
+    ) -> Self {
         let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
         koh.env("KOH_CONFIG_DIR", config)
             .env("XDG_RUNTIME_DIR", runtime)
@@ -3342,6 +3357,46 @@ fn what_was_typed_before_the_key_that_leaves_is_typed() {
             std::thread::sleep(Duration::from_millis(20));
         }
         until("the viewer is gone", || viewers(&host).is_empty());
+    }
+}
+
+#[test]
+fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to() {
+    let host = Host::start("stalled-first", &[]);
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
+    // A terminal that takes nothing from before koh starts (another program has filled it,
+    // and nobody reads): koh cannot ask it what it is like, and waits for nothing to do so.
+    // Told to end, it ends, each of the three ways.
+    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
+        let (tty, theirs) = InTerminal::pty();
+        let mut fills = Command::new("sh");
+        fills
+            .args(["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"])
+            .stdout(theirs.try_clone().unwrap());
+        let mut fills = fills.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let name = how.trim_start_matches('-');
+        let asks = [&host.id, "--direct", &host.addr(), "--session", name];
+        let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
+        // (koh has dialled and has its terminal by now: the session is there.)
+        until("the session is started", || {
+            host.pane(name).join("run").exists()
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        let told = Instant::now();
+        signal(&koh.koh.id().to_string(), how);
+        let ended = loop {
+            match koh.koh.try_wait().unwrap() {
+                Some(ended) => break ended.code(),
+                None => assert!(
+                    told.elapsed() < Duration::from_secs(5),
+                    "{how}: still there"
+                ),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(ended, Some(code), "{how}");
+        let _ = (fills.kill(), fills.wait());
     }
 }
 

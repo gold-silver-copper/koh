@@ -381,13 +381,19 @@ pub fn screen(dir: &Path) -> String {
     fs::read_to_string(dir.join("shown/screen")).unwrap_or_default()
 }
 
-/// Waits until the client's rendered terminal screen matches the server pane's `shown/screen`.
+/// Waits until the client's terminal shows what the session's pane shows: the same rows of
+/// text. (But for blanks at a row's end. A pane's `screen` keeps a blank a program typed where
+/// its line wraps and drops one that was only drawn there, and a viewer draws every cell: the
+/// two files differ in such a blank, and no terminal shows it.)
 pub fn screen_agrees(pane: &Path, client: &Connected) {
+    let rows = |screen: String| -> Vec<String> {
+        let rows = screen.lines().map(|row| row.trim_end().to_string());
+        rows.collect()
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let want = screen(pane);
-        let got = client.screen();
-        if !want.is_empty() && want == got {
+        let (want, got) = (screen(pane), client.screen());
+        if !want.is_empty() && rows(want.clone()) == rows(got.clone()) {
             return;
         }
         assert!(

@@ -985,7 +985,8 @@ fn size(tty: &File) -> ViewSize {
 ///
 /// koh has one key, as ssh has: `Ctrl-] .` leaves, with a link or without one. `Ctrl-] Ctrl-]`
 /// is one Ctrl-] typed, and any other key after Ctrl-] is typed after it. What a terminal marks
-/// as pasted is text, and no key. Before any screen was drawn Ctrl-C ends koh too.
+/// as pasted is text, and no key. Before any screen was drawn Ctrl-C ends koh too. Nothing else
+/// is looked for in what is typed: every other byte is the session's, as it came.
 #[derive(Default)]
 struct Keys {
     /// What was read and is no whole key yet: the start of an escape sequence, of a character
@@ -997,8 +998,13 @@ struct Keys {
     /// When the terminal was last read, and whether what it left unfinished was taken as it
     /// stands since: an Escape that nothing follows is a key.
     last: Option<Timer>,
-    /// Ctrl-] was typed, as these bytes, and the next key says what it meant.
+    /// Ctrl-] was typed, as these bytes, and the next key says what it meant. Behind it, in
+    /// their order, what came since that is no key going down (4 KiB at most).
     prefix: Option<Vec<u8>>,
+    /// The 10 ms took an Escape by itself as the key, and typed it; and whether Ctrl-] waited
+    /// before it. If the next read shows a slow path had cut koh's own key after its first
+    /// byte, it is koh's key all the same.
+    cut: Option<bool>,
     /// In a paste the terminal marks, up to the mark of its end.
     pasting: bool,
 }
@@ -1009,11 +1015,22 @@ impl Keys {
     /// (`first`: 130). With `whole` no more is coming for now.
     fn take(&mut self, typed: &[u8], whole: bool, first: bool) -> Option<i32> {
         const END: &[u8] = b"\x1b[201~";
+        let mut at = 0;
         if !typed.is_empty() {
             self.last = Some(Timer::now());
+            if let Some(held) = self.cut.take().filter(|_| self.raw.is_empty()) {
+                let whole = [b"\x1b", typed].concat();
+                match (held, fux::key(&whole, false)) {
+                    (true, Some((_, name, true))) if name == "dot" => return Some(0),
+                    (false, Some((length, name, true))) if name == "C-]" => {
+                        self.prefix = whole.get(1..length).map(<[u8]>::to_vec);
+                        at = length - 1;
+                    }
+                    _ => {}
+                }
+            }
         }
         let raw = [std::mem::take(&mut self.raw).as_slice(), typed].concat();
-        let mut at = 0;
         while let Some(rest) = raw.get(at..).filter(|rest| !rest.is_empty()) {
             if self.pasting {
                 let end = rest.windows(END.len()).position(|mark| mark == END);
@@ -1034,16 +1051,26 @@ impl Keys {
             let key = rest.get(..length).unwrap_or_default();
             at += length;
             // (A key let go, Ctrl by itself, the mouse and the window's focus are the session's
-            // to hear of, and no key that follows another.)
+            // to hear of, and no key that follows another: behind a Ctrl-] that waits they
+            // wait too, for a key let go before it went down is none to a viewer.)
             if !down || name.starts_with("mouse:") || name.starts_with("focus:") {
-                self.send(key);
+                let room = |held: &&mut Vec<u8>| held.len() + key.len() <= 4096;
+                match self.prefix.as_mut().filter(room) {
+                    Some(held) => held.extend_from_slice(key),
+                    None => {
+                        let held = self.prefix.take().unwrap_or_default();
+                        self.send(&[held.as_slice(), key].concat());
+                    }
+                }
                 continue;
             }
-            match (self.prefix.take(), name.as_str()) {
+            let held = self.prefix.take();
+            self.cut = (whole && key == b"\x1b").then_some(held.is_some());
+            match (held, name.as_str()) {
                 (None, "C-]") => self.prefix = Some(key.to_vec()),
                 (Some(_), "dot") => return Some(0),
-                (Some(_), "C-]") => self.send(key),
-                (Some(prefix), _) => self.send(&[prefix.as_slice(), key].concat()),
+                (Some(held), "C-]") => self.send(&held),
+                (Some(held), _) => self.send(&[held.as_slice(), key].concat()),
                 (None, "C-c") if first => return Some(130),
                 (None, _) => self.send(key),
             }
@@ -1272,6 +1299,20 @@ mod tests {
                 b"\x1b[200~\x1d.\x1b[201~.",
             ),
             (&[b"\x1b[93;5u\x1b[93;5u"], b"\x1b[93;5u"),
+            // (With the kitty keyboard a key is let go too: what comes while Ctrl-] waits is
+            // behind it, in its order. Let go before it went down, a key is none to a viewer.)
+            (
+                &[b"\x1b[93;5:1u", b"\x1b[93;5:3u", b"X"],
+                b"\x1b[93;5:1u\x1b[93;5:3uX",
+            ),
+            (
+                &[b"\x1b[93;5u\x1b[<35;1;1M\x1b[I\x1b[57442;1:3ux"],
+                b"\x1b[93;5u\x1b[<35;1;1M\x1b[I\x1b[57442;1:3ux",
+            ),
+            (
+                &[b"\x1b[93;5:1u\x1b[93;5:3u\x1b[93;5:1u\x1b[93;5:3u"],
+                b"\x1b[93;5:1u\x1b[93;5:3u\x1b[93;5:3u",
+            ),
         ] {
             assert_eq!(
                 typed(&mut Keys::default(), reads, false),
@@ -1279,6 +1320,14 @@ mod tests {
                 "{reads:?}"
             );
         }
+        // What waits behind Ctrl-] is 4 KiB at most: past that Ctrl-] waits no longer, all of
+        // it is typed in its order, and a dot is a dot.
+        let moved = b"\x1b[<35;10;10M".repeat(400);
+        let all = [b"\x1b[93;5u", moved.as_slice(), b"."].concat();
+        assert_eq!(
+            typed(&mut Keys::default(), &[&all], false),
+            (all.clone(), None)
+        );
         // Ctrl-C ends koh while no screen was ever drawn, and is a key after that.
         assert_eq!(
             typed(&mut Keys::default(), &[b"a\x03"], true),
@@ -1313,6 +1362,36 @@ mod tests {
         // And so is one that was read while there was no link, or none yet.
         assert_eq!(keys.take(b"\x1b", false, false), None);
         assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b");
+        // A key a slow path cut after its first byte, the rest 35 ms later: the Escape was
+        // typed by then, and the rest is typed after it, as it came.
+        let cut = |rest: &'static [u8]| {
+            let later = terminal.clone();
+            tokio::spawn(async move {
+                later.send(b"\x1b".to_vec()).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                later.send(rest.to_vec()).await.unwrap();
+            });
+        };
+        cut(b"[A");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b"[A");
+        // But koh's own key is koh's, cut so too: either of its two keys.
+        cut(b"[93;5u\x1b[46u");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b");
+        assert_eq!(keys.next(&mut reads).await, Err(0));
+        let mut keys = Keys::default();
+        terminal.send(b"\x1b[93;5u".to_vec()).await.unwrap();
+        cut(b"[46u");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b[93;5u\x1b");
+        assert_eq!(keys.next(&mut reads).await, Err(0));
+        // (An Escape that was one, and then koh's key: it leaves, and a dot does not.)
+        let mut keys = Keys::default();
+        cut(b".");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b");
+        assert_eq!(keys.next(&mut reads).await.unwrap(), b".");
+        terminal.send(b"\x1d.".to_vec()).await.unwrap();
+        assert_eq!(keys.next(&mut reads).await, Err(0));
+        let mut keys = Keys::default();
         // With no link what is typed is held up to 64 KiB, and no more; it goes out in pieces
         // no message is too long for. The terminal closed ends it, with 0.
         for _ in 0..40 {

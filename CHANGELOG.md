@@ -96,7 +96,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
     be taken for typing. `koh connect` asks it itself, once, before its first attach: the
     kitty keyboard flags it takes and its foreground, background and cursor colours. The
     answers go with each attach, and a session's programs are answered from them. A terminal
-    that answers nothing costs one second, once; an answer that comes later is not typed.
+    that answers nothing costs one second, once; answers that come later than that are
+    typed into the session.
   - **Without a link** your terminal is put back at once (its own screen, no mouse reports)
     and says `koh: no link; reconnecting`; `Ctrl-] .` leaves then too. What is
     typed meanwhile is held, 64 KiB of it, and typed once on return; what was on its way when

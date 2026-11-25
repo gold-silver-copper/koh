@@ -182,9 +182,9 @@ A wrong endpoint id, or a host someone else now controls.
   cursor colours (which `koh connect` asked the terminal itself, once, and sends with each
   attach: three colours and a number more than a server learned before, enough to tell a
   light theme from a dark one and one terminal from some others), and whatever the terminal
-  answers to what the server asks it. A server's questions do reach the terminal, as any
-  program's output does; while the terminal still owes koh its own answers (it never said
-  what it is), an answer to the server in the same form is dropped with them.
+  answers to what the server asks it: a server's questions reach the terminal, as any
+  program's output does, and what the terminal sends after koh's own asking is typed into
+  the session as it is.
 - **Not defended:** a server can mislead a user who chose to connect to it. The endpoint id is
   all that ties a name to a server: check it out of band.
 

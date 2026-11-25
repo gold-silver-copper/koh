@@ -3101,7 +3101,7 @@ fn a_sessions_program_is_told_the_terminals_colours_and_has_its_keys_in_the_form
 }
 
 #[test]
-fn a_terminal_that_answers_nothing_or_late_is_asked_once_and_no_answer_is_typed() {
+fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_is_heard() {
     let mut host = Host::start("late", &[]);
     let session = host.sessions.parent().unwrap().to_path_buf();
     let out = host.tmp.0.join("out");
@@ -3120,13 +3120,12 @@ fn a_terminal_that_answers_nothing_or_late_is_asked_once_and_no_answer_is_typed(
     );
     assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
     assert!(!session.join("colours").exists());
-    // Its answers come now, after the wait, and a key after them: the key is typed, and
-    // nothing of an answer is. Told late, nothing is changed: the plain form it stays.
-    tty.types(b"\x1b[?5u\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\");
-    std::thread::sleep(Duration::from_millis(100));
-    tty.types(b"\x1b]12;rgb:ffff/0000/7f7f\x07\x1b[?62;4cx");
-    until("the key is typed", || {
-        fs::read(&out).unwrap_or_default() == b"x"
+    // What it sends after the wait was typed, whatever its form: koh looks for no answer in
+    // it, and drops none of it. (An answer that comes late is typed into the session so, once.)
+    let late = b"\x1b[?5u\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[?62;4c\x1b]1hello\x07x";
+    tty.types(late);
+    until("what has an answer's form is typed, to the byte", || {
+        fs::read(&out).unwrap_or_default() == late
     });
     assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
     assert!(!session.join("colours").exists());
@@ -3143,7 +3142,31 @@ fn a_terminal_that_answers_nothing_or_late_is_asked_once_and_no_answer_is_typed(
     assert_eq!(asked(&tty), 1);
     tty.types(b"y");
     until("typed on return", || {
-        fs::read(&out).unwrap_or_default() == b"xy"
+        fs::read(&out).unwrap_or_default() == [&late[..], b"y"].concat()
+    });
+    // A terminal that answers in pieces, within the wait: its flags, a colour cut in two, and
+    // what it is, cut in two, with a key right after it. The answers are heard, and the key
+    // is the session's first.
+    let out = host.tmp.0.join("out.pieces");
+    let mut slow = host.attach(&["--session", "p"], &reads_into(&out));
+    slow.answers = false;
+    slow.until("it is asked", |tty| has(tty, b"\x1b[c"));
+    for piece in [
+        &b"\x1b[?5u\x1b]11;rgb:12"[..],
+        b"34/abcd/00ff\x1b\\\x1b[?6",
+        b"2;4cz",
+    ] {
+        slow.types(piece);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    slow.until("the program is ready", |tty| has(tty, b"READY"));
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
+    assert_eq!(
+        fs::read_to_string(session.join("colours")).unwrap(),
+        "background #12ab00\n"
+    );
+    until("the key after its answers is typed", || {
+        fs::read(&out).unwrap_or_default() == b"z"
     });
 }
 

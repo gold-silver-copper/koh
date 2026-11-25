@@ -50,13 +50,13 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     answered from (`colours` and `keyboard` in koh's `fux` session: they are the server's,
     not one session's, and of two clients the last to attach is believed). So vim is told
     your background, and a program that asks for the kitty keyboard protocol has its keys in
-    that form. A terminal that answers nothing is waited on for a second, once for a `koh
-    connect` and not again when a link comes back; it has no colours and the plain keyboard
-    then. An answer that comes after that second is not typed into the session, whenever it
-    comes: until the terminal has said what it is, what has an answer's form (`ESC [ ? … u`,
-    `ESC [ ? … c`, `ESC ] 1…` to its end) is dropped where koh reads its keys, outside a
-    marked paste; no key has that form. Your terminal is taken to draw sixel pictures and
-    24-bit colours (one that does not shows nothing where the picture is).
+    that form. What the terminal sends up to that last answer are its answers (one that
+    tells no colour, or does not know the protocol, has those it gave and the plain
+    keyboard); what it sends after it is what you typed, to the byte, and koh looks for no
+    answer in it. A terminal that does not give that last answer is waited on for a second,
+    once for a `koh connect` and not again when a link comes back: it has no colours and the
+    plain keyboard, and all it sent in that second was typed. Your terminal is taken to draw
+    sixel pictures and 24-bit colours (one that does not shows nothing where the picture is).
   - **Without a link** koh says so and dials again: `koh: no link; reconnecting`, on your
     terminal's own screen, which is put back the moment the link is lost (nothing of the
     viewer's stays on: not the mouse, not the alternate screen). What you type while it says
@@ -124,6 +124,10 @@ koh adds nothing to stop these. What happens instead is said.
   it is dropped, so it waits, as on any terminal. About a megabyte and a half waits on its
   way; past that your terminal itself waits with the paste, and takes no key, `Ctrl-] .`
   neither. Close the terminal then (koh is hung up and ends), or let the program read.
+- Don't run `koh connect` in a terminal that takes longer than a second to say what it is
+  (one reached over a path that slow) and expect a clean first line: its answers come after
+  koh has stopped waiting, and are typed into the session, once, as the answers to any
+  program that asks a terminal are when they come late.
 - Don't expect a key's echo at once while a program floods the screen over a very slow link:
   at 64 kbit/s it was about five seconds and at most seven (measured: some 44 KiB of the
   flood's frames wait ahead of the link, in the server's pty and the stream's window, and the

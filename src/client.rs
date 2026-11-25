@@ -701,23 +701,27 @@ struct Terminal {
 
 impl Terminal {
     /// Asks the terminal for the keyboard's flags (set, read back, given back), for three
-    /// colours, and last what it is, which every terminal answers. That answer ends the wait,
-    /// or a second does: what was not answered by then is not known (no colours, the plain
-    /// keyboard), is not asked again, and is no key when it comes (`keys` still owes it). Or
-    /// the code koh ends with, if its own key was typed meanwhile or the terminal closed.
+    /// colours, and last what it is, which every terminal answers; and reads it until that
+    /// answer has come or a second is over. What came before that answer's end are its
+    /// answers, and that is all the telling of answers from typing there is: what came after
+    /// it was typed, and so was all of it where that answer did not come (nothing is known of
+    /// such a terminal: no colours, the plain keyboard). It is not asked again. Or the code
+    /// koh ends with, if its own key was typed meanwhile or the terminal closed.
     async fn ask(console: &mut Console, keys: &mut Keys) -> std::result::Result<Terminal, i32> {
         const ASKS: &[u8] =
             b"\x1b[>31u\x1b[?u\x1b[<u\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b[c";
-        keys.owed = console.write(ASKS.to_vec()).await;
-        let until = Timer::now() + Duration::from_secs(1);
-        while keys.owed {
+        let (mut said, until) = (Vec::new(), Timer::now() + Duration::from_secs(1));
+        let asked = console.write(ASKS.to_vec()).await;
+        while asked && what_it_is(&said).is_none() {
             match tokio::time::timeout_at(until, console.typed.recv()).await {
-                Ok(Some(typed)) => keys.take(&typed, false, true).map_or(Ok(()), Err)?,
+                Ok(Some(read)) => said.extend(read),
                 Ok(None) => return Err(0),
                 Err(_) => break,
             }
         }
-        Ok(Terminal::said(&keys.answers))
+        let (answers, typed) = said.split_at(what_it_is(&said).unwrap_or(0));
+        keys.take(typed, false, true).map_or(Ok(()), Err)?;
+        Ok(Terminal::said(answers))
     }
 
     /// What its answers say.
@@ -756,6 +760,18 @@ impl Terminal {
         }
         terminal
     }
+}
+
+/// Where a terminal's answer to "what are you" ends in what it sent: after `ESC [ ? 62;4 c`.
+fn what_it_is(said: &[u8]) -> Option<usize> {
+    (0..said.len()).find_map(|at| {
+        let numbers = said.get(at..)?.strip_prefix(b"\x1b[?")?;
+        let length = numbers
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b';');
+        let length = length.count();
+        (numbers.get(length) == Some(&b'c')).then_some(at + length + 4)
+    })
 }
 
 /// The client's terminal, raw from the start to the end: read by a thread and written by
@@ -985,12 +1001,6 @@ struct Keys {
     prefix: Option<Vec<u8>>,
     /// In a paste the terminal marks, up to the mark of its end.
     pasting: bool,
-    /// The terminal was asked what it is like and has not said yet what it is, its last
-    /// answer; and the `answers` it gave. An answer is no key and is not typed, however late it
-    /// comes: it is in a form no key has (`ESC [ ? … u`, `ESC ] 1…` to BEL or `ESC \`, and
-    /// `ESC [ ? … c`, which ends the owing).
-    owed: bool,
-    answers: Vec<u8>,
 }
 
 impl Keys {
@@ -1018,33 +1028,11 @@ impl Keys {
                 }
                 continue;
             }
-            // (A colour is a string, which is no one key to `fux::key`: its end is looked for,
-            // and waited for as a key's is.)
-            if self.owed && (rest.starts_with(b"\x1b]1") || rest == b"\x1b]") {
-                let ends = |end: &usize| {
-                    rest.get(*end) == Some(&7) || rest.get(end - 1..=*end) == Some(b"\x1b\\")
-                };
-                match (3..rest.len().min(64)).find(ends) {
-                    Some(end) => {
-                        self.answer(rest.get(..=end).unwrap_or_default());
-                        at += end + 1;
-                        continue;
-                    }
-                    None if !whole && rest.len() < 64 => break,
-                    None => {}
-                }
-            }
             let Some((length, name, down)) = fux::key(rest, whole) else {
                 break;
             };
             let key = rest.get(..length).unwrap_or_default();
             at += length;
-            if self.owed && key.starts_with(b"\x1b[?") && key.ends_with(b"u") | key.ends_with(b"c")
-            {
-                self.answer(key);
-                self.owed = key.ends_with(b"u");
-                continue;
-            }
             // (A key let go, Ctrl by itself, the mouse and the window's focus are the session's
             // to hear of, and no key that follows another.)
             if !down || name.starts_with("mouse:") || name.starts_with("focus:") {
@@ -1065,21 +1053,6 @@ impl Keys {
         None
     }
 
-    /// Keeps an answer of the terminal's, while they are a terminal's few.
-    fn answer(&mut self, answer: &[u8]) {
-        if self.answers.len() + answer.len() <= 256 {
-            self.answers.extend_from_slice(answer);
-        }
-    }
-
-    /// How long what is no whole key waits for its rest, from the last read: 10 ms; and a
-    /// second for what begins as an answer the terminal owes and no key does (an answer that
-    /// is late comes over a slow path, and may come in pieces).
-    fn patience(&self) -> Duration {
-        let answer = self.raw.starts_with(b"\x1b[?") || self.raw.starts_with(b"\x1b]1");
-        Duration::from_millis(if self.owed && answer { 1000 } else { 10 })
-    }
-
     /// Adds to what is to be sent: to the last message while it has room, and nothing past
     /// `MAX_HELD` (what is typed beyond that while there is no link is lost).
     fn send(&mut self, bytes: &[u8]) {
@@ -1096,7 +1069,7 @@ impl Keys {
     }
 
     /// The next message of what was typed: read of the terminal when none waits. What is no
-    /// whole key waits for its rest (`patience`). Or the code koh ends with: its
+    /// whole key waits for its rest, 10 ms from the last read. Or the code koh ends with: its
     /// own key's, or 0 when the terminal is closed.
     async fn next(
         &mut self,
@@ -1107,7 +1080,7 @@ impl Keys {
                 self.held -= message.len();
                 return Ok(message);
             }
-            let due = self.last.map(|last| last + self.patience());
+            let due = self.last.map(|last| last + Duration::from_millis(10));
             let ends = tokio::select! {
                 more = typed.recv() => self.take(&more.ok_or(0)?, false, false),
                 () = async { tokio::time::sleep_until(due.unwrap_or_else(Timer::now)).await }, if due.is_some() => {
@@ -1190,78 +1163,57 @@ pub fn timeout_duration(secs: Option<u64>) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// What `keys` has to send.
-    fn held(keys: &Keys) -> Vec<u8> {
-        keys.ready.iter().flatten().copied().collect()
-    }
-
-    /// What a terminal that was asked says in these reads: what it is like, and what was typed.
-    fn says(reads: &[&[u8]]) -> (Terminal, Keys) {
-        let mut keys = Keys {
-            owed: true,
-            ..Keys::default()
-        };
-        for read in reads {
-            assert_eq!(keys.take(read, false, true), None);
-        }
-        (Terminal::said(&keys.answers), keys)
-    }
-
     #[test]
-    fn a_terminals_answers_are_its_keyboard_and_colours_and_no_key_however_late_they_come() {
-        // A terminal that takes the keyboard's flags 1 and 4 and tells its colours, one ended by
-        // BEL. What was typed before, between and after its answers is typed, in its order.
-        let said: &[u8] = b"ls\x1b[?5u\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\\x1b[A\x1b]11;rgb:1c1c/1C1c/1c1c\x07\x1b]12;rgb:ff/00/7f\x1b\\\x1b[?62;4c\r";
-        let (terminal, mut keys) = says(&[said]);
-        let typed = held(&keys);
-        assert_eq!(
-            (terminal.keyboard, typed.as_slice()),
-            (5, &b"ls\x1b[A\r"[..])
-        );
+    fn a_terminals_answers_end_with_what_it_is_and_what_comes_after_is_typed_to_the_byte() {
+        // A terminal that takes the keyboard's flags 1 and 4 and tells its colours, one ended
+        // by BEL, one of parts whose two bytes differ; then what it is, and what was typed.
+        let said: &[u8] = b"\x1b[?5u\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\\x1b]11;rgb:1234/abcd/00ff\x07\x1b]12;rgb:ff/00/7f\x1b\\\x1b[?62;4c\x1b[Als\r";
+        let end = what_it_is(said).unwrap();
+        assert_eq!(said.get(end..).unwrap(), b"\x1b[Als\r");
+        let terminal = Terminal::said(said.get(..end).unwrap());
+        assert_eq!(terminal.keyboard, 5);
         assert_eq!(
             terminal.colours,
-            "foreground #d0d0d0\nbackground #1c1c1c\ncursor #ff007f\n"
+            "foreground #d0d0d0\nbackground #12ab00\ncursor #ff007f\n"
         );
-        // Once it has said what it is, it owes nothing: what has an answer's form then was
-        // typed (or pasted), and is the session's.
-        let again = b"\x1b[?5u\x1b[?62c";
-        assert_eq!(keys.take(again, false, false), None);
-        assert_eq!(
-            (keys.owed, held(&keys)),
-            (false, [&typed, &again[..]].concat())
-        );
+        // Its last answer in pieces is none until it is whole, wherever it is cut.
+        for cut in 0..end {
+            assert_eq!(what_it_is(said.get(..cut).unwrap()), None, "{cut}");
+        }
         // One that knows neither says what it is, and no more: no colours, the plain keyboard.
-        // What is no colour is none (a number that was not asked, a part too short or no number),
+        // What is no colour is none (a number that was not asked, a part that is no number),
         // and flags that are no number of eight bits are none.
-        for said in [
-            b"\x1b[?6c".as_slice(),
-            b"\x1b]11;rgb:f/f/f\x1b\\\x1b]10;rgb:+f/00/00\x1b\\\x1b]13;rgb:ff/00/00\x1b\\",
-            b"\x1b]11;rgb:1c1c/1c1c\x1b\\\x1b[?999u",
+        for (said, colours) in [
+            (b"\x1b[?6c".as_slice(), ""),
+            (
+                b"\x1b]10;rgb:+f/00/00\x1b\\\x1b]13;rgb:ff/00/00\x1b\\\x1b[?999u\x1b[?6c",
+                "",
+            ),
+            (
+                b"\x1b]11;rgb:1c1c/1c1c\x1b\\\x1b]10;rgb:f/0/8\x1b\\\x1b[?1;2c",
+                "",
+            ),
         ] {
-            let (terminal, keys) = says(&[said]);
+            let terminal = Terminal::said(said.get(..what_it_is(said).unwrap()).unwrap());
             assert_eq!(
-                (terminal.keyboard, terminal.colours.as_str(), held(&keys)),
-                (0, "", vec![]),
+                (terminal.keyboard, terminal.colours.as_str()),
+                (0, colours),
                 "{said:?}"
             );
         }
-        // One whose answers come after the wait, in pieces cut anywhere, a key between two of
-        // them and a paste that looks like one: when the wait ended it had said nothing, and
-        // of what came later the key and the paste are typed, and no answer is.
-        let late: &[u8] =
-            b"\x1b[?5u\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\x\x1b[200~\x1b[?1u\x1b[201~\x1b[?62c";
-        for cut in 0..late.len() {
-            let (terminal, mut keys) = says(&[]);
+        // One that says nothing of what it is has said nothing: all it sent was typed. And
+        // what is typed is typed whole, the bytes that have an answer's form too, cut anywhere.
+        let typed: &[u8] = b"\x1b[?5u\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\x\x1b[?62c\x1b]1hello\x07y";
+        assert_eq!(
+            what_it_is(b"\x1b[?5u\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\x\x1b[?62"),
+            None
+        );
+        for cut in 0..typed.len() {
+            let mut keys = Keys::default();
+            let reads = [typed.get(..cut).unwrap(), typed.get(cut..).unwrap()];
             assert_eq!(
-                (terminal.keyboard, terminal.colours.as_str(), held(&keys)),
-                (0, "", vec![])
-            );
-            for piece in [&late[..cut], &late[cut..]] {
-                assert_eq!(keys.take(piece, false, false), None, "{cut}");
-            }
-            assert_eq!(
-                (keys.owed, held(&keys).as_slice()),
-                (false, &b"x\x1b[200~\x1b[?1u\x1b[201~"[..]),
+                self::typed(&mut keys, &reads, false),
+                (typed.to_vec(), None),
                 "{cut}"
             );
         }
@@ -1361,20 +1313,6 @@ mod tests {
         // And so is one that was read while there was no link, or none yet.
         assert_eq!(keys.take(b"\x1b", false, false), None);
         assert_eq!(keys.next(&mut reads).await.unwrap(), b"\x1b");
-        // An answer the terminal owes, late and in two pieces half a second apart, is no key
-        // and is not typed; the same bytes from a terminal that owes none are, after 10 ms.
-        for owed in [true, false] {
-            keys.owed = owed;
-            terminal.send(b"\x1b]11;rgb:1c".to_vec()).await.unwrap();
-            let later = terminal.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                later.send(b"1c/1c1c/1c1c\x1b\\y".to_vec()).await.unwrap();
-            });
-            let typed = keys.next(&mut reads).await.unwrap();
-            assert_eq!(typed == b"y", owed, "{typed:?}");
-            while !owed && !keys.next(&mut reads).await.unwrap().ends_with(b"y") {}
-        }
         // With no link what is typed is held up to 64 KiB, and no more; it goes out in pieces
         // no message is too long for. The terminal closed ends it, with 0.
         for _ in 0..40 {

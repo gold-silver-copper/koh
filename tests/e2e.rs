@@ -1255,7 +1255,7 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     let key = tmp.0.join("server.key");
     let (tell, told) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        tell.send(koh::keys::load_clients(Some(&key)).map(|list| list.len()))
+        tell.send(koh::keys::load_clients(Some(&key), |_, _| {}).map(|list| list.len()))
     });
     let read = told.recv_timeout(Duration::from_secs(5));
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
@@ -4408,6 +4408,8 @@ async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
     assert_ne!(e1.id(), key.public());
     assert_ne!(e2.id(), key.public());
     assert_ne!(e1.id(), e2.id());
+    assert!(srv.endpoint.remote_info(e1.id()).await.is_some());
+    assert!(srv.endpoint.remote_info(e2.id()).await.is_some());
     e1.close().await;
     e2.close().await;
     srv.shutdown().await;
@@ -4438,21 +4440,29 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
         (format!("t3 {k} cp"), None),
         (format!("t4 {k} cp="), None),
         (format!("t5 {k} exec="), None),
-        (format!("t6 {k} --cp /srv"), None),
+        (format!("t6 {k} --cp /srv\x1b[2K"), None),
         ("bad_id notakey cp=/srv".into(), None),
+        ("lone_word".into(), None),
     ];
     let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
     fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
 
-    let (entries, skipped) = koh::keys::read_clients(Some(&key)).unwrap();
+    let mut skipped = Vec::new();
+    let entries =
+        koh::keys::load_clients(Some(&key), |n, l| skipped.push((n, l.to_string()))).unwrap();
     let want: Vec<_> = rows.iter().filter_map(|(_, w)| w.clone()).collect();
     let got: Vec<_> = entries
         .iter()
         .map(|e| (e.name.as_str(), e.scope.clone()))
         .collect();
     assert_eq!(got, want);
-    let bad_lines: Vec<_> = skipped.iter().map(|s| s.0).collect();
-    assert_eq!(bad_lines, [10, 11, 12, 13, 14, 15, 16]);
+    let skipped_want: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (l, w))| w.is_none() && !l.is_empty() && !l.starts_with('#'))
+        .map(|(i, (l, _))| (i + 1, l.clone()))
+        .collect();
+    assert_eq!(skipped, skipped_want);
 
     let cli = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_koh"));
@@ -4468,23 +4478,36 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
     for (name, _) in &want {
         assert!(stdout.contains(&format!("{name} ")), "{stdout}");
     }
-    for n in 10..=16 {
-        assert!(stderr.contains(&format!("clients:{n}:")), "{stderr}");
+    assert_eq!(stderr.lines().count(), skipped_want.len(), "{stderr}");
+    for (n, line) in &skipped_want {
+        let expected =
+            format!("koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}");
+        assert!(stderr.contains(&expected), "missing {expected} in {stderr}");
     }
-    assert!(!stderr.contains("# comment"));
 
     let injected = format!("/a\nevil {k}");
-    for bad in [b"".as_slice(), injected.as_bytes(), b"/a\rb", b"/a\xffb"] {
-        let res = cli(&["add", "bad", &k.to_string(), "--cp"])
-            .arg(OsStr::from_bytes(bad))
-            .output()
-            .unwrap();
-        assert_eq!(res.status.code(), Some(2), "{bad:?}");
+    for flag in ["--cp", "--exec"] {
+        for bad in [b"".as_slice(), injected.as_bytes(), b"/a\rb", b"/a\xffb"] {
+            let res = cli(&["add", "bad", &k.to_string(), flag])
+                .arg(OsStr::from_bytes(bad))
+                .output()
+                .unwrap();
+            assert_eq!(res.status.code(), Some(2), "{flag} {bad:?}");
+        }
     }
+    let bad_json = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .arg("servers")
+        .arg(OsStr::from_bytes(b"\xff"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(bad_json.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
+    assert!(bad_json.stderr.is_empty());
     // A trailing CR on the last line without LF is line ending, not DIR, and survives a rename.
     fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r")).unwrap();
     assert_eq!(
-        koh::keys::load_clients(Some(&key)).unwrap()[1].scope,
+        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
         cp("/x")
     );
     assert!(
@@ -4494,7 +4517,7 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
             .success()
     );
     assert_eq!(
-        koh::keys::load_clients(Some(&key)).unwrap()[1].scope,
+        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
         cp("/x")
     );
 

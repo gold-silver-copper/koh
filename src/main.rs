@@ -8,9 +8,9 @@ use std::process::ExitCode;
 
 use koh::client::{Client, ConnectOptions, DialOptions, parse_signal, sync_before_command};
 use koh::keys::{
-    ClientEntry, Role, Route, Scope, ServerEntry, load_or_create_key, load_servers,
-    parse_endpoint_id, parse_relay_url, read_clients, render_qr, reset_key, save_clients,
-    save_servers, validate_peer_name,
+    ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
+    parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
+    validate_peer_name,
 };
 use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
@@ -43,10 +43,8 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let raw: Vec<_> = words.collect();
-    let json = raw.iter().any(|a| a == "--json");
-    let Ok(args) = raw
-        .into_iter()
+    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    let Ok(args) = words
         .map(std::ffi::OsString::into_string)
         .collect::<std::result::Result<Vec<String>, _>>()
     else {
@@ -287,7 +285,14 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let (mut list, skipped) = read_clients(key_file.as_deref())?;
+    let mut list = load_clients(key_file.as_deref(), |n, line| {
+        if clean.is_empty() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}"
+            );
+        }
+    })?;
     match clean.first().map(String::as_str) {
         None => {
             for e in &list {
@@ -297,9 +302,6 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
                     Scope::Exec(d) => format!(" exec={}", d.display()),
                 };
                 let _ = writeln!(std::io::stdout(), "{} {}{scope}", e.name, e.id);
-            }
-            for (n, line) in skipped {
-                let _ = writeln!(std::io::stderr(), "koh: clients:{n}: ignored: {line}");
             }
         }
         Some("add") => {

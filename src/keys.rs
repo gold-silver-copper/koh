@@ -346,24 +346,19 @@ pub fn save_servers(key_file: Option<&Path>, entries: &[ServerEntry]) -> Result<
         .map_err(|e| KohError::failed(format!("write servers: {e}")))
 }
 
-/// A non-blank, non-comment line in `clients` that could not be parsed: `(1-based line number, text)`.
-pub type SkippedLine = (usize, String);
-
-/// Loads allowed `clients` list beside `server.key`.
-pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
-    Ok(read_clients(key_file)?.0)
-}
-
-/// Reads `clients` beside `server.key`, returning valid entries and any lines that were skipped.
-pub fn read_clients(key_file: Option<&Path>) -> Result<(Vec<ClientEntry>, Vec<SkippedLine>)> {
+/// Loads allowed `clients` list beside `server.key`, calling `on_skipped(line_number, line)` for
+/// every non-blank, non-comment line that could not be parsed.
+pub fn load_clients(
+    key_file: Option<&Path>,
+    mut on_skipped: impl FnMut(usize, &str),
+) -> Result<Vec<ClientEntry>> {
     let path = config_dir(key_file)?.join(Role::Server.list_file());
     let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
     };
     let mut out = Vec::new();
-    let mut skipped = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let rest = line.trim_start();
@@ -371,13 +366,13 @@ pub fn read_clients(key_file: Option<&Path>) -> Result<(Vec<ClientEntry>, Vec<Sk
             continue;
         }
         let Some((name, rest)) = rest.split_once(char::is_whitespace) else {
-            skipped.push((i + 1, line.to_string()));
+            on_skipped(i + 1, line);
             continue;
         };
         let rest = rest.trim_start();
         let (id_str, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let Ok(id) = id_str.parse::<EndpointId>() else {
-            skipped.push((i + 1, line.to_string()));
+            on_skipped(i + 1, line);
             continue;
         };
         let scope = match rest.trim_start() {
@@ -386,7 +381,7 @@ pub fn read_clients(key_file: Option<&Path>) -> Result<(Vec<ClientEntry>, Vec<Sk
                 Some(("cp", dir)) if !dir.is_empty() => Scope::Cp(PathBuf::from(dir)),
                 Some(("exec", dir)) if !dir.is_empty() => Scope::Exec(PathBuf::from(dir)),
                 _ => {
-                    skipped.push((i + 1, line.to_string()));
+                    on_skipped(i + 1, line);
                     continue;
                 }
             },
@@ -397,7 +392,7 @@ pub fn read_clients(key_file: Option<&Path>) -> Result<(Vec<ClientEntry>, Vec<Sk
             scope,
         });
     }
-    Ok((out, skipped))
+    Ok(out)
 }
 
 pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<()> {

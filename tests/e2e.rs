@@ -4540,3 +4540,259 @@ async fn each_client_dials_from_its_own_endpoint_id_and_proves_the_client_key() 
     b.close().await;
     srv.shutdown().await;
 }
+
+/// A line in `clients` whose scope is malformed (a typo like `copy=/srv`, `cp:/srv`, `cp`, `cp=`,
+/// `exec=`, `--cp /srv`) is skipped and warned on stderr rather than read as `Scope::Full`, while
+/// valid entries in the same file keep working.
+#[tokio::test]
+async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
+    let tmp = TempDir::new("clients-fail-closed");
+    let srv_cfg = tmp.0.join("srv_cfg");
+    let cli_cfg = tmp.0.join("cli_cfg");
+    fs::create_dir_all(&srv_cfg).unwrap();
+    fs::create_dir_all(&cli_cfg).unwrap();
+    let srv_key = srv_cfg.join("server.key");
+
+    let valid_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("valid.key"))).unwrap();
+    let cases = [
+        ("typo_copy", "copy=/srv"),
+        ("typo_colon", "cp:/srv"),
+        ("typo_bare", "cp"),
+        ("typo_empty_cp", "cp="),
+        ("typo_empty_exec", "exec="),
+        ("typo_flag", "--cp /srv"),
+    ];
+    let mut bad_keys = Vec::new();
+    let mut text = format!("# comment\n\nvalid {}\n", valid_key.public());
+    for (name, bad_scope) in cases {
+        let key = load_or_create_key(Role::Client, Some(&cli_cfg.join(format!("{name}.key"))))
+            .unwrap();
+        text.push_str(&format!("{name} {} {bad_scope}\n", key.public()));
+        bad_keys.push((name, key));
+    }
+    fs::write(srv_cfg.join("clients"), &text).unwrap();
+
+    let loaded = koh::keys::load_clients(Some(&srv_key)).unwrap();
+    assert_eq!(loaded.len(), 1, "only valid entry should load: {loaded:?}");
+    assert_eq!(loaded[0].name, "valid");
+    assert_eq!(loaded[0].scope, Scope::Full);
+
+    // `koh clients` lists only valid entries and warns about each bad line on stderr.
+    let bin = env!("CARGO_BIN_EXE_koh");
+    let cli = Command::new(bin)
+        .args(["clients", "--key-file", srv_key.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(cli.status.success());
+    let stdout = String::from_utf8_lossy(&cli.stdout);
+    let stderr = String::from_utf8_lossy(&cli.stderr);
+    assert!(stdout.contains("valid "), "stdout: {stdout}");
+    for (name, _) in &bad_keys {
+        assert!(!stdout.contains(name), "bad entry listed in stdout: {stdout}");
+        assert!(stderr.contains(name), "missing stderr warning for {name}: {stderr}");
+    }
+
+    let srv = start_server(ServeOptions {
+        key_file: Some(srv_key),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow: Vec::new(),
+        shell: Some("/bin/sh".into()),
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+    .unwrap();
+    let addr = srv.direct_addr.unwrap();
+
+    // Valid client still has full access.
+    let ok_client = Client::connect_direct(
+        valid_key,
+        srv.endpoint_id,
+        Some(Route::Direct(addr)),
+        false,
+    )
+    .await
+    .unwrap();
+    let (code, out, _) = ok_client
+        .exec(vec!["printf ok".into()], Some("/tmp".into()), true, None, true)
+        .await
+        .unwrap();
+    assert_eq!((code, out), (0, b"ok".to_vec()));
+    ok_client.close().await;
+
+    // Every malformed-scope client is refused (exit 4).
+    for (name, key) in bad_keys {
+        let client = Client::connect_direct(
+            key,
+            srv.endpoint_id,
+            Some(Route::Direct(addr)),
+            false,
+        )
+        .await
+        .unwrap();
+        let err = client.jobs(None).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            Exit::REFUSED,
+            "malformed client {name} was not refused: {err:?}"
+        );
+        client.close().await;
+    }
+    srv.shutdown().await;
+}
+
+/// A scope DIR containing spaces is written whole by `koh clients add`, read back whole by
+/// `load_clients`, and enforced as that exact directory (not truncated at the first space).
+#[tokio::test]
+async fn scoped_client_dir_with_spaces_round_trips_and_enforces_exact_dir() {
+    let tmp = TempDir::new("clients-spaces");
+    let srv_cfg = tmp.0.join("srv_cfg");
+    let cli_cfg = tmp.0.join("cli_cfg");
+    let dir_trunc = tmp.0.join("a");
+    let dir_space = tmp.0.join("a b");
+    let dir_weird = tmp.0.join("c  d ");
+    for d in [&srv_cfg, &cli_cfg, &dir_trunc, &dir_space, &dir_weird] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let srv_key = srv_cfg.join("server.key");
+    let cp_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("cp.key"))).unwrap();
+    let exec_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("exec.key"))).unwrap();
+    let weird_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("weird.key"))).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_koh");
+    for (name, id, flag, dir) in [
+        ("cpbot", cp_key.public().to_string(), "--cp", &dir_space),
+        ("execbot", exec_key.public().to_string(), "--exec", &dir_space),
+        ("weirdbot", weird_key.public().to_string(), "--cp", &dir_weird),
+    ] {
+        let out = Command::new(bin)
+            .args([
+                "clients",
+                "--key-file",
+                srv_key.to_str().unwrap(),
+                "add",
+                name,
+                &id,
+                flag,
+                dir.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "clients add {name} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let loaded = koh::keys::load_clients(Some(&srv_key)).unwrap();
+    assert_eq!(loaded.len(), 3);
+    assert_eq!(loaded[0].scope, Scope::Cp(dir_space.clone()));
+    assert_eq!(loaded[1].scope, Scope::Exec(dir_space.clone()));
+    assert_eq!(loaded[2].scope, Scope::Cp(dir_weird.clone()));
+
+    // Empty or newline-bearing scope directories are refused at `clients add` (exit 2).
+    for bad in ["", "/a\nb", "/a\rb"] {
+        let out = Command::new(bin)
+            .args([
+                "clients",
+                "--key-file",
+                srv_key.to_str().unwrap(),
+                "add",
+                "bad",
+                &cp_key.public().to_string(),
+                "--cp",
+                bad,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "expected usage error for scope dir {bad:?}, got {:?}",
+            out.status
+        );
+    }
+
+    let srv = start_server(ServeOptions {
+        key_file: Some(srv_key),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow: Vec::new(),
+        shell: Some("/bin/sh".into()),
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+    .unwrap();
+    let addr = srv.direct_addr.unwrap();
+
+    // cpbot: allowed in `a b`, refused in `a`.
+    let cpbot = Client::connect_direct(cp_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+        .await
+        .unwrap();
+    let payload = tmp.0.join("hi.txt");
+    fs::write(&payload, "hello").unwrap();
+    let trunc_err = cpbot
+        .cp_push(
+            &payload,
+            dir_trunc.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(trunc_err.code, Exit::REFUSED);
+
+    let ok = cpbot
+        .cp_push(
+            &payload,
+            dir_space.display().to_string(),
+            Vec::new(),
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.added, vec!["hi.txt".to_string()]);
+    assert_eq!(fs::read_to_string(dir_space.join("hi.txt")).unwrap(), "hello");
+    cpbot.close().await;
+
+    // execbot: allowed in `a b`, refused in `a`.
+    let execbot =
+        Client::connect_direct(exec_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+            .await
+            .unwrap();
+    let exec_trunc = execbot
+        .exec(
+            vec!["true".into()],
+            Some(dir_trunc.display().to_string()),
+            false,
+            None,
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(exec_trunc.code, Exit::REFUSED);
+
+    let (code, out, _) = execbot
+        .exec(
+            vec!["printf ok".into()],
+            Some(dir_space.display().to_string()),
+            true,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!((code, out), (0, b"ok".to_vec()));
+    execbot.close().await;
+
+    srv.shutdown().await;
+}

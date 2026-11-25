@@ -2,7 +2,7 @@
 //! and QR rendering — compatible with existing `~/.config/koh/` files.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -355,22 +355,34 @@ pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
     };
     let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+    for (i, line) in text.lines().enumerate() {
+        let rest = line.trim_start();
+        if rest.is_empty() || rest.starts_with('#') {
             continue;
         }
-        let mut parts = trimmed.split_whitespace();
-        let (Some(name), Some(id_str)) = (parts.next(), parts.next()) else {
+        let Some((name, rest)) = rest.split_once(char::is_whitespace) else {
             continue;
         };
+        let rest = rest.trim_start();
+        let (id_str, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let Ok(id) = id_str.parse::<EndpointId>() else {
             continue;
         };
-        let scope = match parts.next().and_then(|w| w.split_once('=')) {
-            Some(("cp", dir)) => Scope::Cp(PathBuf::from(dir)),
-            Some(("exec", dir)) => Scope::Exec(PathBuf::from(dir)),
-            _ => Scope::Full,
+        let rest = rest.trim_start();
+        let scope = if rest.is_empty() {
+            Scope::Full
+        } else if let Some(dir) = rest.strip_prefix("cp=").filter(|d| !d.is_empty()) {
+            Scope::Cp(PathBuf::from(dir))
+        } else if let Some(dir) = rest.strip_prefix("exec=").filter(|d| !d.is_empty()) {
+            Scope::Exec(PathBuf::from(dir))
+        } else {
+            let _ = writeln!(
+                std::io::stderr(),
+                "koh: {}:{}: ignoring client {name:?} with unrecognized scope {rest:?}",
+                path.display(),
+                i + 1,
+            );
+            continue;
         };
         out.push(ClientEntry {
             name: name.to_string(),
@@ -389,10 +401,19 @@ pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<
         text.push_str(&e.name);
         text.push(' ');
         text.push_str(&e.id.to_string());
-        match &e.scope {
-            Scope::Full => {}
-            Scope::Cp(dir) => text.push_str(&format!(" cp={}", dir.display())),
-            Scope::Exec(dir) => text.push_str(&format!(" exec={}", dir.display())),
+        let scoped = match &e.scope {
+            Scope::Full => None,
+            Scope::Cp(dir) => Some(("cp", dir)),
+            Scope::Exec(dir) => Some(("exec", dir)),
+        };
+        if let Some((kind, dir)) = scoped {
+            let s = dir
+                .to_str()
+                .filter(|s| !s.is_empty() && !s.contains(['\n', '\r', '\0']))
+                .ok_or_else(|| {
+                    KohError::usage(format!("invalid scope directory {:?}", dir.display()))
+                })?;
+            text.push_str(&format!(" {kind}={s}"));
         }
         text.push('\n');
     }

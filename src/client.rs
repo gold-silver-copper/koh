@@ -700,19 +700,18 @@ struct Terminal {
 }
 
 impl Terminal {
-    /// Asks the terminal for the keyboard's flags (set, read back, given back), for three
-    /// colours, and last what it is, which every terminal answers; and reads it until that
-    /// answer has come or a second is over. What came before that answer's end are its
-    /// answers, and that is all the telling of answers from typing there is: what came after
-    /// it was typed, and so was all of it where that answer did not come (nothing is known of
-    /// such a terminal: no colours, the plain keyboard). It is not asked again. Or the code
-    /// koh ends with, if its own key was typed meanwhile or the terminal closed.
+    /// What the terminal said of itself when it was asked, as its console was opened (`ASKS`):
+    /// it is read until its last answer has come, what it is, or a second is over. What came
+    /// before that answer's end are its answers, and that is all the telling of answers from
+    /// typing there is: what came after it was typed, and so was all of it where that answer
+    /// did not come (nothing is known of such a terminal: no colours, the plain keyboard). It
+    /// is not asked again. Or the code koh ends with, if its own key was typed meanwhile or
+    /// the terminal closed.
     async fn ask(console: &mut Console, keys: &mut Keys) -> std::result::Result<Terminal, i32> {
-        const ASKS: &[u8] =
-            b"\x1b[>31u\x1b[?u\x1b[<u\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b[c";
+        let ahead = std::mem::take(&mut console.ahead);
+        keys.take(&ahead, false, true).map_or(Ok(()), Err)?;
         let (mut said, until) = (Vec::new(), Timer::now() + Duration::from_secs(1));
-        let asked = console.write(ASKS.to_vec()).await;
-        while asked && what_it_is(&said).is_none() {
+        while console.asked && what_it_is(&said).is_none() {
             match tokio::time::timeout_at(until, console.typed.recv()).await {
                 Ok(Some(read)) => said.extend(read),
                 Ok(None) => return Err(0),
@@ -762,6 +761,10 @@ impl Terminal {
     }
 }
 
+/// What a terminal is asked: for the keyboard's flags (set, read back, given back), for three
+/// colours, and last what it is, which every terminal answers.
+const ASKS: &[u8] = b"\x1b[>31u\x1b[?u\x1b[<u\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]12;?\x1b\\\x1b[c";
+
 /// Where a terminal's answer to "what are you" ends in what it sent: after `ESC [ ? 62;4 c`.
 fn what_it_is(said: &[u8]) -> Option<usize> {
     (0..said.len()).find_map(|at| {
@@ -781,6 +784,9 @@ struct Console {
     /// The terminal itself: its size is asked of it, and its mode goes back when it is let go.
     raw: fuxix::Raw,
     tty: File,
+    /// What was typed before the terminal was asked what it is like, and whether it was asked.
+    ahead: Vec<u8>,
+    asked: bool,
     /// What is typed, a read at a time; closed when the terminal is.
     typed: mpsc::Receiver<Vec<u8>>,
     /// What is written, a piece at a time; and the thread that writes it, until this is closed.
@@ -808,9 +814,22 @@ fn reset(flags: bool) -> Vec<u8> {
 }
 
 impl Console {
+    /// Makes the terminal raw, reads what was typed before now (it was there before anything
+    /// is asked, and is no answer), and asks it what it is like: in that order, before
+    /// anything else reads it.
     fn open(input: File, mut output: File) -> Result<Console> {
         let tty = input.try_clone().map_err(terminal_error)?;
         let raw = tty.try_clone().and_then(|tty| fuxix::raw_mode(tty, b""));
+        let raw = raw.map_err(terminal_error)?;
+        let (mut ahead, mut piece) = (Vec::new(), [0; 4096]);
+        let waits = || fuxix::wait([(Some(tty.as_fd()), fuxix::POLLIN)], 0);
+        while waits().is_ok_and(|[typed]| typed != 0) {
+            match (&tty).read(&mut piece) {
+                Ok(n @ 1..) => ahead.extend_from_slice(piece.get(..n).unwrap_or_default()),
+                _ => break,
+            }
+        }
+        let asked = output.write_all(ASKS).is_ok();
         let (keys, typed) = mpsc::channel(4);
         let (out, mut written) = mpsc::channel::<Vec<u8>>(1);
         std::thread::spawn(move || {
@@ -836,8 +855,10 @@ impl Console {
             }
         });
         Ok(Console {
-            raw: raw.map_err(terminal_error)?,
+            raw,
             tty,
+            ahead,
+            asked,
             typed,
             out: Some(out),
             writer: Some(writer),

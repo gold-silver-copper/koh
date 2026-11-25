@@ -4565,8 +4565,8 @@ async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
     let mut bad_keys = Vec::new();
     let mut text = format!("# comment\n\nvalid {}\n", valid_key.public());
     for (name, bad_scope) in cases {
-        let key = load_or_create_key(Role::Client, Some(&cli_cfg.join(format!("{name}.key"))))
-            .unwrap();
+        let key =
+            load_or_create_key(Role::Client, Some(&cli_cfg.join(format!("{name}.key")))).unwrap();
         text.push_str(&format!("{name} {} {bad_scope}\n", key.public()));
         bad_keys.push((name, key));
     }
@@ -4588,8 +4588,14 @@ async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
     let stderr = String::from_utf8_lossy(&cli.stderr);
     assert!(stdout.contains("valid "), "stdout: {stdout}");
     for (name, _) in &bad_keys {
-        assert!(!stdout.contains(name), "bad entry listed in stdout: {stdout}");
-        assert!(stderr.contains(name), "missing stderr warning for {name}: {stderr}");
+        assert!(
+            !stdout.contains(name),
+            "bad entry listed in stdout: {stdout}"
+        );
+        assert!(
+            stderr.contains(name),
+            "missing stderr warning for {name}: {stderr}"
+        );
     }
 
     let srv = start_server(ServeOptions {
@@ -4607,16 +4613,18 @@ async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
     let addr = srv.direct_addr.unwrap();
 
     // Valid client still has full access.
-    let ok_client = Client::connect_direct(
-        valid_key,
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        false,
-    )
-    .await
-    .unwrap();
+    let ok_client =
+        Client::connect_direct(valid_key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+            .await
+            .unwrap();
     let (code, out, _) = ok_client
-        .exec(vec!["printf ok".into()], Some("/tmp".into()), true, None, true)
+        .exec(
+            vec!["printf ok".into()],
+            Some("/tmp".into()),
+            true,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!((code, out), (0, b"ok".to_vec()));
@@ -4624,14 +4632,9 @@ async fn malformed_clients_scope_fails_closed_without_blocking_valid_entries() {
 
     // Every malformed-scope client is refused (exit 4).
     for (name, key) in bad_keys {
-        let client = Client::connect_direct(
-            key,
-            srv.endpoint_id,
-            Some(Route::Direct(addr)),
-            false,
-        )
-        .await
-        .unwrap();
+        let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
+            .await
+            .unwrap();
         let err = client.jobs(None).await.unwrap_err();
         assert_eq!(
             err.code,
@@ -4664,8 +4667,18 @@ async fn scoped_client_dir_with_spaces_round_trips_and_enforces_exact_dir() {
     let bin = env!("CARGO_BIN_EXE_koh");
     for (name, id, flag, dir) in [
         ("cpbot", cp_key.public().to_string(), "--cp", &dir_space),
-        ("execbot", exec_key.public().to_string(), "--exec", &dir_space),
-        ("weirdbot", weird_key.public().to_string(), "--cp", &dir_weird),
+        (
+            "execbot",
+            exec_key.public().to_string(),
+            "--exec",
+            &dir_space,
+        ),
+        (
+            "weirdbot",
+            weird_key.public().to_string(),
+            "--cp",
+            &dir_weird,
+        ),
     ] {
         let out = Command::new(bin)
             .args([
@@ -4761,7 +4774,10 @@ async fn scoped_client_dir_with_spaces_round_trips_and_enforces_exact_dir() {
         .await
         .unwrap();
     assert_eq!(ok.added, vec!["hi.txt".to_string()]);
-    assert_eq!(fs::read_to_string(dir_space.join("hi.txt")).unwrap(), "hello");
+    assert_eq!(
+        fs::read_to_string(dir_space.join("hi.txt")).unwrap(),
+        "hello"
+    );
     cpbot.close().await;
 
     // execbot: allowed in `a b`, refused in `a`.

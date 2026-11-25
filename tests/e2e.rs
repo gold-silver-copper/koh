@@ -2837,6 +2837,73 @@ async fn sessions_are_capped_and_the_oldest_ended_one_makes_room() {
     client.close().await;
 }
 
+/// How `ps` has a process: nothing once it is gone and was waited for (a `Z` while it is not).
+fn in_ps(pid: &str) -> String {
+    let said = Command::new("ps").args(["-o", "stat=", "-p", pid]).output();
+    String::from_utf8_lossy(&said.unwrap().stdout)
+        .trim()
+        .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attach_ends_with_its_stream_and_its_viewer_is_gone_before_its_folder() {
+    let host = Host::start("ends", &[]);
+    let client = host.client().await;
+    let soon = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !done() {
+            assert!(Instant::now() < deadline, "not in 4 s: {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    // A client that stops reading its stream and keeps its connection, under a program that
+    // draws nothing more and with megabytes typed that the program does not read: the server
+    // waits on neither end for it. The attach ends, and its viewer goes.
+    let deaf = ["sh", "-c", "stty -echo; echo READY; exec sleep 300"].map(String::from);
+    let (mut send, mut from, attached) = attach(&client, asks(None, &deaf)).await.unwrap();
+    until("the program is ready", || {
+        screen(&host.pane(&attached.name)).contains("READY")
+    });
+    let pasted = ViewInput::Bytes(vec![b'p'; 8 << 10]);
+    let paste = async {
+        loop {
+            send_msg(&mut send, &pasted, VIEW_FRAME).await.unwrap();
+        }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), paste).await;
+    assert_eq!(viewers(&host).len(), 1);
+    from.stop(0u32.into()).unwrap();
+    let there = host.sessions.parent().unwrap().to_path_buf();
+    let gone = move || {
+        !names_in(&there)
+            .iter()
+            .any(|name| name.starts_with(".view."))
+    };
+    soon(
+        "the viewer of a stream that was stopped is gone",
+        Box::new(gone),
+    );
+    // A viewer that does not leave in its second (stopped, here) is killed and waited for
+    // before the attach is over: no dead process is left for some later moment, and its
+    // folder went after it, not under it.
+    client.close().await;
+    let mut tty = host.attach(&["--session", "z"], &[]);
+    tty.until("the viewer is there", |_| viewers(&host).len() == 1);
+    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
+    signal(&viewer, "-STOP");
+    tty.types(b"\x1d.");
+    assert_eq!(tty.ends(), Some(0));
+    let (pid, there) = (
+        viewer.clone(),
+        host.sessions.parent().unwrap().to_path_buf(),
+    );
+    let reaped = move || in_ps(&pid).is_empty() && !there.join(format!(".view.{viewer}")).exists();
+    soon(
+        "the stopped viewer is killed, waited for, and its folder gone",
+        Box::new(reaped),
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_names() {
     let host = Host::start("older", &[]);

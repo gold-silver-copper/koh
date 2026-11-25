@@ -533,14 +533,17 @@ impl Sessions {
             viewer.env("TERM", &asked.term);
         }
         fuxix::new_session(&mut viewer, false);
+        // (Its folder in the session, which a viewer that is killed does not remove: named
+        // before the viewer, so that whatever ends this, the viewer goes first and its folder
+        // after it.)
+        let _folder;
         let mut viewer = tokio::process::Command::from(viewer)
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| KohError::failed(format!("cannot run {}: {e}", self.exe.display())))?;
         drop(slave);
-        // (Its folder in the session, which a viewer that is killed does not remove.)
         let session = self.dir.parent().zip(viewer.id());
-        let _folder = session.map(|(session, id)| Folder(session.join(format!(".view.{id}"))));
+        _folder = session.map(|(session, id)| Folder(session.join(format!(".view.{id}"))));
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         let attached = Attached {
@@ -551,6 +554,7 @@ impl Sessions {
         // What the viewer draws is sent as the link takes it, and what the client types is
         // written as the viewer takes it: each waits for its own end alone, so a key is not
         // held behind a screen's piece, nor a screen behind a paste.
+        let unread = send.stopped();
         let drawn = async {
             let mut piece = vec![0; 8 << 10];
             // (The pty's other end is closed when the viewer has left: Linux says so with an error.)
@@ -579,11 +583,17 @@ impl Sessions {
             () = typed => false,
             // A newer attach of this client to the run: this one writes no more.
             _ = stopped.changed() => false,
+            // A client that reads its stream no further: nothing is drawn for it.
+            _ = unread => false,
         };
         // The viewer leaves by itself: its pane ended and it drew the last screen, its user
-        // left it, or its terminal is gone now. One that has not in a second is killed.
+        // left it, or its terminal is gone now. One that has not in a second is killed, and
+        // waited for: it is gone when this is over.
         drop((master, reads, writes));
         let gone = tokio::time::timeout(Duration::from_secs(1), viewer.wait()).await;
+        if gone.is_err() {
+            let _ = viewer.kill().await;
+        }
         // The last word, where the viewer left of itself: how the session ended, or 0 if it
         // runs on and the viewer was told to leave. (One that failed says nothing: the client
         // comes again.)

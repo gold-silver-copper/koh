@@ -1446,6 +1446,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "fux",
+ "fux-vt",
  "fuxix",
  "iroh",
  "iroh-base",

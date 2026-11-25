@@ -736,25 +736,19 @@ impl Terminal {
                 .strip_prefix("[?")
                 .and_then(|flags| flags.strip_suffix('u'));
             terminal.keyboard = flags.map_or(terminal.keyboard, |flags| flags.parse().unwrap_or(0));
-            // `]11;rgb:1c1c/1c1c/1c1c`, ended by the next part or by BEL: of each of the three
-            // its first eight bits.
+            // `]11;rgb:1c1c/1c1c/1c1c`, ended by the next part or by BEL: a colour as fux reads
+            // one (three parts of one to four hex digits, the first eight bits of each kept).
             let colour = part
                 .strip_prefix(']')
-                .and_then(|answer| answer.split_once(";rgb:"));
+                .and_then(|answer| answer.split_once(';'));
             let Some((which, value)) = colour else {
                 continue;
             };
-            let name = ["foreground", "background", "cursor"]
-                .into_iter()
-                .zip(["10", "11", "12"]);
-            let name = name.into_iter().find(|(_, number)| *number == which);
-            let parts: Vec<&str> = value.trim_end_matches('\x07').split('/').collect();
-            let hex = |part: &&str| part.len() >= 2 && part.bytes().all(|b| b.is_ascii_hexdigit());
-            if let (Some((name, _)), [r, g, b], true) =
-                (name, parts.as_slice(), parts.iter().all(hex))
-            {
-                let two = |part: &str| part.get(..2).unwrap_or_default().to_lowercase();
-                terminal.colours += &format!("{name} #{}{}{}\n", two(r), two(g), two(b));
+            let names = [("10", "foreground"), ("11", "background"), ("12", "cursor")];
+            let name = names.into_iter().find(|(number, _)| *number == which);
+            let value = fux_vt::colour(value.trim_end_matches('\x07'));
+            if let (Some((_, name)), Some([r, g, b])) = (name, value) {
+                terminal.colours += &format!("{name} #{r:02x}{g:02x}{b:02x}\n");
             }
         }
         terminal
@@ -1233,7 +1227,7 @@ mod tests {
         }
         // One that knows neither says what it is, and no more: no colours, the plain keyboard.
         // What is no colour is none (a number that was not asked, a part that is no number),
-        // and flags that are no number of eight bits are none.
+        // and flags that are no number of eight bits are none. A part of one digit is a colour's.
         for (said, colours) in [
             (b"\x1b[?6c".as_slice(), ""),
             (
@@ -1242,7 +1236,7 @@ mod tests {
             ),
             (
                 b"\x1b]11;rgb:1c1c/1c1c\x1b\\\x1b]10;rgb:f/0/8\x1b\\\x1b[?1;2c",
-                "",
+                "foreground #ff0088\n",
             ),
         ] {
             let terminal = Terminal::said(said.get(..what_it_is(said).unwrap()).unwrap());

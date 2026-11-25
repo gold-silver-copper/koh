@@ -35,7 +35,9 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
     Ctrl-]; any other key after it is typed after it). That is koh's one key, as `~.` is
     ssh's: `koh connect` reads it where you type it, in whatever form your terminal sends
     it, so it leaves with a link or without one, and also while the session's program reads
-    nothing. Every other key is the session's: `C-b` reaches a `tmux` or a `fux` there as it
+    nothing. What you typed before it is typed before koh leaves, where there is a link: it
+    has a second for that, and a link that takes nothing holds the leaving no longer (with no
+    link what is held is not typed, and koh leaves at once). Every other key is the session's: `C-b` reaches a `tmux` or a `fux` there as it
     is typed. It ends with the session's program: with its status, with 128 + N if signal N
     ended it, and with 1 if nothing says how it ended (its holder was killed, the machine was
     restarted, its folder was moved). Left, hung up (a terminal that is closed) or told to

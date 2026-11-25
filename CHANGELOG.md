@@ -110,7 +110,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   - **`koh serve` told to end (SIGTERM) closes as on Ctrl-C**: a service that is stopped or
     restarted tells its clients at once, and they say `no link` then and not ten seconds on.
   - **koh has one key, `Ctrl-] .`**, read by `koh connect` where it is typed (`Ctrl-] Ctrl-]`
-    types one Ctrl-]). **`C-b d` and `C-b C-b` are no keys of koh's any more**: `C-b` is the
+    types one Ctrl-]). What was typed before it is typed before koh leaves: it has a second. **`C-b d` and `C-b C-b` are no keys of koh's any more**: `C-b` is the
     session's, so a `tmux` there has its prefix as it is typed.
   - **Sessions outlive `koh serve`.** They died with it. Stopped and started again it has them,
     and a client dials again and attaches to the run it had. (Under systemd that takes

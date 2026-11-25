@@ -548,8 +548,19 @@ impl InTerminal {
         }
     }
 
+    /// Types into the terminal, all of it: a pty takes only so much at once (a kilobyte on
+    /// macOS), and the rest when koh has read.
     fn types(&mut self, keys: &[u8]) {
-        (&self.tty).write_all(keys).unwrap();
+        let mut typed = 0;
+        while typed < keys.len() {
+            match (&self.tty).write(&keys[typed..]) {
+                Ok(n) => typed += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => panic!("typing: {e}"),
+            }
+        }
     }
 
     /// The exit code koh ended with.

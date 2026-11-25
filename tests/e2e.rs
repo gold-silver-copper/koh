@@ -3428,6 +3428,9 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(ended, Some(code), "{how}");
+        // (The terminal goes first: on macOS a program that leaves a terminal it has written
+        // to is not gone until what it wrote is read, or the terminal's other end is closed.)
+        drop(koh);
         let _ = (fills.kill(), fills.wait());
     }
 }

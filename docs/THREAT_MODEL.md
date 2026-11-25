@@ -130,10 +130,13 @@ have it show another pane, another workspace, or run a script.
   that cannot open a terminal.
 - A scope is read with each request, so narrowing or removing a key takes effect on its next
   request; what it already started goes on.
-- In `clients`, the scope is everything after the endpoint id to the end of the line (so spaces
-  in `DIR` are preserved; `koh clients add` refuses an empty `DIR` or one with a newline or NUL).
-  A line with an unrecognized or empty scope is skipped and warned on stderr, giving that client
-  nothing rather than falling back to an unscoped key.
+- In `clients`, only an absent scope grants unrestricted access, and `DIR` after `cp=` or
+  `exec=` is read verbatim to the end of the line (spaces preserved, no trailing trim, no
+  inline `#` comments). A line with an unrecognized scope or no `DIR` (`cp=`, `exec=`) is
+  skipped and gives that client nothing; `koh clients` names each skipped line on stderr with
+  its line number, and the next `koh clients add`, `rm`, or `rename` writes the file without
+  it. `koh clients add` refuses a `DIR` that is empty, is not UTF-8, or contains `\n` or `\r`
+  (exit 2).
 
 ## 4. A server a client dials
 

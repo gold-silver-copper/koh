@@ -4,7 +4,7 @@ SERVER is a saved name (`koh servers add NAME ID [--direct IP:PORT | --relay-url
 endpoint id. Only `connect` needs a terminal. `koh help-agents` is this and recipes for scripts.
 
 Keys & peers:
-  koh id [client|server]                         print endpoint id (creates key if missing)
+  koh id [client|server]                         print client proof key id or server endpoint id (creates key if missing)
   koh key reset [client|server] --yes            delete key; next use generates a new id
   koh servers [add NAME ID [--direct IP:PORT | --relay-url URL] | rm NAME | rename OLD NEW]
   koh clients [add NAME ID [--cp DIR | --exec DIR] | rm NAME | rename OLD NEW]

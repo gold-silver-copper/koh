@@ -3421,7 +3421,7 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
             match koh.koh.try_wait().unwrap() {
                 Some(ended) => break ended.code(),
                 None => assert!(
-                    told.elapsed() < Duration::from_secs(5),
+                    told.elapsed() < Duration::from_secs(2),
                     "{how}: still there"
                 ),
             }
@@ -3454,7 +3454,7 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
             match tty.koh.try_wait().unwrap() {
                 Some(ended) => break ended.code(),
                 None => assert!(
-                    told.elapsed() < Duration::from_secs(5),
+                    told.elapsed() < Duration::from_secs(2),
                     "{how}: still there"
                 ),
             }

@@ -37,8 +37,10 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
     it, so it leaves with a link or without one, and also while the session's program reads
     nothing. What you typed before it is typed before koh leaves, where there is a link: it
     has a second for that, and a link that takes nothing holds the leaving no longer (with no
-    link what is held is not typed, and koh leaves at once). Every other key is the session's: `C-b` reaches a `tmux` or a `fux` there as it
-    is typed. It ends with the session's program: with its status, with 128 + N if signal N
+    link what is held is not typed, and koh leaves at once). What is no key going down
+    between `Ctrl-]` and the dot (a click or a move of the mouse, a key let go, where the
+    session's program asked to hear of those) is not typed when koh leaves. Every other key
+    is the session's: `C-b` reaches a `tmux` or a `fux` there as it is typed. It ends with the session's program: with its status, with 128 + N if signal N
     ended it, and with 1 if nothing says how it ended (its holder was killed, the machine was
     restarted, its folder was moved). Left, hung up (a terminal that is closed) or told to
     end (SIGTERM), it ends with 0 and the session runs on.
@@ -56,7 +58,9 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
     that form. What the terminal sends up to that last answer are its answers (one that
     tells no colour, or does not know the protocol, has those it gave and the plain
     keyboard); what it sends after it is what you typed, to the byte, and koh looks for no
-    answer in it. A terminal that does not give that last answer is waited on for a second,
+    answer in it. **What you type between koh's question and that last answer is lost**: it
+    is taken for answers. In a terminal on your machine that is a millisecond; where `koh
+    connect` runs inside another session that is slow, it is that session's round trip. A terminal that does not give that last answer is waited on for a second,
     once for a `koh connect` and not again when a link comes back: it has no colours and the
     plain keyboard, and all it sent in that second was typed. Your terminal is taken to draw
     sixel pictures and 24-bit colours (one that does not shows nothing where the picture is).
@@ -131,6 +135,13 @@ koh adds nothing to stop these. What happens instead is said.
   (one reached over a path that slow) and expect a clean first line: its answers come after
   koh has stopped waiting, and are typed into the session, once, as the answers to any
   program that asks a terminal are when they come late.
+- Don't expect `Ctrl-] .` to leave every time where your terminal sends keys in the kitty
+  form over a path so slow that it cuts one key into pieces more than 10 ms apart: the first
+  piece is an Escape by then, and is typed, and koh may not leave that time. Press it again.
+  (koh keeps no piece back to see what follows: it would hold every Escape you type.)
+- Don't type Escape and `Ctrl-] .` within a few milliseconds of each other and expect the
+  Escape to be typed: `fux`'s viewer holds an Escape by itself for a moment, to see whether
+  it starts a sequence, and ends with it when you leave. No hand is that fast; a script is.
 - Don't expect a key's echo at once while a program floods the screen over a very slow link:
   at 64 kbit/s it was about five seconds and at most seven (measured: some 44 KiB of the
   flood's frames wait ahead of the link, in the server's pty and the stream's window, and the

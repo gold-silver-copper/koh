@@ -105,8 +105,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
     terminal resized meanwhile has its size taken on return, and a link that goes during
     the first attach is dialled again.
   - **Every end of `koh connect` but `kill -9` puts the terminal back**; after that one, type
-    `reset`. Told to end (SIGTERM, SIGHUP, SIGINT) it ends within a quarter of a second also
-    when its terminal takes nothing more.
+    `reset`. Told to end (SIGTERM, SIGHUP, SIGINT) it is gone within a second, also when its
+    terminal takes nothing, from before koh started or since.
   - **`koh serve` told to end (SIGTERM) closes as on Ctrl-C**: a service that is stopped or
     restarted tells its clients at once, and they say `no link` then and not ten seconds on.
   - **koh has one key, `Ctrl-] .`**, read by `koh connect` where it is typed (`Ctrl-] Ctrl-]`

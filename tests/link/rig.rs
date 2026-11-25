@@ -213,6 +213,9 @@ impl Rig {
         std::thread::spawn(move || {
             let mut feed_w = feed_w;
             let mut buf = [0u8; 4096];
+            // (What koh asks its terminal at its start is answered as every terminal answers,
+            // with what it is and no more, and is not of what is drawn.)
+            let mut asked = Some(Vec::new());
             while !*reader_stop.borrow() {
                 let Ok([ready]) = fuxix::wait([(Some(master_r.as_fd()), fuxix::POLLIN)], 30) else {
                     break;
@@ -222,9 +225,19 @@ impl Rig {
                 }
                 match (&master_r).read(&mut buf) {
                     Ok(n @ 1..) => {
-                        let slice = &buf[..n];
-                        raw_clone.lock().unwrap().extend_from_slice(slice);
-                        let _ = feed_w.write_all(slice);
+                        let mut slice = buf[..n].to_vec();
+                        if let Some(mut question) = asked.take() {
+                            question.extend_from_slice(&slice);
+                            let Some(end) = question.windows(3).position(|at| at == b"\x1b[c")
+                            else {
+                                asked = Some(question);
+                                continue;
+                            };
+                            write_all_pty(&master_r, b"\x1b[?62c");
+                            slice = question.split_off(end + 3);
+                        }
+                        raw_clone.lock().unwrap().extend_from_slice(&slice);
+                        let _ = feed_w.write_all(&slice);
                     }
                     Ok(0) => break,
                     Err(e)

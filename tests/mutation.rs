@@ -114,6 +114,8 @@ fn seeds() -> Vec<Vec<u8>> {
             run: Some(run),
             client: 7,
             term: text("xterm-256color"),
+            keyboard: 5,
+            colours: text("background #1c1c1c\n"),
         })),
         bytes(&Attached {
             name: text("3"),

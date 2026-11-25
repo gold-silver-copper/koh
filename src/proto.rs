@@ -155,10 +155,13 @@ pub struct Attach {
     pub run: Option<u128>,
     /// A number the client chose when it started: its older stream on the run is ended first.
     pub client: u64,
-    /// The client's `TERM`, for the viewer's environment: printable, 64 bytes at most, or none.
-    /// (Nothing else is said of the terminal, and nothing is asked of it: pictures are drawn
-    /// as on one that draws sixel, and its keys come in their old form.)
+    /// What the client's terminal is like, which the client asked it itself, once: no
+    /// viewer asks across a link. Its `TERM`; the kitty keyboard flags it takes (0: it does
+    /// not know the protocol, or did not say); and its colours, as lines of fux's `colours`
+    /// file (`foreground #d0d0d0`), none if it told of none.
     pub term: String,
+    pub keyboard: u8,
+    pub colours: String,
 }
 
 /// A name a session may have: one of fux's names (letters, digits, `.`, `_` and `-`, at most 64,

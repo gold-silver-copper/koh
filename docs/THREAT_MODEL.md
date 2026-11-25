@@ -47,7 +47,8 @@ waits for their commands (`koh sessions`, `koh output`, `koh wait --session`, wh
 session's folder as a script of that user would: `src/pane.rs`). There is nothing to escalate to. Its
 sessions are `fux` panes of the server's user, in a `fux` session of koh's own beneath the
 server's state (`src/session.rs`): it starts them, types into them, resizes them and hangs
-them up (a pane's `ctl`). Each attach has a viewer of its own on the
+them up (a pane's `ctl`), and says what its terminal is like, which the server writes into
+that `fux` session's `colours` and `keyboard`. Each attach has a viewer of its own on the
 server, `fux`'s viewer of one pane, which has no keys and takes no command: a client cannot
 have it show another pane, another workspace, or run a script.
 
@@ -61,8 +62,12 @@ have it show another pane, another workspace, or run a script.
   not a figure of koh's. A pane's files are read whole, whatever is in them (one that the
   server's user wrote there himself, of any length, too), and what has a file's name and is
   none (a FIFO, a link) is not read and not waited on. An attach says of the client's terminal
-  its size and its `TERM` (printable, 64 bytes at most, for the viewer's environment): a
-  `TERM` that is anything else is refused before a session is started. For each attach
+  its size, its `TERM` (printable, 64 bytes at most), a number for its keyboard and at most
+  three lines of colours (`foreground`, `background`, `cursor`, each `#` and six hex
+  digits): what is anything else is refused before a session is started or a file written.
+  The two files are the server's and not one session's: a client with an unscoped key
+  chooses what the programs of every session there are told of their terminal's colours and
+  keyboard, until the next attach says otherwise. For each attach
   the server runs one viewer on one pty, and ends it with the attach; a client's newer
   attach to a run (by the number it chose) ends its older one first, and a connection has at
   most 16 streams. Of a session's client the server takes 16 KiB a message, typed bytes or a
@@ -160,10 +165,12 @@ A wrong endpoint id, or a host someone else now controls.
   koh undoes what fux's viewer turns on, in one string (`src/client.rs`, `reset`): what was
   cut is ended (CAN, ST), then the frame, the scroll region, the mouse, marked pastes, the
   focus reports, the keys' modes, the cursor's shape and colour, the colours of text, a link
-  left open, the alternate screen and the title. It is written when the link is lost, and at
-  every end of `koh connect` short of `kill -9`. What a server turned on beyond that list (a
-  character set, keyboard flags, which koh's own viewer never sets and koh does not take
-  back: they may be the user's shell's) stays until the user types `reset`.
+  left open, the alternate screen and the title; and one level of keyboard flags, if the
+  terminal said it takes any (koh's viewer sets them aside once then; where it said none, none
+  is taken back: they would be the user's shell's). It is written when the link is lost, and
+  at every end of `koh connect` short of `kill -9`. What a server turned on beyond that list
+  (a character set, keyboard flags set aside more than once) stays until the user types
+  `reset`.
 - **A command's output from it** (`koh exec`, `koh logs`), and what it says a session shows
   or printed (`koh output`, `koh wait --session`), is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
@@ -171,8 +178,13 @@ A wrong endpoint id, or a host someone else now controls.
   until then, as much as the server sends.
 - **It learns** what is typed into a session and reaches it (what was typed while there
   was no link too, on return; not what was lost with a link), the terminal's size in cells
-  and pixels and its `TERM`, sent with each attach, and whatever the terminal answers to
-  what the server asks it (koh and its viewer ask nothing).
+  and pixels, its `TERM`, the keyboard flags it takes and its foreground, background and
+  cursor colours (which `koh connect` asked the terminal itself, once, and sends with each
+  attach: three colours and a number more than a server learned before, enough to tell a
+  light theme from a dark one and one terminal from some others), and whatever the terminal
+  answers to what the server asks it. A server's questions do reach the terminal, as any
+  program's output does; while the terminal still owes koh its own answers (it never said
+  what it is), an answer to the server in the same form is dropped with them.
 - **Not defended:** a server can mislead a user who chose to connect to it. The endpoint id is
   all that ties a name to a server: check it out of band.
 

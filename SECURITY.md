@@ -30,9 +30,10 @@ credit reporters who want it.
   `dispatch`; `src/keys.rs`, `Scope`), and what bounds a peer before and after that
   (`src/server.rs`, `start_server` and `handle_connection`; `src/session.rs`, `Sessions`).
 - Sessions on the server (`src/session.rs`): which pane an attach is given or starts, the
-  check of a client's run and of its `TERM` before anything is made, a client's one stream
-  on a run, and the viewer koh starts for an attach (on what pty, of which pane, and that it
-  ends with the attach); and what a key with no scope is told of a session's folder
+  check of a client's run and of what it says of its terminal before anything is made, a
+  client's one stream on a run, the viewer koh starts for an attach (on what pty, of which
+  pane, and that it ends with the attach), and what a client may have written into koh's own
+  `fux` session (`told`); and what a key with no scope is told of a session's folder
   (`src/pane.rs`: `koh sessions`, `koh output`, `koh wait --session`).
 - The wire decoders and their bounds (`src/proto.rs`), on both ends.
 - The paths a copy's peer may name, on both ends (`src/sync.rs`, `wire_names`), and the paths a
@@ -64,7 +65,10 @@ credit reporters who want it.
 
 - A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
   can read or write, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
-  session: such a key starts them, types into them, resizes them and hangs them up. `koh fux …`
+  session: such a key starts them, types into them, resizes them and hangs them up, and says
+  what its terminal is like into that `fux` session's `colours` and `keyboard` (the two are
+  the session's, not a pane's: a program of any session that asks its terminal is answered
+  from them, where they are there). `koh fux …`
   and `koh hold …` are no requests: they are fux, run by whoever runs koh, on his machine.
 - A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
   the path begins with `DIR` and goes on with plain names (no `..`). **It is not a

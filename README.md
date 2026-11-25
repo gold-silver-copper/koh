@@ -40,15 +40,23 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (~5,800 lines, down from ~
     ended it, and with 1 if nothing says how it ended (its holder was killed, the machine was
     restarted, its folder was moved). Left, hung up (a terminal that is closed) or told to
     end (SIGTERM), it ends with 0 and the session runs on.
-  - **Nothing is asked of your terminal**, by `koh connect` or by the session's viewer: an
-    answer that crosses a link may come late and be taken for typing, so none is asked for.
-    Your terminal is taken to draw sixel pictures and 24-bit colours (one that does not shows
-    nothing where the picture is). Two things are not known for want of asking. Your
-    terminal's own colours: a program that asks them (vim, to choose a light or a dark
-    theme) gets no answer, unless you write them on the server once (below). And whether it
-    speaks the kitty keyboard protocol: a program that asks for it is told that no flag is in
-    force, and keys reach it in their old form. With the attach go `TERM` and the size, in
-    cells and pixels.
+  - **Your terminal is asked what it is like by `koh connect` itself, once**, and nothing is
+    asked of it across the link, where an answer may come late and be taken for typing. Once
+    it has dialled, before its first attach, koh asks which of the kitty keyboard protocol's
+    flags the terminal takes, its foreground, background and cursor colours, and last what
+    it is, which every terminal answers and which ends the asking: the first screen waits
+    for that answer, a millisecond or so. The answers go with every attach, with `TERM` and
+    the size, cells and pixels, and the server writes them where the session's programs are
+    answered from (`colours` and `keyboard` in koh's `fux` session: they are the server's,
+    not one session's, and of two clients the last to attach is believed). So vim is told
+    your background, and a program that asks for the kitty keyboard protocol has its keys in
+    that form. A terminal that answers nothing is waited on for a second, once for a `koh
+    connect` and not again when a link comes back; it has no colours and the plain keyboard
+    then. An answer that comes after that second is not typed into the session, whenever it
+    comes: until the terminal has said what it is, what has an answer's form (`ESC [ ? … u`,
+    `ESC [ ? … c`, `ESC ] 1…` to its end) is dropped where koh reads its keys, outside a
+    marked paste; no key has that form. Your terminal is taken to draw sixel pictures and
+    24-bit colours (one that does not shows nothing where the picture is).
   - **Without a link** koh says so and dials again: `koh: no link; reconnecting`, on your
     terminal's own screen, which is put back the moment the link is lost (nothing of the
     viewer's stays on: not the mouse, not the alternate screen). What you type while it says
@@ -116,6 +124,10 @@ koh adds nothing to stop these. What happens instead is said.
   it is dropped, so it waits, as on any terminal. About a megabyte and a half waits on its
   way; past that your terminal itself waits with the paste, and takes no key, `Ctrl-] .`
   neither. Close the terminal then (koh is hung up and ends), or let the program read.
+- Don't expect a key's echo at once while a program floods the screen over a very slow link:
+  at 64 kbit/s it was five to six seconds (measured: some 44 KiB of the flood's frames wait
+  ahead of the link, in the server's pty and the stream's window, and the echo is drawn
+  behind them); at 256 kbit/s under a tenth of a second. Typing with no flood is not held up.
 - Don't start panes of your own in the sessions workspace: they are sessions to koh, counted
   against `--max-sessions`, attached to by a `koh connect` that names none, and the oldest
   ended one is removed to make room. A `fux view` of that workspace invites it: its keys for a
@@ -138,10 +150,6 @@ koh adds nothing to stop these. What happens instead is said.
   in those seconds is lost with it. After a long cut the link is not back at once with the
   path: koh gives each dial five seconds and waits five between two, so a path whose
   handshake takes longer than that is not dialled with success.
-- To have a session's programs know your terminal's colours, write them on the server, in
-  koh's `fux` session (the folder above the one `koh serve` printed): `koh exec box -- sh -c
-  "printf 'foreground #d0d0d0\nbackground #1c1c1c\n' > PATH/../colours"`. Every session is
-  answered from that file (`fux`'s README has its lines).
 - To take a session's size back, resize your terminal. A session has the size of the terminal
   that last changed: a second client of another size, or one that left, leaves it as it is,
   and a smaller terminal shows the top left of a larger session. A terminal resized while

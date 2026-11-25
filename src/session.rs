@@ -425,8 +425,32 @@ impl Sessions {
         if streamed { None } else { Aside::of(dir) }
     }
 
+    /// What a client says its terminal is like goes where fux's viewer would have written it:
+    /// into koh's own fux session, where its panes' holders read it and answer their programs
+    /// from it. `keyboard` always, `colours` if the terminal told of any. Each under a name of
+    /// the writer's own and then given its name, as fux's viewer writes them: of two at once the
+    /// last is believed and neither fails.
+    fn told(&self, asked: &Attach) {
+        let Some(session) = self.dir.parent() else {
+            return;
+        };
+        let number = self.streamed.fetch_add(1, Ordering::Relaxed);
+        let keyboard = format!("{}\n", asked.keyboard);
+        let files = [("colours", &asked.colours), ("keyboard", &keyboard)];
+        for (name, text) in files.into_iter().filter(|(_, text)| !text.is_empty()) {
+            let own = session.join(format!(".{name}.{}.{number}", std::process::id()));
+            let written = fux::write_new(&own, text.as_bytes());
+            if written
+                .and_then(|()| fs::rename(&own, session.join(name)))
+                .is_err()
+            {
+                let _ = fs::remove_file(&own);
+            }
+        }
+    }
+
     /// Serves one attach, from the request to the stream's end. Checked before anything is
-    /// made: the name, the client's `TERM`, then the run a client that comes
+    /// made: the name, what the client says of its terminal, then the run a client that comes
     /// again names. What is wrong before the answer is the caller's to say; after `Ok` the
     /// stream is this one's: what the session's viewer draws, and at the end `Exit` if the
     /// session ended or its user left it. A stream that ends without that word was cut.
@@ -442,12 +466,20 @@ impl Sessions {
                 "a session's name is letters, digits, '.', '_' and '-', at most 64, not starting with a dot, and none of fux's own: -, colours, keyboard, layout",
             ));
         }
-        // (`TERM` is for the viewer's environment: a name, and nothing a shell would read as more.)
-        if asked.term.len() > 64 || !asked.term.bytes().all(|b| b.is_ascii_graphic()) {
+        // (`TERM` is for the viewer's environment, and the colours are lines of fux's `colours`
+        // file: the three a client asks its terminal for, and nothing else.)
+        let colour = |line: &str| {
+            let hex = |hex: &str| hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+            matches!(line.split_once(" #"), Some(("foreground" | "background" | "cursor", value)) if hex(value))
+        };
+        let term = asked.term.len() <= 64 && asked.term.bytes().all(|b| b.is_ascii_graphic());
+        if !term || asked.colours.len() > 64 || !asked.colours.lines().all(colour) {
             return Err(KohError::usage(
-                "a client's TERM is printable and at most 64 bytes",
+                "what a client says of its terminal is its TERM (printable, at most 64 bytes) and its foreground, background and cursor colours",
             ));
         }
+        // (Before a session is started: its program may ask for a colour as its first act.)
+        self.told(&asked);
         let dir = match (&asked.run, &asked.name) {
             (Some(run), Some(name)) => {
                 let dir = self.dir.join(name);
@@ -472,8 +504,8 @@ impl Sessions {
             let _ = older.send(true);
             older.closed().await;
         }
-        // The viewer: this binary on a pty of the client's size, with the client's `TERM`. It
-        // asks that terminal nothing, and has no keys: every key that reaches it
+        // The viewer: this binary on a pty of the client's size, with the client's `TERM`, told
+        // the keyboard's flags its terminal takes. It has no keys: every key that reaches it
         // is the session's (koh's own key is the client's). It leads a session of its own, and the pty
         // is not its controlling terminal: when the pty's other end closes it is not hung up
         // but reads the end, and leaves as a viewer leaves (a key that is down is let go in
@@ -493,6 +525,7 @@ impl Sessions {
         viewer
             .arg("view-session")
             .arg(&dir)
+            .arg(asked.keyboard.to_string())
             .stdin(end()?)
             .stdout(end()?)
             .stderr(end()?);

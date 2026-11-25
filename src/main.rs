@@ -28,13 +28,15 @@ fn main() -> ExitCode {
     // thread but fux's own, and no runtime.
     let mut words = std::env::args_os().skip(1).peekable();
     match words.peek().and_then(|word| word.to_str()) {
-        // A session's viewer, as `koh serve` runs it on a pty for a client's terminal: of the
-        // pane named, for a terminal that is asked nothing and whose keys come in their old form.
+        // A session's viewer, as `koh serve` runs it on a pty for a client's terminal: the pane,
+        // and the keyboard's flags that terminal takes.
         Some("view-session") => {
-            let pane = words.nth(1).map(PathBuf::from);
-            let viewed = pane
-                .ok_or(String::new())
-                .and_then(|pane| fux::view_pane(pane, 0));
+            let words: Vec<_> = words.skip(1).collect();
+            let [pane, keyboard] = words.as_slice() else {
+                return ExitCode::from(Exit::USAGE.0);
+            };
+            let keyboard = keyboard.to_str().and_then(|flags| flags.parse().ok());
+            let viewed = fux::view_pane(pane.into(), keyboard.unwrap_or(0));
             return viewed.map_or(ExitCode::FAILURE, |()| ExitCode::SUCCESS);
         }
         Some("fux") => return fux::command(words.skip(1)),

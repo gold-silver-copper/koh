@@ -479,6 +479,8 @@ struct InTerminal {
     koh: std::process::Child,
     tty: fs::File,
     drawn: Vec<u8>,
+    /// Whether it says what it is when it is asked, as every terminal does (once: koh asks once).
+    answers: bool,
 }
 
 impl Drop for InTerminal {
@@ -516,6 +518,7 @@ impl InTerminal {
             koh: koh.spawn().unwrap(),
             tty,
             drawn: Vec::new(),
+            answers: true,
         }
     }
 
@@ -527,6 +530,10 @@ impl InTerminal {
             let mut some = [0u8; 4096];
             while let Ok(n @ 1..) = (&self.tty).read(&mut some) {
                 self.drawn.extend_from_slice(&some[..n]);
+            }
+            if self.answers && self.drawn.windows(3).any(|asked| asked == b"\x1b[c") {
+                self.answers = false;
+                self.types(b"\x1b[?62c");
             }
             if done(self) {
                 return;
@@ -2616,6 +2623,8 @@ fn asks(name: Option<&str>, program: &[String]) -> Attach {
         run: None,
         client: 7,
         term: "xterm-256color".into(),
+        keyboard: 0,
+        colours: String::new(),
     }
 }
 
@@ -2894,11 +2903,14 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
     let client = host.client().await;
     let session = host.sessions.parent().unwrap().to_path_buf();
     let sleeps = ["sleep".to_string(), "100".into()];
-    // What a client says of its terminal is its name: one that is none is refused before a
-    // session is started, and nothing of a terminal is written anywhere.
-    let not_said: [fn(&mut Attach); 2] = [
+    // What a client says of its terminal is a name and three colours: anything else is refused
+    // before a session is started or a file written.
+    let not_said: [fn(&mut Attach); 5] = [
         |asks| asks.term = "xterm\n256".into(),
         |asks| asks.term = "x".repeat(65),
+        |asks| asks.colours = "layout #000000\n".into(),
+        |asks| asks.colours = "background #1c1c1c\n../../told #000000\n".into(),
+        |asks| asks.colours = "background #1c1c1c\n".repeat(4),
     ];
     for not_said in not_said {
         let mut asks = asks(None, &sleeps);
@@ -2910,10 +2922,18 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
         (names_in(&session), names_in(&host.sessions)),
         (vec!["koh-sessions".to_string()], vec![])
     );
-    let (mut send, mut from, _) = attach(&client, asks(None, &sleeps)).await.unwrap();
-    let written = names_in(&session);
-    let written = written.iter().filter(|name| !name.starts_with(".view."));
-    assert_eq!(written.collect::<Vec<_>>(), ["koh-sessions"]);
+    // What it may say is written where the session's programs are answered from.
+    let said = Attach {
+        keyboard: 5,
+        colours: "foreground #d0d0d0\nbackground #1c1c1c\n".into(),
+        ..asks(None, &sleeps)
+    };
+    let (mut send, mut from, _) = attach(&client, said.clone()).await.unwrap();
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
+    assert_eq!(
+        fs::read_to_string(session.join("colours")).unwrap(),
+        said.colours
+    );
     // On the stream a client types and tells its terminal's size, a message of 16 KiB at most:
     // one that is longer ends the stream, with nothing of it typed.
     let size = ViewSize {
@@ -2962,11 +2982,15 @@ fn the_exit_code_is_the_programs_and_not_zero_without_one() {
 }
 
 #[test]
-fn koh_connect_asks_its_terminal_nothing_and_puts_it_back_however_it_ends() {
+fn koh_connect_asks_its_terminal_what_it_is_like_and_puts_it_back_however_it_ends() {
     let host = Host::start("terminal", &[]);
     let session = host.sessions.parent().unwrap().to_path_buf();
     // A program that takes the alternate screen, the mouse and pastes marked, and hides the cursor.
     let modes = r"printf '\033[?1049h\033[?1002h\033[?1006h\033[?2004h\033[?25l\033[5;5HMODES-%s' ON; exec sleep 600";
+    let like = [
+        ("colours", "foreground #d0d0d0\nbackground #1c1c1c\n"),
+        ("keyboard", "5\n"),
+    ];
     let on = |terminal: &InPane| {
         until("the terminal shows the program, its modes on", || {
             terminal.says("shown/screen").contains("MODES-ON")
@@ -2974,22 +2998,30 @@ fn koh_connect_asks_its_terminal_nothing_and_puts_it_back_however_it_ends() {
         });
         assert!(!terminal.is_put_back());
     };
-    // A terminal that answers whatever it is asked (a pane of fux's does: what it is, its
-    // colours, its keyboard). It was asked nothing, by koh or by the session's viewer: no answer
-    // was typed into the session, and nothing of a terminal is written on the server.
+    // A terminal that says its colours and takes the keyboard's flags 1 and 4: asked before
+    // anything was dialled, and its answers are in the server's session, where the programs of
+    // its panes are answered from. Nothing of the answers was typed into the session.
     let asks = ["--session", "s", "--", "sh", "-c", modes];
-    let first = InPane::connect(&host, "t1", &[("keyboard", "5\n")], &asks);
+    let first = InPane::connect(&host, "t1", &like, &asks);
     on(&first);
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
-    assert!(!session.join("colours").exists() && !session.join("keyboard").exists());
-    // Told to end, it puts the terminal back before it goes, and the session runs on. Hung
-    // up, as by a terminal that is closed, it ends the same way; and so when its user leaves.
+    assert_eq!(
+        fs::read_to_string(session.join("colours")).unwrap(),
+        like[0].1
+    );
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
+    // Told to end, it puts the terminal back before it goes, and the session runs on.
     signal(&first.pid(), "-TERM");
     assert_eq!(first.ends(), "exited 0");
     until("the terminal is put back", || first.is_put_back());
+    // One that knows neither: no colours are told (the file is as it was), the plain keyboard.
+    // Hung up, as by a terminal that is closed, it ends the same way; and so when its user leaves.
     let second = InPane::connect(&host, "t2", &[], &["--session", "s"]);
     on(&second);
+    assert_eq!(
+        fs::read_to_string(session.join("colours")).unwrap(),
+        like[0].1
+    );
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
     signal(&second.pid(), "-HUP");
     assert_eq!(second.ends(), "exited 0");
     until("the terminal is put back", || second.is_put_back());
@@ -3001,6 +3033,113 @@ fn koh_connect_asks_its_terminal_nothing_and_puts_it_back_however_it_ends() {
     // The session's program was typed nothing, by any of the three, and no viewer is left.
     assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
     until("the viewers are gone", || viewers(&host).is_empty());
+}
+
+/// A program for a session that asks its terminal for its background and, having set the
+/// keyboard's first flag, which flags are in force; and then writes all it reads into `out`.
+fn asks_and_reads_into(out: &Path) -> Vec<String> {
+    let script = r#"stty raw -echo; printf '\033]11;?\033\\\033[>1u\033[?u'; exec cat > "$0""#;
+    ["sh", "-c", script, out.to_str().unwrap()]
+        .map(String::from)
+        .to_vec()
+}
+
+#[test]
+fn a_sessions_program_is_told_the_terminals_colours_and_has_its_keys_in_the_form_it_asked_for() {
+    let host = Host::start("told", &[]);
+    let read =
+        |out: &Path| String::from_utf8_lossy(&fs::read(out).unwrap_or_default()).into_owned();
+    let with = |tag: &str, like: &[(&str, &str)]| {
+        let out = host.tmp.0.join(format!("{tag}.out"));
+        let program = asks_and_reads_into(&out);
+        let mut asks = vec!["--session", tag, "--"];
+        asks.extend(program.iter().map(String::as_str));
+        (InPane::connect(&host, tag, like, &asks), out)
+    };
+    // In a terminal that tells no colours and does not know the kitty keyboard protocol, the
+    // program is told that no flag is in force, and no colour; Escape, typed, is the one byte.
+    let (plain, out) = with("plain", &[]);
+    until("the program is told of no flags", || {
+        read(&out) == "\x1b[?0u"
+    });
+    plain.types(b"\x1b");
+    until("Escape is typed in its old form", || {
+        read(&out) == "\x1b[?0u\x1b"
+    });
+    // In one that says its colours and takes the keyboard's flags, the program is told the
+    // background and that its flag is in force; and Escape, which such a terminal sends in the
+    // protocol's form once the flag is set there, reaches the program in that form.
+    let like = [
+        ("colours", "foreground #d0d0d0\nbackground #1c1c1c\n"),
+        ("keyboard", "5\n"),
+    ];
+    let (kitty, out) = with("kitty", &like);
+    let told = "\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[?1u";
+    until("the program is told the background and its flag", || {
+        read(&out) == told
+    });
+    until("the flag is set in the client's terminal", || {
+        kitty.says("modes").contains("keys1")
+    });
+    kitty.types(b"\x1b[27u");
+    until("Escape is typed in the protocol's form", || {
+        read(&out) == format!("{told}\x1b[27u")
+    });
+    assert_eq!(read(&host.tmp.0.join("plain.out")), "\x1b[?0u\x1b");
+    // koh's key leaves in that form too, and the terminal is as it was.
+    kitty.types(b"\x1b[93;5u.");
+    assert_eq!(kitty.ends(), "exited 0");
+    until("the terminal is put back", || {
+        kitty.is_put_back() && !kitty.says("modes").contains("keys")
+    });
+    assert_eq!(read(&out), format!("{told}\x1b[27u"));
+}
+
+#[test]
+fn a_terminal_that_answers_nothing_or_late_is_asked_once_and_no_answer_is_typed() {
+    let mut host = Host::start("late", &[]);
+    let session = host.sessions.parent().unwrap().to_path_buf();
+    let out = host.tmp.0.join("out");
+    let has = |tty: &mut InTerminal, what: &[u8]| tty.drawn.windows(what.len()).any(|s| s == what);
+    let asked = |tty: &InTerminal| tty.drawn.windows(3).filter(|s| s == b"\x1b[c").count();
+    // A terminal that answers nothing: koh waits a second for it, and goes on with the plain
+    // keyboard and no colours.
+    let began = Instant::now();
+    let mut tty = host.attach(&["--session", "s"], &reads_into(&out));
+    tty.answers = false;
+    tty.until("the program is ready", |tty| has(tty, b"READY"));
+    assert!(
+        began.elapsed() >= Duration::from_secs(1),
+        "{:?}",
+        began.elapsed()
+    );
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
+    assert!(!session.join("colours").exists());
+    // Its answers come now, after the wait, and a key after them: the key is typed, and
+    // nothing of an answer is. Told late, nothing is changed: the plain form it stays.
+    tty.types(b"\x1b[?5u\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\");
+    std::thread::sleep(Duration::from_millis(100));
+    tty.types(b"\x1b]12;rgb:ffff/0000/7f7f\x07\x1b[?62;4cx");
+    until("the key is typed", || {
+        fs::read(&out).unwrap_or_default() == b"x"
+    });
+    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
+    assert!(!session.join("colours").exists());
+    // The server goes and comes back: koh dials again and attaches again, and asks its
+    // terminal nothing again. (So a terminal that answers nothing costs its second once.)
+    host.stop();
+    tty.until("link down", |tty| has(tty, b"no link"));
+    let (down, drawn) = (Instant::now(), tty.drawn.len());
+    host.serve();
+    tty.until("the session is shown again", |tty| {
+        tty.drawn[drawn..].windows(8).any(|s| s == b"\x1b[?1049h")
+    });
+    println!("shown again {:?} after the link went", down.elapsed());
+    assert_eq!(asked(&tty), 1);
+    tty.types(b"y");
+    until("typed on return", || {
+        fs::read(&out).unwrap_or_default() == b"xy"
+    });
 }
 
 #[test]

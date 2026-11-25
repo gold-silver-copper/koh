@@ -51,6 +51,9 @@ class Tty:
             except OSError:
                 some = b''
             self.drawn += some
+            # (A terminal says what it is when it is asked: `koh connect` and the viewer wait for that.)
+            if b'\x1b[c' in some:
+                os.write(self.master, b'\x1b[?62c')
             return some
         return b''
 
@@ -149,7 +152,7 @@ def main():
     start, addr = serve()
     server, server_id, sessions = start()
     def connect(*asks):
-        # (Until the viewer's first bytes: `koh connect` has dialled and attached.)
+        # (Until the viewer's first bytes: `koh connect` has asked its terminal, dialled and attached.)
         tty = Tty([KOH, 'connect', server_id, '--direct', addr, *asks])
         tty.until(b'\x1b[?1049h')
         return tty

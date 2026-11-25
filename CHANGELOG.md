@@ -92,10 +92,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
   - **`koh mount` is removed.** Nothing of a session is a file on the client, and a local key
     script cannot act on a remote pane. `koh output`, `koh wait --session` and `koh sessions`
     read the session's files on the server.
-  - **Nothing is asked of your terminal**: an answer across a link may come late and be
-    taken for typing. So a session's programs are not told your terminal's colours (write
-    them on the server once: the README's "do") and are not offered the kitty keyboard
-    protocol: keys reach them in their old form. Both worked with the mirror.
+  - **Nothing is asked of your terminal across the link**, where an answer may come late and
+    be taken for typing. `koh connect` asks it itself, once, before its first attach: the
+    kitty keyboard flags it takes and its foreground, background and cursor colours. The
+    answers go with each attach, and a session's programs are answered from them. A terminal
+    that answers nothing costs one second, once; an answer that comes later is not typed.
   - **Without a link** your terminal is put back at once (its own screen, no mouse reports)
     and says `koh: no link; reconnecting`; `Ctrl-] .` leaves then too. What is
     typed meanwhile is held, 64 KiB of it, and typed once on return; what was on its way when

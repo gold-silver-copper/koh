@@ -1,6 +1,6 @@
 [package]
 name = "koh"
-version = "0.18.0"
+version = "0.18.1"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -15,8 +15,8 @@ include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md", "/docs/THREAT_MO
 [dependencies]
 anyhow = "1.0.104"
 blake3 = "1.8.7"
-fux = "0.43.4"
-# (fux's own reader of a colour: the same crate fux 0.43.4 has, and no other in the lockfile.)
+fux = "0.43.5"
+# (fux's own reader of a colour: the same crate fux 0.43.5 has, and no other in the lockfile.)
 fux-vt = "0.20.1"
 fuxix = "0.12.0"
 iroh = "=1.3.0"

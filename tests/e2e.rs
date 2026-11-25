@@ -3315,9 +3315,10 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
 fn what_was_typed_before_the_key_that_leaves_is_typed() {
     let host = Host::start("before", &[]);
     // What is typed right before `Ctrl-] .`, in one write with it (a paste and the key, a
-    // fast hand): koh leaves, and the session has it, all of it and in its order. One byte,
-    // and some thousands.
-    let lines: Vec<u8> = (0..400)
+    // fast hand): koh leaves, and the session has it, all of it and in its order. One byte;
+    // and more than a pty holds at once, so that the last of it waits on the server for the
+    // viewer to read what is before it, while the client is leaving.
+    let lines: Vec<u8> = (0..5000)
         .flat_map(|n| format!("{n:07}\n").into_bytes())
         .collect();
     for (name, typed) in [("one", &b"q"[..]), ("many", &lines[..])] {

@@ -604,7 +604,12 @@ impl Sessions {
         let left = tokio::select! {
             biased;
             drawn = drawn => drawn.is_ok(),
-            () = typed => false,
+            // (All the client typed is typed: this side of the stream ends with it, which a
+            // client that leaves waits for before it lets its connection go.)
+            () = typed => {
+                let _ = send.finish();
+                false
+            }
             // A newer attach of this client to the run: this one writes no more.
             _ = stopped.changed() => false,
             // A client that reads its stream no further: nothing is drawn for it.

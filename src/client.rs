@@ -989,7 +989,7 @@ impl Console {
         // was typed before that is sent first, and nothing the link says meanwhile undoes the
         // leaving.
         if let (Ok(Some(_)), true) = (&ended, left) {
-            keys.last(send).await;
+            keys.last(send, recv).await;
         }
         ended
     }
@@ -1134,17 +1134,18 @@ impl Keys {
     }
 
     /// Sends what was typed and is not sent, and ends the stream, as koh leaves: the session
-    /// has what was typed before the key that leaves. A quarter of a second for the link to
-    /// take it: one that takes nothing does not hold the leaving.
-    async fn last(&mut self, send: &mut SendStream) {
+    /// has what was typed before the key that leaves. The server ends its side when it has
+    /// typed all of it; until then what it draws is read, and dropped. A quarter of a second
+    /// for all of that: a link that takes nothing does not hold the leaving.
+    async fn last(&mut self, send: &mut SendStream, recv: &mut RecvStream) {
         let sent = async {
             for bytes in std::mem::take(&mut self.ready) {
                 send_msg(send, &ViewInput::Bytes(bytes), VIEW_FRAME).await?;
             }
             let _ = send.finish();
-            send.stopped()
-                .await
-                .map_err(|e| KohError::failed(e.to_string()))
+            let mut drawn = [0; 4096];
+            while let Ok(Some(_)) = recv.read(&mut drawn).await {}
+            Ok::<_, KohError>(())
         };
         let _ = tokio::time::timeout(Duration::from_millis(250), sent).await;
     }

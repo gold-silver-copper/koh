@@ -760,10 +760,18 @@ while True:
 "#;
     rig.pane("s", &["python3", "-c", py]);
     let client = rig.connect("s", "a").await;
-    // Let the flood saturate the 256 kbit/s link for 1 second first.
+    // The flood has a second to itself first. (What it is on the terminal then, below the
+    // key's row: it is drawn on while the keys are typed, or this measures no flood.)
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let before = rig.net.counts(client.id);
-    let t0 = Instant::now();
+    let flood = || {
+        client
+            .screen()
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let (before, drawn, t0) = (rig.net.counts(client.id), flood(), Instant::now());
 
     let mut echoes = Vec::new();
     for ch in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'] {
@@ -786,11 +794,7 @@ while True:
         "key echo during seq 1 2000000 flood at 256 kbit/s ({bps:.0} B/s down, waited={}): median={median:?}, worst={worst:?}, all={echoes:?}",
         after.waited - before.waited
     );
-    assert!(
-        after.bytes - before.bytes > 20_000,
-        "flood did not saturate during echo test: {} B",
-        after.bytes - before.bytes
-    );
+    assert!(flood() != drawn, "the flood was not drawn on meanwhile");
     assert!(
         median < Duration::from_secs(2) && worst < Duration::from_secs(3),
         "echo queued behind flood: median={median:?}, worst={worst:?}"

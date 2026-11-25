@@ -1135,8 +1135,9 @@ impl Keys {
 
     /// Sends what was typed and is not sent, and ends the stream, as koh leaves: the session
     /// has what was typed before the key that leaves. The server ends its side when it has
-    /// typed all of it; until then what it draws is read, and dropped. A quarter of a second
-    /// for all of that: a link that takes nothing does not hold the leaving.
+    /// typed all of it; until then what it draws is read, and dropped. It is little (what
+    /// one read gave, and what the stream's window held: some 20 KiB at most), and has a
+    /// second: a link that takes nothing does not hold the leaving longer.
     async fn last(&mut self, send: &mut SendStream, recv: &mut RecvStream) {
         let sent = async {
             for bytes in std::mem::take(&mut self.ready) {
@@ -1147,7 +1148,7 @@ impl Keys {
             while let Ok(Some(_)) = recv.read(&mut drawn).await {}
             Ok::<_, KohError>(())
         };
-        let _ = tokio::time::timeout(Duration::from_millis(250), sent).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), sent).await;
     }
 
     /// The next message of what was typed: read of the terminal when none waits. What is no

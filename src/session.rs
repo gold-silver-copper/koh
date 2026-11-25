@@ -617,14 +617,14 @@ impl Sessions {
         };
         // What was typed is the viewer's to read before its terminal goes: a pty that is closed
         // drops what its other end has not read, and a client that leaves has typed what it
-        // typed. A quarter of a second for it: a viewer that reads nothing holds nothing up.
+        // typed. A second for it: a viewer that reads nothing holds nothing up for longer.
         let unread = || fuxix::wait([(Some(slave.as_fd()), fuxix::POLLIN)], 0);
         let read = async {
             while unread().is_ok_and(|[typed]| typed != 0) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         };
-        let _ = tokio::time::timeout(Duration::from_millis(250), read).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), read).await;
         // The viewer leaves by itself: its pane ended and it drew the last screen, its user
         // left it, or its terminal is gone now. One that has not in a second is killed, and
         // waited for: it is gone when this is over.

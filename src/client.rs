@@ -1063,7 +1063,17 @@ impl Keys {
                 }
                 continue;
             }
-            let Some((length, name, down)) = fux::key(rest, whole) else {
+            // (A sequence that a byte of no sequence breaks, a control among its numbers, is
+            // none: what stood before that byte is typed as it is, and the byte is read as
+            // the key it may be, koh's own too. Read on to an end, it would take that key in.)
+            let broken = rest.strip_prefix(b"\x1b[").and_then(|inside| {
+                let numbers = inside.iter().take_while(|b| (0x20..=0x3f).contains(*b));
+                let numbers = numbers.count();
+                let breaks = |b: &u8| !(0x40..=0x7e).contains(b);
+                (inside.get(numbers).is_some_and(breaks))
+                    .then(|| (numbers + 2, String::new(), true))
+            });
+            let Some((length, name, down)) = broken.or_else(|| fux::key(rest, whole)) else {
                 break;
             };
             let key = rest.get(..length).unwrap_or_default();
@@ -1287,7 +1297,7 @@ mod tests {
     fn kohs_key_leaves_in_whatever_form_a_terminal_sends_it_and_nothing_else_does() {
         // `Ctrl-] .` leaves: in one read or two, in the old form of keys and in the kitty
         // protocol's, with the key's release, Ctrl's own press and a mouse report between the two.
-        let leaves: [&[&[u8]]; 5] = [
+        let leaves: [&[&[u8]]; 6] = [
             &[b"ab\x1d."],
             &[b"ab\x1d", b"."],
             &[b"ab\x1b[93;5u\x1b[46u"],
@@ -1297,6 +1307,9 @@ mod tests {
                 b"\x1b[<35;1;1M\x1b[46;1:1u",
             ],
             &[b"ab\x1b[93;", b"5u."],
+            // (A sequence that never had its end, and then koh's key: the key is not read
+            // into the sequence, which a byte of no sequence broke.)
+            &[b"ab\x1b[?", b"\x1d", b"."],
         ];
         for reads in leaves {
             let (sent, ends) = typed(&mut Keys::default(), reads, false);
@@ -1317,6 +1330,8 @@ mod tests {
                 b"\x1b[200~\x1d.\x1b[201~.",
             ),
             (&[b"\x1b[93;5u\x1b[93;5u"], b"\x1b[93;5u"),
+            (&[b"\x1b[?", b"\x1dx"], b"\x1b[?\x1dx"),
+            (&[b"\x1d\x1b[12;\x1b[A."], b"\x1d\x1b[12;\x1b[A."),
             // (With the kitty keyboard a key is let go too: what comes while Ctrl-] waits is
             // behind it, in its order. Let go before it went down, a key is none to a viewer.)
             (

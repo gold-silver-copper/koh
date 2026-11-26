@@ -15,7 +15,8 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
     `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,
     `--relay-url`, and `--` before `HOST`; ssh options such as `-l`, `-p`, and `-o` exit 2. If your
     git configuration sets `ssh.variant = ssh`, pass `git -c ssh.variant=simple` so git does not
-    add `-o`.
+    add `-o`. A remote destination path containing non-UTF-8 bytes needs rsync's `-s` (koh requires
+    UTF-8 command-line arguments).
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
@@ -239,6 +240,7 @@ koh exec box -- uname -a
 koh exec box --sync proj -- cargo test
 rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
 rsync -a -e 'koh rsh' box:dst/ dst/
+koh rsh box git init -q --bare repo.git
 GIT_SSH_COMMAND='koh rsh' git push box:repo.git HEAD:refs/heads/main
 GIT_SSH_COMMAND='koh rsh' git clone -b main box:repo.git
 tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'

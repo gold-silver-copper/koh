@@ -49,10 +49,14 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
     unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` and
     `koh wait` report `ended` with exit 1.
   - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
-    name anew (starting an ended name removes its old folder first, also if the new program fails
-    to start).
-  - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number (`1`,
-    `2`, …) instead of `j1`, `j2`, …; `koh jobs` shows the command as `fux`'s `status` formats it.
+    name anew (starting an ended name removes its old folder once the request passes validation,
+    also if the new program then fails to start).
+  - `koh wait` and `koh logs -f` on a job whose name is started anew meanwhile now print
+    `that job was started anew` and exit 1 (keeping the old job's output, never the replacement's;
+    previously `wait` returned the old job's exit status).
+  - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number
+    (`1`–`9999`, failing once 9,999 unnamed folders are kept) instead of `j1`, `j2`, …; `koh jobs`
+    shows the command as `fux`'s `status` formats it.
   - Session start failures (sharing the same `fux start` helper) now report `nothing was started: …`
     instead of `no session was started: …` (exit 126 unchanged).
 

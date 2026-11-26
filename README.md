@@ -35,17 +35,18 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     streamed in fixed-size blocks (no 80-column wrapping, no screen truncation). `koh serve` keeps
     no job state in memory: jobs survive `koh serve` being restarted, and not a reboot (they live
     in the runtime directory). Job names follow `fux`'s pane-name rule and unnamed jobs take
-    `fux`'s first free number (`1`, `2`, …); starting an ended name removes its old folder and log
-    first, also if the new program cannot be started. Each job's `out` file grows without bound:
-    remove ended job folders yourself or start the name anew. When a job's program ends, anything
-    it left in its process group is hung up (`nohup`/`setsid` for processes that must outlive it);
-    output written by a leftover process after the leader exits may appear in `out` later
-    (`koh logs --all`) and not in a `koh logs -f` that already ended. `koh kill` writes `kill N`
-    to the pane's `ctl` FIFO and reaches a job only while its holder lives; a holder killed with
-    `-9` leaves its program running, while `koh jobs` and `koh wait` report `ended` with exit 1.
-    Run one `koh serve` per state directory (two servers for the same user sharing the default
-    state directory share the jobs folder and do not coordinate starts). `koh serve` no longer
-    needs `kill(1)` or `id(1)` on its `PATH`.
+    `fux`'s first free number (`1`–`9999`, failing once 9,999 unnamed folders are kept); starting
+    an ended name removes its old folder and log once the request passes validation (a bad `-C`
+    is refused first), also if the new program then fails to start. Each job's `out` file grows
+    without bound: remove ended job folders yourself or start the name anew. When a job's program
+    ends, anything it left in its process group is hung up (`nohup`/`setsid` for processes that
+    must outlive it); output written by a leftover process after the leader exits may appear in
+    `out` later (`koh logs --all`) and not in a `koh logs -f` that already ended. `koh kill`
+    writes `kill N` to the pane's `ctl` FIFO and reaches a job only while its holder lives; a
+    holder killed with `-9` leaves its program running, while `koh jobs` and `koh wait` report
+    `ended` with exit 1. Run one `koh serve` per state directory (two servers for the same user
+    sharing the default state directory share the jobs folder and do not coordinate starts).
+    `koh serve` no longer needs `kill(1)` or `id(1)` on its `PATH`.
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`
@@ -208,8 +209,8 @@ koh adds nothing to stop these. What happens instead is said.
   -r PATH/NAME`, the path `koh serve` printed). Until then `--session NAME` shows how it
   ended, and ends the same.
 - On Linux, restart `koh serve` after you replace the `koh` binary. Until then no new session
-  starts: koh runs itself by its own path, which is gone, and says "cannot run PATH (deleted):
-  No such file or directory". Sessions that run go on.
+  or job starts: koh runs itself by its own path, which is gone, and says "cannot run PATH
+  (deleted): No such file or directory". Sessions and jobs that run go on.
 - After the upgrade to this koh, end the sessions an older one started: a session is known
   by its `run`, which holders write since `fux` 0.43.3, and a pane without one is no session
   to koh (not listed, not attached to; its name cannot be started until its folder is
@@ -218,11 +219,11 @@ koh adds nothing to stop these. What happens instead is said.
   reads the end of its terminal and leaves by itself, and the folder of one that was killed
   too (`STATE/fux/.view.PID`) is removed when `koh serve` starts.
 - Under systemd, give `koh serve`'s unit `KillMode=process` and the user
-  `loginctl enable-linger`: else stopping the service, or logging out, kills every session
-  ("`koh serve` under systemd", below, has a unit to copy).
-  A session's holder and its program inherit the descriptors `koh serve` was itself given
+  `loginctl enable-linger`: else stopping the service, or logging out, kills every session and
+  job ("`koh serve` under systemd", below, has a unit to copy).
+  A session or job holder and its program inherit the descriptors `koh serve` was itself given
   that are not close-on-exec (a socket the unit was passed, say): pass `koh serve` nothing
-  its sessions should not hold.
+  its sessions or jobs should not hold.
 - To see every session on the server as tabs: `koh fux view PATH`, the path `koh serve` printed.
 - For `koh output --last` and `koh wait --session`, have the session's shell mark its prompts
   (OSC 133). Without marks `--last` is the screen, and a `wait` ends with the session or its
@@ -277,9 +278,9 @@ koh output box --session 1 --last      # what the last command printed
 ## `koh serve` under systemd
 
 koh has no unit of its own and no word of systemd in its code: a unit is yours to write. Write
-it with `KillMode=process`. A session lives on when `koh serve` is stopped, but systemd's
+it with `KillMode=process`. Sessions and jobs live on when `koh serve` is stopped, but systemd's
 default ends every process a service started when the service stops or is restarted, its
-sessions with it, whether you asked for the restart (an upgrade) or `koh serve` died.
+sessions and jobs with it, whether you asked for the restart (an upgrade) or `koh serve` died.
 
 ```ini
 # ~/.config/systemd/user/koh.service
@@ -292,7 +293,7 @@ After=network-online.target
 ExecStart=%h/.cargo/bin/koh serve
 Restart=always
 RestartSec=5
-# Stopping or restarting the service ends `koh serve` alone: its sessions go on.
+# Stopping or restarting the service ends `koh serve` alone: its sessions and jobs go on.
 KillMode=process
 
 [Install]

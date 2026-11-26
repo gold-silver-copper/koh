@@ -25,6 +25,7 @@ Headless persistent jobs (terminal-less fux panes in STATE/fux/koh-jobs; survive
   koh jobs SERVER [NAME] [--json]
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
   koh wait SERVER NAME [--tail N] [--timeout SECS] [--json]                 (a job; a session: below)
+            (wait and logs -f exit 1 with "that job was started anew" if NAME is restarted meanwhile)
   koh kill SERVER NAME [--signal TERM|KILL|INT|HUP|1..31] [--json]
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;

@@ -177,10 +177,10 @@ does not check, and a key that is a symlink is read as the file it leads to (`sr
 Sessions and jobs' logs are kept in the server's state: `$XDG_RUNTIME_DIR/koh`; where that is
 not set, the system's temporary directory under `koh-UID` (the effective user id), which koh
 does not check the ownership of. A state directory that is there is taken as it is; the
-sessions' folder beneath it (`fux/koh-sessions`) is made 0700 where koh makes it, and a
-pane's folder 0700 by fux. Anything that runs as the server's user can type into a session,
-resize it, hang it up and remove it, and start a pane there that koh takes for a session:
-the files are the interface. A session's holder is no child of `koh serve` and is not ended
-with it; nor is a session's viewer when `koh serve` is killed outright: it reads the end of
-its terminal and leaves. A viewer's folder (`fux/.view.PID`) is in the server's state; a
-viewer has no keys there. On a client a session leaves nothing.
+sessions' and jobs' folders beneath it (`fux/koh-sessions` and `fux/koh-jobs`) are made 0700
+where koh makes them, and a pane's folder 0700 by fux. Anything that runs as the server's user
+can type into a session, resize it, hang it up and remove it, and start a pane there that koh
+takes for a session: the files are the interface. A session's holder is no child of `koh serve`
+and is not ended with it; nor is a session's viewer when `koh serve` is killed outright: it
+reads the end of its terminal and leaves. A viewer's folder (`fux/.view.PID`) is in the server's
+state; a viewer has no keys there. On a client a session leaves nothing.

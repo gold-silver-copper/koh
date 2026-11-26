@@ -43,8 +43,8 @@ a QUIC handshake: the transport does not know the allowlist.
 
 ## 2. A client with an allowed key and no scope
 
-It is the server's user: it runs any command (`koh exec`, `koh run`), reads and writes any file
-that user can (`koh cp`), and attaches to any session, lists them, reads their text and
+It is the server's user: it runs any command (`koh exec`, `koh rsh`, `koh run`), and attaches to
+any session, lists them, reads their text and
 waits for their commands (`koh sessions`, `koh output`, `koh wait --session`, which read a
 session's folder as a script of that user would: `src/pane.rs`). There is nothing to escalate to. Its
 sessions are `fux` panes of the server's user, in a `fux` session of koh's own beneath the
@@ -56,9 +56,8 @@ have it show another pane, another workspace, or run a script.
 
 - **Bounds:** a message is refused before it is read past its length (`src/proto.rs`): 512
   bytes for a proof; 1 MiB for a request, the answer that it was taken, and the short answers
-  (a list of jobs); 256 KiB for a piece of a file, of input or of output; 16 KiB for every
-  message of a session, either way; 4 MiB for what a copy says it needs and for its summary; 8 MiB
-  for a copy's manifest and what a job's wait returns. A session's text (`koh output`, `koh
+  (a list of jobs); 256 KiB for a piece of input or of output; 16 KiB for every message of a
+  session, either way; 8 MiB for what a job's wait returns. A session's text (`koh output`, `koh
   wait --session`) and the list of sessions are sent in pieces of 64 KiB and are as long as
   the pane's files, and the folders kept, make them: for files that fux wrote, fux's bounds,
   not a figure of koh's. A pane's files are read whole, whatever is in them (one that the
@@ -80,10 +79,7 @@ have it show another pane, another workspace, or run a script.
   not take waits in QUIC's window and the pty's buffer, not in koh. What the viewer draws is
   sent 8 KiB a message as the link takes it, and nothing of it is kept. A message that is
   more than it should be, or one that has bytes after it, ends the stream. What a pane's
-  folder holds is bounded by fux's holder, not by koh. A copy's tree is at most 100,000 entries, each at
-  most 128 directories beneath it. With `--delete` that holds for what the destination already
-  has: something deeper there fails the whole copy (exit 1) before anything is removed or any
-  file is written, even where the copy would have removed it. At most `--max-sessions`
+  folder holds is bounded by fux's holder, not by koh. At most `--max-sessions`
   sessions (64) are kept: folders in the sessions' folder, whoever made them. The oldest that
   has ended and that no client is attached to makes room for a new one, once that has
   started; with none such the client is told the server is busy. The cap can be over by one:
@@ -105,24 +101,13 @@ have it show another pane, another workspace, or run a script.
 
 `koh clients add NAME ID --cp DIR` or `--exec DIR` (`src/keys.rs`, `Scope`).
 
-- **`--cp DIR`** copies to and from paths that are beneath `DIR` by their text. The path a
-  client names must begin with `DIR` and go on with plain names (no `..`, no NUL). `DIR` is
-  resolved for this, each time, and the path may begin with it as `clients` has it or as it
-  resolves; the path itself is not resolved (`src/keys.rs`, `check_beneath`). The names a copy
-  then sends are held to plain names the same way (`src/sync.rs`, `wire_names`). **It is not a
-  confinement:** the server uses the path as the file system resolves it, so a symlink beneath
-  `DIR` leads where it leads, and a key that finds one leading out of `DIR` reads and writes
-  there as the server's user. The scope keeps a script or a slip of the hand in `DIR`; the
-  operator trusts his machines and what is on them. A copy makes no symlinks: one in a tree
-  that is read is not sent, `--delete` leaves it, one in the tree a copy lands in is followed,
-  and a file that lands where one is replaces it (a file is written under a new name of its
-  own beside where it lands and renamed, with mode 0644 or 0755 and never setuid). Every other
-  request is refused (exit 4).
+- **`--cp DIR`** is kept in `clients` until scoped keys are removed; with file copy removed from
+  the protocol, every request under it is refused (exit 4).
 - A `DIR` written in `clients` as its resolved path refuses a path that reaches it by another
   name (`/var/home/u` for `/home/u`, `/private/tmp` for `/tmp`): only `DIR` is resolved. That
   refuses more, never less.
 - **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
-  the same rule, and copies as above. **It is not a sandbox:** the command is any command,
+  the same rule. **It is not a sandbox:** the command is any command,
   run as the server's user, and reaches whatever that user can. Every other request is refused:
   a session (the scope is looked at before the name, the run or anything else of an
   attach, and before anything is made) and everything about jobs but starting one (their
@@ -142,11 +127,6 @@ have it show another pane, another workspace, or run a script.
 
 A wrong endpoint id, or a host someone else now controls.
 
-- **A copy from it** (`koh cp SERVER:SRC DST`) lands beneath `DST` by the text of its names:
-  each is a plain name (no `..`, no `/`), and where they lead is the file system's to say, so
-  a symlink already in `DST` is followed, as the user's own `cp` would follow it. The client
-  takes at most 100,000 entries, only the files it asked for, and no file longer than the
-  server said.
 - **A session from it** (`koh connect`) is what a terminal's output is, and no more. What
   the server sends as drawn is written to the user's terminal as it came, 16 KiB a message;
   koh reads none of it, and nothing of a session is a file, a folder, a script or a command

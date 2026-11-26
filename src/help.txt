@@ -1,4 +1,4 @@
-koh — peer-to-peer remote shell, headless jobs, delta sync, and fux sessions over iroh QUIC.
+koh — peer-to-peer remote shell, headless jobs, and fux sessions over iroh QUIC.
 
 SERVER is a saved name (`koh servers add NAME ID [--direct IP:PORT | --relay-url URL]`) or an
 endpoint id. Only `connect` needs a terminal. `koh help-agents` is this and recipes for scripts.
@@ -14,8 +14,8 @@ Keys & peers:
              and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop while stdin is open):
-  koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...
-  koh exec SERVER [--sync DIR] [-C DIR] [--json] --sh 'SHELL LINE'
+  koh exec SERVER [-C DIR] -- PROG ARG...
+  koh exec SERVER [-C DIR] --sh 'SHELL LINE'
   koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)
             rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
             GIT_SSH_COMMAND='koh rsh' git clone box:repo.git
@@ -23,15 +23,11 @@ Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop while st
             (only --key-file, --direct, --relay-url, -- before HOST; ssh flags like -l/-p/-o exit 2)
 
 Headless persistent jobs (raw append-only logs; outlive koh and network drops):
-  koh run SERVER [--name NAME] [--sync DIR] [-C DIR] [--json] -- PROG ARG...
+  koh run SERVER [--name NAME] [-C DIR] [--json] -- PROG ARG...
   koh jobs SERVER [NAME] [--json]
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
-  koh wait SERVER NAME [--text SUBSTR] [--tail N] [--timeout SECS] [--json]   (a job; a session: below)
+  koh wait SERVER NAME [--tail N] [--timeout SECS] [--json]                 (a job; a session: below)
   koh kill SERVER NAME [--signal TERM|KILL|INT|HUP] [--json]
-
-Delta file sync (blake3 hashes, atomic replace):
-  koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SRC... SERVER:DST
-  koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SERVER:SRC... DST
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
 `koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):
@@ -57,11 +53,11 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             for the first command that ends there after it was asked (so ask before you type
             the command): prints what that one printed and exits with its code. Or until the
             session ends: its screen, and its program's status as `koh connect` gives it.
-            After SECS: the screen, and 124. Not with JOB, --text or --tail, which are a job's.
+            After SECS: the screen, and 124. Not with JOB or --tail, which are a job's.
             (--last and wait go by a shell's marks of its prompts, OSC 133: `koh help-agents`
             has the lines for bash, and nearly the same three as a script over the files.)
 
-Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json (not rsh)
+Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json (not exec, rsh, logs)
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
             (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote

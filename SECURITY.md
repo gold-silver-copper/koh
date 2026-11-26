@@ -36,17 +36,15 @@ credit reporters who want it.
   `fux` session (`told`); and what a key with no scope is told of a session's folder
   (`src/pane.rs`: `koh sessions`, `koh output`, `koh wait --session`).
 - The wire decoders and their bounds (`src/proto.rs`), on both ends.
-- The paths a copy's peer may name, on both ends (`src/sync.rs`, `wire_names`), and the paths a
-  scoped key may name (`src/keys.rs`, `Scope`). Where a symlink leads is not in scope: see
-  below.
+- The paths a scoped key may name (`src/keys.rs`, `Scope`). Where a symlink leads is not in
+  scope: see below.
 - Commands and jobs the server starts (`src/server.rs`, `handle_exec`; `src/jobs.rs`).
-- What a server can do to a client: the files of a copy (`src/sync.rs`), and a session,
-  which is what a terminal's output can do and no more (`src/client.rs`: `attach`,
-  `Console`, `reset`). koh writes a session's bytes to the terminal unread; the [threat
-  model](docs/THREAT_MODEL.md) lists what a terminal lets output do. In scope is that
-  nothing else of the client is reached (no file, no command), that the terminal is put
-  back at every end of `koh connect` and when a link is lost, and that what is typed is never
-  typed twice.
+- What a server can do to a client: a session, which is what a terminal's output can do and no
+  more (`src/client.rs`: `attach`, `Console`, `reset`). koh writes a session's bytes to the
+  terminal unread; the [threat model](docs/THREAT_MODEL.md) lists what a terminal lets output
+  do. In scope is that nothing else of the client is reached (no file, no command), that the
+  terminal is put back at every end of `koh connect` and when a link is lost, and that what is
+  typed is never typed twice.
 
 **Out of scope: report upstream** (dependencies koh does not author):
 
@@ -63,25 +61,19 @@ credit reporters who want it.
 
 ## What a key can do
 
-- A key with no scope is a shell as the server's user: commands, jobs, copies anywhere that user
-  can read or write, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
+- A key with no scope is a shell as the server's user: commands, jobs, and sessions. A session is a `fux` pane of that user, in koh's own `fux`
   session: such a key starts them, types into them, resizes them and hangs them up, and says
   what its terminal is like into that `fux` session's `colours` and `keyboard` (the two are
   the session's, not a pane's: a program of any session that asks its terminal is answered
   from them, where they are there). `koh fux …`
   and `koh hold …` are no requests: they are fux, run by whoever runs koh, on his machine.
-- A `--cp DIR` key copies to and from paths that are beneath `DIR` by the text of the path:
-  the path begins with `DIR` and goes on with plain names (no `..`). **It is not a
-  confinement.** `DIR` itself is resolved, and a path may begin with it as `clients` has it or
-  as it resolves; the path a client names is not resolved, so a symlink beneath `DIR` leads
-  where it leads, and a copy through it reads and writes there. The scope is a convenience and
-  a guard against mistakes; koh trusts the machines it runs on and what is on them. (A `DIR`
-  written as its resolved path refuses a path that reaches it by another name: `/var/home/u/d`
-  in `clients` refuses `/home/u/d/f`. Write `DIR` as its clients will name it.)
+- A `--cp DIR` key is kept in `clients` until scoped keys are removed; with file copy removed
+  from the protocol, every request under it is refused (exit 4).
 - A `--exec DIR` key runs commands and starts jobs, which must start in a directory beneath
-  `DIR` by the same rule, and copies as a `--cp DIR` key does. **It is not a sandbox**: only
-  the starting directory's path is checked, and the command is any command, run as the
-  server's user. Give it only to a peer you would give a shell.
+  `DIR` by the text of the path (`DIR` itself is resolved; the path a client names is not, so a
+  symlink beneath `DIR` leads where it leads). **It is not a sandbox**: only the starting
+  directory's path is checked, and the command is any command, run as the server's user. Give it
+  only to a peer you would give a shell.
 
 ## Past audits
 

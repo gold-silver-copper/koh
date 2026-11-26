@@ -1,14 +1,14 @@
 # koh
 
-Ultra-minimal peer-to-peer remote shell, headless jobs, delta file sync, and interactive
+Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src/` without its tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,200 lines of `src/` without its tests, down from ~22,000):
 
-- **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/20`) with TLS-bound Ed25519 client proofs,
-  compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files, QR codes
-  on `koh serve` / `koh id --qr`, and `--cp`/`--exec` path-scoped keys.
-- **Layer 2 — Raw Streams & Delta Sync (no PTY):**
+- **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
+  compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files and
+  `--cp`/`--exec` path-scoped keys.
+- **Layer 2 — Raw Streams & Jobs (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF (SIGHUP on disconnect while
     stdin is still open; a command whose stdin has ended runs on).
   - `koh rsh HOST WORD…`: ssh's argument shape over `exec` (`WORD…` joined with spaces and run via
@@ -24,8 +24,6 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
-  - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete`, `--exclude`,
-    `-p`, `--dry-run`).
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`
@@ -35,7 +33,7 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
     `koh hold …` are words of this machine: they ask no server anything.
   - A session is shown by its **viewer, which runs on the server**: `fux`'s viewer, this
     binary again, on a terminal of the client's size that `koh serve` makes for it. What it
-    draws is sent as it draws it, and what is typed at the client is typed into it (`koh/20`):
+    draws is sent as it draws it, and what is typed at the client is typed into it (`koh/21`):
     the client's terminal shows the bytes, as with ssh. Nothing of the session's folder
     leaves the server, and the client keeps nothing: no copy, no file, no viewer of its own.
     Each `koh connect` has a viewer to itself, started when it attaches and gone when it
@@ -109,8 +107,8 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
       command that has ended by the time it looks is not the one it gives. When the session
       ends instead, it prints the last screen and exits as `koh connect` does; so too, with
       1 and nothing printed, when the session's folder is gone or another run has its name.
-      After `SECS`: the screen, and 124. A `wait` is for a job or for a session: `JOB`,
-      `--text` and `--tail` are not said with `--session` (exit 2).
+      After `SECS`: the screen, and 124. A `wait` is for a job or for a session: `JOB` and
+      `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
       the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
@@ -241,7 +239,6 @@ koh serve
 # Client: save server and use it
 koh servers add box <server-id>
 koh exec box -- uname -a
-koh exec box --sync proj -- cargo test
 rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
 rsync -a -e 'koh rsh' box:dst/ dst/
 koh rsh box git init -q --bare repo.git
@@ -249,7 +246,6 @@ GIT_SSH_COMMAND='koh rsh' git push box:repo.git HEAD:refs/heads/main
 GIT_SSH_COMMAND='koh rsh' git clone -b main box:repo.git
 tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
 koh run box --name build -- make -j4 && koh wait box build
-koh cp -r --exclude target ./src box:proj/
 koh connect box
 koh sessions box                       # each session: attached, running, busy, last exit code
 koh wait box --session 1 --timeout 600 # until the command there ends: its output, its code

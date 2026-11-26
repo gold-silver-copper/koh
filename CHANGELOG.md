@@ -21,12 +21,24 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`,
   `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
   now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
-  joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the existing `exec` request
-  (`koh/20`), preserving stdout, stderr, and the remote exit status; non-terminal stdin is
-  forwarded, and terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url`
-  (and `--`) are accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.)
-  are refused with exit 2. A command exceeding the 1 MiB control frame bound exits 2 for both
-  `exec` and `rsh`. Only clients need this.
+  joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the `exec` request (`koh/21`),
+  preserving stdout, stderr, and the remote exit status; non-terminal stdin is forwarded, and
+  terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url` (and `--`) are
+  accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.) are refused
+  with exit 2. A request exceeding the 1 MiB control frame bound exits 2.
+
+### Removed
+
+- **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the `blake3` dependency** (wire
+  protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
+  `rsync -e 'koh rsh'` (push and pull) or `tar | koh rsh` instead.
+- **QR codes on `koh serve` and `koh id --qr`** (and the `qrcode` dependency): copy the endpoint
+  id printed by `koh serve` or `koh id`.
+- **`koh wait --text SUBSTR`**: wait for the job to exit (`koh wait`), or follow its log with
+  `koh logs -f`.
+- **`--json` on `koh exec` and `koh logs`**: these commands stream raw bytes directly; read their
+  stdout, stderr, and exit status instead. `--json` remains on `run`, `jobs`, `kill`, `wait`,
+  `sessions`, `output`, and for errors.
 
 ### Security
 

@@ -520,10 +520,12 @@ async fn cmd_jobs(args: &[String]) -> Result<Exit> {
             continue;
         }
         let a = args.get(i).map(String::as_str).unwrap_or_default();
-        match a {
-            _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
-            _ if name.is_none() && !a.starts_with('-') => name = Some(a.to_string()),
-            _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
+        if server.is_none() {
+            server = Some(a.to_string());
+        } else if name.is_none() {
+            name = Some(a.to_string());
+        } else {
+            return Err(KohError::usage(format!("unexpected argument {a:?}")));
         }
         i += 1;
     }

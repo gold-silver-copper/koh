@@ -103,6 +103,10 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
 
 ### Fixed
 
+- **A server that does not answer a request in 15 s ends the client** with exit 255 and `koh: the
+  server did not answer the request in 15 s`, and the connection is closed; before, a server
+  that took a request and said nothing (stopped, stuck, or not koh) kept every command but
+  `connect` waiting for ever. Only the first reply is timed: a quiet command may run for hours.
 - **`koh exec` (and the new `koh rsh`) now behaves as a real pipe in both directions and hangs up
   the remote command whenever the client goes.** Seven defects in `exec` were eliminated by
   rebuilding the pump with independent input/output paths, raw stdin bytes on the stream, and a

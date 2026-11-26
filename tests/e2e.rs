@@ -3842,6 +3842,46 @@ impl RawExecPeer {
     }
 }
 
+#[tokio::test]
+async fn a_server_that_does_not_answer_a_request_ends_the_client() {
+    // The first request is answered late, inside the limit; the second is never answered.
+    let mut answered = 0;
+    let peer = RawExecPeer::start("no-reply", move |_conn, mut send, _recv| {
+        answered += 1;
+        let late = answered == 1;
+        async move {
+            tokio::time::sleep(Duration::from_millis(if late { 500 } else { 10_000 })).await;
+            let _ = send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL).await;
+            let _ = send_msg(&mut send, &koh::proto::ExecServerMsg::Exit(0), MAX_CTRL).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+            late
+        }
+    })
+    .await;
+    let key = new_key(&peer.tmp, "client.key");
+    let route = Some(Route::Direct(peer.addr.parse().unwrap()));
+    for late in [true, false] {
+        let id = peer.id.parse().unwrap();
+        let mut client = Client::connect_direct(key.clone(), id, route.clone(), false)
+            .await
+            .unwrap();
+        client.reply_wait = Duration::from_secs(1);
+        let began = Instant::now();
+        let done = client.exec(vec!["true".into()], None).await;
+        match late {
+            true => assert_eq!(done.unwrap(), 0),
+            false => {
+                let err = done.unwrap_err();
+                assert_eq!(err.code, Exit::INTERNAL, "{err}");
+                assert_eq!(err.message, "the server did not answer the request in 1 s");
+                assert!(began.elapsed() < Duration::from_secs(3));
+            }
+        }
+        client.close().await;
+    }
+    peer.close().await;
+}
+
 #[test]
 fn exec_b_simultaneous_four_mib_each_way_no_deadlock() {
     let host = Host::start("exec-b", &[]);

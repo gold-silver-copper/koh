@@ -111,6 +111,11 @@ pub async fn connect_server(
     Ok((endpoint, addr, conn))
 }
 
+/// How long a server that took a request has to answer it: what it does before its first
+/// reply is work of its own (a listing, a file opened, a program or a holder started), never a
+/// wait on a program or a clock; and a link that works has no need of the dial's fifteen.
+pub const REPLY_WAIT: Duration = Duration::from_secs(15);
+
 /// A connection to the server at `addr`, in fifteen seconds or not at all.
 pub async fn dial(endpoint: &Endpoint, addr: EndpointAddr) -> Result<Connection> {
     tokio::time::timeout(Duration::from_secs(15), endpoint.connect(addr, ALPN))

@@ -19,8 +19,8 @@ use tokio::time::Instant as Timer;
 
 use crate::keys::{Role, load_or_create_key, resolve_server};
 use crate::net::{
-    close_error, connect_server, dial, map_conn_err, open_authed_stream, transport_config,
-    view_transport_config,
+    REPLY_WAIT, close_error, connect_server, dial, map_conn_err, open_authed_stream,
+    transport_config, view_transport_config,
 };
 use crate::proto::{
     Attach, Attached, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
@@ -52,6 +52,8 @@ pub struct Client {
     /// Where the server is, for a connection made anew on the same endpoint.
     addr: EndpointAddr,
     conn: Connection,
+    /// How long a request's first reply is waited for (`REPLY_WAIT`; a test's may be shorter).
+    pub reply_wait: Duration,
 }
 
 /// Retries `op` on `Interrupted`/`WouldBlock`, waiting on `event` when the fd is non-blocking.
@@ -136,6 +138,7 @@ impl Client {
             endpoint,
             addr,
             conn,
+            reply_wait: REPLY_WAIT,
         })
     }
 
@@ -152,6 +155,7 @@ impl Client {
             endpoint,
             addr,
             conn,
+            reply_wait: REPLY_WAIT,
         })
     }
 
@@ -167,17 +171,27 @@ impl Client {
         self.conn.clone()
     }
 
+    /// A request sent, and the server's first reply to it within `reply_wait`: a server that
+    /// says nothing by then is 255, and the connection is closed (what it started is hung up).
     pub async fn request(&self, req: &Request) -> Result<(SendStream, RecvStream)> {
         let bytes = encode(req, MAX_CTRL).map_err(|e| KohError::usage(e.message))?;
-        let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
-        send_frame(&mut send, &bytes)
+        let asked = async {
+            let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
+            send_frame(&mut send, &bytes)
+                .await
+                .map_err(|e| close_error(&self.conn).unwrap_or(e))?;
+            let reply: Reply = recv_msg(&mut recv, MAX_CTRL)
+                .await
+                .map_err(|e| map_conn_err(&self.conn, e.message))?;
+            reply.into_result().map(|()| (send, recv))
+        };
+        tokio::time::timeout(self.reply_wait, asked)
             .await
-            .map_err(|e| close_error(&self.conn).unwrap_or(e))?;
-        let reply: Reply = recv_msg(&mut recv, MAX_CTRL)
-            .await
-            .map_err(|e| map_conn_err(&self.conn, e.message))?;
-        reply.into_result()?;
-        Ok((send, recv))
+            .map_err(|_| {
+                self.conn.close(0u32.into(), b"no reply");
+                let secs = self.reply_wait.as_secs_f32();
+                KohError::internal(format!("the server did not answer the request in {secs} s"))
+            })?
     }
 
     pub async fn close(self) {

@@ -14,7 +14,7 @@ use koh::keys::{
 };
 use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
-use koh::sync::{DELETE_REQUIRES_DIR, check_delete_dir};
+use koh::sync::ONE_DIRECTORY;
 use koh::{Exit, KohError, Result};
 
 const HELP: &str = include_str!("help.txt");
@@ -883,18 +883,13 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
         ));
     };
     if delete && srcs.len() > 1 {
-        return Err(KohError::usage(DELETE_REQUIRES_DIR));
+        return Err(KohError::usage(ONE_DIRECTORY));
     }
     let summary = if let Some((server, rpath)) = split_remote(dst) {
         if srcs.iter().any(|s| split_remote(s).is_some()) {
             return Err(KohError::usage(
                 "cannot mix remote sources with a remote destination",
             ));
-        }
-        if delete {
-            for src in srcs {
-                check_delete_dir(Path::new(src))?;
-            }
         }
         let client = Client::connect(server, &opts, false).await?;
         let rdst = if rpath.is_empty() {

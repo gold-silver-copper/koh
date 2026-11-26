@@ -56,7 +56,6 @@ impl JobManager {
         name: Option<String>,
         argv: &[String],
         cwd: &Path,
-        shell: bool,
     ) -> Result<JobInfo> {
         // What an older job of the name left, to be removed with the lock let go: it is named
         // here, before the lock, so it is dropped after it however this returns.
@@ -99,7 +98,7 @@ impl JobManager {
             .try_clone()
             .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
 
-        let mut cmd = build_command(argv, cwd, shell)?;
+        let mut cmd = build_command(argv, cwd)?;
         fuxix::new_session(&mut cmd, false);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
@@ -301,8 +300,8 @@ fn record_info(rec: &JobRecord) -> JobInfo {
     }
 }
 
-/// Builds a `std::process::Command` from argv (either raw exec or `sh -c` when `shell = true`).
-pub fn build_command(argv: &[String], cwd: &Path, shell: bool) -> Result<Command> {
+/// Builds a `std::process::Command` from argv and working directory.
+pub fn build_command(argv: &[String], cwd: &Path) -> Result<Command> {
     if !cwd.is_dir() {
         return Err(KohError::new(
             Exit::CANNOT_START,
@@ -310,22 +309,11 @@ pub fn build_command(argv: &[String], cwd: &Path, shell: bool) -> Result<Command
             format!("no such directory: {}", cwd.display()),
         ));
     }
-    let mut cmd = if shell {
-        let line = argv
-            .first()
-            .ok_or_else(|| KohError::usage("missing shell command"))?;
-        let mut c = Command::new("/bin/sh");
-        c.arg("-c").arg(line);
-        c
-    } else {
-        let Some((prog, args)) = argv.split_first() else {
-            return Err(KohError::usage("missing command"));
-        };
-        let mut c = Command::new(prog);
-        c.args(args);
-        c
+    let Some((prog, args)) = argv.split_first() else {
+        return Err(KohError::usage("missing command"));
     };
-    cmd.current_dir(cwd);
+    let mut cmd = Command::new(prog);
+    cmd.args(args).current_dir(cwd);
     Ok(cmd)
 }
 

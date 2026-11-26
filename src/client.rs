@@ -23,10 +23,9 @@ use crate::net::{
     view_transport_config,
 };
 use crate::proto::{
-    Attach, Attached, ExecClientMsg, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL,
-    MAX_FRAME, Reply, Request, SessionInfo, VIEW_FRAME, ViewInput, ViewOutput, ViewSize,
-    WaitResult, decode, encode, recv_msg, recv_msg_opt, recv_pieces, send_frame, send_msg,
-    session_name,
+    Attach, Attached, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
+    Request, SessionInfo, VIEW_FRAME, ViewInput, ViewOutput, ViewSize, WaitResult, decode, encode,
+    recv_msg, recv_msg_opt, recv_pieces, send_frame, send_msg, session_name,
 };
 use crate::{Exit, KohError, Result};
 
@@ -74,14 +73,17 @@ fn io_wait<W: std::os::fd::AsFd, T>(
 }
 
 /// Writes all of `bytes` to `w` and flushes, waiting on `POLLOUT` if non-blocking.
-fn write_wait(mut w: impl std::io::Write + std::os::fd::AsFd, mut bytes: &[u8]) {
+fn write_wait(
+    mut w: impl std::io::Write + std::os::fd::AsFd,
+    mut bytes: &[u8],
+) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        match io_wait(&mut w, fuxix::POLLOUT, |w| w.write(bytes)) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+        match io_wait(&mut w, fuxix::POLLOUT, |w| w.write(bytes))? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => bytes = bytes.get(n..).unwrap_or_default(),
         }
     }
-    let _ = io_wait(&mut w, fuxix::POLLOUT, std::io::Write::flush);
+    io_wait(&mut w, fuxix::POLLOUT, std::io::Write::flush)
 }
 
 /// A session's text as it was sent, in pieces: what of it is no UTF-8 is shown as U+FFFD.
@@ -184,60 +186,86 @@ impl Client {
         self.endpoint.close().await;
     }
 
-    /// Raw non-PTY exec with separate stdout/stderr, stdin EOF, and exit code passthrough.
-    pub async fn exec(&self, argv: Vec<String>, cwd: Option<String>, shell: bool) -> Result<i32> {
-        let (mut send, mut recv) = self.request(&Request::Exec { argv, cwd, shell }).await?;
-
-        let stdin_task = tokio::spawn(async move {
-            if !std::io::stdin().is_terminal() {
-                let mut buf = vec![0u8; 32 << 10];
-                loop {
-                    let read = tokio::task::spawn_blocking(move || {
-                        let mut stdin = std::io::stdin().lock();
-                        let n = io_wait(&mut stdin, fuxix::POLLIN, |s| s.read(&mut buf));
+    /// Raw non-PTY exec: stdin is sent as raw bytes and finished at its end; stdout and stderr
+    /// are written as they come, and the command's status is the answer. Once connected, a lost
+    /// link or a stream with no status is 255; EPIPE on stdout or stderr is 141, another write
+    /// error is 1; INT, TERM, HUP or USR1 here is 128 + N (the caller closes the link, hanging
+    /// the remote command up; rsync signals its `-e` transport with USR1).
+    pub async fn exec(&self, argv: Vec<String>, cwd: Option<String>) -> Result<i32> {
+        let lost = |why: String| KohError::internal(format!("the link was lost: {why}"));
+        let sig = |k| signal(k).map_err(|e| lost(e.to_string()));
+        let (mut s_int, mut s_term, mut s_hup, mut s_usr1) = (
+            sig(SignalKind::interrupt())?,
+            sig(SignalKind::terminate())?,
+            sig(SignalKind::hangup())?,
+            sig(SignalKind::user_defined1())?,
+        );
+        let signalled = async move {
+            tokio::select! {
+                _ = s_int.recv() => 128 + SignalKind::interrupt().as_raw_value(),
+                _ = s_term.recv() => 128 + SignalKind::terminate().as_raw_value(),
+                _ = s_hup.recv() => 128 + SignalKind::hangup().as_raw_value(),
+                _ = s_usr1.recv() => 128 + SignalKind::user_defined1().as_raw_value(),
+            }
+        };
+        let run = async {
+            let (mut send, mut recv) =
+                self.request(&Request::Exec { argv, cwd })
+                    .await
+                    .map_err(|e| match e.code {
+                        Exit::UNREACHABLE => lost(e.message),
+                        _ => e,
+                    })?;
+            let mut stdin_task = tokio::task::JoinSet::new();
+            stdin_task.spawn(async move {
+                if !std::io::stdin().is_terminal() {
+                    let mut buf = vec![0u8; 32 << 10];
+                    while let Ok((Ok(n @ 1..), b)) = tokio::task::spawn_blocking(move || {
+                        let n = io_wait(&mut std::io::stdin().lock(), fuxix::POLLIN, |s| {
+                            s.read(&mut buf)
+                        });
                         (n, buf)
                     })
-                    .await;
-                    match read {
-                        Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => break,
-                        Ok((Ok(n), b)) => {
-                            buf = b;
-                            if let Some(slice) = buf.get(..n)
-                                && send_msg(
-                                    &mut send,
-                                    &ExecClientMsg::Stdin(slice.to_vec()),
-                                    MAX_CHUNK,
-                                )
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
+                    .await
+                    {
+                        buf = b;
+                        let slice = buf.get(..n).unwrap_or_default();
+                        if send.write_all(slice).await.is_err() {
+                            return;
                         }
                     }
                 }
+            });
+            loop {
+                let (is_out, b) = match recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK).await {
+                    Err(e) => break Err(lost(e.message)),
+                    Ok(None) => break Err(lost("no exit status came".into())),
+                    Ok(Some(ExecServerMsg::Exit(code))) => break Ok(code),
+                    Ok(Some(ExecServerMsg::Stdout(b))) => (true, b),
+                    Ok(Some(ExecServerMsg::Stderr(b))) => (false, b),
+                };
+                let written = tokio::task::spawn_blocking(move || {
+                    if is_out {
+                        write_wait(std::io::stdout().lock(), &b)
+                    } else {
+                        write_wait(std::io::stderr().lock(), &b)
+                    }
+                })
+                .await
+                .map_err(|e| lost(e.to_string()))?;
+                if let Err(e) = written {
+                    break if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(KohError::failed(format!("write: {e}")))
+                    };
+                }
             }
-            let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
-            let _ = send.finish();
-        });
-
-        let mut exit_code = 0i32;
-        while let Some(msg) = recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK).await? {
-            match msg {
-                ExecServerMsg::Stdout(bytes) => {
-                    write_wait(std::io::stdout().lock(), &bytes);
-                }
-                ExecServerMsg::Stderr(bytes) => {
-                    write_wait(std::io::stderr().lock(), &bytes);
-                }
-                ExecServerMsg::Exit(code) => {
-                    exit_code = code;
-                    break;
-                }
-            }
+        };
+        tokio::select! {
+            code = signalled => Ok(code),
+            done = run => done,
         }
-        stdin_task.abort();
-        Ok(exit_code)
     }
 
     pub async fn run_job(
@@ -245,16 +273,8 @@ impl Client {
         name: Option<String>,
         argv: Vec<String>,
         cwd: Option<String>,
-        shell: bool,
     ) -> Result<JobInfo> {
-        let (_, mut recv) = self
-            .request(&Request::Run {
-                name,
-                argv,
-                cwd,
-                shell,
-            })
-            .await?;
+        let (_, mut recv) = self.request(&Request::Run { name, argv, cwd }).await?;
         recv_msg(&mut recv, MAX_CTRL).await
     }
 

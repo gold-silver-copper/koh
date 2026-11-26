@@ -10,18 +10,25 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust
   user; any `clients` line that is not `NAME ID` (including an older `cp=`/`exec=` line) grants
   no access and is ignored (a non-UTF-8 `clients` file is rejected whole).
 - **Layer 2 — Raw Streams & Jobs (no PTY):**
-  - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF (SIGHUP on disconnect while
-    stdin is still open; a command whose stdin has ended runs on).
+  - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, and process-group hangup
+    (SIGHUP to the group, a 2 s wait, then SIGKILL to the group before reaping the leader, so
+    every hangup takes 2 s and HUP-ignoring group members are killed too) whenever the client
+    disconnects, loses its stdout/stderr pipe (EPIPE, exit 141), or receives INT/TERM/HUP/USR1
+    (exit 128+N), or when `koh serve` stops cleanly—whether or not stdin has already ended. When
+    the server cannot receive the close (a client killed with `-9`, a machine that vanishes, or a
+    network path that is down), the remote command is noticed only when the link's idle timeout
+    runs out (about 15–20 s). A child that leaves the command's process group is not signalled on
+    hangup.
   - `koh rsh HOST WORD…`: ssh's argument shape over `exec` (`WORD…` joined with spaces and run via
-    `/bin/sh -c` on the server; same streams and remote exit status), so `rsync -e 'koh rsh'` and
-    `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,
+    `/bin/sh -c --` on the server; same streams and remote exit status), so `rsync -e 'koh rsh'`
+    and `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,
     `--relay-url`, and `--` before `HOST`; ssh options such as `-l`, `-p`, and `-o` exit 2. An
     address with a user (`git@box:repo.git`) is not understood; use the server's saved name as the
     host (`box:repo.git`). If your git configuration sets `ssh.variant = ssh`, pass
     `git -c ssh.variant=simple` so git does not add `-o`. A remote path containing non-UTF-8 bytes
-    needs rsync's `-s` (push and pull; koh requires UTF-8 command-line arguments). If you interrupt
-    an rsync transfer, wait about 20 s before running again: the remote rsync may live until the
-    idle timeout and with `--partial` can rename its piece over a file a later run completed.
+    needs rsync's `-s` (push and pull; koh requires UTF-8 command-line arguments). When the server
+    cannot receive the close (as above), an interrupted `rsync --partial` can outlive the client
+    until the idle timeout and rename its piece over a later run.
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.

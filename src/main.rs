@@ -71,8 +71,9 @@ fn main() -> ExitCode {
     let streams_stdin = matches!(args.first().map(String::as_str), Some("exec" | "rsh"));
     let done = rt.block_on(run(args));
     if streams_stdin {
-        // Output has been flushed and the connection closed before `run` returns;
-        // a blocked read of stdin does not hold `exec` or `rsh` after the remote command ends.
+        // On normal completion, output has been flushed and the connection closed before `run`
+        // returns; on a signal, one blocking output write may still be in flight and koh exits
+        // without waiting for it (or for a blocked read of stdin).
         rt.shutdown_background();
     }
     match done {
@@ -432,9 +433,9 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
     }
     let server =
         server.ok_or_else(|| KohError::usage("usage: koh exec SERVER [-C DIR] -- PROG ARG..."))?;
-    let (argv, shell) = match sh_line {
-        Some(line) => (vec![line], true),
-        None if !argv.is_empty() => (argv, false),
+    let argv = match sh_line {
+        Some(line) => sh_argv(line),
+        None if !argv.is_empty() => argv,
         None => {
             return Err(KohError::usage(
                 "missing command (use `-- PROG ...` or `--sh 'LINE'`)",
@@ -442,7 +443,11 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
         }
     };
 
-    run_exec(&server, &opts, argv, cwd, shell).await
+    run_exec(&server, &opts, argv, cwd).await
+}
+
+fn sh_argv(line: String) -> Vec<String> {
+    vec!["/bin/sh".into(), "-c".into(), "--".into(), line]
 }
 
 async fn run_exec(
@@ -450,10 +455,9 @@ async fn run_exec(
     opts: &DialOptions,
     argv: Vec<String>,
     cwd: Option<String>,
-    shell: bool,
 ) -> Result<Exit> {
     let client = Client::connect(server, opts, false).await?;
-    let done = client.exec(argv, cwd, shell).await;
+    let done = client.exec(argv, cwd).await;
     client.close().await;
     let code = done?;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
@@ -486,7 +490,7 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    run_exec(host, &opts, vec![words.join(" ")], None, true).await
+    run_exec(host, &opts, sh_argv(words.join(" ")), None).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {
@@ -520,13 +524,13 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
     }
     let server =
         server.ok_or_else(|| KohError::usage("usage: koh run SERVER [--name N] -- PROG ARG..."))?;
-    let (argv, shell) = match sh_line {
-        Some(line) => (vec![line], true),
-        None if !argv.is_empty() => (argv, false),
+    let argv = match sh_line {
+        Some(line) => sh_argv(line),
+        None if !argv.is_empty() => argv,
         None => return Err(KohError::usage("missing command")),
     };
     let client = Client::connect(&server, &opts, false).await?;
-    let done = client.run_job(name, argv, cwd, shell).await;
+    let done = client.run_job(name, argv, cwd).await;
     client.close().await;
     let info = done?;
     if opts.json {

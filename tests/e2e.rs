@@ -155,9 +155,13 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     let info = client
         .run_job(
             Some("long".into()),
-            vec![format!("printf '{long_line}\\nREADY_TOKEN\\n'; exit 7")],
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "--".into(),
+                format!("printf '{long_line}\\nREADY_TOKEN\\n'; exit 7"),
+            ],
             Some(tmp.0.display().to_string()),
-            true,
         )
         .await
         .unwrap();
@@ -177,9 +181,13 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     let _ = client
         .run_job(
             Some("srv".into()),
-            vec!["printf 'BOOTING\\n'; sleep 60".into()],
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "--".into(),
+                "printf 'BOOTING\\n'; sleep 60".into(),
+            ],
             Some(tmp.0.display().to_string()),
-            true,
         )
         .await
         .unwrap();
@@ -201,9 +209,14 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
 async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
     let (tmp, srv, client, _, _) = boot_pair("wait-limit").await;
     let cwd = Some(tmp.0.display().to_string());
-    let script = vec!["sleep 0.3; exit 3".to_string()];
+    let script = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "--".into(),
+        "sleep 0.3; exit 3".into(),
+    ];
     client
-        .run_job(Some("brief".into()), script, cwd, true)
+        .run_job(Some("brief".into()), script, cwd)
         .await
         .unwrap();
     // More seconds than the clock has: the job is waited for to its end, and the server serves on.
@@ -222,9 +235,14 @@ async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
 async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_does() {
     let (tmp, srv, client, _, _) = boot_pair("left").await;
     let cwd = Some(tmp.0.display().to_string());
-    let script = vec!["sleep 60".to_string()];
+    let script = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "--".into(),
+        "sleep 60".into(),
+    ];
     client
-        .run_job(Some("long".into()), script, cwd, true)
+        .run_job(Some("long".into()), script, cwd)
         .await
         .unwrap();
     let name = || "long".to_string();
@@ -636,7 +654,7 @@ async fn a_command_that_fails_gives_its_place_back_at_once() {
 }
 
 #[tokio::test]
-async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_seconds_after_it() {
+async fn a_connection_s_place_comes_back_when_its_requests_have_ended() {
     let tmp = TempDir::new("place-requests");
     let friend = new_key(&tmp, "friend.key");
     let more = ServeOptions {
@@ -645,14 +663,18 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_se
     };
     let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
     let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-    // A command, which hanging up does not end, of a client that then leaves. (It says when
-    // it is that: a client that left before, on a slow machine, hung up a shell that had not
-    // yet read its first word.)
+    // A command that ignores SIGHUP (so it runs into the 2 s HANGUP_WAIT window) of a client
+    // that then leaves. (It writes `deaf` after installing the trap so the client never leaves
+    // before the shell has read its first word.)
     let left = |script: &str| {
         let exec = Request::Exec {
-            argv: vec![format!("trap '' HUP; : > deaf; {script}")],
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "--".into(),
+                format!("trap '' HUP; : > deaf; {script}"),
+            ],
             cwd: Some(tmp.0.display().to_string()),
-            shell: true,
         };
         let deaf = tmp.0.join("deaf");
         async move {
@@ -686,36 +708,21 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended_or_five_se
         served.expect("the place came back within 20 s");
     };
 
-    // The command goes on for a second after its client left: the place is the connection's
-    // until then, and the next client's only once the command has ended.
+    // The command finishes during the 2 s hangup grace window after its client left: the place
+    // stays the connection's until hangup finishes, then goes to the next client.
     let (client, streams) = left("sleep 1; : > ended").await;
     drop(streams);
     client.close().await;
     served().await;
     assert!(tmp.0.join("ended").exists(), "served beside the command");
 
-    // A command that goes on writing to a client that left is read no further, and so ends:
-    // it does not hold the place for the five seconds a command that does not end has.
+    // A command that keeps writing to a client that left gets closed pipes immediately and ends
+    // without holding the connection place past hangup.
     let (client, streams) = left("sleep 0.2; head -c 2097152 /dev/zero").await;
     drop(streams);
     client.close().await;
-    let cut_off = tokio::time::timeout(Duration::from_secs(3), served()).await;
-    cut_off.expect("the place of a command that only writes came back within 3 s");
-
-    // A command that does not end is let go of five seconds after its connection: the place
-    // is not its to keep.
-    let (client, streams) = left("echo $$ > pid; exec sleep 600").await;
-    until("the command runs", || tmp.0.join("pid").is_file());
-    drop(streams);
-    client.close().await;
-    let left_at = Instant::now();
-    served().await;
-    let after = left_at.elapsed();
-    assert!(after >= Duration::from_secs(4), "after {after:?}");
-    signal(
-        fs::read_to_string(tmp.0.join("pid")).unwrap().trim(),
-        "-KILL",
-    );
+    let cut_off = tokio::time::timeout(Duration::from_secs(10), served()).await;
+    cut_off.expect("the place of a command that only writes came back within 10 s");
 
     srv.shutdown().await;
 }
@@ -1086,10 +1093,7 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
         .await
         .unwrap();
     let sleep = vec!["/bin/sleep".to_string(), "300".into()];
-    let job = client
-        .run_job(Some("j".into()), sleep, None, false)
-        .await
-        .unwrap();
+    let job = client.run_job(Some("j".into()), sleep, None).await.unwrap();
     served.started.push(job.pid);
 
     // While it runs, the server answers others: nothing waits for kill(1) but who asked for it.
@@ -1114,7 +1118,11 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
     let left = tmp.0.join("left.pid");
     let line = format!("/bin/sleep 300 & echo $! > {}", left.display());
     client
-        .run_job(Some("o".into()), vec![line], None, true)
+        .run_job(
+            Some("o".into()),
+            vec!["/bin/sh".into(), "-c".into(), "--".into(), line],
+            None,
+        )
         .await
         .unwrap();
     let ended = client.wait_job("o".into(), 10, Some(10)).await;
@@ -1390,7 +1398,7 @@ impl Host {
     fn stop_by(&mut self, how: &str) {
         let mut served = self.served.take().unwrap();
         signal(&served.server.id().to_string(), how);
-        served.server.wait().unwrap();
+        wait_child(&mut served.server, 15, "koh serve stop");
     }
 
     fn pane(&self, name: &str) -> PathBuf {
@@ -3372,14 +3380,16 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     let srv_id = srv.endpoint_id.to_string();
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
     let marker = tmp.0.join("ran");
-    let touch = format!("touch {}", marker.display());
+    let touch = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "--".into(),
+        format!("touch {}", marker.display()),
+    ];
     for refused in [cp_key, exec_key, typo] {
         let cl = dial(refused).await.unwrap();
         assert_eq!(
-            cl.exec(vec![touch.clone()], None, true)
-                .await
-                .unwrap_err()
-                .code,
+            cl.exec(touch.clone(), None).await.unwrap_err().code,
             Exit::REFUSED
         );
         cl.close().await;
@@ -3398,7 +3408,7 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     // Same id on a skipped line and a good line is allowed; removing the good line revokes it.
     let v = dial(valid).await.unwrap();
     assert!(v.jobs(None).await.unwrap().is_empty());
-    assert_eq!(v.exec(vec!["true".into()], None, false).await.unwrap(), 0);
+    assert_eq!(v.exec(vec!["true".into()], None).await.unwrap(), 0);
     fs::write(&clients_file, &skipped_only).unwrap();
     assert_eq!(v.jobs(None).await.unwrap_err().code, Exit::REFUSED);
     v.close().await;
@@ -3515,19 +3525,20 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
     assert_eq!((rc, out.as_slice()), (Some(11), b"rsh-hi\n".as_slice()));
 
     // At every open-fd limit where `koh exec` can bind, both stdout and stderr arrive
-    // without needing spare descriptors to duplicate them.
+    // without needing spare descriptors to duplicate them. (At marginal limits 11-12, iroh's
+    // background probes can print a socket warning to stderr, so stderr is matched by marker.)
     box_sh(
         &host,
         "found=0
          for n in 10 11 12 13 14 15 16 18 20 24 32; do
            set +e
-           (ulimit -n \"$n\" 2>/dev/null && exec koh exec box -- /bin/sh -c 'printf O; printf E >&2') >o 2>e
+           (ulimit -n \"$n\" 2>/dev/null && exec koh exec box -- /bin/sh -c 'printf O; printf ERRMARK >&2') >o 2>e
            rc=$?
            set -e
            if [ \"$rc\" = 0 ]; then
              found=1
              [ \"$(cat o)\" = O ]
-             [ \"$(cat e)\" = E ]
+             grep -q ERRMARK e
            fi
          done
          [ \"$found\" = 1 ]",
@@ -3766,4 +3777,747 @@ fn rsh_options_rsync_and_git() {
         let cloned = host.tmp.0.join("cloned/hello.txt");
         assert_eq!(fs::read(cloned).unwrap(), b"from-git\n");
     }
+}
+
+struct KillPid {
+    path: PathBuf,
+    disarmed: bool,
+}
+
+impl KillPid {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            disarmed: false,
+        }
+    }
+
+    fn dead_within(&mut self, secs: u64, what: &str) {
+        let pid = fs::read_to_string(&self.path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        assert!(!pid.is_empty(), "{what}: empty pid");
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while pid_running(&pid) {
+            if Instant::now() >= deadline {
+                panic!("{what}: pid {pid} still alive after {secs}s");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        self.disarmed = true;
+    }
+}
+
+impl Drop for KillPid {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Ok(pid) = fs::read_to_string(&self.path) {
+            let pid = pid.trim();
+            if !pid.is_empty() && pid_running(pid) {
+                signal(pid, "-KILL");
+            }
+        }
+    }
+}
+
+fn pid_running(pid: &str) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid])
+        .output()
+        .ok();
+    out.is_some_and(|o| {
+        let s = String::from_utf8_lossy(&o.stdout);
+        let t = s.trim();
+        !t.is_empty() && !t.starts_with('Z')
+    })
+}
+
+fn read_exact_bounded<const N: usize, R: std::io::Read + Send + 'static>(
+    mut r: R,
+    child: &mut std::process::Child,
+    secs: u64,
+    what: &str,
+) -> ([u8; N], R) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; N];
+        let res = r.read_exact(&mut buf).map(|()| (buf, r));
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}: read_exact failed: {e}");
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what}: read_exact timed out after {secs}s");
+        }
+    }
+}
+
+fn run_bounded(cmd: &mut Command, secs: u64, what: &str) -> std::process::Output {
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out_r = child.stdout.take().unwrap();
+    let mut err_r = child.stderr.take().unwrap();
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_r.read_to_end(&mut b);
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_r.read_to_end(&mut b);
+        b
+    });
+    let status = wait_child(&mut child, secs, what);
+    std::process::Output {
+        status,
+        stdout: out_t.join().unwrap(),
+        stderr: err_t.join().unwrap(),
+    }
+}
+
+/// A minimal raw QUIC peer for tests that control the server's reply/close sequence.
+struct RawExecPeer {
+    tmp: TempDir,
+    ep: iroh::Endpoint,
+    id: String,
+    addr: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl RawExecPeer {
+    async fn start<F, Fut>(tag: &'static str, mut respond: F) -> Self
+    where
+        F: FnMut(iroh::endpoint::Connection, SendStream, RecvStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        let tmp = TempDir::new(tag);
+        fs::create_dir_all(tmp.0.join("cli_cfg")).unwrap();
+        fs::create_dir_all(tmp.0.join("crun")).unwrap();
+        let srv_key = load_or_create_key(Role::Server, Some(&tmp.0.join("srv.key"))).unwrap();
+        let id = srv_key.public().to_string();
+        let ep = koh::net::bind_server(
+            srv_key,
+            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+            true,
+        )
+        .await
+        .unwrap();
+        let addr = ep.bound_sockets()[0].to_string();
+        let ep_srv = ep.clone();
+        let task = tokio::spawn(async move {
+            while let Some(incoming) = ep_srv.accept().await {
+                let Ok(conn) = incoming.await else { continue };
+                let Ok((send, mut recv)) = conn.accept_bi().await else {
+                    continue;
+                };
+                if koh::net::verify_client(&conn, &mut recv).await.is_err() {
+                    continue;
+                }
+                let Ok(_): koh::Result<Request> = recv_msg(&mut recv, MAX_CTRL).await else {
+                    continue;
+                };
+                if !respond(conn, send, recv).await {
+                    break;
+                }
+            }
+        });
+        Self {
+            tmp,
+            ep,
+            id,
+            addr,
+            task,
+        }
+    }
+
+    fn koh(&self, target: &str, extra: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_koh"));
+        cmd.args(["exec", target, "--direct", &self.addr])
+            .args(extra)
+            .args(["--", "true"])
+            .env("KOH_CONFIG_DIR", self.tmp.0.join("cli_cfg"))
+            .env("XDG_RUNTIME_DIR", self.tmp.0.join("crun"))
+            .stdin(std::process::Stdio::null());
+        cmd
+    }
+
+    async fn close(self) {
+        self.ep.close().await;
+        self.task.abort();
+        let _ = self.task.await;
+    }
+}
+
+#[test]
+fn exec_b_simultaneous_four_mib_each_way_no_deadlock() {
+    let host = Host::start("exec-b", &[]);
+    let addr = host.addr();
+    let n = 4 * 1024 * 1024;
+    let sent_in: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 256) as u8).collect();
+    let sent_out: Vec<u8> = (0..n).map(|i| ((i * 131 + 7) % 256) as u8).collect();
+    let out_file = host.tmp.0.join("out.bin");
+    let in_file = host.tmp.0.join("in.bin");
+    fs::write(&out_file, &sent_out).unwrap();
+    let out_arg = out_file.display().to_string();
+    let in_arg = in_file.display().to_string();
+
+    // Remote writes 4 MiB stdout BEFORE reading 4 MiB stdin; client writes stdin while reading stdout.
+    let mut child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat \"$1\"; cat > \"$2\"",
+            "_",
+            &out_arg,
+            &in_arg,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut stdin_pipe = child.stdin.take().unwrap();
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let expected_in = sent_in.clone();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin_pipe.write_all(&sent_in);
+    });
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::with_capacity(n);
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let st = wait_child(&mut child, 15, "4 MiB bidirectional exec");
+    let _ = writer.join();
+    let got_out = reader.join().unwrap();
+    let got_err = err_reader.join().unwrap();
+    assert!(
+        st.success(),
+        "expected exit 0, got {st:?}; stderr={}",
+        String::from_utf8_lossy(&got_err)
+    );
+    assert_eq!(got_out.len(), sent_out.len(), "stdout byte count");
+    assert!(got_out == sent_out, "stdout bytes mismatch");
+    let got_in = fs::read(&in_file).unwrap();
+    assert_eq!(got_in.len(), expected_in.len(), "stdin byte count");
+    assert!(got_in == expected_in, "stdin bytes mismatch");
+}
+
+#[test]
+fn exec_c_broken_stdout_pipe_returns_141_and_hangs_up_producer() {
+    let host = Host::start("exec-c", &[]);
+    let addr = host.addr();
+    let pid_file = host.tmp.0.join("yes.pid");
+    let mut guard = KillPid::new(pid_file.clone());
+    let pid_arg = pid_file.display().to_string();
+
+    let mut child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes",
+            "_",
+            &pid_arg,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let (head, stdout) =
+        read_exact_bounded::<2, _>(child.stdout.take().unwrap(), &mut child, 10, "exec-c y");
+    assert_eq!(&head, b"y\n");
+    drop(stdout);
+
+    let st = wait_child(&mut child, 10, "koh exec with closed stdout pipe");
+    guard.dead_within(10, "remote yes after stdout EPIPE");
+    assert_eq!(
+        st.code(),
+        Some(141),
+        "expected 141 on stdout EPIPE, got {st:?}"
+    );
+}
+
+#[tokio::test]
+async fn exec_d_link_lost_after_start_exits_255_not_3() {
+    let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+    let drop_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(drop_rx)));
+    let peer = RawExecPeer::start("exec-d", move |conn, mut send, _recv| {
+        let drop_rx = drop_rx.clone();
+        async move {
+            let _ = send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL).await;
+            let _ = send_msg(
+                &mut send,
+                &koh::proto::ExecServerMsg::Stdout(b"started\n".to_vec()),
+                MAX_CHUNK,
+            )
+            .await;
+            if let Some(rx) = drop_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+            conn.close(0u32.into(), b"lost");
+            false
+        }
+    })
+    .await;
+
+    // (d1) Server that is never reached (Client::connect fails) still exits 3.
+    let wrong_id = load_or_create_key(Role::Server, Some(&peer.tmp.0.join("wrong.key")))
+        .unwrap()
+        .public()
+        .to_string();
+    let mut unreach = peer.koh(&wrong_id, &["--relay-url", "http://127.0.0.1:1"]);
+    let unreach_out =
+        tokio::task::spawn_blocking(move || run_bounded(&mut unreach, 10, "unreachable exec"))
+            .await
+            .unwrap();
+    assert_eq!(
+        unreach_out.status.code(),
+        Some(3),
+        "expected 3 when server never reached, got {:?}; stderr={}",
+        unreach_out.status,
+        String::from_utf8_lossy(&unreach_out.stderr)
+    );
+
+    // (d2) Link lost after Reply::Ok and output exits 255 (not 3), preserving received stdout.
+    let mut child = peer
+        .koh(&peer.id, &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out_r = child.stdout.take().unwrap();
+    let (mut child, got_started, _out_r) = tokio::task::spawn_blocking(move || {
+        let (buf, out_r) = read_exact_bounded::<8, _>(out_r, &mut child, 10, "exec-d started");
+        (child, buf, out_r)
+    })
+    .await
+    .unwrap();
+    assert_eq!(&got_started, b"started\n");
+    let _ = drop_tx.send(());
+    let (st, stderr) = tokio::task::spawn_blocking(move || {
+        let st = wait_child(&mut child, 10, "exec-d lost link");
+        let mut err = Vec::new();
+        let _ = child.stderr.take().unwrap().read_to_end(&mut err);
+        (st, err)
+    })
+    .await
+    .unwrap();
+    peer.close().await;
+    assert_eq!(
+        st.code(),
+        Some(255),
+        "expected 255 on lost link after start, got {st:?}; stderr={}",
+        String::from_utf8_lossy(&stderr)
+    );
+}
+
+#[test]
+fn exec_e_stdout_write_error_exits_1_not_0() {
+    let host = Host::start("exec-e", &[]);
+    let addr = host.addr();
+    let out_file = host.tmp.0.join("zero-limit.out");
+
+    // Portable non-EPIPE stdout write failure (EFBIG on both Linux and macOS):
+    // ignore SIGXFSZ and cap file size at 0 blocks so writing to stdout returns EFBIG.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args([
+        "-c",
+        "trap '' XFSZ; ulimit -f 0; exec \"$1\" exec \"$2\" --direct \"$3\" -- printf 'hello\\n' > \"$4\"",
+        "_",
+        env!("CARGO_BIN_EXE_koh"),
+        &host.id,
+        &addr,
+        &out_file.display().to_string(),
+    ])
+    .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+    .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+    .env("HOME", host.tmp.0.join("home"))
+    .stdin(std::process::Stdio::null());
+    let out = run_bounded(&mut cmd, 10, "koh exec with EFBIG stdout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1 on stdout EFBIG, got {:?}; stderr={stderr}",
+        out.status
+    );
+    assert!(
+        stderr.contains("write:"),
+        "expected write error on stderr, got {stderr:?}"
+    );
+}
+
+#[test]
+fn exec_f_sh_and_rsh_handle_leading_dash_command() {
+    let host = Host::start("exec-f", &[]);
+    let addr = host.addr();
+    let cases = [
+        (
+            vec![
+                "exec",
+                &host.id,
+                "--direct",
+                &addr,
+                "--sh",
+                "-nosuchcmd 2>/dev/null; echo sh-dash-ok",
+            ],
+            "sh-dash-ok\n",
+            "exec --sh leading dash",
+        ),
+        (
+            vec![
+                "rsh",
+                "--direct",
+                &addr,
+                &host.id,
+                "-nosuchcmd 2>/dev/null; echo rsh-dash-ok",
+            ],
+            "rsh-dash-ok\n",
+            "rsh leading dash",
+        ),
+    ];
+    for (args, expected, what) in cases {
+        let out = run_bounded(&mut host.koh(&args), 10, what);
+        assert!(
+            out.status.success(),
+            "{what} failed: {:?}; stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
+    }
+}
+
+#[tokio::test]
+async fn exec_g_stream_eof_without_exit_status_exits_255_not_0() {
+    let peer = RawExecPeer::start("exec-g", |_conn, mut send, _recv| async move {
+        let _ = send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL).await;
+        let _ = send_msg(
+            &mut send,
+            &koh::proto::ExecServerMsg::Stdout(b"partial\n".to_vec()),
+            MAX_CHUNK,
+        )
+        .await;
+        let _ = send.finish();
+        let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
+        false
+    })
+    .await;
+    let mut cmd = peer.koh(&peer.id, &[]);
+    let out = tokio::task::spawn_blocking(move || run_bounded(&mut cmd, 10, "exec-g"))
+        .await
+        .unwrap();
+    peer.close().await;
+    assert_eq!(
+        out.status.code(),
+        Some(255),
+        "expected 255 on stream EOF without Exit, got {:?}; stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"partial\n");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no exit status came"),
+        "expected missing-status stderr, got {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn exec_hangup_kills_hup_ignoring_group_member() {
+    let host = Host::start("exec-group-member", &[]);
+    let addr = host.addr();
+    let pid_file = host.tmp.0.join("worker.pid");
+    let mut guard = KillPid::new(pid_file.clone());
+    let pid_arg = pid_file.display().to_string();
+
+    // Leader dies on SIGHUP while its same-group worker ignores SIGHUP; SIGKILL must still kill it.
+    let mut child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat >/dev/null; (trap '' HUP; echo READY; exec sleep 301) & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+            "_",
+            &pid_arg,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (ready, _out) = read_exact_bounded::<6, _>(
+        child.stdout.take().unwrap(),
+        &mut child,
+        10,
+        "group member READY",
+    );
+    assert_eq!(&ready, b"READY\n");
+    until("worker pid written", || pid_file.is_file());
+
+    signal(&child.id().to_string(), "-TERM");
+    let st = wait_child(&mut child, 10, "koh exec on SIGTERM (group member)");
+    assert_eq!(st.code(), Some(143), "expected 143, got {st:?}");
+    guard.dead_within(10, "HUP-ignoring group member");
+}
+
+#[test]
+fn exec_signal_exits_while_stdout_pipe_is_blocked() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let host = Host::start("exec-sig-blocked", &[]);
+    let addr = host.addr();
+    let usr1 = tokio::signal::unix::SignalKind::user_defined1().as_raw_value();
+
+    for nonblocking in [false, true] {
+        let tag = if nonblocking { "nonblock" } else { "blocking" };
+        let pid_file = host.tmp.0.join(format!("yes-{tag}.pid"));
+        let mut guard = KillPid::new(pid_file.clone());
+        let pid_arg = pid_file.display().to_string();
+
+        let mut cmd = host.koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes",
+            "_",
+            &pid_arg,
+        ]);
+        cmd.stderr(std::process::Stdio::piped());
+        let (mut child, reader_box): (std::process::Child, Box<dyn std::io::Read + Send>) =
+            if nonblocking {
+                let (peer, sock) = UnixStream::pair().unwrap();
+                sock.set_nonblocking(true).unwrap();
+                cmd.stdout(OwnedFd::from(sock));
+                let child = cmd.spawn().unwrap();
+                drop(cmd);
+                (child, Box::new(peer))
+            } else {
+                cmd.stdout(std::process::Stdio::piped());
+                let mut child = cmd.spawn().unwrap();
+                let out = child.stdout.take().unwrap();
+                (child, Box::new(out))
+            };
+
+        // Read 1 byte, keep read end open without draining so write_wait blocks on full pipe.
+        let (one, mut reader_box) = read_exact_bounded::<1, _>(
+            reader_box,
+            &mut child,
+            10,
+            &format!("sig-blocked first byte ({tag})"),
+        );
+        assert_eq!(&one, b"y");
+        std::thread::sleep(Duration::from_millis(500));
+
+        signal(&child.id().to_string(), "-USR1");
+        let st = wait_child(&mut child, 10, &format!("koh exec USR1 blocked ({tag})"));
+        assert_eq!(
+            st.code(),
+            Some(128 + usr1),
+            "expected 128+USR1={} ({tag}), got {st:?}",
+            128 + usr1
+        );
+        let mut got = one.to_vec();
+        let _ = reader_box.read_to_end(&mut got);
+        assert!(
+            got.iter().enumerate().all(|(i, &b)| b == b"y\n"[i % 2]),
+            "captured bytes ({tag}) are not a prefix of `y\\n` repeated (len={})",
+            got.len()
+        );
+        guard.dead_within(10, &format!("remote yes ({tag})"));
+    }
+}
+
+#[tokio::test]
+async fn exec_signal_before_reply_ok_closes_link() {
+    let (got_req_tx, got_req_rx) = tokio::sync::oneshot::channel();
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+    let got_req_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(got_req_tx)));
+    let stopped_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(stopped_tx)));
+    let peer = RawExecPeer::start("exec-sig-pre-ok", move |_conn, send, _recv| {
+        let got_req_tx = got_req_tx.clone();
+        let stopped_tx = stopped_tx.clone();
+        async move {
+            if let Some(tx) = got_req_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            // Hold Reply::Ok back; expect the client's SIGTERM to close the link promptly.
+            let saw_stop = tokio::time::timeout(Duration::from_secs(10), send.stopped())
+                .await
+                .is_ok();
+            if let Some(tx) = stopped_tx.lock().await.take() {
+                let _ = tx.send(saw_stop);
+            }
+            false
+        }
+    })
+    .await;
+
+    let mut child = peer
+        .koh(&peer.id, &[])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), got_req_rx)
+        .await
+        .expect("server did not receive Request::Exec")
+        .unwrap();
+    signal(&child.id().to_string(), "-TERM");
+    let st =
+        tokio::task::spawn_blocking(move || wait_child(&mut child, 10, "koh exec pre-Ok TERM"))
+            .await
+            .unwrap();
+    let saw_stop = tokio::time::timeout(Duration::from_secs(10), stopped_rx)
+        .await
+        .expect("server task timed out")
+        .unwrap();
+    peer.close().await;
+    assert_eq!(
+        st.code(),
+        Some(143),
+        "expected 143 on pre-Ok SIGTERM, got {st:?}"
+    );
+    assert!(
+        saw_stop,
+        "server did not observe link close on pre-Ok SIGTERM"
+    );
+}
+
+#[test]
+fn exec_stdin_closed_early_does_not_hang_sender() {
+    let host = Host::start("exec-early-stdin", &[]);
+    let addr = host.addr();
+
+    // Remote closes stdin early while client still sends 64 MiB: no hang, stdout arrives, exit 0.
+    let mut child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec 0<&-; sleep 1; echo done",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin_pipe = child.stdin.take().unwrap();
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        let block = vec![0u8; 64 << 10];
+        for _ in 0..1024 {
+            if stdin_pipe.write_all(&block).is_err() {
+                break;
+            }
+        }
+    });
+    let reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut b);
+        b
+    });
+    let st = wait_child(&mut child, 10, "early stdin close with 64 MiB sender");
+    let _ = writer.join();
+    assert!(st.success(), "expected exit 0, got {st:?}");
+    assert_eq!(reader.join().unwrap(), b"done\n");
+}
+
+#[test]
+fn exec_serve_shutdown_with_hup_ignoring_exec_and_live_session() {
+    let mut host = Host::start("exec-srv-shut", &[]);
+    let addr = host.addr();
+
+    // Start a live `koh connect` session alongside a HUP-ignoring `koh exec` with /dev/null stdin.
+    let mut tty = host.attach(&[], &sh("echo SESSION_UP; exec sleep 60"));
+    tty.until("session is up", |t| {
+        t.drawn.windows(10).any(|w| w == b"SESSION_UP")
+    });
+
+    let pid_file = host.tmp.0.join("hup-exec.pid");
+    let mut guard = KillPid::new(pid_file.clone());
+    let pid_arg = pid_file.display().to_string();
+    let mut exec_child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "trap '' HUP; echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo READY; exec sleep 600",
+            "_",
+            &pid_arg,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (ready, _out) = read_exact_bounded::<6, _>(
+        exec_child.stdout.take().unwrap(),
+        &mut exec_child,
+        10,
+        "serve shutdown READY",
+    );
+    assert_eq!(&ready, b"READY\n");
+
+    // SIGTERM to `koh serve`: must finish within 8 s and kill the HUP-ignoring exec command.
+    let t0 = Instant::now();
+    host.stop_by("-TERM");
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "koh serve shutdown took {elapsed:?} (>= 8 s)"
+    );
+    let st = wait_child(&mut exec_child, 10, "koh exec on serve SIGTERM");
+    assert_eq!(st.code(), Some(255), "expected 255, got {st:?}");
+    guard.dead_within(10, "HUP-ignoring exec after serve SIGTERM");
+    tty.types(b"\x1d.");
+    let _ = tty.ends();
 }

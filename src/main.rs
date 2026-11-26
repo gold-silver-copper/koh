@@ -496,6 +496,16 @@ async fn run_exec(
     sync_dir: Option<PathBuf>,
     excludes: Vec<String>,
 ) -> Result<Exit> {
+    let req = Request::Exec {
+        argv: argv.clone(),
+        cwd: cwd.clone(),
+        shell,
+    };
+    if encode(&req, MAX_CTRL).is_err() {
+        return Err(KohError::usage(format!(
+            "command exceeds maximum size ({MAX_CTRL} bytes)"
+        )));
+    }
     let client = Client::connect(server, opts, false).await?;
     let done = async {
         if let Some(dir) = sync_dir {
@@ -549,18 +559,7 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    let line = words.join(" ");
-    let req = Request::Exec {
-        argv: vec![line.clone()],
-        cwd: None,
-        shell: true,
-    };
-    if encode(&req, MAX_CTRL).is_err() {
-        return Err(KohError::usage(format!(
-            "command exceeds maximum size ({MAX_CTRL} bytes)"
-        )));
-    }
-    run_exec(host, &opts, vec![line], None, true, None, vec![]).await
+    run_exec(host, &opts, vec![words.join(" ")], None, true, None, vec![]).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {

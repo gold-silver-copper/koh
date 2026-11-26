@@ -4568,652 +4568,224 @@ async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
     srv.shutdown().await;
 }
 
+fn box_sh(host: &Host, script: &str) {
+    let addr = host.addr();
+    let add = ["servers", "add", "box", &host.id, "--direct", &addr];
+    assert!(host.koh(&add).status().unwrap().success());
+    let bin = Path::new(env!("CARGO_BIN_EXE_koh")).parent().unwrap();
+    let mut paths = vec![bin.to_path_buf()];
+    if let Some(old) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&old));
+    }
+    let out = Command::new("/bin/sh")
+        .args(["-ec", script])
+        .current_dir(&host.tmp.0)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+        .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+        .env("XDG_CONFIG_HOME", host.tmp.0.join("xdg_cfg"))
+        .env("HOME", host.tmp.0.join("home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "status={:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 #[test]
 fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
     let host = Host::start("exec-open-stdin", &[]);
     let addr = host.addr();
-
-    // Case 1: remote prints a line and exits 7 while local stdin pipe stays open.
-    let mut cmd = host.koh(&[
-        "exec",
-        &host.id,
-        "--direct",
-        &addr,
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'hello-open-stdin\\n'; exit 7",
-    ]);
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let _hold_stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break Some(s);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let out = out_thread.join().unwrap();
-    let status = status.expect("koh exec hung with open stdin after remote command ended");
-    assert_eq!(status.code(), Some(7));
-    assert_eq!(out, b"hello-open-stdin\n");
-    drop(_hold_stdin);
-
-    // Case 2: larger stdout (~135 KiB) is not cut short when exiting with open stdin.
-    let mut cmd = host.koh(&[
-        "exec",
-        &host.id,
-        "--direct",
-        &addr,
-        "--",
-        "awk",
-        "BEGIN { for (i = 0; i < 4096; i++) printf \"0123456789abcdef0123456789abcdef\\n\" }",
-    ]);
-    cmd.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
-    let _hold_stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-    let out_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(s) = child.try_wait().unwrap() {
-            break Some(s);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let out = out_thread.join().unwrap();
-    let status = status.expect("koh exec hung on large stdout with open stdin");
-    assert_eq!(status.code(), Some(0));
-    let expected: Vec<u8> = b"0123456789abcdef0123456789abcdef\n".repeat(4096);
-    assert_eq!(out.len(), expected.len());
-    assert_eq!(out, expected);
-    drop(_hold_stdin);
-}
-
-fn path_with_koh() -> std::ffi::OsString {
-    let bin_dir = Path::new(env!("CARGO_BIN_EXE_koh")).parent().unwrap();
-    let mut paths = vec![bin_dir.to_path_buf()];
-    if let Some(old) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&old));
-    }
-    std::env::join_paths(paths).unwrap()
-}
-
-fn save_box_server(host: &Host) {
-    let addr = host.addr();
-    let st = host
-        .koh(&["servers", "add", "box", &host.id, "--direct", &addr])
-        .status()
-        .unwrap();
-    assert!(st.success(), "koh servers add box failed");
-}
-
-#[test]
-fn rsh_runs_joined_words_forwards_streams_and_refuses_ssh_options() {
-    let host = Host::start("rsh-cli", &[]);
-    save_box_server(&host);
-
-    // Words are joined with spaces and run via `sh -c`, as ssh does.
-    let out = host
-        .koh(&["rsh", "box", "printf", "'%s:%s\\n'", "foo", "bar"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(out.stdout, b"foo:bar\n");
-    assert!(out.stderr.is_empty());
-
-    // Single shell string (as git passes): separate stdout/stderr and exit code propagated.
-    let out = host
-        .koh(&["rsh", "box", "printf 'out\\n'; printf 'err\\n' >&2; exit 9"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(9));
-    assert_eq!(out.stdout, b"out\n");
-    assert_eq!(out.stderr, b"err\n");
-
-    // Stdin is read to its end and forwarded.
-    let mut child = host
-        .koh(&["rsh", "box", "cat"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"stdin-via-rsh\n")
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, b"stdin-via-rsh\n");
-
-    // Options after HOST belong to the remote command, not koh (`--json`, `-n`).
-    let out = host
-        .koh(&["rsh", "box", "printf", "%s", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, b"--json");
-
-    // `--` before HOST stops option parsing; koh dial options before HOST work with raw id.
-    let out = host
-        .koh(&["rsh", "--", "box", "printf", "sep-ok"])
-        .stdout(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, b"sep-ok");
-
-    let addr = host.addr();
-    let out = host
-        .koh(&["rsh", "--direct", &addr, &host.id, "printf", "direct-ok"])
-        .stdout(std::process::Stdio::piped())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, b"direct-ok");
-
-    // Unsupported ssh options before HOST are plainly refused with exit 2.
-    for (args, needle) in [
-        (&["rsh", "-l", "alice", "box", "true"][..], "-l"),
-        (&["rsh", "-p", "2222", "box", "true"][..], "-p"),
-        (
-            &["rsh", "-o", "SendEnv=GIT_PROTOCOL", "box", "true"][..],
-            "-o",
-        ),
-        (&["rsh", "--json", "box", "true"][..], "--json"),
-        (&["rsh", "--", "box"][..], "usage"),
-        (&["rsh", "box"][..], "usage"),
-        (&["rsh"][..], "usage"),
-    ] {
-        let out = host
-            .koh(args)
+    let run_open = |remote: &[&str]| {
+        let mut args = vec!["exec", &host.id, "--direct", &addr, "--"];
+        args.extend_from_slice(remote);
+        let mut child = host
+            .koh(&args)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
+            .spawn()
             .unwrap();
-        assert_eq!(out.status.code(), Some(2), "args={args:?}");
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains(needle), "args={args:?} stderr={err:?}");
-        assert!(
-            out.stdout.is_empty(),
-            "args={args:?} stdout={:?}",
-            out.stdout
-        );
-    }
+        let _hold = child.stdin.take().unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        let st = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if Instant::now() >= until {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let st = st.expect("koh exec hung with open stdin");
+        (st.code(), reader.join().unwrap())
+    };
+    let (rc, out) = run_open(&["/bin/sh", "-c", "printf 'hi\\n'; exit 7"]);
+    assert_eq!((rc, out.as_slice()), (Some(7), b"hi\n".as_slice()));
+    let awk = "BEGIN { for (i = 0; i < 4096; i++) printf \"0123456789abcdef0123456789abcdef\\n\" }";
+    let (rc, out) = run_open(&["awk", awk]);
+    assert_eq!(rc, Some(0));
+    assert_eq!(out, b"0123456789abcdef0123456789abcdef\n".repeat(4096));
 }
 
 #[test]
-fn rsh_rsync_push_delete_exclude_incremental_and_pull() {
-    if Command::new("rsync").arg("--version").output().is_err() {
-        eprintln!(
-            "skipping rsh_rsync_push_delete_exclude_incremental_and_pull: rsync not installed"
-        );
-        return;
-    }
-    let host = Host::start("rsh-rsync", &[]);
-    save_box_server(&host);
-    let path_env = path_with_koh();
+fn rsh_options_rsync_and_git() {
+    let host = Host::start("rsh-e2e", &[]);
+    let direct_cmd = format!(
+        "[ \"$(koh rsh --direct {} {} printf ok)\" = ok ]",
+        host.addr(),
+        host.id
+    );
+    box_sh(
+        &host,
+        &format!(
+            "set +e; koh rsh box 'printf out; printf err >&2; exit 9' >o 2>e; rc=$?; set -e
+             [ \"$rc\" = 9 ] && [ \"$(cat o)\" = out ] && [ \"$(cat e)\" = err ]
+             [ \"$(printf 'in\\n' | koh rsh box cat)\" = in ]
+             [ \"$(koh rsh -- box printf %s --json)\" = --json ]
+             {direct_cmd}
+             for f in -G -o -l -p --json; do
+               set +e; koh rsh \"$f\" box --json >o 2>e; rc=$?; set -e
+               [ \"$rc\" = 2 ] && [ ! -s o ] && grep -Fq -- \"$f\" e
+             done
+             set +e; koh rsh box >o 2>e; rc=$?; set -e
+             [ \"$rc\" = 2 ] && [ ! -s o ] && grep -Fq usage e"
+        ),
+    );
 
-    let src = host.tmp.0.join("src");
-    let remote_dst = host.tmp.0.join("home").join("dst");
-    let pulled = host.tmp.0.join("pulled");
+    let (src, dst) = (host.tmp.0.join("src"), host.tmp.0.join("home/dst"));
     fs::create_dir_all(src.join("sub")).unwrap();
     fs::create_dir_all(src.join("target")).unwrap();
-    fs::create_dir_all(&remote_dst).unwrap();
-
+    fs::create_dir_all(dst.join("target")).unwrap();
     let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
     fs::write(src.join("big.bin"), &big).unwrap();
-    fs::write(src.join("sub/hello.txt"), b"hello from rsync\n").unwrap();
-    std::os::unix::fs::symlink("sub/hello.txt", src.join("link_hello")).unwrap();
-    fs::write(src.join("target/ignored.txt"), b"must-not-copy").unwrap();
-    fs::write(remote_dst.join("stray.txt"), b"delete-me").unwrap();
+    fs::write(src.join("sub/with space.txt"), b"spaced\n").unwrap();
+    std::os::unix::fs::symlink("sub/with space.txt", src.join("link_s")).unwrap();
+    fs::write(src.join("target/ignored.txt"), b"skip").unwrap();
+    fs::write(dst.join("stray.txt"), b"bye").unwrap();
+    fs::write(dst.join("target/keep.txt"), b"stay").unwrap();
 
-    let run_rsync = |args: &[&str]| {
-        Command::new("rsync")
-            .args(args)
-            .env("PATH", &path_env)
-            .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
-            .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
-            .env("HOME", host.tmp.0.join("home"))
-            .output()
-            .unwrap()
-    };
+    box_sh(
+        &host,
+        "tar -C src -cf - . | koh rsh box 'mkdir -p tardst && tar -C tardst -xf -'",
+    );
+    let tar_f = host.tmp.0.join("home/tardst/sub/with space.txt");
+    assert_eq!(fs::read(tar_f).unwrap(), b"spaced\n");
 
-    // 1. Push with --delete and --exclude target (only flags portable to openrsync/2.6.9).
-    let src_slash = format!("{}/", src.display());
-    let out1 = run_rsync(&[
-        "-av",
-        "--delete",
-        "--exclude",
-        "target",
-        "-e",
-        "koh rsh",
-        &src_slash,
-        "box:dst/",
-    ]);
-    assert!(
-        out1.status.success(),
-        "rsync push 1 failed: status={:?}\nstdout={}\nstderr={}",
-        out1.status,
-        String::from_utf8_lossy(&out1.stdout),
-        String::from_utf8_lossy(&out1.stderr)
-    );
-    assert_eq!(fs::read(remote_dst.join("big.bin")).unwrap(), big);
-    assert_eq!(
-        fs::read(remote_dst.join("sub/hello.txt")).unwrap(),
-        b"hello from rsync\n"
-    );
-    assert_eq!(
-        fs::read_link(remote_dst.join("link_hello")).unwrap(),
-        Path::new("sub/hello.txt")
-    );
-    assert!(
-        !remote_dst.join("stray.txt").exists(),
-        "stray.txt was not deleted"
-    );
-    assert!(
-        !remote_dst.join("target").exists(),
-        "target was not excluded"
-    );
+    if Command::new("rsync").arg("--version").output().is_err() {
+        eprintln!("skipping rsync in rsh_options_rsync_and_git: rsync not installed");
+    } else {
+        let sync = "rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/";
+        box_sh(&host, sync);
+        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), big);
+        assert_eq!(
+            fs::read(dst.join("sub/with space.txt")).unwrap(),
+            b"spaced\n"
+        );
+        let link = fs::read_link(dst.join("link_s")).unwrap();
+        assert_eq!(link, Path::new("sub/with space.txt"));
+        assert!(!dst.join("stray.txt").exists() && !dst.join("target/ignored.txt").exists());
+        assert_eq!(fs::read(dst.join("target/keep.txt")).unwrap(), b"stay");
 
-    let ino_before = fs::metadata(remote_dst.join("big.bin")).unwrap().ino();
+        let inos = || {
+            (
+                fs::metadata(dst.join("big.bin")).unwrap().ino(),
+                fs::metadata(dst.join("sub/with space.txt")).unwrap().ino(),
+            )
+        };
+        let before = inos();
+        box_sh(&host, sync);
+        assert_eq!(inos(), before, "second rsync rewrote unchanged files");
 
-    // 2. Second push sends almost nothing and does not rewrite big.bin.
-    let out2 = run_rsync(&[
-        "-av",
-        "--delete",
-        "--exclude",
-        "target",
-        "-e",
-        "koh rsh",
-        &src_slash,
-        "box:dst/",
-    ]);
-    assert!(
-        out2.status.success(),
-        "rsync push 2 failed: status={:?}\nstdout={}\nstderr={}",
-        out2.status,
-        String::from_utf8_lossy(&out2.stdout),
-        String::from_utf8_lossy(&out2.stderr)
-    );
-    assert_eq!(
-        fs::metadata(remote_dst.join("big.bin")).unwrap().ino(),
-        ino_before,
-        "big.bin should not be rewritten on an unchanged second run"
-    );
-    let stdout2 = String::from_utf8_lossy(&out2.stdout);
-    assert!(
-        !stdout2.lines().any(|l| l.trim() == "big.bin"),
-        "big.bin should not be transferred again:\n{stdout2}"
-    );
-    if let Some(sent_line) = stdout2.lines().find(|l| l.starts_with("sent ")) {
-        let num: String = sent_line
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("")
-            .chars()
-            .filter(|c| c.is_ascii_digit())
-            .collect();
-        if let Ok(bytes) = num.parse::<u64>() {
-            assert!(
-                bytes < 4096,
-                "second rsync run sent {bytes} bytes, expected almost nothing:\n{stdout2}"
-            );
-        }
+        box_sh(&host, "rsync -a -e 'koh rsh' box:dst/ pulled/");
+        assert_eq!(fs::read(host.tmp.0.join("pulled/big.bin")).unwrap(), big);
+        let p_sp = host.tmp.0.join("pulled/sub/with space.txt");
+        assert_eq!(fs::read(p_sp).unwrap(), b"spaced\n");
+        let p_lk = fs::read_link(host.tmp.0.join("pulled/link_s")).unwrap();
+        assert_eq!(p_lk, Path::new("sub/with space.txt"));
     }
 
-    // 3. Pull back and verify contents and symlink.
-    let pulled_slash = format!("{}/", pulled.display());
-    let out3 = run_rsync(&["-a", "-e", "koh rsh", "box:dst/", &pulled_slash]);
-    assert!(
-        out3.status.success(),
-        "rsync pull failed: status={:?}\nstdout={}\nstderr={}",
-        out3.status,
-        String::from_utf8_lossy(&out3.stdout),
-        String::from_utf8_lossy(&out3.stderr)
-    );
-    assert_eq!(fs::read(pulled.join("big.bin")).unwrap(), big);
-    assert_eq!(
-        fs::read(pulled.join("sub/hello.txt")).unwrap(),
-        b"hello from rsync\n"
-    );
-    assert_eq!(
-        fs::read_link(pulled.join("link_hello")).unwrap(),
-        Path::new("sub/hello.txt")
-    );
-}
-
-#[test]
-fn rsh_git_push_and_clone() {
     if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("skipping rsh_git_push_and_clone: git not installed");
-        return;
+        eprintln!("skipping git in rsh_options_rsync_and_git: git not installed");
+    } else {
+        box_sh(
+            &host,
+            "git init --bare home/demo.git >/dev/null
+             mkdir work && cd work && git init >/dev/null
+             printf 'from-git\\n' > hello.txt && git add hello.txt && git commit -qm init
+             GIT_SSH_COMMAND='koh rsh' git push box:demo.git HEAD:refs/heads/main
+             cd .. && GIT_SSH_COMMAND='koh rsh' git clone -b main box:demo.git cloned",
+        );
+        let cloned = host.tmp.0.join("cloned/hello.txt");
+        assert_eq!(fs::read(cloned).unwrap(), b"from-git\n");
     }
-    let host = Host::start("rsh-git", &[]);
-    save_box_server(&host);
-    let path_env = path_with_koh();
+}
 
-    let bare = host.tmp.0.join("home").join("demo.git");
-    let work = host.tmp.0.join("work");
-    let cloned = host.tmp.0.join("cloned");
-    fs::create_dir_all(&bare).unwrap();
-    fs::create_dir_all(&work).unwrap();
-
-    let run_git = |cwd: &Path, args: &[&str]| {
-        Command::new("git")
-            .current_dir(cwd)
-            .args(args)
-            .env("PATH", &path_env)
-            .env("GIT_SSH_COMMAND", "koh rsh")
-            .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
-            .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
-            .env("HOME", host.tmp.0.join("home"))
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .unwrap()
-    };
-
-    assert!(run_git(&bare, &["init", "--bare"]).status.success());
-    assert!(run_git(&work, &["init"]).status.success());
-    fs::write(work.join("hello.txt"), b"hello from git\n").unwrap();
-    assert!(run_git(&work, &["add", "hello.txt"]).status.success());
-    assert!(run_git(&work, &["commit", "-m", "init"]).status.success());
-
-    let push = run_git(&work, &["push", "box:demo.git", "HEAD:refs/heads/main"]);
-    assert!(
-        push.status.success(),
-        "git push failed: status={:?}\nstdout={}\nstderr={}",
-        push.status,
-        String::from_utf8_lossy(&push.stdout),
-        String::from_utf8_lossy(&push.stderr)
-    );
-
-    let clone = run_git(
-        &host.tmp.0,
-        &[
-            "clone",
-            "-b",
-            "main",
-            "box:demo.git",
-            &cloned.display().to_string(),
-        ],
-    );
-    assert!(
-        clone.status.success(),
-        "git clone failed: status={:?}\nstdout={}\nstderr={}",
-        clone.status,
-        String::from_utf8_lossy(&clone.stdout),
-        String::from_utf8_lossy(&clone.stderr)
-    );
-    assert_eq!(
-        fs::read(cloned.join("hello.txt")).unwrap(),
-        b"hello from git\n"
+#[test]
+fn cp_delete_requires_one_directory_push_and_pull() {
+    let host = Host::start("cp-delete-dir", &[]);
+    box_sh(
+        &host,
+        "mkdir -p ld ldst home/rd home/rdst
+         printf f > f; ln -s f lf; ln -s ld ld_link; printf ok > ld/ok
+         printf rf > home/rf; ln -s rf home/rlf; ln -s rd home/rd_link; printf rok > home/rd/rok
+         printf h > home/keep_home; printf k > home/rdst/keep; printf k > ldst/keep
+         refuse() {
+           set +e; koh cp --delete \"$1\" \"$2\" >o 2>e; rc=$?; set -e
+           [ \"$rc\" = 2 ] && grep -Fq directory e && grep -Fq deleted e
+         }
+         refuse f box:rdst/; refuse f box:; refuse lf box:rdst/
+         refuse box:rf ldst; refuse box:rlf ldst
+         for pair in 'missing box:rdst/' 'box:missing ldst'; do
+           set +e; koh cp --delete $pair >o 2>e; rc=$?; set -e; [ \"$rc\" = 1 ]
+         done
+         [ -f home/rdst/keep ] && [ -f ldst/keep ] && [ -f home/keep_home ]
+         for s in ld ld/ ld/. ld_link; do
+           printf s > home/rdst/stray
+           koh cp -r --delete \"$s\" box:rdst/ >/dev/null
+           [ -f home/rdst/ok ] && [ ! -e home/rdst/stray ]
+         done
+         for s in box:rd box:rd/ box:rd/. box:rd_link; do
+           printf s > ldst/stray
+           koh cp -r --delete \"$s\" ldst >/dev/null
+           [ -f ldst/rok ] && [ ! -e ldst/stray ]
+         done",
     );
 }
 
 #[test]
-fn cp_delete_refuses_non_directory_source_push_and_pull() {
-    let host = Host::start("cp-delete-file", &[]);
-    save_box_server(&host);
-
-    let local_one = host.tmp.0.join("one.txt");
-    let local_link = host.tmp.0.join("link_one.txt");
-    let local_dir = host.tmp.0.join("local_dir");
-    let local_src_dir = host.tmp.0.join("src_dir");
-    let remote_home = host.tmp.0.join("home");
-    let remote_dir = remote_home.join("remote_dir");
-    let remote_one = remote_home.join("remote_one.txt");
-    let remote_home_keep = remote_home.join("keep_home.txt");
-    fs::create_dir_all(&local_dir).unwrap();
-    fs::create_dir_all(&local_src_dir).unwrap();
-    fs::create_dir_all(&remote_dir).unwrap();
-
-    fs::write(&local_one, b"one\n").unwrap();
-    std::os::unix::fs::symlink(&local_one, &local_link).unwrap();
-    fs::write(local_src_dir.join("fresh.txt"), b"fresh\n").unwrap();
-    fs::write(local_dir.join("keep_local.txt"), b"stay-local\n").unwrap();
-    fs::write(remote_dir.join("keep_remote.txt"), b"stay-remote\n").unwrap();
-    fs::write(&remote_one, b"remote-one\n").unwrap();
-    fs::write(&remote_home_keep, b"stay-home\n").unwrap();
-
-    let run_cp = |args: &[&str]| {
-        host.koh(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .unwrap()
-    };
-
-    // Push a single file with --delete into a remote dir: refused (exit 2), nothing deleted.
-    let out = run_cp(&[
-        "cp",
-        "--delete",
-        &local_one.display().to_string(),
-        "box:remote_dir/",
-    ]);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "expected exit 2, got {:?}\nstdout={}\nstderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("directory"),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        remote_dir.join("keep_remote.txt").exists(),
-        "keep_remote.txt was deleted!"
-    );
-    assert!(!remote_dir.join("one.txt").exists());
-
-    // Push a single file with --delete to remote home (`box:`): refused (exit 2), home intact.
-    let out = run_cp(&["cp", "--delete", &local_one.display().to_string(), "box:"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(remote_home_keep.exists(), "keep_home.txt was deleted!");
-
-    // Symlink to a file with --delete: refused (exit 2), nothing deleted.
-    let out = run_cp(&[
-        "cp",
-        "--delete",
-        &local_link.display().to_string(),
-        "box:remote_dir/",
-    ]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(remote_dir.join("keep_remote.txt").exists());
-
-    // Pull a single file with --delete into a local dir: refused (exit 2), nothing deleted.
-    let out = run_cp(&[
-        "cp",
-        "--delete",
-        "box:remote_one.txt",
-        &local_dir.display().to_string(),
-    ]);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "expected exit 2 on pull, got {:?}\nstdout={}\nstderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("directory"),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        local_dir.join("keep_local.txt").exists(),
-        "keep_local.txt was deleted!"
-    );
-    assert!(!local_dir.join("remote_one.txt").exists());
-
-    // Pushing and pulling a single directory with --delete still works.
-    let out = run_cp(&[
-        "cp",
-        "-r",
-        "--delete",
-        &local_src_dir.display().to_string(),
-        "box:remote_dir/",
-    ]);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(fs::read(remote_dir.join("fresh.txt")).unwrap(), b"fresh\n");
-    assert!(!remote_dir.join("keep_remote.txt").exists());
-
-    let out = run_cp(&[
-        "cp",
-        "-r",
-        "--delete",
-        "box:remote_dir",
-        &local_dir.display().to_string(),
-    ]);
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(fs::read(local_dir.join("fresh.txt")).unwrap(), b"fresh\n");
-    assert!(!local_dir.join("keep_local.txt").exists());
-}
-
-#[test]
-fn failed_run_preserves_existing_job_log_and_listing() {
+fn failed_run_preserves_existing_job_and_leaves_no_orphan() {
     let host = Host::start("run-keep-job", &[]);
-    save_box_server(&host);
-
-    let run_cli = |args: &[&str]| {
-        host.koh(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .unwrap()
-    };
-
-    let out = run_cli(&[
-        "run",
-        "box",
-        "--name",
-        "keep",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'kept-log-line\\n'",
-    ]);
-    assert_eq!(out.status.code(), Some(0));
-
-    let waited = run_cli(&["wait", "box", "keep", "--timeout", "10"]);
-    assert_eq!(waited.status.code(), Some(0));
-
-    let logs_before = run_cli(&["logs", "box", "keep", "--all"]);
-    assert_eq!(logs_before.status.code(), Some(0));
-    assert_eq!(logs_before.stdout, b"kept-log-line\n");
-
-    let jobs_before = run_cli(&["jobs", "box", "keep"]);
-    assert_eq!(jobs_before.status.code(), Some(0));
-    let listing_before = String::from_utf8_lossy(&jobs_before.stdout).into_owned();
-    assert!(
-        listing_before.contains("keep\texited 0\t"),
-        "{listing_before}"
+    box_sh(
+        &host,
+        "set +e; koh run box --name fresh -- /no/such/bin; rc=$?; set -e
+         [ \"$rc\" = 127 ] && [ ! -e run/koh/jobs/fresh ]
+         koh run box --name keep -- /bin/sh -c 'printf \"kept\\n\"' >/dev/null
+         koh wait box keep --timeout 10 >/dev/null
+         set +e; koh run box --name keep -- /no/such/bin; rc1=$?
+         koh run box -C /no/such/dir --name keep -- true; rc2=$?; set -e
+         [ \"$rc1\" = 127 ] && [ \"$rc2\" = 126 ]
+         [ \"$(koh logs box keep --all)\" = kept ]
+         koh jobs box keep | grep -Fq 'keep	exited 0'
+         koh run box --name keep -- /bin/sh -c 'printf \"new\\n\"' >/dev/null
+         koh wait box keep --timeout 10 >/dev/null
+         [ \"$(koh logs box keep --all)\" = new ]",
     );
-    assert!(listing_before.contains("kept-log-line"), "{listing_before}");
-
-    // Failed replacement (missing program -> 127) must leave `keep` untouched.
-    let bad_bin = run_cli(&["run", "box", "--name", "keep", "--", "/no/such/binary"]);
-    assert_eq!(bad_bin.status.code(), Some(127));
-
-    // Failed replacement (missing cwd -> 126) must also leave `keep` untouched.
-    let bad_cwd = run_cli(&[
-        "run",
-        "box",
-        "-C",
-        "/no/such/koh/dir",
-        "--name",
-        "keep",
-        "--",
-        "/bin/sh",
-        "-c",
-        "echo nope",
-    ]);
-    assert_eq!(bad_cwd.status.code(), Some(126));
-
-    let logs_after = run_cli(&["logs", "box", "keep", "--all"]);
-    assert_eq!(logs_after.status.code(), Some(0));
-    assert_eq!(
-        logs_after.stdout, b"kept-log-line\n",
-        "previous job log was wiped by failed run"
-    );
-
-    let jobs_after = run_cli(&["jobs", "box", "keep"]);
-    assert_eq!(jobs_after.status.code(), Some(0));
-    let listing_after = String::from_utf8_lossy(&jobs_after.stdout);
-    assert!(
-        listing_after.contains("keep\texited 0\t"),
-        "{listing_after}"
-    );
-    assert!(listing_after.contains("kept-log-line"), "{listing_after}");
-
-    // A valid replacement afterward still works.
-    let ok_replace = run_cli(&[
-        "run",
-        "box",
-        "--name",
-        "keep",
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'replaced-log\\n'",
-    ]);
-    assert_eq!(ok_replace.status.code(), Some(0));
-    assert_eq!(
-        run_cli(&["wait", "box", "keep", "--timeout", "10"])
-            .status
-            .code(),
-        Some(0)
-    );
-    let logs_new = run_cli(&["logs", "box", "keep", "--all"]);
-    assert_eq!(logs_new.status.code(), Some(0));
-    assert_eq!(logs_new.stdout, b"replaced-log\n");
 }

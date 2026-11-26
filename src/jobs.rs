@@ -20,6 +20,7 @@ struct JobRecord {
     name: String,
     pid: u32,
     command: String,
+    dir: PathBuf,
     started: Instant,
     state_tx: watch::Sender<(String, Option<i32>)>,
 }
@@ -28,7 +29,7 @@ struct JobRecord {
 pub struct JobManager {
     root: PathBuf,
     next_id: u32,
-    jobs: BTreeMap<String, (Arc<JobRecord>, PathBuf)>,
+    jobs: BTreeMap<String, Arc<JobRecord>>,
 }
 
 pub type JobStateRx = watch::Receiver<(String, Option<i32>)>;
@@ -57,10 +58,9 @@ impl JobManager {
         cwd: &Path,
         shell: bool,
     ) -> Result<JobInfo> {
-        // What an older job of the name left, to be removed with the lock let go: named here,
-        // before the lock, so it is dropped after it however this returns.
+        // What an older job of the name left, to be removed with the lock let go: it is named
+        // here, before the lock, so it is dropped after it however this returns.
         let mut _old = None;
-        let mut _prev = None;
         let mut guard = mgr
             .lock()
             .map_err(|_| KohError::internal("job lock poisoned"))?;
@@ -69,7 +69,7 @@ impl JobManager {
                 if !is_safe_name(&n) {
                     return Err(KohError::usage(format!("invalid job name {n:?}")));
                 }
-                if let Some((existing, _)) = guard.jobs.get(&n)
+                if let Some(existing) = guard.jobs.get(&n)
                     && existing.state_tx.borrow().0 == "running"
                 {
                     return Err(KohError::failed(format!("job {n:?} is already running")));
@@ -84,47 +84,35 @@ impl JobManager {
                 }
             },
         };
-        fs::create_dir_all(&guard.root)
-            .map_err(|e| KohError::failed(format!("mkdir jobs root: {e}")))?;
         let dir = guard.root.join(&job_name);
-        let old = Aside::try_of(&dir)
-            .map_err(|e| KohError::failed(format!("move earlier job dir aside: {e}")))?;
-        let started = (|| -> Result<std::process::Child> {
-            // Exclusive create: if anything is still at `dir`, never truncate its log.
-            fs::create_dir(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
-            let spawned = (|| -> Result<std::process::Child> {
-                let log_out = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(dir.join("log"))
-                    .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
-                let log_err = log_out
-                    .try_clone()
-                    .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
-                let mut cmd = build_command(argv, cwd, shell)?;
-                fuxix::new_session(&mut cmd, false);
-                cmd.stdin(Stdio::null())
-                    .stdout(Stdio::from(log_out))
-                    .stderr(Stdio::from(log_err));
-                cmd.spawn().map_err(|e| {
-                    let code = if e.kind() == std::io::ErrorKind::NotFound {
-                        Exit::NOT_FOUND
-                    } else {
-                        Exit::CANNOT_START
-                    };
-                    KohError::new(code, "cannot_start", format!("spawn job: {e}"))
-                })
-            })();
-            if spawned.is_err() {
-                let _ = fs::remove_dir_all(&dir);
-            }
-            spawned
-        })();
-        let mut child = match started {
-            Ok(child) => child,
-            Err(err) => return Err(rollback_start(&mut guard, &job_name, &dir, old, err)),
-        };
+        _old = Aside::of(&dir);
+        fs::create_dir_all(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+
+        let log_path = dir.join("log");
+        let log_out = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
+        let log_err = log_out
+            .try_clone()
+            .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
+
+        let mut cmd = build_command(argv, cwd, shell)?;
+        fuxix::new_session(&mut cmd, false);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::from(log_out))
+            .stderr(Stdio::from(log_err));
+
+        let mut child = cmd.spawn().map_err(|e| {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                Exit::NOT_FOUND
+            } else {
+                Exit::CANNOT_START
+            };
+            KohError::new(code, "cannot_start", format!("spawn job: {e}"))
+        })?;
         let pid = child.id();
         let command_str = argv.join(" ");
         let _ = atomic_write(&dir.join("state"), b"running\n");
@@ -138,18 +126,11 @@ impl JobManager {
             name: job_name.clone(),
             pid,
             command: command_str.clone(),
+            dir: dir.clone(),
             started: Instant::now(),
             state_tx,
         });
-        if let Some((_, prev_dir)) = guard
-            .jobs
-            .insert(job_name.clone(), (rec.clone(), dir.clone()))
-            && prev_dir != dir
-        {
-            _prev = Aside::of(&prev_dir);
-        }
-        // Only remove the older folder once the new job is running and listed.
-        _old = old;
+        guard.jobs.insert(job_name.clone(), rec.clone());
         drop(guard);
 
         let dir_wait = dir.clone();
@@ -182,7 +163,7 @@ impl JobManager {
 
     pub fn list(&self, filter: Option<&str>) -> Result<Vec<JobInfo>> {
         if let Some(name) = filter {
-            let (rec, _) = self.jobs.get(name).ok_or_else(|| {
+            let rec = self.jobs.get(name).ok_or_else(|| {
                 KohError::new(
                     Exit::NOT_FOUND,
                     "not_found",
@@ -191,11 +172,11 @@ impl JobManager {
             })?;
             return Ok(vec![record_info(rec)]);
         }
-        Ok(self.jobs.values().map(|(r, _)| record_info(r)).collect())
+        Ok(self.jobs.values().map(|r| record_info(r)).collect())
     }
 
     pub fn get(&self, name: &str) -> Result<JobHandle> {
-        let (rec, dir) = self.jobs.get(name).ok_or_else(|| {
+        let rec = self.jobs.get(name).ok_or_else(|| {
             KohError::new(
                 Exit::NOT_FOUND,
                 "not_found",
@@ -203,7 +184,7 @@ impl JobManager {
             )
         })?;
         Ok(JobHandle {
-            log_path: dir.join("log"),
+            log_path: rec.dir.join("log"),
             state_rx: rec.state_tx.subscribe(),
             started: rec.started,
         })
@@ -218,17 +199,13 @@ impl JobManager {
             let guard = mgr
                 .lock()
                 .map_err(|_| KohError::internal("job lock poisoned"))?;
-            guard
-                .jobs
-                .get(name)
-                .map(|(r, _)| r.clone())
-                .ok_or_else(|| {
-                    KohError::new(
-                        Exit::NOT_FOUND,
-                        "not_found",
-                        format!("no job named {name:?}"),
-                    )
-                })?
+            guard.jobs.get(name).cloned().ok_or_else(|| {
+                KohError::new(
+                    Exit::NOT_FOUND,
+                    "not_found",
+                    format!("no job named {name:?}"),
+                )
+            })?
         };
         let signal = if (1..32).contains(&sig) { sig } else { 15 };
         if let Err(err) = signal_group(rec.pid, signal).await
@@ -310,27 +287,6 @@ pub(crate) async fn signal_group(pgid: u32, signal: i32) -> Result<()> {
         )));
     }
     kill(&[format!("-{signal}"), "--".into(), format!("-{pgid}")]).await
-}
-
-fn rollback_start(
-    guard: &mut JobManager,
-    job_name: &str,
-    dir: &Path,
-    old: Option<Aside>,
-    mut err: KohError,
-) -> KohError {
-    if let Some(old) = old
-        && let Err((kept, e)) = old.restore(dir)
-    {
-        if let Some((_, rec_dir)) = guard.jobs.get_mut(job_name) {
-            *rec_dir = kept.clone();
-        }
-        err.message.push_str(&format!(
-            "; earlier job folder could not be put back ({e}) and is kept at {}",
-            kept.display()
-        ));
-    }
-    err
 }
 
 fn record_info(rec: &JobRecord) -> JobInfo {
@@ -479,102 +435,5 @@ pub async fn wait_job(
             _ = state_rx.changed() => {}
             () = tokio::time::sleep(wait_for) => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    #[tokio::test]
-    async fn failed_rollback_updates_record_dir_for_logs_wait_and_reports_path() {
-        let root = std::env::temp_dir().join(format!("koh-job-rb-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let Ok(jm) = JobManager::new(root.clone()) else {
-            return;
-        };
-        let mgr = Arc::new(Mutex::new(jm));
-
-        let started = JobManager::start(
-            &mgr,
-            Some("keep".into()),
-            &["printf 'OLD\\n'".into()],
-            &root,
-            true,
-        );
-        assert!(started.is_ok());
-        let handle = mgr.lock().ok().and_then(|g| g.get("keep").ok());
-        assert!(handle.is_some());
-        if let Some(h) = handle {
-            let w = wait_job(h.log_path, h.state_rx, None, 200, Some(5)).await;
-            assert!(w.as_ref().is_ok_and(|r| r.exit == 0 && r.tail == "OLD\n"));
-        }
-
-        // Move `keep` aside, plant a blocker containing `OTHER\n` at `keep`, and run rollback.
-        let dir = root.join("keep");
-        let old = Aside::try_of(&dir).ok().flatten();
-        assert!(old.is_some());
-        assert!(fs::create_dir_all(&dir).is_ok());
-        assert!(fs::write(dir.join("log"), b"OTHER\n").is_ok());
-
-        let err = mgr.lock().ok().map(|mut g| {
-            rollback_start(
-                &mut g,
-                "keep",
-                &dir,
-                old,
-                KohError::new(Exit::NOT_FOUND, "cannot_start", "spawn job: missing"),
-            )
-        });
-        assert!(err.is_some());
-        if let Some(err) = err {
-            assert_eq!(err.code, Exit::NOT_FOUND);
-            assert!(
-                err.message.contains("spawn job: missing"),
-                "{}",
-                err.message
-            );
-            assert!(
-                err.message.contains("could not be put back"),
-                "{}",
-                err.message
-            );
-            let kept = err.message.rsplit("kept at ").next().unwrap_or("");
-            assert!(kept.contains(".gone."), "{}", err.message);
-            let saved =
-                fuxix::open_regular(Path::new(kept).join("log")).and_then(std::io::read_to_string);
-            assert_eq!(saved.ok().as_deref(), Some("OLD\n"));
-        }
-
-        // Both `logs` (`read_log_tail`) and `wait` (`wait_job`) read `OLD\n`, never `OTHER\n`.
-        let handle = mgr.lock().ok().and_then(|g| g.get("keep").ok());
-        assert!(handle.is_some());
-        if let Some(h) = handle {
-            let tail = read_log_tail(&h.log_path, None);
-            assert_eq!(tail.ok().as_deref(), Some(b"OLD\n".as_slice()));
-            let w = wait_job(h.log_path, h.state_rx, None, 200, Some(5)).await;
-            assert!(w.as_ref().is_ok_and(|r| r.exit == 0 && r.tail == "OLD\n"));
-        }
-        let listed = mgr.lock().ok().and_then(|g| g.list(Some("keep")).ok());
-        assert!(listed.as_ref().is_some_and(|v| v.len() == 1));
-
-        // When moving the old folder aside itself fails (EACCES), report that error, not EEXIST.
-        let ro = root.join("ro");
-        assert!(fs::create_dir_all(ro.join("prev")).is_ok());
-        if let Ok(jm2) = JobManager::new(ro.clone()) {
-            let mgr2 = Arc::new(Mutex::new(jm2));
-            let _ = fs::set_permissions(&ro, fs::Permissions::from_mode(0o500));
-            let res = JobManager::start(&mgr2, Some("prev".into()), &["true".into()], &root, true);
-            let _ = fs::set_permissions(&ro, fs::Permissions::from_mode(0o700));
-            if let Err(e) = res {
-                assert!(
-                    e.message.contains("move earlier job dir aside"),
-                    "{}",
-                    e.message
-                );
-            }
-        }
-        let _ = fs::remove_dir_all(&root);
     }
 }

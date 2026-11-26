@@ -526,14 +526,13 @@ async fn dispatch(
         Request::CpPull {
             src,
             excludes,
-            delete,
             preserve_root,
             ..
         } => {
             let src = expand_home(Path::new(&src))?;
             scope.check_cp(&src)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let sent = send_tree(&src, &excludes, preserve_root, delete, send, &mut recv).await;
+            let sent = send_tree(&src, &excludes, preserve_root, send, &mut recv).await;
             say_failure(send, sent).await;
             Ok(())
         }

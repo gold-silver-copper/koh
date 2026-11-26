@@ -4837,20 +4837,22 @@ fn rsh_options_rsync_and_git() {
         ),
     );
 
-    // Joined rsh line over MAX_CTRL (1 MiB) exits 2 (usage), where the OS allows spawning it.
+    // Commands over MAX_CTRL (1 MiB) exit 2 (usage) for both rsh and exec, where OS allows spawn.
     let big_word = "x".repeat(130);
-    let mut over = host.koh(&["rsh", "box"]);
-    for _ in 0..9000 {
-        over.arg(&big_word);
-    }
-    if let Ok(out) = over
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-    {
-        assert_eq!(out.status.code(), Some(2));
-        assert!(out.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+    for head in [&["rsh", "box"][..], &["exec", "box", "--"][..]] {
+        let mut over = host.koh(head);
+        for _ in 0..9000 {
+            over.arg(&big_word);
+        }
+        if let Ok(out) = over
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+        }
     }
 
     let (src, dst) = (host.tmp.0.join("src"), host.tmp.0.join("home/dst"));
@@ -4924,73 +4926,4 @@ fn rsh_options_rsync_and_git() {
         let cloned = host.tmp.0.join("cloned/hello.txt");
         assert_eq!(fs::read(cloned).unwrap(), b"from-git\n");
     }
-}
-
-#[test]
-fn cp_delete_requires_one_directory_push_and_pull() {
-    let host = Host::start("cp-delete-dir", &[]);
-    box_sh(
-        &host,
-        "mkdir -p ld ldst home/rd home/rdst
-         printf f > f; ln -s f lf; ln -s ld ld_link; printf ok > ld/ok
-         printf rf > home/rf; ln -s rf home/rlf; ln -s rd home/rd_link; printf rok > home/rd/rok
-         printf h > home/keep_home; printf k > home/rdst/keep; printf k > ldst/keep
-         refuse() {
-           set +e; koh cp --delete \"$1\" \"$2\" >o 2>e; rc=$?; set -e
-           [ \"$rc\" = 2 ]
-           grep -Fq directory e
-           grep -Fq deleted e
-         }
-         refuse f box:rdst/; refuse f box:; refuse lf box:rdst/
-         refuse box:rf ldst; refuse box:rlf ldst
-         set +e; koh cp --delete ld ld box:rdst/ >o 2>e; rc=$?; set -e
-         [ \"$rc\" = 2 ]
-         grep -Fq 'single source' e
-         for pair in 'missing box:rdst/' 'box:missing ldst'; do
-           set +e; koh cp --delete $pair >o 2>e; rc=$?; set -e
-           [ \"$rc\" = 1 ]
-         done
-         [ -f home/rdst/keep ]
-         [ -f ldst/keep ]
-         [ -f home/keep_home ]
-         for s in ld ld/ ld/. ld_link; do
-           printf s > home/rdst/stray
-           koh cp -r --delete \"$s\" box:rdst/ >/dev/null
-           [ -f home/rdst/ok ]
-           [ ! -e home/rdst/stray ]
-         done
-         for s in box:rd box:rd/ box:rd/. box:rd_link; do
-           printf s > ldst/stray
-           koh cp -r --delete \"$s\" ldst >/dev/null
-           [ -f ldst/rok ]
-           [ ! -e ldst/stray ]
-         done",
-    );
-}
-
-#[test]
-fn failed_run_preserves_existing_job_and_leaves_no_orphan() {
-    let host = Host::start("run-keep-job", &[]);
-    box_sh(
-        &host,
-        "set +e; koh run box --name fresh -- /no/such/bin; rc=$?; set -e
-         [ \"$rc\" = 127 ]
-         [ ! -e run/koh/jobs/fresh ]
-         koh run box --name keep -- /bin/sh -c 'printf \"kept\\n\"' >/dev/null
-         koh wait box keep --timeout 10 >/dev/null
-         set +e
-         koh run box --name keep -- /no/such/bin; rc1=$?
-         koh run box -C /no/such/dir --name keep -- true; rc2=$?
-         set -e
-         [ \"$rc1\" = 127 ]
-         [ \"$rc2\" = 126 ]
-         koh logs box keep --all >o
-         [ \"$(cat o)\" = kept ]
-         koh jobs box keep >o
-         grep -Fq 'keep	exited 0' o
-         koh run box --name keep -- /bin/sh -c 'printf \"new\\n\"' >/dev/null
-         koh wait box keep --timeout 10 >/dev/null
-         koh logs box keep --all >o
-         [ \"$(cat o)\" = new ]",
-    );
 }

@@ -27,10 +27,6 @@ pub const MAX_FILES: usize = 100_000;
 const MAX_DEPTH: usize = 128;
 const CHUNK_SIZE: usize = 64 << 10;
 
-/// Why `--delete` of anything but one directory is refused.
-pub const ONE_DIRECTORY: &str = "--delete is for copying one directory: the source is no \
-     directory, and with it other entries of the destination could be deleted";
-
 /// Simple glob matcher supporting `*`, `?`, and `**` against relative paths and basenames.
 pub fn matches_exclude(rel: &str, patterns: &[String]) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
@@ -347,15 +343,11 @@ pub async fn send_tree(
     root: &Path,
     excludes: &[String],
     preserve_root: bool,
-    delete: bool,
     send: &mut SendStream,
     recv: &mut RecvStream,
 ) -> Result<SyncSummary> {
     let meta = fs::metadata(root)
         .map_err(|e| KohError::failed(format!("stat {}: {e}", root.display())))?;
-    if delete && !meta.is_dir() {
-        return Err(KohError::usage(ONE_DIRECTORY));
-    }
     let (manifest, prefix) = long(|| manifest(root, &meta, excludes, preserve_root))?;
     let files: BTreeMap<String, SyncEntry> = manifest
         .iter()

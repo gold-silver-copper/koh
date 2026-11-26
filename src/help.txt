@@ -32,7 +32,6 @@ Headless persistent jobs (raw append-only logs; outlive koh and network drops):
 Delta file sync (blake3 hashes, atomic replace):
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SRC... SERVER:DST
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SERVER:SRC... DST
-            (--delete is for one directory: with a file it is refused)
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
 `koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):

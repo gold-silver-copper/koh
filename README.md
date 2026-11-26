@@ -24,8 +24,8 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
-  - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete` of one
-    directory, `--exclude`, `-p`, `--dry-run`).
+  - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete`, `--exclude`,
+    `-p`, `--dry-run`).
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`

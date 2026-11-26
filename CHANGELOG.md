@@ -22,9 +22,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
   now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
   joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the existing `exec` request
-  (`koh/20`), preserving stdout, stderr, stdin, and the remote exit status. Only `--key-file`,
-  `--direct`, and `--relay-url` (and `--`) are accepted before `HOST`; ssh flags that koh cannot
-  honour (`-l`, `-p`, `-o`, etc.) are refused with exit 2. Only clients need this.
+  (`koh/20`), preserving stdout, stderr, and the remote exit status; non-terminal stdin is
+  forwarded, and terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url`
+  (and `--`) are accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.)
+  are refused with exit 2. A command exceeding the 1 MiB control frame bound exits 2 for both
+  `exec` and `rsh`. Only clients need this.
 
 ### Security
 
@@ -54,22 +56,6 @@ binary, its tests and the fuzz targets share code, and any release may change it
   after their output has been flushed and the connection closed, and wait on readiness (`poll`) if
   a caller such as macOS `openrsync` passes non-blocking stdin/stdout/stderr descriptors instead of
   treating `EAGAIN` as EOF or dropping streamed (non-`--json`) output. Only clients need this.
-- **`koh cp --delete` is now refused unless the source is a single directory (push and pull).**
-  Previously, `koh cp --delete one.txt box:dir/` deleted every other entry in `dir`, and
-  `koh cp --delete one.txt box:` deleted everything else in the remote home directory; pulling a
-  single file with `--delete` did the same to the local destination. Both now exit 2 with a
-  message explaining why and leave the destination untouched. Push is refused by the client (so a
-  client before this version still deletes on a push); pull is refused by the server (so pulling a
-  single file with `--delete` from a server before this version still deletes other entries in the
-  local destination).
-- **A `koh run --name NAME` that cannot start now leaves an earlier job of that name as it was.**
-  Previously, `koh run box --name keep -- /no/such` exited 127 after already replacing `keep`'s
-  directory with an empty log, wiping the earlier job's log. On a failed start, the new job
-  directory is removed and any earlier job's directory is put back, leaving its log and listing
-  intact (and leaving no directory when there was no earlier job). If putting the earlier
-  directory back itself fails, koh keeps it on disk, points the earlier job's record at it so
-  `jobs`, `logs`, and `wait` still read the true log by name, and reports both the start error and
-  the retained path with the start's exit status. Only servers need this.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started

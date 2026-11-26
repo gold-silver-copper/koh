@@ -109,7 +109,7 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     the corner instead). A program that draws with the Kitty graphics protocol alone
     (`kitten icat`) shows nothing in a session.
   - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
-    --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
+    --session NAME [--timeout SECS]` are answered on the server from a
     session's files. They read what a script there could. What is
     of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
     marks and the text) is read between two looks at the same even `generation`; what is of
@@ -118,7 +118,8 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     - `sessions` lists each folder that has a `status`, the oldest first: its name, whether a
       client is attached, what `state` says became of its program (`running` only while the
       holder lives; `ended` where none does and nothing says how), whether a command runs,
-      the last command's exit code, the size and the title.
+      the last command's exit code, the size and the title: a line a session, the fields
+      separated by tabs, as `koh help` says.
     - `output` is the screen the session shows. With `--last` it is what the last command
       that has ended printed: the text from where its output began to where it ended, out of
       `history.1`, `history` and the main screen, each line whole however the screen wrapped
@@ -240,7 +241,7 @@ koh adds nothing to stop these. What happens instead is said.
   came and went unread)`, more marks came between two of its looks than a pane keeps (a
   thousand: some 250 commands inside a tenth of a second, a script's doing). The first
   command that ended is then no longer listed: what it gives is the oldest that is, its code
-  and its output, and it says so on that line (`detail`, with `--json`).
+  and its output, and it says so on the line it prints on stderr.
 - End the sessions that a koh built on a `fux` before 0.43.2 started, if you `koh wait` on
   them: such a session's holder does not number its marks (its folder has no
   `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh

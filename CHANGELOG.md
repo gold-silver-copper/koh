@@ -44,7 +44,7 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
     leader exits may appear in `out` later (`koh logs --all`) and not in a `logs -f` that already
     ended.
   - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
-    lives (signals outside `1..31` exit 2); without `--json`, `koh kill` prints
+    lives (signals outside `1..31` exit 2); `koh kill` prints
     `koh: job NAME is not running (STATE)` on stderr when the job was not running (exit 0
     unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` and
     `koh wait` report `ended` with exit 1.
@@ -72,9 +72,16 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   id printed by `koh serve` or `koh id`.
 - **`koh wait --text SUBSTR`**: wait for the job to exit (`koh wait`), or follow its log with
   `koh logs -f`.
-- **`--json` on `koh exec` and `koh logs`**: these commands stream raw bytes directly; read their
-  stdout, stderr, and exit status instead. `--json` remains on `run`, `jobs`, `kill`, `wait`,
-  `sessions`, `output`, and for errors (not on `exec`, `rsh`, `logs`).
+- **`--json`, on every command and for errors** (and the `serde_json` dependency): it is an
+  unexpected argument (exit 2). An error is one line on stderr and the exit code. `koh jobs` and
+  `koh sessions` print a line a job or session, the fields separated by one tab, the last (the
+  command; the title) the rest of the line; `koh help` says the fields, and they are kept. Instead
+  of `koh jobs SERVER --json`, write
+  `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'`; `koh run` prints the
+  job's name, `koh wait` the tail on stdout and how it ended on stderr (`· exited 3`, `· timed
+  out`) with that status as its exit code, and `koh output` the text. A session's folder (JSON's
+  `pane_dir`) is the `sessions dir:` that `koh serve` prints, then the session's name; a job's
+  pid is not shown (`koh kill` goes by name).
 - **Scoped keys (`koh clients add NAME ID --cp DIR | --exec DIR`)**: an allowed key is the
   server's user; to separate trust, run `koh serve` under another user account or on another
   machine. Every `clients` line must be `NAME ID`: any line with an extra field (including older

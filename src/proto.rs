@@ -26,10 +26,8 @@ pub struct KeyProof {
 }
 
 /// Application-level QUIC close codes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum CloseCode {
-    Done = 0,
     Refused = 1,
     Busy = 2,
     Protocol = 3,
@@ -257,7 +255,6 @@ fn kind_of(kind: &str) -> &'static str {
         "refused" => "refused",
         "usage" => "usage",
         "unreachable" => "unreachable",
-        "timeout" => "timeout",
         "busy" => "busy",
         "not_found" => "not_found",
         "cannot_start" => "cannot_start",

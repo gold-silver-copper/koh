@@ -1,4 +1,4 @@
-//! Client operations for koh: exec, headless jobs, delta cp/--sync, and sessions. A session
+//! Client operations for koh: exec, headless jobs, and sessions. A session
 //! is shown by a viewer that runs on the server: `koh connect` writes what that draws to its
 //! terminal and sends what is typed there, and keeps nothing of the session here.
 
@@ -8,7 +8,7 @@ use std::hash::{BuildHasher as _, RandomState};
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::os::fd::AsFd as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream};
@@ -24,10 +24,10 @@ use crate::net::{
 };
 use crate::proto::{
     Attach, Attached, ExecClientMsg, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL,
-    MAX_FRAME, Reply, Request, SessionInfo, SyncSummary, VIEW_FRAME, ViewInput, ViewOutput,
-    ViewSize, WaitResult, decode, recv_msg, recv_msg_opt, recv_pieces, send_msg, session_name,
+    MAX_FRAME, Reply, Request, SessionInfo, VIEW_FRAME, ViewInput, ViewOutput, ViewSize,
+    WaitResult, decode, encode, recv_msg, recv_msg_opt, recv_pieces, send_frame, send_msg,
+    session_name,
 };
-use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
 
 #[derive(Clone, Debug, Default)]
@@ -167,8 +167,9 @@ impl Client {
     }
 
     pub async fn request(&self, req: &Request) -> Result<(SendStream, RecvStream)> {
+        let bytes = encode(req, MAX_CTRL).map_err(|e| KohError::usage(e.message))?;
         let (mut send, mut recv) = open_authed_stream(&self.conn, &self.secret).await?;
-        send_msg(&mut send, req, MAX_CTRL)
+        send_frame(&mut send, &bytes)
             .await
             .map_err(|e| close_error(&self.conn).unwrap_or(e))?;
         let reply: Reply = recv_msg(&mut recv, MAX_CTRL)
@@ -184,28 +185,11 @@ impl Client {
     }
 
     /// Raw non-PTY exec with separate stdout/stderr, stdin EOF, and exit code passthrough.
-    pub async fn exec(
-        &self,
-        argv: Vec<String>,
-        cwd: Option<String>,
-        shell: bool,
-        stdin_bytes: Option<Vec<u8>>,
-        capture_json: bool,
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
+    pub async fn exec(&self, argv: Vec<String>, cwd: Option<String>, shell: bool) -> Result<i32> {
         let (mut send, mut recv) = self.request(&Request::Exec { argv, cwd, shell }).await?;
 
         let stdin_task = tokio::spawn(async move {
-            if let Some(data) = stdin_bytes {
-                for chunk in data.chunks(32 << 10) {
-                    if send_msg(&mut send, &ExecClientMsg::Stdin(chunk.to_vec()), MAX_CHUNK)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
-            } else if !std::io::stdin().is_terminal() {
+            if !std::io::stdin().is_terminal() {
                 let mut buf = vec![0u8; 32 << 10];
                 loop {
                     let read = tokio::task::spawn_blocking(move || {
@@ -232,31 +216,19 @@ impl Client {
                         }
                     }
                 }
-                let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
-            } else {
-                let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
             }
+            let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
             let _ = send.finish();
         });
 
-        let mut cap_out = Vec::new();
-        let mut cap_err = Vec::new();
         let mut exit_code = 0i32;
         while let Some(msg) = recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK).await? {
             match msg {
                 ExecServerMsg::Stdout(bytes) => {
-                    if capture_json {
-                        cap_out.extend_from_slice(&bytes);
-                    } else {
-                        write_wait(std::io::stdout().lock(), &bytes);
-                    }
+                    write_wait(std::io::stdout().lock(), &bytes);
                 }
                 ExecServerMsg::Stderr(bytes) => {
-                    if capture_json {
-                        cap_err.extend_from_slice(&bytes);
-                    } else {
-                        write_wait(std::io::stderr().lock(), &bytes);
-                    }
+                    write_wait(std::io::stderr().lock(), &bytes);
                 }
                 ExecServerMsg::Exit(code) => {
                     exit_code = code;
@@ -265,7 +237,7 @@ impl Client {
             }
         }
         stdin_task.abort();
-        Ok((exit_code, cap_out, cap_err))
+        Ok(exit_code)
     }
 
     pub async fn run_job(
@@ -343,14 +315,12 @@ impl Client {
     pub async fn wait_job(
         &self,
         name: String,
-        text: Option<String>,
         tail: usize,
         timeout_secs: Option<u64>,
     ) -> Result<WaitResult> {
         let (_, mut recv) = self
             .request(&Request::WaitJob {
                 name,
-                text,
                 tail,
                 timeout_secs,
             })
@@ -384,128 +354,6 @@ impl Client {
         let mut waited: WaitResult = recv_msg(&mut recv, MAX_CTRL).await?;
         waited.tail = text(&mut recv).await?;
         Ok(waited)
-    }
-
-    pub async fn cp_push(
-        &self,
-        local_src: &Path,
-        remote_dst: String,
-        excludes: Vec<String>,
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-    ) -> Result<SyncSummary> {
-        self.cp_push_many(
-            &[local_src.to_path_buf()],
-            &remote_dst,
-            &excludes,
-            delete,
-            preserve_mtime,
-            dry_run,
-        )
-        .await
-    }
-
-    pub async fn cp_push_many(
-        &self,
-        local_srcs: &[PathBuf],
-        remote_dst: &str,
-        excludes: &[String],
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-    ) -> Result<SyncSummary> {
-        if local_srcs.is_empty() {
-            return Err(KohError::usage("cp requires at least one source"));
-        }
-        if local_srcs.len() > 1 && delete {
-            return Err(KohError::usage("--delete requires a single source"));
-        }
-        let preserve_root = local_srcs.len() > 1;
-        let mut total = SyncSummary {
-            dry_run,
-            ..SyncSummary::default()
-        };
-        for src in local_srcs {
-            let (mut send, mut recv) = self
-                .request(&Request::CpPush {
-                    dst: remote_dst.to_string(),
-                    excludes: excludes.to_vec(),
-                    delete,
-                    preserve_mtime,
-                    dry_run,
-                })
-                .await?;
-            let part = send_tree(src, excludes, preserve_root, &mut send, &mut recv).await?;
-            total.merge(part);
-        }
-        Ok(total)
-    }
-
-    pub async fn cp_pull(
-        &self,
-        remote_src: String,
-        local_dst: &Path,
-        excludes: Vec<String>,
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-    ) -> Result<SyncSummary> {
-        self.cp_pull_many(
-            &[remote_src],
-            local_dst,
-            &excludes,
-            delete,
-            preserve_mtime,
-            dry_run,
-        )
-        .await
-    }
-
-    pub async fn cp_pull_many(
-        &self,
-        remote_srcs: &[String],
-        local_dst: &Path,
-        excludes: &[String],
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-    ) -> Result<SyncSummary> {
-        if remote_srcs.is_empty() {
-            return Err(KohError::usage("cp requires at least one source"));
-        }
-        if remote_srcs.len() > 1 && delete {
-            return Err(KohError::usage("--delete requires a single source"));
-        }
-        let preserve_root = remote_srcs.len() > 1;
-        let mut total = SyncSummary {
-            dry_run,
-            ..SyncSummary::default()
-        };
-        for src in remote_srcs {
-            let (mut send, mut recv) = self
-                .request(&Request::CpPull {
-                    src: src.clone(),
-                    excludes: excludes.to_vec(),
-                    delete,
-                    preserve_mtime,
-                    dry_run,
-                    preserve_root,
-                })
-                .await?;
-            let part = receive_tree(
-                local_dst,
-                excludes,
-                delete,
-                preserve_mtime,
-                dry_run,
-                &mut send,
-                &mut recv,
-            )
-            .await?;
-            total.merge(part);
-        }
-        Ok(total)
     }
 
     /// One attach: the request and the server's answer to it. What goes wrong is said with
@@ -1231,40 +1079,6 @@ fn reconnect_delay(attempt: u32) -> Duration {
     }
 }
 
-/// Helper for `--sync DIR` before `exec` or `run`.
-pub async fn sync_before_command(
-    client: &Client,
-    local_dir: &Path,
-    cwd: Option<&str>,
-    excludes: Vec<String>,
-    quiet: bool,
-) -> Result<(String, SyncSummary)> {
-    let remote_dir = match cwd {
-        Some(c) => c.to_string(),
-        None => local_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty() && *n != ".")
-            .map(String::from)
-            .ok_or_else(|| KohError::usage("--sync . requires -C REMOTE_DIR"))?,
-    };
-    let summary = client
-        .cp_push(local_dir, remote_dir.clone(), excludes, false, false, false)
-        .await?;
-    if !quiet {
-        let changed = summary.added.len() + summary.updated.len();
-        let _ = writeln!(
-            std::io::stderr(),
-            "synced {} -> {} ({changed} changed, {} unchanged, {} bytes)",
-            local_dir.display(),
-            remote_dir,
-            summary.unchanged,
-            summary.bytes_transferred
-        );
-    }
-    Ok((remote_dir, summary))
-}
-
 /// Parses a signal name or number for `koh kill --signal`.
 pub fn parse_signal(s: &str) -> Result<i32> {
     if let Ok(n) = s.parse::<i32>() {
@@ -1278,11 +1092,6 @@ pub fn parse_signal(s: &str) -> Result<i32> {
         "TERM" => Ok(15),
         _ => Err(KohError::usage(format!("unknown signal {s:?}"))),
     }
-}
-
-/// Wait duration helper used by tests & CLI.
-pub fn timeout_duration(secs: Option<u64>) -> Option<Duration> {
-    secs.map(Duration::from_secs)
 }
 
 #[cfg(test)]

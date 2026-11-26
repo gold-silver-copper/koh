@@ -14,7 +14,7 @@ use crate::keys::Route;
 use crate::proto::{ALPN, CloseCode, KeyProof, MAX_PROOF, recv_msg, send_msg};
 use crate::{KohError, Result};
 
-const PROOF_LABEL: &[u8] = b"koh/20 client proof";
+const PROOF_LABEL: &[u8] = b"koh/21 client proof";
 
 /// What koh asks of QUIC on every endpoint it binds but a session's client's: a connection that
 /// waits long (`waiting`: a server's, a `wait`'s) may be silent for 30 s, any other for 15.
@@ -199,9 +199,11 @@ pub fn close_error(conn: &Connection) -> Option<KohError> {
     else {
         return None;
     };
-    match CloseCode::from_u64(close.error_code.into_inner()) {
-        Some(CloseCode::Refused) => Some(KohError::refused("server refused this client key")),
-        Some(CloseCode::Busy) => Some(busy()),
+    match close.error_code.into_inner() {
+        c if c == CloseCode::Refused as u64 => {
+            Some(KohError::refused("server refused this client key"))
+        }
+        c if c == CloseCode::Busy as u64 => Some(busy()),
         _ => None,
     }
 }

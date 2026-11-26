@@ -3,16 +3,15 @@
 
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use koh::client::{Client, ConnectOptions, DialOptions, parse_signal, sync_before_command};
+use koh::client::{Client, ConnectOptions, DialOptions, parse_signal};
 use koh::keys::{
     ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
-    parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
-    validate_peer_name,
+    parse_endpoint_id, parse_relay_url, reset_key, save_clients, save_servers, validate_peer_name,
 };
-use koh::proto::{MAX_CTRL, Request, SessionInfo, encode};
+use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
@@ -43,8 +42,13 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let json = words.peek().is_none_or(|w| w != "rsh")
-        && std::env::args_os().skip(1).any(|a| a == "--json");
+    let json = words
+        .peek()
+        .is_none_or(|w| !matches!(w.to_str(), Some("rsh" | "exec" | "logs")))
+        && std::env::args_os()
+            .skip(1)
+            .take_while(|a| a != "--")
+            .any(|a| a == "--json");
     let Ok(args) = words
         .map(std::ffi::OsString::into_string)
         .collect::<std::result::Result<Vec<String>, _>>()
@@ -124,7 +128,6 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "logs" => cmd_logs(rest).await,
         "kill" => cmd_kill(rest).await,
         "wait" => cmd_wait(rest).await,
-        "cp" => cmd_cp(rest).await,
         "sessions" | "output" => cmd_sessions(rest, cmd == "output").await,
         "connect" => cmd_session(rest).await,
         other => Err(KohError::usage(format!(
@@ -144,23 +147,18 @@ fn parse_role(s: &str) -> Result<Role> {
 }
 
 fn cmd_id(args: &[String]) -> Result<Exit> {
-    let (mut role, mut key_file, mut qr) = (Role::Client, None::<PathBuf>, false);
+    let (mut role, mut key_file) = (Role::Client, None::<PathBuf>);
     let mut i = 0;
     while let Some(a) = args.get(i).map(String::as_str) {
         match a {
             "--key-file" => key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
-            "--qr" => qr = true,
             "client" | "server" => role = parse_role(a)?,
             _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
         }
         i += 1;
     }
     let key = load_or_create_key(role, key_file.as_deref())?;
-    let id = key.public();
-    let _ = writeln!(std::io::stdout(), "{id}");
-    if qr {
-        let _ = writeln!(std::io::stderr(), "{}", render_qr(&id));
-    }
+    let _ = writeln!(std::io::stdout(), "{}", key.public());
     Ok(Exit::OK)
 }
 
@@ -442,13 +440,7 @@ fn parse_common_dial(args: &[String], i: &mut usize, opts: &mut DialOptions) -> 
 
 async fn cmd_exec(args: &[String]) -> Result<Exit> {
     let mut opts = DialOptions::default();
-    let (mut server, mut cwd, mut sync_dir, mut sh_line) = (
-        None::<String>,
-        None::<String>,
-        None::<PathBuf>,
-        None::<String>,
-    );
-    let mut excludes = Vec::new();
+    let (mut server, mut cwd, mut sh_line) = (None::<String>, None::<String>, None::<String>);
     let mut argv = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -457,23 +449,20 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
             argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
             break;
         }
-        if parse_common_dial(args, &mut i, &mut opts)? {
+        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
         match a {
             "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
-            "--sync" => sync_dir = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
-            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
             "--sh" => sh_line = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
             _ => return Err(KohError::usage(format!("unexpected exec argument {a:?}"))),
         }
         i += 1;
     }
-    let server = server.ok_or_else(|| {
-        KohError::usage("usage: koh exec SERVER [-C DIR] [--sync DIR] -- PROG ARG...")
-    })?;
+    let server =
+        server.ok_or_else(|| KohError::usage("usage: koh exec SERVER [-C DIR] -- PROG ARG..."))?;
     let (argv, shell) = match sh_line {
         Some(line) => (vec![line], true),
         None if !argv.is_empty() => (argv, false),
@@ -484,51 +473,20 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
         }
     };
 
-    run_exec(&server, &opts, argv, cwd, shell, sync_dir, excludes).await
+    run_exec(&server, &opts, argv, cwd, shell).await
 }
 
 async fn run_exec(
     server: &str,
     opts: &DialOptions,
     argv: Vec<String>,
-    mut cwd: Option<String>,
+    cwd: Option<String>,
     shell: bool,
-    sync_dir: Option<PathBuf>,
-    excludes: Vec<String>,
 ) -> Result<Exit> {
-    let req = Request::Exec {
-        argv: argv.clone(),
-        cwd: cwd.clone(),
-        shell,
-    };
-    if encode(&req, MAX_CTRL).is_err() {
-        return Err(KohError::usage(format!(
-            "command exceeds maximum size ({MAX_CTRL} bytes)"
-        )));
-    }
     let client = Client::connect(server, opts, false).await?;
-    let done = async {
-        if let Some(dir) = sync_dir {
-            let (remote_dir, _) =
-                sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
-            cwd = Some(remote_dir);
-        }
-        client.exec(argv, cwd, shell, None, opts.json).await
-    }
-    .await;
+    let done = client.exec(argv, cwd, shell).await;
     client.close().await;
-    let (code, out, err) = done?;
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::json!({
-                "exit": code,
-                "stdout": String::from_utf8_lossy(&out),
-                "stderr": String::from_utf8_lossy(&err),
-            })
-        );
-    }
+    let code = done?;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
 }
 
@@ -559,24 +517,17 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    run_exec(host, &opts, vec![words.join(" ")], None, true, None, vec![]).await
+    run_exec(host, &opts, vec![words.join(" ")], None, true).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut server, mut name, mut cwd, mut sync_dir, mut sh_line) = (
+    let mut opts = DialOptions::default();
+    let (mut server, mut name, mut cwd, mut sh_line) = (
         None::<String>,
         None::<String>,
         None::<String>,
-        None::<PathBuf>,
         None::<String>,
     );
-    let mut excludes = Vec::new();
     let mut argv = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -592,8 +543,6 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
         match a {
             "--name" => name = Some(take_opt(args, &mut i, a)?),
             "-C" | "--cwd" => cwd = Some(take_opt(args, &mut i, a)?),
-            "--sync" => sync_dir = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
-            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
             "--sh" => sh_line = Some(take_opt(args, &mut i, a)?),
             _ if server.is_none() && !a.starts_with('-') => server = Some(a.to_string()),
             _ => return Err(KohError::usage(format!("unexpected run argument {a:?}"))),
@@ -608,15 +557,7 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
         None => return Err(KohError::usage("missing command")),
     };
     let client = Client::connect(&server, &opts, false).await?;
-    let done = async {
-        if let Some(dir) = sync_dir {
-            let (remote_dir, _) =
-                sync_before_command(&client, &dir, cwd.as_deref(), excludes, opts.json).await?;
-            cwd = Some(remote_dir);
-        }
-        client.run_job(name, argv, cwd, shell).await
-    }
-    .await;
+    let done = client.run_job(name, argv, cwd, shell).await;
     client.close().await;
     let info = done?;
     if opts.json {
@@ -632,12 +573,7 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_jobs(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut name) = (None::<String>, None::<String>);
     let mut i = 0;
     while i < args.len() {
@@ -682,21 +618,16 @@ async fn cmd_jobs(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_logs(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut name, mut tail, mut all, mut follow) =
         (None::<String>, None::<String>, None::<usize>, false, false);
     let mut i = 0;
     while i < args.len() {
-        if parse_common_dial(args, &mut i, &mut opts)? {
+        let a = args.get(i).map(String::as_str).unwrap_or_default();
+        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
             "--tail" => {
                 tail = Some(
@@ -734,12 +665,7 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_kill(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut name, mut sig) = (None::<String>, None::<String>, 15i32);
     let mut i = 0;
     while i < args.len() {
@@ -774,14 +700,8 @@ async fn cmd_kill(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_wait(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut server, mut job, mut text, mut session, mut tail, mut timeout) = (
-        None::<String>,
+    let mut opts = DialOptions::default();
+    let (mut server, mut job, mut session, mut tail, mut timeout) = (
         None::<String>,
         None::<String>,
         None::<String>,
@@ -796,7 +716,6 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         }
         let a = args.get(i).map(String::as_str).unwrap_or_default();
         match a {
-            "--text" => text = Some(take_opt(args, &mut i, a)?),
             "--session" => session = Some(take_opt(args, &mut i, a)?),
             "--tail" => {
                 let lines = take_opt(args, &mut i, a)?.parse();
@@ -820,8 +739,8 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
     if session.is_none() && job.is_none() {
         return Err(KohError::usage(usage));
     }
-    if session.is_some() && (job.is_some() || text.is_some() || tail.is_some()) {
-        let both = "a wait is for a job or for a session: JOB, --text and --tail are a job's";
+    if session.is_some() && (job.is_some() || tail.is_some()) {
+        let both = "a wait is for a job or for a session: JOB and --tail are a job's";
         return Err(KohError::usage(format!(
             "{both}, and are not said with --session"
         )));
@@ -829,11 +748,7 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
     let client = Client::connect(&server, &opts, true).await?;
     let res = match (session, job) {
         (Some(session), _) => client.wait_session(session, timeout).await,
-        (None, Some(name)) => {
-            client
-                .wait_job(name, text, tail.unwrap_or(200), timeout)
-                .await
-        }
+        (None, Some(name)) => client.wait_job(name, tail.unwrap_or(200), timeout).await,
         (None, None) => Err(KohError::usage(usage)),
     };
     client.close().await;
@@ -852,138 +767,6 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
         let _ = writeln!(std::io::stderr(), "· {}", res.detail);
     }
     Ok(Exit(u8::try_from(res.exit).unwrap_or(1)))
-}
-
-async fn cmd_cp(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
-    let (mut delete, mut preserve, mut dry_run) = (false, false, false);
-    let mut excludes = Vec::new();
-    let mut pos = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args.get(i).map(String::as_str).unwrap_or_default();
-        if a == "--" {
-            pos.extend_from_slice(args.get(i + 1..).unwrap_or_default());
-            break;
-        }
-        if parse_common_dial(args, &mut i, &mut opts)? {
-            i += 1;
-            continue;
-        }
-        match a {
-            "-r" | "-R" | "--recursive" => {}
-            "--delete" => delete = true,
-            "-p" | "--preserve" => preserve = true,
-            "--dry-run" | "-n" => dry_run = true,
-            "--exclude" => excludes.push(take_opt(args, &mut i, a)?),
-            _ if !a.starts_with('-') => pos.push(a.to_string()),
-            _ => return Err(KohError::usage(format!("unexpected cp flag {a:?}"))),
-        }
-        i += 1;
-    }
-    if pos.len() < 2 {
-        return Err(KohError::usage(
-            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
-        ));
-    }
-    let Some((dst, srcs)) = pos.split_last() else {
-        return Err(KohError::usage(
-            "usage: koh cp [-r] [--delete] [--exclude PAT] [-p] [--dry-run] SRC... DST",
-        ));
-    };
-    if delete && srcs.len() > 1 {
-        return Err(KohError::usage("--delete requires a single source"));
-    }
-    let summary = if let Some((server, rpath)) = split_remote(dst) {
-        if srcs.iter().any(|s| split_remote(s).is_some()) {
-            return Err(KohError::usage(
-                "cannot mix remote sources with a remote destination",
-            ));
-        }
-        let client = Client::connect(server, &opts, false).await?;
-        let rdst = if rpath.is_empty() {
-            ".".to_string()
-        } else {
-            rpath.to_string()
-        };
-        let local_srcs: Vec<PathBuf> = srcs.iter().map(PathBuf::from).collect();
-        let s = client
-            .cp_push_many(&local_srcs, &rdst, &excludes, delete, preserve, dry_run)
-            .await;
-        client.close().await;
-        s?
-    } else {
-        let mut server_name: Option<&str> = None;
-        let mut remote_srcs = Vec::with_capacity(srcs.len());
-        for src in srcs {
-            let Some((srv, rpath)) = split_remote(src) else {
-                return Err(KohError::usage(
-                    "all sources must be SERVER:PATH when destination is local",
-                ));
-            };
-            match server_name {
-                None => server_name = Some(srv),
-                Some(prev) if prev != srv => {
-                    return Err(KohError::usage(
-                        "all remote sources in one `koh cp` must use the same server",
-                    ));
-                }
-                Some(_) => {}
-            }
-            remote_srcs.push(if rpath.is_empty() {
-                ".".to_string()
-            } else {
-                rpath.to_string()
-            });
-        }
-        let server =
-            server_name.ok_or_else(|| KohError::usage("one of SRC or DST must be SERVER:PATH"))?;
-        let client = Client::connect(server, &opts, false).await?;
-        let s = client
-            .cp_pull_many(
-                &remote_srcs,
-                Path::new(dst),
-                &excludes,
-                delete,
-                preserve,
-                dry_run,
-            )
-            .await;
-        client.close().await;
-        s?
-    };
-
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::to_string(&summary).unwrap_or_default()
-        );
-    } else {
-        for p in &summary.added {
-            let _ = writeln!(std::io::stdout(), "+ {p}");
-        }
-        for p in &summary.updated {
-            let _ = writeln!(std::io::stdout(), "~ {p}");
-        }
-        for p in &summary.deleted {
-            let _ = writeln!(std::io::stdout(), "- {p}");
-        }
-    }
-    Ok(Exit::OK)
-}
-
-fn split_remote(s: &str) -> Option<(&str, &str)> {
-    let (host, path) = s.split_once(':')?;
-    if host.is_empty() || host.contains('/') {
-        return None;
-    }
-    Some((host, path))
 }
 
 /// `koh sessions SERVER`, and as `output` `koh output SERVER --session NAME [--last]`: what a
@@ -1046,12 +829,7 @@ fn listed(s: &SessionInfo) -> String {
 
 /// `koh connect`.
 async fn cmd_session(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let mut server = None::<String>;
     let mut asks = ConnectOptions::default();
     let mut i = 0;

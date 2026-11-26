@@ -8,8 +8,8 @@
 mod entry;
 
 use koh::proto::{
-    Attach, Attached, ExecClientMsg, ExecServerMsg, Failure, JobInfo, KeyProof, LogMsg, Reply,
-    Request, SyncEntry, SyncMsg, SyncSummary, ViewInput, ViewOutput, ViewSize, WaitResult,
+    Attach, Attached, ExecClientMsg, ExecServerMsg, JobInfo, KeyProof, LogMsg, Reply, Request,
+    ViewInput, ViewOutput, ViewSize, WaitResult,
 };
 
 /// xorshift64*: the same numbers on every run.
@@ -32,17 +32,9 @@ fn bytes<T: serde::Serialize>(value: &T) -> Vec<u8> {
     postcard::to_allocvec(value).unwrap()
 }
 
-/// One valid encoding of every message a peer sends, and paths as a copy's peer names them.
+/// One valid encoding of every message a peer sends.
 fn seeds() -> Vec<Vec<u8>> {
     let text = |s: &str| s.to_string();
-    let entry = SyncEntry {
-        path: text("dir/file.txt"),
-        size: 5,
-        mtime_secs: 1_700_000_000,
-        mode: 0o644,
-        hash: [7; 32],
-        is_dir: false,
-    };
     let job = JobInfo {
         name: text("build"),
         pid: 4242,
@@ -81,24 +73,8 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         bytes(&Request::WaitJob {
             name: text("build"),
-            text: Some(text("READY")),
             tail: 50,
             timeout_secs: Some(5),
-        }),
-        bytes(&Request::CpPush {
-            dst: text("proj"),
-            excludes: vec![text("target"), text("*.o")],
-            delete: true,
-            preserve_mtime: true,
-            dry_run: false,
-        }),
-        bytes(&Request::CpPull {
-            src: text("proj/src"),
-            excludes: vec![text("**/tmp")],
-            delete: false,
-            preserve_mtime: false,
-            dry_run: true,
-            preserve_root: true,
         }),
         bytes(&Request::Attach(Attach {
             name: Some(text("3")),
@@ -123,29 +99,6 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         bytes(&ExecClientMsg::Stdin(b"in".to_vec())),
         bytes(&ExecClientMsg::Eof),
-        bytes(&SyncMsg::Manifest(vec![entry.clone(), entry])),
-        bytes(&SyncMsg::Need(vec![text("dir/file.txt")])),
-        bytes(&SyncMsg::FileStart {
-            path: text("dir/file.txt"),
-            size: 5,
-            mtime_secs: -1,
-            mode: 0o755,
-        }),
-        bytes(&SyncMsg::FileChunk(b"hello".to_vec())),
-        bytes(&SyncMsg::FileEnd),
-        bytes(&SyncMsg::Summary(SyncSummary {
-            added: vec![text("a")],
-            updated: vec![text("b")],
-            deleted: vec![text("c")],
-            unchanged: 4,
-            bytes_transferred: 5,
-            dry_run: false,
-        })),
-        bytes(&SyncMsg::Failed(Failure {
-            code: 4,
-            kind: text("refused"),
-            message: text("dir: \"link\" is a symlink"),
-        })),
         bytes(&Reply::Ok),
         bytes(&Reply::Err {
             code: 75,
@@ -170,9 +123,6 @@ fn seeds() -> Vec<Vec<u8>> {
         }),
         bytes(&ViewInput::Bytes(b"ls\r".to_vec())),
         bytes(&ViewOutput::Bytes(b"\x1b[2J".to_vec())),
-        b"dir/sub/file.txt\ntarget\n*.o\nsub/**/x?".to_vec(),
-        b"../etc/passwd\n**\n".to_vec(),
-        b"a//b/./c\0d\n*a*b*c*d*\n?".to_vec(),
     ]
 }
 
@@ -227,7 +177,6 @@ fn no_mutated_message_panics_a_decoder() {
     let run = |data: &[u8]| {
         entry::to_server(data);
         entry::to_client(data);
-        entry::paths(data);
     };
     for seed in &seeds {
         run(seed);

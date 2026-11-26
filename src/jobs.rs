@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::Read as _;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -356,57 +356,24 @@ pub fn read_log_tail(path: &Path, tail_lines: Option<usize>) -> Result<Vec<u8>> 
     Ok(data.get(start..).unwrap_or_default().to_vec())
 }
 
-/// Waits for a job to finish (or for `text` to appear in its raw log), up to `timeout_secs`:
-/// more of them than the clock has is no limit (`after`).
+/// Waits for a job to finish, up to `timeout_secs`: more of them than the clock has is no limit
+/// (`after`).
 pub async fn wait_job(
     log_path: PathBuf,
     mut state_rx: watch::Receiver<(String, Option<i32>)>,
-    text: Option<String>,
     tail: usize,
     timeout_secs: Option<u64>,
 ) -> Result<WaitResult> {
     let deadline = timeout_secs.map(|s| after(Timer::now(), Duration::from_secs(s)));
-    let mut scan_offset = 0u64;
 
     loop {
-        if let Some(needle) = text.as_deref()
-            && let Ok(mut f) = fuxix::open_regular(&log_path)
-            && f.seek(SeekFrom::Start(scan_offset)).is_ok()
-        {
-            let mut chunk = Vec::new();
-            if f.read_to_end(&mut chunk).is_ok() {
-                if String::from_utf8_lossy(&chunk).contains(needle) {
-                    let tail_bytes = read_log_tail(&log_path, Some(tail)).unwrap_or_default();
-                    return Ok(WaitResult {
-                        timed_out: false,
-                        exit: 0,
-                        tail: String::from_utf8_lossy(&tail_bytes).into_owned(),
-                        detail: "matched".into(),
-                    });
-                }
-                // Keep small overlap so matches straddling reads are never missed.
-                let overlap = needle.len().saturating_sub(1) as u64;
-                let end = scan_offset.saturating_add(chunk.len() as u64);
-                scan_offset = end.saturating_sub(overlap);
-            }
-        }
-
         let (state, exit) = state_rx.borrow().clone();
         if state != "running" {
             let tail_bytes = read_log_tail(&log_path, Some(tail)).unwrap_or_default();
-            let tail_str = String::from_utf8_lossy(&tail_bytes).into_owned();
-            if text.is_some() {
-                return Ok(WaitResult {
-                    timed_out: false,
-                    exit: 1,
-                    tail: tail_str,
-                    detail: format!("job ended ({state}) before text matched"),
-                });
-            }
             return Ok(WaitResult {
                 timed_out: false,
                 exit: exit.unwrap_or(1),
-                tail: tail_str,
+                tail: String::from_utf8_lossy(&tail_bytes).into_owned(),
                 detail: state,
             });
         }
@@ -423,11 +390,7 @@ pub async fn wait_job(
             });
         }
 
-        let sleep = if text.is_some() {
-            Duration::from_millis(25)
-        } else {
-            Duration::from_millis(200)
-        };
+        let sleep = Duration::from_millis(200);
         let wait_for = deadline.map_or(sleep, |dl| {
             dl.saturating_duration_since(Timer::now()).min(sleep)
         });

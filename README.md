@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
@@ -44,9 +44,9 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust
     `out` later (`koh logs --all`) and not in a `koh logs -f` that already ended. `koh kill`
     writes `kill N` to the pane's `ctl` FIFO and reaches a job only while its holder lives; a
     holder killed with `-9` leaves its program running, while `koh jobs` lists the job as
-    `ended` (exit 0) and `koh wait` reports `ended` with exit 1. Run one `koh serve` per state directory (two servers for the same user
-    sharing the default state directory share the jobs folder and do not coordinate starts).
-    `koh serve` no longer needs `kill(1)` or `id(1)` on its `PATH`.
+    `ended` (exit 0) and `koh wait` reports `ended` with exit 1. Run one `koh serve` per state
+    directory (two servers for the same user sharing the default state directory share the jobs
+    folder and do not coordinate starts). `koh serve` needs no `kill(1)` or `id(1)` on its `PATH`.
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`
@@ -72,10 +72,11 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust
     link what is held is not typed, and koh leaves at once). What is no key going down
     between `Ctrl-]` and the dot (a click or a move of the mouse, a key let go, where the
     session's program asked to hear of those) is not typed when koh leaves. Every other key
-    is the session's: `C-b` reaches a `tmux` or a `fux` there as it is typed. It ends with the session's program: with its status, with 128 + N if signal N
-    ended it, and with 1 if nothing says how it ended (its holder was killed, the machine was
-    restarted, its folder was moved). Left, hung up (a terminal that is closed) or told to
-    end (SIGTERM), it ends with 0 and the session runs on.
+    is the session's: `C-b` reaches a `tmux` or a `fux` there as it is typed. It ends with the
+    session's program: with its status, with 128 + N if signal N ended it, and with 1 if
+    nothing says how it ended (its holder was killed, the machine was restarted, its folder
+    was moved). Left, hung up (a terminal that is closed) or told to end (SIGTERM), it ends
+    with 0 and the session runs on.
   - **Your terminal is asked what it is like by `koh connect` itself, once**, and nothing is
     asked of it across the link, where an answer may come late and be taken for typing. Once
     it has dialled, before its first attach, koh asks which of the kitty keyboard protocol's
@@ -92,7 +93,8 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust
     keyboard); what it sends after it is what you typed, to the byte, and koh looks for no
     answer in it. **What you type between koh's question and that last answer is lost**: it
     is taken for answers. In a terminal on your machine that is a millisecond; where `koh
-    connect` runs inside another session that is slow, it is that session's round trip. A terminal that does not give that last answer is waited on for a second,
+    connect` runs inside another session that is slow, it is that session's round trip. A
+    terminal that does not give that last answer is waited on for a second,
     once for a `koh connect` and not again when a link comes back: it has no colours and the
     plain keyboard, and all it sent in that second was typed. Your terminal is taken to draw
     sixel pictures and 24-bit colours (one that does not shows nothing where the picture is).
@@ -103,7 +105,7 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust
     link that is silent is known to be lost after eight seconds. What was on its way when a
     link died may be lost. Nothing is ever typed twice. When the link is back a new viewer
     draws the whole screen as it is then: nothing of the old one is gone on from.
-  - Sixel is the one picture format, as in `fux` 0.43, and your terminal is taken to draw it:
+  - Sixel is the one picture format, as in `fux`, and your terminal is taken to draw it:
     one that does not shows nothing where the picture is. A picture is scaled by the size of
     a cell in pixels, which your terminal's window says (one that says none gets a line in
     the corner instead). A program that draws with the Kitty graphics protocol alone
@@ -135,14 +137,14 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust
       `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
-      the holder lives and the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
-      line in `marks`): a command has ended when an `end` is there with a higher number than
-      the last `end` had when the wait was asked. Where a mark is on the screen is not
-      asked, so a screen that scrolls, has a line inserted or is cleared ends nothing, and
-      nothing is inferred. koh sets up no shell: `koh help-agents` has the lines for
-      bash, and nearly the same three commands as a script over the files, for `koh exec`. In
-      a shell that marks an `end` at every prompt, an empty line entered is an `end` too: a
-      `wait` then returns the output and the code of the command before, again.
+      the holder lives and the last mark is `output`. `fux` numbers a pane's marks
+      (`marks.dropped` and a mark's line in `marks`): a command has ended when an `end` is
+      there with a higher number than the last `end` had when the wait was asked. Where a
+      mark is on the screen is not asked, so a screen that scrolls, has a line inserted or is
+      cleared ends nothing, and nothing is inferred. koh sets up no shell: `koh help-agents`
+      has the lines for bash, and nearly the same three commands as a script over the files,
+      for `koh exec`. In a shell that marks an `end` at every prompt, an empty line entered is
+      an `end` too: a `wait` then returns the output and the code of the command before, again.
 
 ### Sessions: don't, and do
 
@@ -212,10 +214,10 @@ koh adds nothing to stop these. What happens instead is said.
 - On Linux, restart `koh serve` after you replace the `koh` binary. Until then no new session
   or job starts: koh runs itself by its own path, which is gone, and says "cannot run PATH
   (deleted): No such file or directory". Sessions and jobs that run go on.
-- After the upgrade to this koh, end the sessions an older one started: a session is known
-  by its `run`, which holders write since `fux` 0.43.3, and a pane without one is no session
-  to koh (not listed, not attached to; its name cannot be started until its folder is
-  removed). A holder keeps the code it was started with.
+- End the sessions that a koh built on a `fux` before 0.43.3 started: a session is known by
+  its `run`, which holders write since then, and a pane without one is no session to koh (not
+  listed, not attached to; its name cannot be started until its folder is removed). A holder
+  keeps the code it was started with.
 - If `koh serve` was killed outright, start it again before you count what is left: a viewer
   reads the end of its terminal and leaves by itself, and the folder of one that was killed
   too (`STATE/fux/.view.PID`) is removed when `koh serve` starts.

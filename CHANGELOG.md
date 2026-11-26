@@ -15,140 +15,86 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
-The protocol is `koh/21` (up from `koh/20`): upgrade both client and server together.
+koh 0.19.0 speaks `koh/21`, which 0.18 does not: upgrade clients and servers together. It needs no
+`fux` installed: it carries `fux` 0.44.0 (`koh fux …`).
 
 ### Added
 
-- **`koh rsh HOST WORD…` lets `rsync` and `git` run directly over koh.** Commands such as
-  `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`,
-  `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
-  now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
-  joins `WORD…` with spaces, and runs them with `/bin/sh -c --` over the `exec` request (`koh/21`),
-  preserving stdout, stderr, and the remote exit status; non-terminal stdin is forwarded, and
-  terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url` (and `--`) are
-  accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.) are refused
-  with exit 2. A request exceeding the 1 MiB control frame bound is refused with exit 2 when it is
-  sent (a server that cannot be reached is exit 3 first).
+- **`koh rsh HOST WORD…`**, ssh's argument shape over `koh exec`, so `rsync`, `git` and `tar` run
+  over koh with no wrapper:
+  - `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/` (and `box:dst/ dst/` to pull)
+  - `GIT_SSH_COMMAND='koh rsh' git clone box:repo.git`
+  - `tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'`
+
+  Only `--key-file`, `--direct` and `--relay-url` are taken before `HOST`; ssh's own flags
+  (`-l`, `-p`, `-o`) exit 2.
 
 ### Changed
 
-- **Headless jobs are now terminal-less `fux` panes (`fux start --out`) in
-  `STATE/fux/koh-jobs/NAME`; `koh serve` keeps no jobs in memory** (built on `fux` 0.44.0,
-  `fux-vt` 0.20.1, and `fuxix` 0.13.0):
-  - Jobs survive `koh serve` being restarted, and not a reboot (they live in the runtime
-    directory).
-  - Logs stream in fixed-size chunks on both server and client without reading whole files into
-    memory, and tails seek backwards in blocks.
-  - When a job's program ends, processes left in its process group are hung up (use `nohup` or
-    `setsid` for processes that must outlive it); output written by a leftover process after the
-    leader exits may appear in `out` later (`koh logs --all`) and not in a `logs -f` that already
-    ended.
-  - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
-    lives (signals outside `1..31` exit 2); `koh kill` prints
-    `koh: job NAME is not running (STATE)` on stderr when the job was not running (exit 0
-    unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` lists the
-    job as `ended` (exit 0) and `koh wait` reports `ended` with exit 1.
-  - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
-    name anew (starting an ended name removes its old folder once the request passes validation,
-    also if the new program then fails to start).
-  - `koh wait` and `koh logs -f` on a job whose name is started anew meanwhile now print
-    `that job was started anew` and exit 1 (keeping the old job's output, never the replacement's;
-    previously `wait` returned the old job's exit status).
-  - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number
-    (`1`–`9999`, failing once 9,999 unnamed folders are kept) instead of `j1`, `j2`, …; `koh jobs`
-    shows the command as `fux`'s `status` formats it.
-  - Session start failures (sharing the same `fux start` helper) now report `nothing was started: …`
-    instead of `no session was started: …` (exit 126 unchanged).
+- **`koh exec` and `koh rsh` are a pipe you can rely on:**
+  - koh ends when the remote command does, also while its own stdin is still open.
+  - When the client goes (it is interrupted, its output is closed, or its link is lost), the
+    remote command's process group is sent SIGHUP and, 2 s later, SIGKILL.
+  - `koh exec box -- yes | head -1` returns at once, and the remote `yes` is hung up.
+  - Megabytes in both directions at once do not stall.
+  - The exit status is the remote command's; koh's own are 141 when its stdout or stderr is a
+    closed pipe, 1 on another error writing them, 128+N when koh gets signal N (INT, TERM, HUP,
+    USR1), 255 when the link is lost or no status comes, and 3 only when the server was never
+    reached.
+  - `--sh LINE` is `/bin/sh -c -- LINE`, so a line that begins with `-` is a command.
+- **Jobs are `fux` panes, and `koh serve` keeps none in memory:**
+  - A job outlives a restart of `koh serve`, not a reboot.
+  - When a job's program ends, whatever it left running in its process group is hung up (use
+    `nohup` or `setsid` for what must stay).
+  - `koh kill` reaches a job while its holder lives.
+  - A name that is running cannot be started again (exit 1). An ended name started anew
+    replaces the old job and its log; a `koh wait` or `koh logs -f` on the old one then says
+    `that job was started anew` and exits 1.
+  - Job names are session names (letters, digits, `.`, `_`, `-`, at most 64, no dot first); a
+    job given no name is the first free number, `1`, `2`, … (it was `j1`, `j2`, …).
+  - `koh jobs` shows the command as the job's holder wrote it (a control character as `?`).
+- **`koh serve`, told to end, waits a few seconds for its connections to end** (their commands
+  hung up) before it lets go of its key.
+- **Errors are written to stderr**, as `koh: …`, and the exit status says which kind.
 
 ### Removed
 
-- **Runtime dependence on external `kill(1)` and `id(1)`:** `koh serve` no longer requires
-  `kill(1)` or `id(1)` on its `PATH` (it reads its uid via `fuxix::uid()`, hangs up `exec` groups
-  via `fuxix::signal_to`, and signals jobs through each pane's `ctl` FIFO).
-- **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the direct `blake3` dependency**
-  (wire protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
-  `rsync -e 'koh rsh'` (push and pull) or `tar | koh rsh` instead.
-- **QR codes on `koh serve` and `koh id --qr`** (and the `qrcode` dependency): copy the endpoint
-  id printed by `koh serve` or `koh id`.
-- **`koh wait --text SUBSTR`**: wait for the job to exit (`koh wait`), or follow its log with
-  `koh logs -f`.
-- **`--json`, on every command and for errors** (and the `serde_json` dependency): it is no
-  longer an option of any command. Errors go to stderr, and the exit code says which kind.
-  `koh jobs` and `koh sessions` print a line a job or session, the fields separated by one tab,
-  the last (the command; the title) the rest of the line, a control character in any field shown
-  as `?`; `koh help` says the fields, and they are kept. Instead
-  of `koh jobs SERVER --json`, write
-  `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'`; `koh run` prints the
-  job's name, `koh wait` the tail on stdout and how it ended on stderr (`· exited 3`, `· timed
-  out`) with that status as its exit code, and `koh output` the text. A session's folder (JSON's
-  `pane_dir`) is the `sessions dir:` that `koh serve` prints, then the session's name; a job's
-  pid is not shown (`koh kill` goes by name).
-- **Scoped keys (`koh clients add NAME ID --cp DIR | --exec DIR`)**: an allowed key is the
-  server's user; to separate trust, run `koh serve` under another user account or on another
-  machine. Every `clients` line must be `NAME ID`: any line with an extra field (including older
-  `cp=…` or `exec=…` lines) grants no access and is refused (exit 4) unless that id is allowed by
-  another valid line or by `koh serve --allow ID` (which holds for the life of that server).
-  `koh clients` names each skipped line on stderr; a successful `koh clients add`, `rm`, or
-  `rename` rewrites the file from accepted lines only (dropping skipped lines, comments, and
-  blank lines), while `rm`/`rename` of a name that appears only on skipped lines fails and leaves
-  the file as it was. A non-UTF-8 `clients` file is refused whole (no key from it is allowed, and
-  `koh clients` exits 1 without naming a line).
+- **`koh cp` and `--sync`/`--exclude` on `exec` and `run`:** use rsync over koh,
+  `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`.
+- **Scoped keys, `koh clients add NAME ID --cp DIR | --exec DIR`:** an allowed key can do what
+  the server's user can. To keep a client to less, run its `koh serve` as another user or on
+  another machine. A `clients` line with anything after `NAME ID` (an old scoped line too)
+  grants nothing, and `koh clients` names it on stderr.
+- **`--json`, on every command:** `koh jobs` and `koh sessions` print a line a job or session,
+  the fields separated by one tab and the last of them the rest of the line, as `koh --help`
+  says: `koh jobs box | awk -F '\t' '$1 == "build" && $2 == "running"'`. `koh run` prints the
+  job's name; `koh wait` prints the tail of the output on stdout and how it ended on stderr,
+  and exits with its status.
+- **QR codes** (`koh serve`'s and `koh id --qr`): copy the id that `koh id` or `koh serve`
+  prints.
+- **`koh wait --text TEXT`:** wait for the job's end, `koh wait box build`, or follow its log,
+  `koh logs box build -f`.
+- **The need for `kill(1)` and `id(1)`** on the server's `PATH`.
 
 ### Security
 
-- **A `clients` line with an extra or unreadable field no longer grants full access.** In
-  0.18.0–0.18.1, any unrecognized third word on a line in `clients` (such as `copy=/srv`,
-  `cp:/srv`, `cp`, or an inline comment `laptop ID # my laptop`) was read as an unrestricted key.
-  See **Removed** above for the exact `clients` rule now (`NAME ID` only).
+- **A `clients` line with a third word no longer allows its key.** 0.18.0 and 0.18.1 read
+  `laptop ID cp=/srv`, or `laptop ID # my laptop`, as a key with full access.
 
 ### Fixed
 
-- **`koh exec` (and the new `koh rsh`) now behaves as a real pipe in both directions and hangs up
-  the remote command whenever the client goes.** Seven defects in `exec` were eliminated by
-  rebuilding the pump with independent input/output paths, raw stdin bytes on the stream, and a
-  single peer-disconnect watcher:
-  - *Orphan remote commands after stdin ended:* Previously, once local stdin reached EOF (such as
-    `</dev/null`), disconnecting the client did not hang up the remote command. Now the server
-    watches the stream through drain and exit, sends SIGHUP to the command's process group, waits
-    2 s, sends SIGKILL to the group, and then reaps the leader whenever the client disconnects,
-    and `koh` closes the connection immediately on `INT`, `TERM`, `HUP`, or `USR1` (exiting
-    `128 + N`, including while `Reply::Ok` is in flight or local stdout is blocked).
-  - *Deadlock when both sides write megabytes at once:* Previously, a server-side write to child
-    stdin could block the same loop that drained child stdout/stderr. Now stdin and output are
-    pumped independently, so multi-megabyte bidirectional transfers complete without stalling.
-  - *Never-ending producers under `| head`:* Previously, closing `koh`'s stdout pipe was ignored,
-    so `koh exec box -- yes | head -1` never returned and left the producer running on the
-    server. Now a broken pipe on stdout or stderr exits `141` at once and closes the link so the
-    remote producer is hung up.
-  - *Exit 3 ("unreachable") after connecting:* Previously, losing the connection mid-exec reported
-    exit `3` as if the server had never been reached. Now, among failures `koh` itself reports,
-    exit `3` is only when `koh` never reached the server (a remote command's own exit status `3`
-    is still passed through); losing the link after connecting exits `255`.
-  - *Silent success when writing to `koh`'s own stdout/stderr failed:* Previously, write errors
-    such as `>/dev/full` were ignored and `koh` exited `0`. Now non-pipe write failures exit `1`.
-  - *Shell commands starting with `-`:* Previously, `koh exec --sh LINE` (and `koh run --sh LINE`)
-    ran `/bin/sh -c LINE` without `--`, so a command starting with `-` was parsed as a shell
-    option. Now the client expands `--sh` (and `koh rsh`) to `/bin/sh -c -- LINE` (so a job
-    started with `koh run --sh LINE` appears as `/bin/sh -c -- LINE` in `koh jobs`).
-  - *Silent exit `0` when the stream ended without an exit status:* Previously, a truncated stream
-    defaulted to exit `0`. Now a stream that ends without an exit status exits `255`.
-- **Graceful `koh serve` shutdown waits for active connections before releasing its key.** When
-  told to end (`SIGINT`/`SIGTERM`), `koh serve` now closes its endpoint and gives active
-  connections a grace period to tear down (up to ~5 s per connection for in-flight requests, or
-  ~2 s for a live session, not a hard wall-clock bound if synchronous work is stalled) before
-  dropping its server key lock and exiting, so active `exec` commands are hung up cleanly.
-- **`koh exec` (and `koh rsh`) now exits as soon as the remote command ends, even if local stdin
-  stays open.** Previously, `(sleep 8) | koh exec box -- echo hi` printed `hi` and waited 8 seconds
-  until stdin closed (dropping the tokio runtime waited on a blocked read of stdin). `koh exec`
-  and `koh rsh` now shut down the runtime in the background once the connection is closed, and
-  wait on readiness (`poll`) if a caller such as macOS `openrsync` passes non-blocking
-  stdin/stdout/stderr descriptors instead of treating `EAGAIN` as EOF or dropping streamed output.
-- **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
-  rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
-  parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started
-  at once, one could end with `cannot reach server: timed out`, and parallel `koh wait` calls
-  lost their connections. Each client process now dials from a fresh key of its own and proves
-  `client.key` on each stream (`KeyProof`), and the server authorizes solely by that proved key.
+- **Several `koh` commands of one client at once no longer cut each other's links:** each
+  process dials with a key of its own and proves `client.key` on every request.
+
+### Not guarded
+
+- A client killed with `-9`, or behind a path that is down, is noticed after the link's idle
+  timeout, about 15–20 s; until then its remote command runs.
+- A job holder killed with `-9` leaves its program running: `koh jobs` lists the job as
+  `ended`, and `koh wait` exits 1.
+- Two `koh serve` of one user on one state directory share the jobs folder and do not
+  coordinate starts: run one per state directory.
+- A job's log grows without bound: remove ended jobs' folders, or start the name anew.
 
 ## [0.18.1] — 2026-11-25
 

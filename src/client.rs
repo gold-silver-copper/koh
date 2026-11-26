@@ -283,19 +283,9 @@ impl Client {
         recv_msg(&mut recv, MAX_CTRL).await
     }
 
-    pub async fn logs(
-        &self,
-        name: String,
-        tail: Option<usize>,
-        all: bool,
-        follow: bool,
-    ) -> Result<(Vec<u8>, String, Option<i32>, u64)> {
-        let mut buf = Vec::new();
-        let (state, exit, age) = self.logs_to(name, tail, all, follow, &mut buf).await?;
-        Ok((buf, state, exit, age))
-    }
-
-    /// Streams job logs directly to `out` without buffering the whole log in memory.
+    /// Streams job logs directly to `out`. Returns `Ok(Some((state, exit, age_secs)))` from
+    /// `Done`, or `Ok(None)` if `out` hit `BrokenPipe` (caller exits 141). Other write/flush
+    /// errors exit 1; stream EOF without `Done` exits 255.
     pub async fn logs_to(
         &self,
         name: String,
@@ -303,7 +293,7 @@ impl Client {
         all: bool,
         follow: bool,
         mut out: impl std::io::Write,
-    ) -> Result<(String, Option<i32>, u64)> {
+    ) -> Result<Option<(String, Option<i32>, u64)>> {
         let (_, mut recv) = self
             .request(&Request::Logs {
                 name,
@@ -312,13 +302,22 @@ impl Client {
                 follow,
             })
             .await?;
-        let (mut final_state, mut final_exit, mut age) = (String::new(), None, 0u64);
+        let fail = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                Ok(None)
+            } else {
+                Err(KohError::failed(format!("write: {e}")))
+            }
+        };
         while let Some(msg) = recv_msg_opt::<LogMsg>(&mut recv, MAX_CHUNK).await? {
             match msg {
                 LogMsg::Data(bytes) => {
-                    let _ = out.write_all(&bytes);
-                    if follow {
-                        let _ = out.flush();
+                    let wrote = out
+                        .write_all(&bytes)
+                        .and_then(|()| if follow { out.flush() } else { Ok(()) });
+                    if let Err(e) = wrote {
+                        let _ = recv.stop(0u32.into());
+                        return fail(e);
                     }
                 }
                 LogMsg::Done {
@@ -326,15 +325,14 @@ impl Client {
                     exit,
                     age_secs,
                 } => {
-                    final_state = state;
-                    final_exit = exit;
-                    age = age_secs;
-                    break;
+                    return match out.flush() {
+                        Ok(()) => Ok(Some((state, exit, age_secs))),
+                        Err(e) => fail(e),
+                    };
                 }
             }
         }
-        let _ = out.flush();
-        Ok((final_state, final_exit, age))
+        Err(KohError::internal("log stream ended without status"))
     }
 
     pub async fn kill_job(&self, name: String, signal: i32) -> Result<JobInfo> {
@@ -1112,10 +1110,7 @@ fn reconnect_delay(attempt: u32) -> Duration {
 /// Parses a signal name or number for `koh kill --signal`.
 pub fn parse_signal(s: &str) -> Result<i32> {
     if let Ok(n) = s.parse::<i32>() {
-        if (1..32).contains(&n) {
-            return Ok(n);
-        }
-        return Err(KohError::usage(format!("invalid signal {s:?} (use 1..31)")));
+        return Ok(n);
     }
     match s.to_ascii_uppercase().trim_start_matches("SIG") {
         "HUP" => Ok(1),

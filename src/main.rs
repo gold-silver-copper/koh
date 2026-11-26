@@ -627,7 +627,9 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
         .logs_to(name, tail, all, follow, std::io::stdout())
         .await;
     client.close().await;
-    let (state, exit, age) = done?;
+    let Some((state, exit, age)) = done? else {
+        return Ok(Exit(141));
+    };
     let _ = writeln!(std::io::stderr(), "· {state} {age}s");
     Ok(if follow {
         Exit(u8::try_from(exit.unwrap_or(0)).unwrap_or(1))

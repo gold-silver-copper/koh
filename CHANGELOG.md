@@ -58,14 +58,17 @@ binary, its tests and the fuzz targets share code, and any release may change it
   Previously, `koh cp --delete one.txt box:dir/` deleted every other entry in `dir`, and
   `koh cp --delete one.txt box:` deleted everything else in the remote home directory; pulling a
   single file with `--delete` did the same to the local destination. Both now exit 2 with a
-  message explaining why and leave the destination untouched. Push is refused by the client; pull
-  is refused by the server, so pulling a single file with `--delete` from a server before this
-  version still deletes other entries in the local destination.
+  message explaining why and leave the destination untouched. Push is refused by the client (so a
+  client before this version still deletes on a push); pull is refused by the server (so pulling a
+  single file with `--delete` from a server before this version still deletes other entries in the
+  local destination).
 - **A `koh run --name NAME` that cannot start now leaves an earlier job of that name as it was.**
   Previously, `koh run box --name keep -- /no/such` exited 127 after already replacing `keep`'s
   directory with an empty log, wiping the earlier job's log. On a failed start, the new job
   directory is removed and any earlier job's directory is put back, leaving its log and listing
-  intact (and leaving no directory when there was no earlier job). Only servers need this.
+  intact (and leaving no directory when there was no earlier job). If putting the earlier
+  directory back itself fails, koh keeps it on disk and reports both the start error and the
+  retained path with the start's exit status. Only servers need this.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started

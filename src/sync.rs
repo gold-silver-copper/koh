@@ -29,7 +29,7 @@ const CHUNK_SIZE: usize = 64 << 10;
 
 /// Why `--delete` of anything but one directory is refused.
 pub const ONE_DIRECTORY: &str = "--delete is for copying one directory: the source is no \
-     directory, and with it every other name in the destination would be deleted";
+     directory, and with it other entries of the destination could be deleted";
 
 /// Simple glob matcher supporting `*`, `?`, and `**` against relative paths and basenames.
 pub fn matches_exclude(rel: &str, patterns: &[String]) -> bool {

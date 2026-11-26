@@ -62,7 +62,7 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             (--last and wait go by a shell's marks of its prompts, OSC 133: `koh help-agents`
             has the lines for bash, and nearly the same three as a script over the files.)
 
-Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
+Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json (not rsh)
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
             (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote

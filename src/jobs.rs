@@ -303,18 +303,28 @@ impl Jobs {
             let d = dir.to_path_buf();
             let reading = out.as_ref().map(|(f, at, lim)| (Arc::clone(f), *at, *lim));
             let (was, chunk) = pooled(move || {
-                // Check `ended` BEFORE reading `out`: the holder drains `out` before writing
-                // final `state`, so once `was` is `Some`, no more bytes can arrive.
-                let was = ended(&d, run);
-                let chunk = reading.and_then(|(f, at, lim)| {
+                let read = |f: &File, at: u64, lim: Option<u64>| {
                     let want = lim
                         .map_or(PIECE as u64, |e| e.saturating_sub(at))
                         .min(PIECE as u64);
                     (want > 0)
-                        .then(|| read_piece(&f, at, want as usize).unwrap_or_default())
+                        .then(|| read_piece(f, at, want as usize).unwrap_or_default())
                         .filter(|bytes| !bytes.is_empty())
-                });
-                (was, chunk)
+                };
+                if let Some((f, at, lim)) = reading {
+                    if let Some(chunk) = read(&f, at, lim) {
+                        return (None, Some(chunk));
+                    }
+                    if lim.is_some() {
+                        return (None, None);
+                    }
+                    // Check `ended` BEFORE re-reading `out`: the holder drains `out` before
+                    // writing final `state`, so once `was` is `Some`, no more bytes can arrive.
+                    let was = ended(&d, run);
+                    (was, read(&f, at, None))
+                } else {
+                    (ended(&d, run), None)
+                }
             })
             .await?;
             if let Some(chunk) = chunk {

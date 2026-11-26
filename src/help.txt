@@ -23,8 +23,8 @@ Raw commands (no PTY; separate stdout/stderr; stdin EOF; group hangup on disconn
 Headless persistent jobs (terminal-less fux panes in STATE/fux/koh-jobs; survive koh serve restarts):
   koh run SERVER [--name NAME] [-C DIR] -- PROG ARG...   prints the job's name
   koh jobs SERVER [NAME]
-            a line a job: name, state (running, exited N, killed N, hungup, or ended where
-            nothing says how), age in seconds (`12s`), command
+            a line a job: name, state (running, exited N, killed N, hungup, lost WHY, or ended
+            where nothing says how), age in seconds (`12s`), command
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
   koh wait SERVER NAME [--tail N] [--timeout SECS]          (a job; a session: below)
             (wait and logs -f exit 1 with "that job was started anew" if NAME is restarted meanwhile)
@@ -49,9 +49,10 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             none), size (`80x24`), title
             A line of `jobs` and of `sessions` is its fields with one tab between each, for
             scripts: the fields before the last are kept for good, in this order, and the last
-            (the command; the title) is the rest of the line, `$NF` to awk. No field holds a
-            tab or a line end: fux writes a command's control characters as `?` and keeps
-            none in a title, and koh prints them as fux wrote them. So
+            (the command; the title) is the rest of the line, `$NF` to `awk -F '\t'` (split on
+            tabs, not on blanks: a state has a space, and a job with no command or a session
+            with no title still has its last field, empty). No field holds a tab or a line
+            end: koh prints a control character in any of them as `?`. So
             `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'` holds. A job's
             exit status is in its state (`exited N`), or is `koh wait`'s; a session's folder
             is the folder `koh serve` printed, then the session's name.
@@ -67,7 +68,7 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             has the lines for bash, and nearly the same three as a script over the files.)
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL
-                An error is one line on stderr (`koh: ...`) and the exit code below.
+                Errors go to stderr (`koh: ...`), and the exit code below says which kind.
 Exit codes: 0 ok, 1 failed (or write error), 2 usage, 3 unreachable, 4 refused, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 128+N signal (141 broken pipe),
             255 koh internal error (or exec link lost / no exit status after connecting).

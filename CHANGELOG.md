@@ -46,8 +46,8 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
     lives (signals outside `1..31` exit 2); `koh kill` prints
     `koh: job NAME is not running (STATE)` on stderr when the job was not running (exit 0
-    unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` and
-    `koh wait` report `ended` with exit 1.
+    unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` lists the
+    job as `ended` (exit 0) and `koh wait` reports `ended` with exit 1.
   - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
     name anew (starting an ended name removes its old folder once the request passes validation,
     also if the new program then fails to start).
@@ -72,10 +72,11 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   id printed by `koh serve` or `koh id`.
 - **`koh wait --text SUBSTR`**: wait for the job to exit (`koh wait`), or follow its log with
   `koh logs -f`.
-- **`--json`, on every command and for errors** (and the `serde_json` dependency): it is an
-  unexpected argument (exit 2). An error is one line on stderr and the exit code. `koh jobs` and
-  `koh sessions` print a line a job or session, the fields separated by one tab, the last (the
-  command; the title) the rest of the line; `koh help` says the fields, and they are kept. Instead
+- **`--json`, on every command and for errors** (and the `serde_json` dependency): it is no
+  longer an option of any command. Errors go to stderr, and the exit code says which kind.
+  `koh jobs` and `koh sessions` print a line a job or session, the fields separated by one tab,
+  the last (the command; the title) the rest of the line, a control character in any field shown
+  as `?`; `koh help` says the fields, and they are kept. Instead
   of `koh jobs SERVER --json`, write
   `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'`; `koh run` prints the
   job's name, `koh wait` the tail on stdout and how it ended on stderr (`· exited 3`, `· timed

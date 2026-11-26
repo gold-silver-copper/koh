@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust lines in `src/*.rs`, 5,500 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
@@ -115,11 +115,11 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     marks and the text) is read between two looks at the same even `generation`; what is of
     one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
     replaces a file whole. A session lives while its holder has the lock on its folder.
-    - `sessions` lists each folder that has a `status`, the oldest first: its name, whether a
-      client is attached, what `state` says became of its program (`running` only while the
-      holder lives; `ended` where none does and nothing says how), whether a command runs,
-      the last command's exit code, the size and the title: a line a session, the fields
-      separated by tabs, as `koh help` says.
+    - `sessions` lists each pane with a valid name, a `run` and a `status`, the oldest first:
+      its name, whether a client is attached, what `state` says became of its program
+      (`running` only while the holder lives; `ended` where none does and nothing says how),
+      whether a command runs, the last command's exit code, the size and the title: a line a
+      session, the fields separated by tabs, as `koh help` says.
     - `output` is the screen the session shows. With `--last` it is what the last command
       that has ended printed: the text from where its output began to where it ended, out of
       `history.1`, `history` and the main screen, each line whole however the screen wrapped
@@ -135,7 +135,7 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
       `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
-      the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
+      the holder lives and the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
       line in `marks`): a command has ended when an `end` is there with a higher number than
       the last `end` had when the wait was asked. Where a mark is on the screen is not
       asked, so a screen that scrolls, has a line inserted or is cleared ends nothing, and

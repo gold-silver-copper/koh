@@ -11,9 +11,11 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0 and 0.18.1 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0, 0.18.1 and 0.19.0 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.19.0] — 2026-11-26
 
 koh 0.19.0 speaks `koh/21`, which 0.18 does not: upgrade clients and servers together. It needs no
 `fux` installed: it carries `fux` 0.44.0 (`koh fux …`). Sessions that a 0.18.1 server started carry
@@ -39,14 +41,15 @@ over to it; jobs do not (below).
     keeps koh waiting, as with ssh.)
   - Input and output are pumped apart, so a remote stdin that is full no longer keeps koh from
     draining the output.
-  - With `yes | head -1`, koh exits 141 on its next failed write and closes the link. When the
-    client goes while the command runs, the server sends its process group SIGHUP and, 2 s
-    later, SIGKILL.
+  - With `koh exec box -- yes | head -1`, koh exits 141 on its next failed write and closes the
+    link. When the client goes while the command runs, the server sends its process group SIGHUP
+    and, 2 s later, SIGKILL.
   - Exit statuses: the remote command's own is passed through. koh's own are 141 for a closed
     output pipe, 1 for another error writing its output, 128+N for signal N (INT, TERM, HUP,
     USR1) once connected, and 255 when the link fails or no status comes. 3 means the
-    connection could not be made: a link lost after that was 3 in 0.18.1 and is 255 now. (4
-    refused, 75 busy, 126 and 127 are as before.)
+    connection could not be made. After connecting, a transport failure that was 3 in 0.18.1,
+    and an end with no status that was 0, are 255 now. (4 refused, 75 busy, 126 and 127 are as
+    before.)
   - `exec --sh LINE` and `run --sh LINE` run `/bin/sh -c -- LINE`, so a line that begins with
     `-` is not read as one of sh's options.
   - A terminal's stdin is sent as end of input; any other stdin is forwarded (as before).
@@ -63,19 +66,20 @@ over to it; jobs do not (below).
   - A name that is running still cannot be started again (exit 1). An ended name started anew
     replaces the old job and its log; a `koh wait` or `koh logs -f` on the old one then says
     `that job was started anew` and exits 1.
-  - Job names are session names: letters, digits, `.`, `_`, `-`, at most 64, no dot first, and
-    not `-`, `colours`, `keyboard` or `layout`. A job given no name is the first free number,
+  - Job names are session names: ASCII letters and digits, `.`, `_`, `-`, at most 64, no dot first,
+    and not `-`, `colours`, `keyboard` or `layout`. A job given no name is the first free number,
     `1`, `2`, … (it was `j1`, `j2`, …).
-  - `koh jobs` lists the oldest first (it was by name), and its command column stops at 4,096
-    characters.
+  - `koh jobs` lists the oldest first (it was by name). Its command column stops at 4,096
+    characters, and for `run --sh LINE` it shows `/bin/sh -c -- LINE`, not `LINE` alone.
   - `koh logs`, with or without `-f`, exits 141 when its stdout is a closed pipe, 1 on another
-    error writing it, and 255 when the stream ends without its end.
+    error writing it, and 255 if the stream closes before the server reports the end.
   - `koh wait --tail N` gives at most 8 MiB less 4 KiB, also if that cuts a line: use
     `koh logs --tail N` for the whole lines.
 - **`koh jobs` and `koh sessions`** print a control character in any field as `?`.
-- **`koh clients`** prints `NAME ID` only. A successful `add`, `rm` or `rename` writes the file
-  anew from the lines it accepts; `rm` or `rename` of a name that is only on a skipped line exits
-  1 and leaves the file. `servers` and `clients` `rm` and `rename` refuse a word more.
+- **`koh clients`** prints `NAME ID` only, and names each line it skips on stderr. A successful
+  `add`, `rm` or `rename` writes the file anew from the lines it accepts; `rm` or `rename` of a name
+  that is only on a skipped line exits 1 and leaves the file. `servers` and `clients` `rm` and
+  `rename` refuse a word more.
 - **`koh serve`, told to end, waits a few seconds for its connections to end** (their commands
   hung up) before it lets go of its key.
 - **Errors are written to stderr**, as `koh: …`, and the exit status says which kind.
@@ -86,8 +90,9 @@ over to it; jobs do not (below).
   `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`.
 - **Scoped keys, `koh clients add NAME ID --cp DIR | --exec DIR`:** an allowed key can do what
   the server's user can. To keep a client to less, run its `koh serve` as another user or on
-  another machine. An old scoped line in `clients` allows nothing: its key is refused, exit 4
-  (and 4 no longer means "out of scope").
+  another machine. An old scoped line in `clients` allows nothing: a key that is only on such
+  lines is refused, exit 4 (a `NAME ID` line for that id, or `koh serve --allow`, still allows
+  it), and 4 no longer means "out of scope".
 - **`--json`, on every command:** `koh jobs` and `koh sessions` print a line a job or session,
   the fields separated by one tab and the last of them the rest of the line, as `koh --help`
   says: `koh jobs box | awk -F '\t' '$1 == "build" && $2 == "running"'`. `koh run` prints the
@@ -112,8 +117,8 @@ over to it; jobs do not (below).
 
 ### Not guarded
 
-- A client killed with `-9`, or behind a path that is down, is noticed after the link's idle
-  timeout, about 15–20 s; until then its remote command runs.
+- An `exec` or `rsh` client killed with `-9`, or whose path goes down: its remote command can
+  run on until the link times out, about 15–20 s.
 - A job holder killed with `-9` leaves its program running: `koh jobs` lists the job as
   `ended`, and `koh wait` exits 1.
 - Two `koh serve` of one user on one state directory share the jobs folder and do not
@@ -877,7 +882,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/gold-silver-copper/koh/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/gold-silver-copper/koh/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gold-silver-copper/koh/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/gold-silver-copper/koh/compare/v0.17.1...v0.17.2

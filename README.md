@@ -214,10 +214,6 @@ koh adds nothing to stop these. What happens instead is said.
 - On Linux, restart `koh serve` after you replace the `koh` binary. Until then no new session
   or job starts: koh runs itself by its own path, which is gone, and says "cannot run PATH
   (deleted): No such file or directory". Sessions and jobs that run go on.
-- End the sessions that a koh built on a `fux` before 0.43.3 started: a session is known by
-  its `run`, which holders write since then, and a pane without one is no session to koh (not
-  listed, not attached to; its name cannot be started until its folder is removed). A holder
-  keeps the code it was started with.
 - If `koh serve` was killed outright, start it again before you count what is left: a viewer
   reads the end of its terminal and leaves by itself, and the folder of one that was killed
   too (`STATE/fux/.view.PID`) is removed when `koh serve` starts.

@@ -107,7 +107,10 @@ have it show another pane, another workspace, or run a script.
   name (`/var/home/u` for `/home/u`, `/private/tmp` for `/tmp`): only `DIR` is resolved. That
   refuses more, never less.
 - **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
-  the same rule. **It is not a sandbox:** the command is any command,
+  the text of the path: it must begin with `DIR` (as `clients` has it or as `DIR` resolves) and
+  go on with plain names (no `..`, no NUL). The path itself is not resolved (`src/keys.rs`,
+  `check_beneath`), so a symlink beneath `DIR` leads where it leads. **It is not a sandbox:** the
+  command is any command,
   run as the server's user, and reaches whatever that user can. Every other request is refused:
   a session (the scope is looked at before the name, the run or anything else of an
   attach, and before anything is made) and everything about jobs but starting one (their

@@ -15,6 +15,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+The protocol is `koh/21` (up from `koh/20`): upgrade both client and server together.
+
 ### Added
 
 - **`koh rsh HOST WORD…` lets `rsync` and `git` run directly over koh.** Commands such as
@@ -25,12 +27,13 @@ binary, its tests and the fuzz targets share code, and any release may change it
   preserving stdout, stderr, and the remote exit status; non-terminal stdin is forwarded, and
   terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url` (and `--`) are
   accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.) are refused
-  with exit 2. A request exceeding the 1 MiB control frame bound exits 2.
+  with exit 2. A request exceeding the 1 MiB control frame bound is refused with exit 2 when it is
+  sent (a server that cannot be reached is exit 3 first).
 
 ### Removed
 
-- **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the `blake3` dependency** (wire
-  protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
+- **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the direct `blake3` dependency**
+  (wire protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
   `rsync -e 'koh rsh'` (push and pull) or `tar | koh rsh` instead.
 - **QR codes on `koh serve` and `koh id --qr`** (and the `qrcode` dependency): copy the endpoint
   id printed by `koh serve` or `koh id`.
@@ -38,7 +41,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   `koh logs -f`.
 - **`--json` on `koh exec` and `koh logs`**: these commands stream raw bytes directly; read their
   stdout, stderr, and exit status instead. `--json` remains on `run`, `jobs`, `kill`, `wait`,
-  `sessions`, `output`, and for errors.
+  `sessions`, `output`, and for errors (not on `exec`, `rsh`, `logs`).
 
 ### Security
 
@@ -56,7 +59,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
   the next `koh clients add`, `rm`, or `rename` rewrites the file without it; `koh serve` logs
   nothing per request. `koh clients add` refuses a `--cp` or `--exec` `DIR` that is empty, is
   not UTF-8, or contains `\n` or `\r` (exit 2). The on-disk format is unchanged for every line
-  0.18.1 wrote correctly. Only servers need this.
+  0.18.1 wrote correctly.
 
 ### Fixed
 
@@ -67,14 +70,13 @@ binary, its tests and the fuzz targets share code, and any release may change it
   a blocked read of stdin). `koh exec` and `koh rsh` now shut down the runtime in the background
   after their output has been flushed and the connection closed, and wait on readiness (`poll`) if
   a caller such as macOS `openrsync` passes non-blocking stdin/stdout/stderr descriptors instead of
-  treating `EAGAIN` as EOF or dropping streamed (non-`--json`) output. Only clients need this.
+  treating `EAGAIN` as EOF or dropping streamed output.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started
   at once, one could end with `cannot reach server: timed out`, and parallel `koh wait` calls
   lost their connections. Each client process now dials from a fresh key of its own and proves
   `client.key` on each stream (`KeyProof`), and the server authorizes solely by that proved key.
-  Only clients need this.
 
 ## [0.18.1] — 2026-11-25
 

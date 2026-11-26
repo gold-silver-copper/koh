@@ -8,7 +8,7 @@
 mod entry;
 
 use koh::proto::{
-    Attach, Attached, ExecClientMsg, ExecServerMsg, JobInfo, KeyProof, LogMsg, Reply, Request,
+    Attach, Attached, ExecServerMsg, JobInfo, KeyProof, LogMsg, Reply, Request, SessionInfo,
     ViewInput, ViewOutput, ViewSize, WaitResult,
 };
 
@@ -43,6 +43,18 @@ fn seeds() -> Vec<Vec<u8>> {
         age_secs: 9,
         command: text("make -j4"),
     };
+    let session = SessionInfo {
+        name: text("1"),
+        attached: true,
+        state: text("running"),
+        cols: 80,
+        rows: 24,
+        title: text("sh"),
+        running_command: false,
+        last_exit: Some(0),
+        age_secs: 5,
+        pane_dir: text("/tmp/koh/fux/koh-sessions/1"),
+    };
     let run = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128;
     vec![
         bytes(&KeyProof {
@@ -52,13 +64,11 @@ fn seeds() -> Vec<Vec<u8>> {
         bytes(&Request::Exec {
             argv: vec![text("uname"), text("-a")],
             cwd: Some(text("~/proj")),
-            shell: false,
         }),
         bytes(&Request::Run {
             name: Some(text("build")),
-            argv: vec![text("make")],
+            argv: vec![text("/bin/sh"), text("-c"), text("--"), text("make")],
             cwd: None,
-            shell: true,
         }),
         bytes(&Request::Jobs { name: None }),
         bytes(&Request::Logs {
@@ -97,8 +107,6 @@ fn seeds() -> Vec<Vec<u8>> {
             name: text("3"),
             run,
         }),
-        bytes(&ExecClientMsg::Stdin(b"in".to_vec())),
-        bytes(&ExecClientMsg::Eof),
         bytes(&Reply::Ok),
         bytes(&Reply::Err {
             code: 75,
@@ -115,6 +123,7 @@ fn seeds() -> Vec<Vec<u8>> {
             age_secs: 2,
         }),
         bytes(&vec![job.clone(), job]),
+        bytes(&vec![session.clone(), session]),
         bytes(&WaitResult {
             timed_out: true,
             exit: 124,

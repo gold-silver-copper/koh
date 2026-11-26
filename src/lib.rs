@@ -117,36 +117,30 @@ pub(crate) fn after(from: tokio::time::Instant, long: std::time::Duration) -> to
 /// (A name of its own that begins with a dot: nothing lists it as a session, and a folder that
 /// has the name already is not written over.) Giving it the name is one call however much the
 /// folder holds, and is what is done under a lock; the removing is done after, with nothing held.
-pub(crate) struct Aside(std::path::PathBuf);
+pub(crate) struct Aside(Option<std::path::PathBuf>);
 
 impl Aside {
-    fn next(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        dir.with_file_name(format!(".{tag}.{}.{nth}", std::process::id()))
-    }
-
     /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
     pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
-        let aside = Self::next(dir, "gone");
-        std::fs::rename(dir, &aside).ok().map(|()| Self(aside))
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let aside = dir.with_file_name(format!(".gone.{}.{nth}", std::process::id()));
+        std::fs::rename(dir, &aside).ok().map(|()| Self(Some(aside)))
     }
 
-    /// A fresh empty sibling beside `dir`, removed on drop unless renamed into place.
-    pub(crate) fn stage(dir: &std::path::Path) -> std::io::Result<Self> {
-        let path = Self::next(dir, "starting");
-        std::fs::create_dir_all(&path)?;
-        Ok(Self(path))
-    }
-
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
+    /// Puts the folder back at `dir`; if rename fails, disarms drop so it stays on disk.
+    pub(crate) fn restore(mut self, dir: &std::path::Path) {
+        if let Some(aside) = self.0.take() {
+            let _ = std::fs::rename(aside, dir);
+        }
     }
 }
 
 impl Drop for Aside {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(aside) = &self.0 {
+            let _ = std::fs::remove_dir_all(aside);
+        }
     }
 }
 

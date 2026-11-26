@@ -58,10 +58,9 @@ impl JobManager {
         cwd: &Path,
         shell: bool,
     ) -> Result<JobInfo> {
-        // What an older job of the name left (or a staging dir from a failed start), to be
-        // removed with the lock let go: named before the lock so it drops after it however this returns.
+        // What an older job of the name left, to be removed with the lock let go: it is named
+        // here, before the lock, so it is dropped after it however this returns.
         let mut _old = None;
-        let mut _stage = None;
         let mut guard = mgr
             .lock()
             .map_err(|_| KohError::internal("job lock poisoned"))?;
@@ -85,46 +84,58 @@ impl JobManager {
                 }
             },
         };
-        let mut cmd = build_command(argv, cwd, shell)?;
+        fs::create_dir_all(&guard.root)
+            .map_err(|e| KohError::failed(format!("mkdir jobs root: {e}")))?;
         let dir = guard.root.join(&job_name);
-        let stage =
-            Aside::stage(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
-        let stage_dir = stage.path().to_path_buf();
-        _stage = Some(stage);
-
-        let log_out = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(stage_dir.join("log"))
-            .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
-        let log_err = log_out
-            .try_clone()
-            .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
-
-        fuxix::new_session(&mut cmd, false);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::from(log_out))
-            .stderr(Stdio::from(log_err));
-
-        let mut child = cmd.spawn().map_err(|e| {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                Exit::NOT_FOUND
-            } else {
-                Exit::CANNOT_START
-            };
-            KohError::new(code, "cannot_start", format!("spawn job: {e}"))
-        })?;
+        let old = Aside::of(&dir);
+        let started = (|| -> Result<std::process::Child> {
+            // Exclusive create: if putting an older folder aside failed, never truncate its log.
+            fs::create_dir(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+            let spawned = (|| -> Result<std::process::Child> {
+                let log_out = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(dir.join("log"))
+                    .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
+                let log_err = log_out
+                    .try_clone()
+                    .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
+                let mut cmd = build_command(argv, cwd, shell)?;
+                fuxix::new_session(&mut cmd, false);
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::from(log_out))
+                    .stderr(Stdio::from(log_err));
+                cmd.spawn().map_err(|e| {
+                    let code = if e.kind() == std::io::ErrorKind::NotFound {
+                        Exit::NOT_FOUND
+                    } else {
+                        Exit::CANNOT_START
+                    };
+                    KohError::new(code, "cannot_start", format!("spawn job: {e}"))
+                })
+            })();
+            if spawned.is_err() {
+                let _ = fs::remove_dir_all(&dir);
+            }
+            spawned
+        })();
+        let mut child = match started {
+            Ok(child) => child,
+            Err(err) => {
+                if let Some(old) = old {
+                    old.restore(&dir);
+                }
+                return Err(err);
+            }
+        };
         let pid = child.id();
         let command_str = argv.join(" ");
-        let _ = atomic_write(&stage_dir.join("state"), b"running\n");
+        let _ = atomic_write(&dir.join("state"), b"running\n");
         let _ = atomic_write(
-            &stage_dir.join("meta"),
+            &dir.join("meta"),
             format!("pid {pid}\ncommand {command_str}\n").as_bytes(),
         );
-        _old = Aside::of(&dir);
-        fs::rename(&stage_dir, &dir)
-            .map_err(|e| KohError::failed(format!("commit job dir: {e}")))?;
 
         let (state_tx, _) = watch::channel(("running".to_string(), None));
         let rec = Arc::new(JobRecord {
@@ -136,6 +147,8 @@ impl JobManager {
             state_tx,
         });
         guard.jobs.insert(job_name.clone(), rec.clone());
+        // Only remove the older folder once the new job is running and listed.
+        _old = old;
         drop(guard);
 
         let dir_wait = dir.clone();

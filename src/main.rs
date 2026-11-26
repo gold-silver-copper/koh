@@ -190,6 +190,12 @@ fn key_file_and_rest(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> 
     Ok((key_file, rest))
 }
 
+/// The words after a subcommand: as many as its usage names, and no more.
+fn words<'a, const N: usize>(clean: &'a [String], usage: &str) -> Result<&'a [String; N]> {
+    let words = clean.get(1..).unwrap_or_default();
+    words.try_into().map_err(|_| KohError::usage(usage))
+}
+
 fn cmd_servers(args: &[String]) -> Result<Exit> {
     let (key_file, clean) = key_file_and_rest(args)?;
     let mut list = load_servers(key_file.as_deref())?;
@@ -239,8 +245,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            const USAGE: &str = "usage: koh servers rm NAME";
-            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let [name] = words(&clean, "usage: koh servers rm NAME")?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -249,9 +254,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            const USAGE: &str = "usage: koh servers rename OLD NEW";
-            let old = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
-            let new = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
+            let [old, new] = words(&clean, "usage: koh servers rename OLD NEW")?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no server named {old:?}")));
@@ -283,12 +286,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             }
         }
         Some("add") => {
-            const USAGE: &str = "usage: koh clients add NAME ID";
-            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
-            let id_s = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
-            if let Some(extra) = clean.get(3) {
-                return Err(KohError::usage(format!("unexpected argument {extra:?}")));
-            }
+            let [name, id_s] = words(&clean, "usage: koh clients add NAME ID")?;
             validate_peer_name(name)?;
             let id = parse_endpoint_id(id_s)?;
             list.retain(|e| e.name != *name);
@@ -299,8 +297,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            const USAGE: &str = "usage: koh clients rm NAME";
-            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let [name] = words(&clean, "usage: koh clients rm NAME")?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -309,9 +306,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            const USAGE: &str = "usage: koh clients rename OLD NEW";
-            let old = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
-            let new = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
+            let [old, new] = words(&clean, "usage: koh clients rename OLD NEW")?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no client named {old:?}")));
@@ -533,9 +528,14 @@ async fn cmd_jobs(args: &[String]) -> Result<Exit> {
     let client = Client::connect(&server, &opts, false).await?;
     let list = client.jobs(name).await;
     client.close().await;
+    // (`fux::plain`: a control character in a peer's text is a `?`, so no field holds a tab.)
     for j in &list? {
-        let (name, state, age, command) = (&j.name, &j.state, j.age_secs, &j.command);
-        let _ = writeln!(std::io::stdout(), "{name}\t{state}\t{age}s\t{command}");
+        let [name, state, command] = [&j.name, &j.state, &j.command].map(|f| fux::plain(f));
+        let _ = writeln!(
+            std::io::stdout(),
+            "{name}\t{state}\t{}s\t{command}",
+            j.age_secs
+        );
     }
     Ok(Exit::OK)
 }
@@ -722,12 +722,12 @@ async fn cmd_sessions(args: &[String], output: bool) -> Result<Exit> {
     Ok(Exit::OK)
 }
 
-/// A session as a line of `koh sessions`.
+/// A session as a line of `koh sessions` (its texts `fux::plain`, as a job's).
 fn listed(s: &SessionInfo) -> String {
     let attached = if s.attached { "attached" } else { "detached" };
     let busy = if s.running_command { "busy" } else { "idle" };
     let last = s.last_exit.map_or("-".to_string(), |code| code.to_string());
-    let (name, state, title) = (&s.name, &s.state, &s.title);
+    let [name, state, title] = [&s.name, &s.state, &s.title].map(|f| fux::plain(f));
     format!(
         "{name}\t{attached}\t{state}\t{busy}\texit={last}\t{}x{}\t{title}\n",
         s.cols, s.rows

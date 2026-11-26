@@ -450,6 +450,14 @@ fn cli_help_keys_and_peer_lists() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&list.stdout).contains("box "));
+    // A word more than `rm NAME` is a usage error, and nothing is removed.
+    let rm = |more: &[&str]| {
+        let mut koh = Command::new(bin);
+        koh.env("KOH_CONFIG_DIR", &tmp.0)
+            .args(["servers", "rm", "box"]);
+        koh.args(more).status().unwrap().code()
+    };
+    assert_eq!((rm(&["extra"]), rm(&[])), (Some(2), Some(0)));
 }
 
 #[tokio::test]
@@ -2456,9 +2464,10 @@ fn sessions_lists_what_the_folders_say() {
     );
     // A title the program gave a tab is still the last field: a title has no control character.
     fs::write(pane.join("in"), "printf '\\033]2;a\\tb\\007'\n").unwrap();
-    until("the title is set", || {
-        list()[0].len() == 7 && of("live", 6) == "ab"
-    });
+    let title = || fs::read_to_string(pane.join("title")).unwrap_or_default();
+    until("the title is set", || title() == "ab\n");
+    let line = &list()[0];
+    assert_eq!((line.len(), line[6].as_str()), (7, "ab"), "{line:?}");
     // The client leaves: the session is not attached.
     signal(&live.koh.id().to_string(), "-TERM");
     assert_eq!(live.ends(), Some(0));
@@ -4494,21 +4503,28 @@ fn jobs_lists_a_line_a_job_the_command_last() {
     assert_eq!(job_cmd(&host, "run", &args, 10).stdout, b"tabbed\n");
     let waited = job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 15);
     assert_eq!(waited.status.code(), Some(3));
-    // Name, state, age and the command, the rest of the line: a tab in it is shown as `?`.
-    let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 10).stdout).unwrap();
-    let fields: Vec<&str> = listed.strip_suffix('\n').unwrap().split('\t').collect();
-    let [name, state, age, command] = fields[..] else {
-        panic!("{listed:?}")
-    };
-    assert_eq!(
-        (name, state, command),
-        ("tabbed", "exited 3", "sh -c exit 3 a?b")
-    );
-    assert!(
-        age.strip_suffix('s')
-            .is_some_and(|n| n.parse::<u64>().is_ok()),
-        "{age}"
-    );
+    // Name, state, age and the command, the rest of the line: a tab in it is shown as `?`,
+    // as fux writes it, and as koh prints it when the folder's `status` has one.
+    let status = host
+        .sessions
+        .parent()
+        .unwrap()
+        .join("koh-jobs/tabbed/status");
+    for written in ["a?b", "a\tb"] {
+        let was = fs::read_to_string(&status).unwrap();
+        fs::write(&status, was.replace("a?b", written)).unwrap();
+        let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 10).stdout).unwrap();
+        let fields: Vec<&str> = listed.strip_suffix('\n').unwrap().split('\t').collect();
+        let [name, state, age, command] = fields[..] else {
+            panic!("{listed:?}")
+        };
+        assert_eq!(
+            (name, state, command),
+            ("tabbed", "exited 3", "sh -c exit 3 a?b")
+        );
+        let secs = age.strip_suffix('s').map(str::parse::<u64>);
+        assert!(secs.is_some_and(|n| n.is_ok()), "{age}");
+    }
 }
 
 #[test]

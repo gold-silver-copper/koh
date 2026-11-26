@@ -120,14 +120,21 @@ pub(crate) fn after(from: tokio::time::Instant, long: std::time::Duration) -> to
 pub(crate) struct Aside(Option<std::path::PathBuf>);
 
 impl Aside {
-    /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
-    pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
+    /// `dir` put aside; `Ok(None)` if nothing was there, `Err(e)` if moving it aside failed.
+    pub(crate) fn try_of(dir: &std::path::Path) -> std::io::Result<Option<Self>> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let aside = dir.with_file_name(format!(".gone.{}.{nth}", std::process::id()));
-        std::fs::rename(dir, &aside)
-            .ok()
-            .map(|()| Self(Some(aside)))
+        match std::fs::rename(dir, &aside) {
+            Ok(()) => Ok(Some(Self(Some(aside)))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
+    pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
+        Self::try_of(dir).ok().flatten()
     }
 
     /// Puts the folder back at `dir`; if rename fails, disarms drop so it stays on disk and

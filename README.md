@@ -6,9 +6,9 @@ Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust lines in `src/*.rs`, 5,600 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
-  compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files. An
-  allowed key is the server's user; any `clients` line carrying an extra field (such as an old
-  `cp=`/`exec=` entry) is skipped and refused (exit 4).
+  using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
+  user; any `clients` line that is not `NAME ID` (including an older `cp=`/`exec=` line) grants
+  no access and is ignored (a non-UTF-8 `clients` file is rejected whole).
 - **Layer 2 — Raw Streams & Jobs (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF (SIGHUP on disconnect while
     stdin is still open; a command whose stdin has ended runs on).

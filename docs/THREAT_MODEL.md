@@ -94,11 +94,16 @@ have it show another pane, another workspace, or run a script.
   more. A look that has begun is finished; so is a read for `koh output` or `koh sessions`,
   whose client is not looked for until the answer is sent.)
 - **Allowlist (`clients`).** Every line must be `NAME ID` (plus blank lines and `#` comments).
-  Any line with an extra field (including an older `cp=…` or `exec=…` line) is skipped and gives
-  that key nothing (exit 4): `koh clients` names each skipped line on stderr with its line number,
-  and the next `koh clients add`, `rm`, or `rename` writes the file without it. The file is read
-  anew for each request, so removing a key takes effect on its next request; what it already
-  started goes on.
+  Any other line (including an older `cp=…` or `exec=…` line) grants no access: its key is
+  refused (exit 4) unless independently allowed by another valid line or by `koh serve --allow
+  ID`. `koh clients` names each skipped line on stderr with its line number; a successful `koh
+  clients add`, `rm`, or `rename` rewrites the file from accepted lines only (dropping skipped
+  lines, comments, and blank lines), while `rm` or `rename` of a name that appears only on a
+  skipped line fails (`no client named`) and leaves the file unchanged. A `clients` file that is
+  not UTF-8 is refused whole: no key from it is allowed, and `koh clients` fails without naming
+  a line. For every id not given by `--allow` (which holds for the life of that `koh serve`
+  regardless of the file), `clients` is read anew on each request, so removing its last valid
+  line takes effect on its next request; what it already started goes on.
 - **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
   itself may come as slowly as its sender likes, and a connection that has proved a key may
   stay, asking nothing, for as long as it is kept alive. So a client with any allowed key can

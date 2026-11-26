@@ -7,7 +7,7 @@ Keys & peers:
   koh id [client|server]                         print the client id the server should allow (or server)
   koh key reset [client|server] --yes            delete key; next use generates a new id
   koh servers [add NAME ID [--direct IP:PORT | --relay-url URL] | rm NAME | rename OLD NEW]
-  koh clients [add NAME ID | rm NAME | rename OLD NEW]
+  koh clients [add NAME ID | rm NAME | rename OLD NEW]   (lines with anything after ID are ignored)
   koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
             [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
             (needs kill(1) on its PATH: jobs are ended and commands hung up with it;

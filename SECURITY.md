@@ -68,8 +68,10 @@ credit reporters who want it.
   there). `koh fux …` and `koh hold …` are no requests: they are fux, run by whoever runs koh,
   on his machine.
 - A `clients` line must be `NAME ID`. Any line with an extra field (including an older `cp=…` or
-  `exec=…` line) is ignored and gives that key nothing (exit 4); `koh clients` names each skipped
-  line on stderr.
+  `exec=…` line) grants no access: its key is refused (exit 4) unless allowed by another valid
+  line or by `koh serve --allow ID`, and `koh clients` names each skipped line on stderr. A
+  `clients` file that is not UTF-8 is refused whole (no key from it is allowed, and `koh clients`
+  exits 1 without naming a line).
 
 ## Past audits
 

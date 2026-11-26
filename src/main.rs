@@ -176,18 +176,22 @@ fn cmd_key(args: &[String]) -> Result<Exit> {
     Ok(Exit::OK)
 }
 
-fn cmd_servers(args: &[String]) -> Result<Exit> {
-    let mut key_file = None::<PathBuf>;
-    let mut clean = Vec::new();
+/// `--key-file PATH` wherever it is in `args`, and the words that are not it.
+fn key_file_and_rest(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> {
+    let (mut key_file, mut rest) = (None, Vec::new());
     let mut i = 0;
     while let Some(a) = args.get(i).map(String::as_str) {
-        if a == "--key-file" {
-            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
-        } else {
-            clean.push(a.to_string());
+        match a {
+            "--key-file" => key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            _ => rest.push(a.to_string()),
         }
         i += 1;
     }
+    Ok((key_file, rest))
+}
+
+fn cmd_servers(args: &[String]) -> Result<Exit> {
+    let (key_file, clean) = key_file_and_rest(args)?;
     let mut list = load_servers(key_file.as_deref())?;
     match clean.first().map(String::as_str) {
         None => {
@@ -235,9 +239,8 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            let name = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh servers rm NAME"))?;
+            const USAGE: &str = "usage: koh servers rm NAME";
+            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -246,12 +249,9 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            let old = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
-            let new = clean
-                .get(2)
-                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
+            const USAGE: &str = "usage: koh servers rename OLD NEW";
+            let old = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let new = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no server named {old:?}")));
@@ -269,17 +269,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
 }
 
 fn cmd_clients(args: &[String]) -> Result<Exit> {
-    let mut key_file = None::<PathBuf>;
-    let mut clean = Vec::new();
-    let mut i = 0;
-    while let Some(a) = args.get(i).map(String::as_str) {
-        if a == "--key-file" {
-            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
-        } else {
-            clean.push(a.to_string());
-        }
-        i += 1;
-    }
+    let (key_file, clean) = key_file_and_rest(args)?;
     let mut list = load_clients(key_file.as_deref(), |n, line| {
         let _ = writeln!(
             std::io::stderr(),
@@ -309,9 +299,8 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            let name = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh clients rm NAME"))?;
+            const USAGE: &str = "usage: koh clients rm NAME";
+            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -320,12 +309,9 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            let old = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
-            let new = clean
-                .get(2)
-                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
+            const USAGE: &str = "usage: koh clients rename OLD NEW";
+            let old = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let new = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no client named {old:?}")));

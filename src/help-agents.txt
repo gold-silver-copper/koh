@@ -1,10 +1,11 @@
 
 Recipes: a session's files, for whoever would rather script than ask.
 A session is a fux pane: a folder of plain files on the server, in the folder `koh serve`
-printed (`koh sessions SERVER --json` has each one's as `pane_dir`). `koh sessions`, `koh
-output` and `koh wait --session` read those files there and no more; the script below is
-nearly the same as sh, for `koh exec` or for a script of your own on the server (where it is
-not the same, its comments say: `last` cuts whole lines, `wait` prints the last output):
+printed (`sessions dir:`, by default `$XDG_RUNTIME_DIR/koh/fux/koh-sessions`), and named
+as `koh sessions` names it. `koh sessions`, `koh output` and `koh wait --session` read
+those files there and no more; the script below is nearly the same as sh, for `koh exec`
+or for a script of your own on the server (where it is not the same, its comments say:
+`last` cuts whole lines, `wait` prints the last output):
 
   koh help-agents | sed -n '/^#!/,$p' | koh rsh SERVER 'cat > sessions.sh'
   koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed

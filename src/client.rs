@@ -193,33 +193,6 @@ impl Client {
     /// the remote command up; rsync signals its `-e` transport with USR1).
     pub async fn exec(&self, argv: Vec<String>, cwd: Option<String>) -> Result<i32> {
         let lost = |why: String| KohError::internal(format!("the link was lost: {why}"));
-        let (mut send, mut recv) =
-            self.request(&Request::Exec { argv, cwd })
-                .await
-                .map_err(|e| match e.code {
-                    Exit::UNREACHABLE => lost(e.message),
-                    _ => e,
-                })?;
-        let stdin_task = tokio::spawn(async move {
-            if !std::io::stdin().is_terminal() {
-                let mut buf = vec![0u8; 32 << 10];
-                while let Ok((Ok(n @ 1..), b)) = tokio::task::spawn_blocking(move || {
-                    let n = io_wait(&mut std::io::stdin().lock(), fuxix::POLLIN, |s| {
-                        s.read(&mut buf)
-                    });
-                    (n, buf)
-                })
-                .await
-                {
-                    buf = b;
-                    let slice = buf.get(..n).unwrap_or_default();
-                    if send.write_all(slice).await.is_err() {
-                        return;
-                    }
-                }
-            }
-            let _ = send.finish();
-        });
         let sig = |k| signal(k).map_err(|e| lost(e.to_string()));
         let (mut s_int, mut s_term, mut s_hup, mut s_usr1) = (
             sig(SignalKind::interrupt())?,
@@ -227,31 +200,73 @@ impl Client {
             sig(SignalKind::hangup())?,
             sig(SignalKind::user_defined1())?,
         );
-        let done = loop {
-            let msg = tokio::select! {
-                msg = recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK) => msg,
-                _ = s_int.recv() => break Ok(128 + SignalKind::interrupt().as_raw_value()),
-                _ = s_term.recv() => break Ok(128 + SignalKind::terminate().as_raw_value()),
-                _ = s_hup.recv() => break Ok(128 + SignalKind::hangup().as_raw_value()),
-                _ = s_usr1.recv() => break Ok(128 + SignalKind::user_defined1().as_raw_value()),
-            };
-            let written = match msg {
-                Err(e) => break Err(lost(e.message)),
-                Ok(None) => break Err(lost("no exit status came".into())),
-                Ok(Some(ExecServerMsg::Exit(code))) => break Ok(code),
-                Ok(Some(ExecServerMsg::Stdout(b))) => write_wait(std::io::stdout().lock(), &b),
-                Ok(Some(ExecServerMsg::Stderr(b))) => write_wait(std::io::stderr().lock(), &b),
-            };
-            if let Err(e) = written {
-                break if e.kind() == std::io::ErrorKind::BrokenPipe {
-                    Ok(141)
-                } else {
-                    Err(KohError::failed(format!("write: {e}")))
-                };
+        let signalled = async move {
+            tokio::select! {
+                _ = s_int.recv() => 128 + SignalKind::interrupt().as_raw_value(),
+                _ = s_term.recv() => 128 + SignalKind::terminate().as_raw_value(),
+                _ = s_hup.recv() => 128 + SignalKind::hangup().as_raw_value(),
+                _ = s_usr1.recv() => 128 + SignalKind::user_defined1().as_raw_value(),
             }
         };
-        stdin_task.abort();
-        done
+        let run = async {
+            let (mut send, mut recv) =
+                self.request(&Request::Exec { argv, cwd })
+                    .await
+                    .map_err(|e| match e.code {
+                        Exit::UNREACHABLE => lost(e.message),
+                        _ => e,
+                    })?;
+            let mut stdin_task = tokio::task::JoinSet::new();
+            stdin_task.spawn(async move {
+                if !std::io::stdin().is_terminal() {
+                    let mut buf = vec![0u8; 32 << 10];
+                    while let Ok((Ok(n @ 1..), b)) = tokio::task::spawn_blocking(move || {
+                        let n = io_wait(&mut std::io::stdin().lock(), fuxix::POLLIN, |s| {
+                            s.read(&mut buf)
+                        });
+                        (n, buf)
+                    })
+                    .await
+                    {
+                        buf = b;
+                        let slice = buf.get(..n).unwrap_or_default();
+                        if send.write_all(slice).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = send.finish();
+            });
+            loop {
+                let (is_out, b) = match recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK).await {
+                    Err(e) => break Err(lost(e.message)),
+                    Ok(None) => break Err(lost("no exit status came".into())),
+                    Ok(Some(ExecServerMsg::Exit(code))) => break Ok(code),
+                    Ok(Some(ExecServerMsg::Stdout(b))) => (true, b),
+                    Ok(Some(ExecServerMsg::Stderr(b))) => (false, b),
+                };
+                let written = tokio::task::spawn_blocking(move || {
+                    if is_out {
+                        write_wait(std::io::stdout().lock(), &b)
+                    } else {
+                        write_wait(std::io::stderr().lock(), &b)
+                    }
+                })
+                .await
+                .map_err(|e| lost(e.to_string()))?;
+                if let Err(e) = written {
+                    break if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        Ok(141)
+                    } else {
+                        Err(KohError::failed(format!("write: {e}")))
+                    };
+                }
+            }
+        };
+        tokio::select! {
+            code = signalled => Ok(code),
+            done = run => done,
+        }
     }
 
     pub async fn run_job(

@@ -43,7 +43,8 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    let json = words.peek().is_none_or(|w| w != "rsh")
+        && std::env::args_os().skip(1).any(|a| a == "--json");
     let Ok(args) = words
         .map(std::ffi::OsString::into_string)
         .collect::<std::result::Result<Vec<String>, _>>()
@@ -117,6 +118,7 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "clients" => cmd_clients(rest),
         "serve" => cmd_serve(rest).await,
         "exec" => cmd_exec(rest).await,
+        "rsh" => cmd_rsh(rest).await,
         "run" => cmd_run(rest).await,
         "jobs" => cmd_jobs(rest).await,
         "logs" => cmd_logs(rest).await,
@@ -510,6 +512,43 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
             })
         );
     }
+    Ok(Exit(u8::try_from(code).unwrap_or(1)))
+}
+
+async fn cmd_rsh(args: &[String]) -> Result<Exit> {
+    const USAGE: &str =
+        "usage: koh rsh [--key-file PATH] [--direct IP:PORT] [--relay-url URL] HOST WORD...";
+    let mut opts = DialOptions::default();
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if !a.starts_with('-') {
+            break;
+        }
+        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        return Err(KohError::usage(format!(
+            "rsh does not support option {a:?} (only --key-file, --direct, --relay-url before HOST)"
+        )));
+    }
+    let Some(host) = args.get(i) else {
+        return Err(KohError::usage(USAGE));
+    };
+    let words = args.get(i + 1..).unwrap_or_default();
+    if words.is_empty() {
+        return Err(KohError::usage(USAGE));
+    }
+    let client = Client::connect(host, &opts, false).await?;
+    let done = client
+        .exec(vec![words.join(" ")], None, true, None, false)
+        .await;
+    client.close().await;
+    let (code, _, _) = done?;
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
 }
 

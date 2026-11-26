@@ -4656,3 +4656,330 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
     assert_eq!(out, expected);
     drop(_hold_stdin);
 }
+
+fn path_with_koh() -> std::ffi::OsString {
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_koh")).parent().unwrap();
+    let mut paths = vec![bin_dir.to_path_buf()];
+    if let Some(old) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&old));
+    }
+    std::env::join_paths(paths).unwrap()
+}
+
+fn save_box_server(host: &Host) {
+    let addr = host.addr();
+    let st = host
+        .koh(&["servers", "add", "box", &host.id, "--direct", &addr])
+        .status()
+        .unwrap();
+    assert!(st.success(), "koh servers add box failed");
+}
+
+#[test]
+fn rsh_runs_joined_words_forwards_streams_and_refuses_ssh_options() {
+    let host = Host::start("rsh-cli", &[]);
+    save_box_server(&host);
+
+    // Words are joined with spaces and run via `sh -c`, as ssh does.
+    let out = host
+        .koh(&["rsh", "box", "printf", "'%s:%s\\n'", "foo", "bar"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"foo:bar\n");
+    assert!(out.stderr.is_empty());
+
+    // Single shell string (as git passes): separate stdout/stderr and exit code propagated.
+    let out = host
+        .koh(&["rsh", "box", "printf 'out\\n'; printf 'err\\n' >&2; exit 9"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(9));
+    assert_eq!(out.stdout, b"out\n");
+    assert_eq!(out.stderr, b"err\n");
+
+    // Stdin is read to its end and forwarded.
+    let mut child = host
+        .koh(&["rsh", "box", "cat"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"stdin-via-rsh\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"stdin-via-rsh\n");
+
+    // Options after HOST belong to the remote command, not koh (`--json`, `-n`).
+    let out = host
+        .koh(&["rsh", "box", "printf", "%s", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"--json");
+
+    // `--` before HOST stops option parsing; koh dial options before HOST work with raw id.
+    let out = host
+        .koh(&["rsh", "--", "box", "printf", "sep-ok"])
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"sep-ok");
+
+    let addr = host.addr();
+    let out = host
+        .koh(&["rsh", "--direct", &addr, &host.id, "printf", "direct-ok"])
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"direct-ok");
+
+    // Unsupported ssh options before HOST are plainly refused with exit 2.
+    for (args, needle) in [
+        (&["rsh", "-l", "alice", "box", "true"][..], "-l"),
+        (&["rsh", "-p", "2222", "box", "true"][..], "-p"),
+        (
+            &["rsh", "-o", "SendEnv=GIT_PROTOCOL", "box", "true"][..],
+            "-o",
+        ),
+        (&["rsh", "--json", "box", "true"][..], "--json"),
+        (&["rsh", "--", "box"][..], "usage"),
+        (&["rsh", "box"][..], "usage"),
+        (&["rsh"][..], "usage"),
+    ] {
+        let out = host
+            .koh(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "args={args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(needle), "args={args:?} stderr={err:?}");
+        assert!(out.stdout.is_empty(), "args={args:?} stdout={:?}", out.stdout);
+    }
+}
+
+#[test]
+fn rsh_rsync_push_delete_exclude_incremental_and_pull() {
+    if Command::new("rsync").arg("--version").output().is_err() {
+        eprintln!("skipping rsh_rsync_push_delete_exclude_incremental_and_pull: rsync not installed");
+        return;
+    }
+    let host = Host::start("rsh-rsync", &[]);
+    save_box_server(&host);
+    let path_env = path_with_koh();
+
+    let src = host.tmp.0.join("src");
+    let remote_dst = host.tmp.0.join("home").join("dst");
+    let pulled = host.tmp.0.join("pulled");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::create_dir_all(src.join("target")).unwrap();
+    fs::create_dir_all(&remote_dst).unwrap();
+
+    let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs::write(src.join("big.bin"), &big).unwrap();
+    fs::write(src.join("sub/hello.txt"), b"hello from rsync\n").unwrap();
+    std::os::unix::fs::symlink("sub/hello.txt", src.join("link_hello")).unwrap();
+    fs::write(src.join("target/ignored.txt"), b"must-not-copy").unwrap();
+    fs::write(remote_dst.join("stray.txt"), b"delete-me").unwrap();
+
+    let run_rsync = |args: &[&str]| {
+        Command::new("rsync")
+            .args(args)
+            .env("PATH", &path_env)
+            .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+            .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+            .env("HOME", host.tmp.0.join("home"))
+            .output()
+            .unwrap()
+    };
+
+    // 1. Push with --delete and --exclude target (only flags portable to openrsync/2.6.9).
+    let src_slash = format!("{}/", src.display());
+    let out1 = run_rsync(&[
+        "-av",
+        "--delete",
+        "--exclude",
+        "target",
+        "-e",
+        "koh rsh",
+        &src_slash,
+        "box:dst/",
+    ]);
+    assert!(
+        out1.status.success(),
+        "rsync push 1 failed: status={:?}\nstdout={}\nstderr={}",
+        out1.status,
+        String::from_utf8_lossy(&out1.stdout),
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert_eq!(fs::read(remote_dst.join("big.bin")).unwrap(), big);
+    assert_eq!(
+        fs::read(remote_dst.join("sub/hello.txt")).unwrap(),
+        b"hello from rsync\n"
+    );
+    assert_eq!(
+        fs::read_link(remote_dst.join("link_hello")).unwrap(),
+        Path::new("sub/hello.txt")
+    );
+    assert!(!remote_dst.join("stray.txt").exists(), "stray.txt was not deleted");
+    assert!(!remote_dst.join("target").exists(), "target was not excluded");
+
+    let ino_before = fs::metadata(remote_dst.join("big.bin")).unwrap().ino();
+
+    // 2. Second push sends almost nothing and does not rewrite big.bin.
+    let out2 = run_rsync(&[
+        "-av",
+        "--delete",
+        "--exclude",
+        "target",
+        "-e",
+        "koh rsh",
+        &src_slash,
+        "box:dst/",
+    ]);
+    assert!(
+        out2.status.success(),
+        "rsync push 2 failed: status={:?}\nstdout={}\nstderr={}",
+        out2.status,
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert_eq!(
+        fs::metadata(remote_dst.join("big.bin")).unwrap().ino(),
+        ino_before,
+        "big.bin should not be rewritten on an unchanged second run"
+    );
+    let stdout2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(
+        !stdout2.lines().any(|l| l.trim() == "big.bin"),
+        "big.bin should not be transferred again:\n{stdout2}"
+    );
+    if let Some(sent_line) = stdout2.lines().find(|l| l.starts_with("sent ")) {
+        let num: String = sent_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(bytes) = num.parse::<u64>() {
+            assert!(
+                bytes < 4096,
+                "second rsync run sent {bytes} bytes, expected almost nothing:\n{stdout2}"
+            );
+        }
+    }
+
+    // 3. Pull back and verify contents and symlink.
+    let pulled_slash = format!("{}/", pulled.display());
+    let out3 = run_rsync(&["-a", "-e", "koh rsh", "box:dst/", &pulled_slash]);
+    assert!(
+        out3.status.success(),
+        "rsync pull failed: status={:?}\nstdout={}\nstderr={}",
+        out3.status,
+        String::from_utf8_lossy(&out3.stdout),
+        String::from_utf8_lossy(&out3.stderr)
+    );
+    assert_eq!(fs::read(pulled.join("big.bin")).unwrap(), big);
+    assert_eq!(
+        fs::read(pulled.join("sub/hello.txt")).unwrap(),
+        b"hello from rsync\n"
+    );
+    assert_eq!(
+        fs::read_link(pulled.join("link_hello")).unwrap(),
+        Path::new("sub/hello.txt")
+    );
+}
+
+#[test]
+fn rsh_git_push_and_clone() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping rsh_git_push_and_clone: git not installed");
+        return;
+    }
+    let host = Host::start("rsh-git", &[]);
+    save_box_server(&host);
+    let path_env = path_with_koh();
+
+    let bare = host.tmp.0.join("home").join("demo.git");
+    let work = host.tmp.0.join("work");
+    let cloned = host.tmp.0.join("cloned");
+    fs::create_dir_all(&bare).unwrap();
+    fs::create_dir_all(&work).unwrap();
+
+    let run_git = |cwd: &Path, args: &[&str]| {
+        Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("PATH", &path_env)
+            .env("GIT_SSH_COMMAND", "koh rsh")
+            .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+            .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+            .env("HOME", host.tmp.0.join("home"))
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .unwrap()
+    };
+
+    assert!(run_git(&bare, &["init", "--bare"]).status.success());
+    assert!(run_git(&work, &["init"]).status.success());
+    fs::write(work.join("hello.txt"), b"hello from git\n").unwrap();
+    assert!(run_git(&work, &["add", "hello.txt"]).status.success());
+    assert!(
+        run_git(&work, &["commit", "-m", "init"])
+            .status
+            .success()
+    );
+
+    let push = run_git(&work, &["push", "box:demo.git", "HEAD:refs/heads/main"]);
+    assert!(
+        push.status.success(),
+        "git push failed: status={:?}\nstdout={}\nstderr={}",
+        push.status,
+        String::from_utf8_lossy(&push.stdout),
+        String::from_utf8_lossy(&push.stderr)
+    );
+
+    let clone = run_git(
+        &host.tmp.0,
+        &[
+            "clone",
+            "-b",
+            "main",
+            "box:demo.git",
+            &cloned.display().to_string(),
+        ],
+    );
+    assert!(
+        clone.status.success(),
+        "git clone failed: status={:?}\nstdout={}\nstderr={}",
+        clone.status,
+        String::from_utf8_lossy(&clone.stdout),
+        String::from_utf8_lossy(&clone.stderr)
+    );
+    assert_eq!(fs::read(cloned.join("hello.txt")).unwrap(), b"hello from git\n");
+}

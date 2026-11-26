@@ -7,8 +7,8 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
-  user; any `clients` line that is not `NAME ID` (including an older `cp=`/`exec=` line) grants
-  no access and is ignored (a non-UTF-8 `clients` file is rejected whole).
+  user; any `clients` line that is not `NAME ID` grants no access and is ignored (a non-UTF-8
+  `clients` file is rejected whole).
 - **Layer 2 — Raw Streams & Jobs (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, and process-group hangup
     (SIGHUP to the group, a 2 s wait, then SIGKILL to the group before reaping the leader, so
@@ -46,7 +46,7 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust
     holder killed with `-9` leaves its program running, while `koh jobs` lists the job as
     `ended` (exit 0) and `koh wait` reports `ended` with exit 1. Run one `koh serve` per state
     directory (two servers for the same user sharing the default state directory share the jobs
-    folder and do not coordinate starts). `koh serve` needs no `kill(1)` or `id(1)` on its `PATH`.
+    folder and do not coordinate starts).
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`

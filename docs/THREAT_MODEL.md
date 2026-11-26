@@ -103,7 +103,9 @@ have it show another pane, another workspace, or run a script.
   not UTF-8 is refused whole: no key from it is allowed, and `koh clients` fails without naming
   a line. For every id not given by `--allow` (which holds for the life of that `koh serve`
   regardless of the file), `clients` is read anew on each request, so removing its last valid
-  line takes effect on its next request; what it already started goes on.
+  line takes effect on its next request: jobs and sessions it already started go on, while a
+  refused request closes its connection, hanging up any command still streaming on that same
+  connection.
 - **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
   itself may come as slowly as its sender likes, and a connection that has proved a key may
   stay, asking nothing, for as long as it is kept alive. So a client with any allowed key can

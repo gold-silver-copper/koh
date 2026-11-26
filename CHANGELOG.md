@@ -49,9 +49,9 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   another valid line or by `koh serve --allow ID` (which holds for the life of that server).
   `koh clients` names each skipped line on stderr; a successful `koh clients add`, `rm`, or
   `rename` rewrites the file from accepted lines only (dropping skipped lines, comments, and
-  blank lines), while `rm`/`rename` of a name on a skipped line fails and leaves the file as it
-  was. A non-UTF-8 `clients` file is refused whole (no key from it is allowed, and `koh clients`
-  exits 1 without naming a line).
+  blank lines), while `rm`/`rename` of a name that appears only on skipped lines fails and leaves
+  the file as it was. A non-UTF-8 `clients` file is refused whole (no key from it is allowed, and
+  `koh clients` exits 1 without naming a line).
 
 ### Security
 

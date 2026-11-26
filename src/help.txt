@@ -7,7 +7,7 @@ Keys & peers:
   koh id [client|server]                         print the client id the server should allow (or server)
   koh key reset [client|server] --yes            delete key; next use generates a new id
   koh servers [add NAME ID [--direct IP:PORT | --relay-url URL] | rm NAME | rename OLD NEW]
-  koh clients [add NAME ID [--cp DIR | --exec DIR] | rm NAME | rename OLD NEW]
+  koh clients [add NAME ID | rm NAME | rename OLD NEW]  (lines with an extra field after ID are ignored)
   koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
             [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
             (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
@@ -59,7 +59,7 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL
                 --json on run, jobs, wait, kill, sessions, output (and errors, not exec/rsh/logs)
-Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
+Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
             (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote
             command's exit status.)

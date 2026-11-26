@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use koh::client::{Client, ConnectOptions, DialOptions, parse_signal};
 use koh::keys::{
-    ClientEntry, Role, Route, Scope, ServerEntry, load_clients, load_or_create_key, load_servers,
+    ClientEntry, Role, Route, ServerEntry, load_clients, load_or_create_key, load_servers,
     parse_endpoint_id, parse_relay_url, reset_key, save_clients, save_servers, validate_peer_name,
 };
 use koh::proto::SessionInfo;
@@ -211,12 +211,10 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             }
         }
         Some("add") => {
-            let name = clean.get(1).ok_or_else(|| {
-                KohError::usage("usage: koh servers add NAME ID [--direct IP:PORT]")
-            })?;
-            let id_s = clean.get(2).ok_or_else(|| {
-                KohError::usage("usage: koh servers add NAME ID [--direct IP:PORT]")
-            })?;
+            const USAGE: &str =
+                "usage: koh servers add NAME ID [--direct IP:PORT | --relay-url URL]";
+            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let id_s = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
             validate_peer_name(name)?;
             let id = parse_endpoint_id(id_s)?;
             let mut route = None;
@@ -293,59 +291,30 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
         i += 1;
     }
     let mut list = load_clients(key_file.as_deref(), |n, line| {
-        if clean.is_empty() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}"
-            );
-        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "koh: clients:{n}: ignored, not NAME ID: {line:?}"
+        );
     })?;
     match clean.first().map(String::as_str) {
         None => {
             for e in &list {
-                let scope = match &e.scope {
-                    Scope::Full => String::new(),
-                    Scope::Cp(d) => format!(" cp={}", d.display()),
-                    Scope::Exec(d) => format!(" exec={}", d.display()),
-                };
-                let _ = writeln!(std::io::stdout(), "{} {}{scope}", e.name, e.id);
+                let _ = writeln!(std::io::stdout(), "{} {}", e.name, e.id);
             }
         }
         Some("add") => {
-            let name = clean.get(1).ok_or_else(|| {
-                KohError::usage("usage: koh clients add NAME ID [--cp DIR | --exec DIR]")
-            })?;
-            let id_s = clean.get(2).ok_or_else(|| {
-                KohError::usage("usage: koh clients add NAME ID [--cp DIR | --exec DIR]")
-            })?;
+            const USAGE: &str = "usage: koh clients add NAME ID";
+            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
+            let id_s = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
+            if let Some(extra) = clean.get(3) {
+                return Err(KohError::usage(format!("unexpected argument {extra:?}")));
+            }
             validate_peer_name(name)?;
             let id = parse_endpoint_id(id_s)?;
-            let mut scope = Scope::Full;
-            let mut j = 3;
-            while let Some(a) = clean.get(j).map(String::as_str) {
-                match a {
-                    "--cp" | "--exec" => {
-                        let dir = take_opt(&clean, &mut j, a)?;
-                        if dir.is_empty() || dir.contains(['\n', '\r']) {
-                            return Err(KohError::usage(format!(
-                                "{a} directory cannot be empty or contain a line break"
-                            )));
-                        }
-                        scope = if a == "--cp" {
-                            Scope::Cp(PathBuf::from(dir))
-                        } else {
-                            Scope::Exec(PathBuf::from(dir))
-                        };
-                    }
-                    _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
-                }
-                j += 1;
-            }
             list.retain(|e| e.name != *name);
             list.push(ClientEntry {
                 name: name.clone(),
                 id,
-                scope,
             });
             save_clients(key_file.as_deref(), &list)?;
         }
@@ -646,7 +615,7 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
     }
     let (Some(server), Some(name)) = (server, name) else {
         return Err(KohError::usage(
-            "usage: koh logs SERVER JOB [--tail N | --all] [-f]",
+            "usage: koh logs SERVER JOB [--tail N | --all] [-f|--follow]",
         ));
     };
     let client = Client::connect(&server, &opts, follow).await?;

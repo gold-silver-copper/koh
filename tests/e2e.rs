@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use koh::Exit;
 use koh::client::Client;
-use koh::keys::{ClientEntry, Role, Route, Scope, load_or_create_key, save_clients};
+use koh::keys::{Role, Route, load_or_create_key};
 use koh::proto::{
     Attach, Attached, MAX_CHUNK, MAX_CTRL, Request, VIEW_FRAME, ViewInput, ViewOutput, ViewSize,
     recv_msg, send_msg,
@@ -373,28 +373,15 @@ impl InTerminal {
 }
 
 #[tokio::test]
-async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
+async fn unauthorized_key_is_refused_with_exit_4() {
     let tmp = TempDir::new("auth");
     let srv_cfg = tmp.0.join("srv_cfg");
     let cli_cfg = tmp.0.join("cli_cfg");
     fs::create_dir_all(&srv_cfg).unwrap();
     fs::create_dir_all(&cli_cfg).unwrap();
 
-    let allowed_dir = tmp.0.join("allowed");
-    fs::create_dir_all(&allowed_dir).unwrap();
-
     let stranger_key =
         load_or_create_key(Role::Client, Some(&cli_cfg.join("stranger.key"))).unwrap();
-    let cp_only_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("cponly.key"))).unwrap();
-    save_clients(
-        Some(&srv_cfg.join("server.key")),
-        &[ClientEntry {
-            name: "cpbot".into(),
-            id: cp_only_key.public(),
-            scope: Scope::Cp(allowed_dir.clone()),
-        }],
-    )
-    .unwrap();
 
     let srv = start_server(ServeOptions {
         key_file: Some(srv_cfg.join("server.key")),
@@ -410,7 +397,6 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
     .unwrap();
     let addr = srv.direct_addr.unwrap();
 
-    // 1. Unknown key -> Exit::REFUSED (4).
     let stranger = Client::connect_direct(
         stranger_key,
         srv.endpoint_id,
@@ -422,27 +408,6 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
     let err = stranger.jobs(None).await.unwrap_err();
     assert_eq!(err.code, Exit::REFUSED, "expected exit 4, got {err:?}");
     stranger.close().await;
-
-    // 2. cp-scoped key cannot exec (exit 4).
-    let cpbot = Client::connect_direct(
-        cp_only_key,
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    let exec_err = cpbot
-        .exec(
-            vec!["true".into()],
-            Some(allowed_dir.display().to_string()),
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(exec_err.code, Exit::REFUSED);
-
-    cpbot.close().await;
     srv.shutdown().await;
 }
 
@@ -486,44 +451,6 @@ fn cli_help_keys_and_peer_lists() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stdout).contains("\"kind\":\"usage\""));
-}
-
-/// A server with one `--cp DIR` key, and that key's client.
-async fn boot_scoped(tag: &str) -> (TempDir, koh::server::RunningServer, Client, PathBuf) {
-    let tmp = TempDir::new(tag);
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    let allowed = tmp.0.join("allowed");
-    for dir in [&srv_cfg, &cli_cfg, &allowed] {
-        fs::create_dir_all(dir).unwrap();
-    }
-    let key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
-    save_clients(
-        Some(&srv_cfg.join("server.key")),
-        &[ClientEntry {
-            name: "cpbot".into(),
-            id: key.public(),
-            scope: Scope::Cp(allowed.clone()),
-        }],
-    )
-    .unwrap();
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_cfg.join("server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: Vec::new(),
-        shell: None,
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.unwrap();
-    let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
-        .await
-        .unwrap();
-    (tmp, srv, client, allowed)
 }
 
 #[tokio::test]
@@ -1024,87 +951,6 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-#[tokio::test]
-async fn an_exec_scoped_key_runs_beneath_its_directory_and_nothing_else() {
-    use std::os::unix::fs::symlink;
-    let tmp = TempDir::new("exec-scope");
-    let (allowed, outside) = (tmp.0.join("allowed"), tmp.0.join("outside"));
-    fs::create_dir_all(allowed.join("sub")).unwrap();
-    fs::create_dir_all(&outside).unwrap();
-    symlink(&outside, allowed.join("out")).unwrap();
-    let key = new_key(&tmp, "exec.key");
-    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
-    save_clients(
-        Some(&tmp.0.join("srv_cfg/server.key")),
-        &[ClientEntry {
-            name: "runner".into(),
-            id: key.public(),
-            scope: Scope::Exec(allowed.clone()),
-        }],
-    )
-    .unwrap();
-    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
-    let client = Client::connect_direct(key, srv.endpoint_id, route, false)
-        .await
-        .unwrap();
-    let out_file = tmp.0.join("out");
-    let at = |dir: &std::path::Path| Some(dir.display().to_string());
-    let pwd = |dir: PathBuf| {
-        let (client, out_file) = (&client, out_file.clone());
-        async move {
-            let line = format!("pwd > {}", out_file.display());
-            let code = client.exec(vec![line], at(&dir), true).await?;
-            Ok::<_, koh::KohError>((code, fs::read_to_string(&out_file).unwrap()))
-        }
-    };
-
-    // A command starts in its directory, or in one beneath it, and is any command: this is no
-    // sandbox, and the command reaches what the server's user can.
-    let (code, out) = pwd(allowed.join("sub")).await.unwrap();
-    assert_eq!(code, 0);
-    assert!(out.trim_end().ends_with("/allowed/sub"));
-    let reach = format!(
-        "cat {} > {}",
-        outside.join("secret").display(),
-        out_file.display()
-    );
-    fs::write(outside.join("secret"), "reached").unwrap();
-    assert_eq!(
-        client.exec(vec![reach], at(&allowed), true).await.unwrap(),
-        0
-    );
-    assert_eq!(fs::read_to_string(&out_file).unwrap(), "reached");
-
-    // It does not start elsewhere, and elsewhere is told by the text of the path: a directory
-    // that is beneath its own by name and somewhere else in fact (a symlink out of it) is
-    // beneath its own.
-    for dir in [outside.clone(), tmp.0.clone(), allowed.join("sub/../..")] {
-        let err = pwd(dir.clone()).await.unwrap_err();
-        assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
-    }
-    let (code, out) = pwd(allowed.join("out")).await.unwrap();
-    assert_eq!(code, 0);
-    assert!(out.trim_end().ends_with("/outside"));
-    let job = client
-        .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
-        .await
-        .unwrap();
-    assert_eq!(job.name, "j");
-    let nowhere = client
-        .run_job(None, vec!["true".into()], at(&outside), false)
-        .await;
-    assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
-
-    // And it asks for nothing else: no look at jobs, its own among them. (Nor a session:
-    // `the_three_commands_are_a_full_keys`.)
-    assert_eq!(client.jobs(None).await.unwrap_err().code, Exit::REFUSED);
-    let waited = client.wait_job("j".into(), 10, Some(1)).await;
-    assert_eq!(waited.unwrap_err().code, Exit::REFUSED);
-
-    client.close().await;
-    srv.shutdown().await;
 }
 
 #[tokio::test]
@@ -1824,31 +1670,6 @@ impl InPane {
         });
         self.says("state").trim().to_string()
     }
-}
-
-#[tokio::test]
-async fn a_scoped_key_cannot_attach() {
-    let (tmp, srv, client, allowed) = boot_scoped("scoped-attach").await;
-    // A `--cp` key, and then the same key as an `--exec` key: neither has sessions.
-    for exec in [false, true] {
-        if exec {
-            let scope = Scope::Exec(allowed.clone());
-            let entry = ClientEntry {
-                name: "bot".into(),
-                id: load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg/client.key")))
-                    .unwrap()
-                    .public(),
-                scope,
-            };
-            save_clients(Some(&tmp.0.join("srv_cfg/server.key")), &[entry]).unwrap();
-        }
-        let err = attach(&client, asks(None, &[])).await.unwrap_err();
-        assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    }
-    // Refused before anything is made.
-    assert_eq!(names_in(&tmp.0.join("state/fux/koh-sessions")), [""; 0]);
-    client.close().await;
-    srv.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2929,52 +2750,6 @@ fn wait_session_ends_when_the_session_does() {
 }
 
 #[test]
-fn the_three_commands_are_a_full_keys() {
-    let host = Host::start("full-key", &[]);
-    host.session("s", &sh("echo ready; sleep 30"), "ready");
-    // A key with a scope, of either kind, beside the full key: it lists no session, reads
-    // none and waits for none, and is told so.
-    let bot = host.tmp.0.join("bot_cfg");
-    fs::create_dir_all(&bot).unwrap();
-    let id = load_or_create_key(Role::Client, Some(&bot.join("client.key")))
-        .unwrap()
-        .public();
-    let dir = host.tmp.0.join("home");
-    for scope in [Scope::Cp(dir.clone()), Scope::Exec(dir.clone())] {
-        let entry = ClientEntry {
-            name: "bot".into(),
-            id,
-            scope,
-        };
-        save_clients(Some(&host.tmp.0.join("srv_cfg/server.key")), &[entry]).unwrap();
-        let mut terminal = InTerminal::connect(
-            &bot,
-            &host.tmp.0.join("crun"),
-            &[&host.id, "--direct", &host.addr(), "--session", "s"],
-        );
-        assert_eq!(terminal.ends(), Some(4), "scoped key attached");
-        let asks: [&[&str]; 4] = [
-            &["sessions"],
-            &["output", "--session", "s"],
-            &["output", "--session", "s", "--last"],
-            &["wait", "--session", "s", "--timeout", "1"],
-        ];
-        for asks in asks {
-            let mut koh = host.koh(&[asks[0], &host.id, "--direct", &host.addr()]);
-            koh.args(&asks[1..]).env("KOH_CONFIG_DIR", &bot);
-            let said = koh.stderr(std::process::Stdio::piped()).output().unwrap();
-            let why = String::from_utf8_lossy(&said.stderr);
-            assert_eq!(said.status.code(), Some(4), "{asks:?}: {why}");
-            assert!(why.contains("scope"), "{asks:?}: {why}");
-        }
-    }
-    // The full key is answered.
-    let (code, list, said) = host.asked("sessions", &[]);
-    assert_eq!(code, Some(0), "{said}");
-    assert!(list.starts_with("s\tdetached\trunning\t"), "{list:?}");
-}
-
-#[test]
 fn the_recipes_of_help_agents_read_what_the_commands_read() {
     let host = Host::start("recipes", &[]);
     let pane = host.session("s", &marking_shell(&host), "$");
@@ -3468,45 +3243,36 @@ async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
 }
 
 #[test]
-fn clients_file_scopes_fail_closed_and_preserve_spaces() {
+fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
 
     let tmp = TempDir::new("clients-parse");
     let (key, file) = (tmp.0.join("server.key"), tmp.0.join("clients"));
     let k = iroh::SecretKey::from_bytes(&[1; 32]).public();
-    let cp = |p: &str| Scope::Cp(p.into());
-    let ex = |p: &str| Scope::Exec(p.into());
     let rows = [
         ("# comment".into(), None),
         (String::new(), None),
-        (format!("full {k}"), Some(("full", Scope::Full))),
-        (format!("ws {k}   "), Some(("ws", Scope::Full))),
-        (format!("cp {k} cp=/srv"), Some(("cp", cp("/srv")))),
-        (format!("sp {k}\tcp=/a  b "), Some(("sp", cp("/a  b ")))),
-        (format!("ex {k} exec=~/a b"), Some(("ex", ex("~/a b")))),
-        (format!("h {k} cp=/a # n"), Some(("h", cp("/a # n")))),
-        (format!("cr {k} cp=/c d\r"), Some(("cr", cp("/c d")))),
+        (format!("full {k}"), Some("full")),
+        (format!("ws {k}   "), Some("ws")),
+        (format!("cp {k} cp=/srv"), None),
+        (format!("ex {k} exec=~/a b"), None),
         (format!("t1 {k} copy=/srv"), None),
-        (format!("t2 {k} cp:/srv"), None),
-        (format!("t3 {k} cp"), None),
-        (format!("t4 {k} cp="), None),
-        (format!("t5 {k} exec="), None),
-        (format!("t6 {k} --cp /srv\x1b[2K"), None),
-        ("bad_id notakey cp=/srv".into(), None),
+        (format!("t2 {k} # inline"), None),
+        (format!("t3 {k} --cp /srv\x1b[2K"), None),
+        ("bad_id notakey".into(), None),
         ("lone_word".into(), None),
+        (format!("cr {k}\r"), Some("cr")),
     ];
     let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
-    fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
+    // No trailing LF: exercises a bare trailing `\r` on the last line.
+    fs::write(&file, text.join("\n")).unwrap();
 
     let mut skipped = Vec::new();
     let entries =
         koh::keys::load_clients(Some(&key), |n, l| skipped.push((n, l.to_string()))).unwrap();
-    let want: Vec<_> = rows.iter().filter_map(|(_, w)| w.clone()).collect();
-    let got: Vec<_> = entries
-        .iter()
-        .map(|e| (e.name.as_str(), e.scope.clone()))
-        .collect();
+    let want: Vec<_> = rows.iter().filter_map(|(_, w)| *w).collect();
+    let got: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(got, want);
     let skipped_want: Vec<_> = rows
         .iter()
@@ -3527,25 +3293,20 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
-    for (name, _) in &want {
+    for name in &want {
         assert!(stdout.contains(&format!("{name} ")), "{stdout}");
     }
     assert_eq!(stderr.lines().count(), skipped_want.len(), "{stderr}");
     for (n, line) in &skipped_want {
-        let expected =
-            format!("koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}");
+        let expected = format!("koh: clients:{n}: ignored, not NAME ID: {line:?}");
         assert!(stderr.contains(&expected), "missing {expected} in {stderr}");
     }
 
-    let injected = format!("/a\nevil {k}");
     for flag in ["--cp", "--exec"] {
-        for bad in [b"".as_slice(), injected.as_bytes(), b"/a\rb", b"/a\xffb"] {
-            let res = cli(&["add", "bad", &k.to_string(), flag])
-                .arg(OsStr::from_bytes(bad))
-                .output()
-                .unwrap();
-            assert_eq!(res.status.code(), Some(2), "{flag} {bad:?}");
-        }
+        let res = cli(&["add", "bad", &k.to_string(), flag, "/srv"])
+            .output()
+            .unwrap();
+        assert_eq!(res.status.code(), Some(2), "{flag}");
     }
     let bad_json = Command::new(env!("CARGO_BIN_EXE_koh"))
         .arg("servers")
@@ -3556,65 +3317,91 @@ fn clients_file_scopes_fail_closed_and_preserve_spaces() {
     assert_eq!(bad_json.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
     assert!(bad_json.stderr.is_empty());
-    // Trailing CRs on the last line without LF are line endings, not DIR, and survive a rename.
-    fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r\r")).unwrap();
-    assert_eq!(
-        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
-        cp("/x")
-    );
-    assert!(
-        cli(&["rename", "lead", "renamed"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert_eq!(
-        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
-        cp("/x")
-    );
 
-    // Hand-written bare CR in another line does not block `koh clients rm`.
-    fs::write(&file, format!("raw {k} cp=/a\rb\nother {k}\n")).unwrap();
+    // `rm` on a skipped name fails and leaves the file unchanged; `add`, `rename`, and `rm` of
+    // accepted names warn about skipped lines on stderr and rewrite from accepted lines only.
+    let before = format!("old {k} cp=/srv\nother {k}\n");
+    fs::write(&file, &before).unwrap();
+    let rm_old = cli(&["rm", "old"]).output().unwrap();
+    assert!(!rm_old.status.success());
+    let rm_err = String::from_utf8_lossy(&rm_old.stderr);
+    assert!(rm_err.contains("koh: clients:1: ignored") && rm_err.contains("no client named"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    let added = cli(&["add", "alice", &k.to_string()]).output().unwrap();
+    assert!(added.status.success());
+    assert!(String::from_utf8_lossy(&added.stderr).contains("koh: clients:1: ignored"));
+    assert!(cli(&["rename", "alice", "bob"]).status().unwrap().success());
+    let names: Vec<_> = koh::keys::load_clients(Some(&key), |_, _| {})
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["other", "bob"]);
     assert!(cli(&["rm", "other"]).status().unwrap().success());
+    assert_eq!(fs::read_to_string(&file).unwrap(), format!("bob {k}\n"));
 }
 
-#[tokio::test]
-async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     let tmp = TempDir::new("clients-enforce");
-    let (dir_a, dir_ab) = (tmp.0.join("a"), tmp.0.join("a b"));
-    for d in [&tmp.0.join("srv_cfg"), &dir_a, &dir_ab] {
+    let bot_cfg = tmp.0.join("bot_cfg");
+    let crun = tmp.0.join("crun");
+    for d in [tmp.0.join("srv_cfg"), bot_cfg.clone(), crun.clone()] {
         fs::create_dir_all(d).unwrap();
     }
-    let srv_key = tmp.0.join("srv_cfg/server.key");
     let valid = new_key(&tmp, "v.key");
+    let cp_key = load_or_create_key(Role::Client, Some(&bot_cfg.join("client.key"))).unwrap();
+    let exec_key = new_key(&tmp, "ex.key");
     let typo = new_key(&tmp, "t.key");
-    let exec_key = new_key(&tmp, "c.key");
-    let mut add = Command::new(env!("CARGO_BIN_EXE_koh"));
-    add.args(["clients", "--key-file"]).arg(&srv_key);
-    add.args(["add", "runner", &exec_key.public().to_string(), "--exec"])
-        .arg(&dir_ab);
-    assert!(add.status().unwrap().success());
-    let mut text = fs::read_to_string(tmp.0.join("srv_cfg/clients")).unwrap();
-    text.push_str(&format!(
-        "typo {} copy=/srv\nvalid {}\n",
+    let clients_file = tmp.0.join("srv_cfg/clients");
+    let skipped_only = format!(
+        "cpbot {} cp=/srv\nexecbot {} exec=/srv\ntypo {} copy=/srv\nold_valid {} cp=/srv\n",
+        cp_key.public(),
+        exec_key.public(),
         typo.public(),
         valid.public()
-    ));
-    fs::write(tmp.0.join("srv_cfg/clients"), text).unwrap();
+    );
+    fs::write(
+        &clients_file,
+        format!("{skipped_only}valid {}\n", valid.public()),
+    )
+    .unwrap();
 
     let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let addr = srv.direct_addr.unwrap().to_string();
+    let srv_id = srv.endpoint_id.to_string();
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
-    let t = dial(typo).await.unwrap();
-    let v = dial(valid).await.unwrap();
-    let c = dial(exec_key).await.unwrap();
-    assert_eq!(t.jobs(None).await.unwrap_err().code, Exit::REFUSED);
-    assert!(v.jobs(None).await.unwrap().is_empty());
-    let run_in = |d: &Path| c.exec(vec!["true".into()], Some(d.display().to_string()), false);
-    assert_eq!(run_in(&dir_a).await.unwrap_err().code, Exit::REFUSED);
-    assert_eq!(run_in(&dir_ab).await.unwrap(), 0);
-    for cl in [t, v, c] {
+    let marker = tmp.0.join("ran");
+    let touch = format!("touch {}", marker.display());
+    for refused in [cp_key, exec_key, typo] {
+        let cl = dial(refused).await.unwrap();
+        assert_eq!(
+            cl.exec(vec![touch.clone()], None, true)
+                .await
+                .unwrap_err()
+                .code,
+            Exit::REFUSED
+        );
         cl.close().await;
     }
+    assert!(!marker.exists(), "refused key ran a command");
+
+    // Refused `koh connect` via the binary exits 4 promptly (no infinite retry) and creates no session.
+    let mut terminal = InTerminal::connect(
+        &bot_cfg,
+        &crun,
+        &[&srv_id, "--direct", &addr, "--session", "s"],
+    );
+    assert_eq!(terminal.ends(), Some(4), "refused connect must exit 4");
+    assert_eq!(names_in(&tmp.0.join("state/fux/koh-sessions")), [""; 0]);
+
+    // Same id on a skipped line and a good line is allowed; removing the good line revokes it.
+    let v = dial(valid).await.unwrap();
+    assert!(v.jobs(None).await.unwrap().is_empty());
+    assert_eq!(v.exec(vec!["true".into()], None, false).await.unwrap(), 0);
+    fs::write(&clients_file, &skipped_only).unwrap();
+    assert_eq!(v.jobs(None).await.unwrap_err().code, Exit::REFUSED);
+    v.close().await;
     srv.shutdown().await;
 }
 

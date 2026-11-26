@@ -42,24 +42,23 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
 - **`--json` on `koh exec` and `koh logs`**: these commands stream raw bytes directly; read their
   stdout, stderr, and exit status instead. `--json` remains on `run`, `jobs`, `kill`, `wait`,
   `sessions`, `output`, and for errors (not on `exec`, `rsh`, `logs`).
+- **Scoped keys (`koh clients add NAME ID --cp DIR | --exec DIR`)**: an allowed key is the
+  server's user; to separate trust, run `koh serve` under another user account or on another
+  machine. Every `clients` line must be `NAME ID`: any line with an extra field (including older
+  `cp=…` or `exec=…` lines) grants no access and is refused (exit 4) unless that id is allowed by
+  another valid line or by `koh serve --allow ID` (which holds for the life of that server).
+  `koh clients` names each skipped line on stderr; a successful `koh clients add`, `rm`, or
+  `rename` rewrites the file from accepted lines only (dropping skipped lines, comments, and
+  blank lines), while `rm`/`rename` of a name that appears only on skipped lines fails and leaves
+  the file as it was. A non-UTF-8 `clients` file is refused whole (no key from it is allowed, and
+  `koh clients` exits 1 without naming a line).
 
 ### Security
 
-- **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
-  with spaces is read back as it was written.** In 0.18.0–0.18.1, any third word on a line in
-  `clients` that was not `cp=DIR` or `exec=DIR` (a typo such as `copy=/srv`, `cp:/srv`, `cp`,
-  or an inline comment like `laptop ID # my laptop`, which was a full key in 0.18.1 and is now
-  a line not taken) was read as an unscoped key that could run anything; and a `DIR` containing
-  a space (`koh clients add NAME ID --cp "/a b"`) was split at the first space and enforced as
-  `/a` instead of `/a b`. Now the scope is everything after the endpoint id to the end of the
-  line verbatim (no trim at its end and no `#` comment after it): only an absent scope grants
-  full access, and a line whose scope is unrecognized or has no `DIR` (`cp=` or `exec=`, which
-  0.18.1 read as the home directory) is skipped and gives that client nothing without locking
-  out valid entries. `koh clients` names each skipped line on stderr with its line number, and
-  the next `koh clients add`, `rm`, or `rename` rewrites the file without it; `koh serve` logs
-  nothing per request. `koh clients add` refuses a `--cp` or `--exec` `DIR` that is empty, is
-  not UTF-8, or contains `\n` or `\r` (exit 2). The on-disk format is unchanged for every line
-  0.18.1 wrote correctly.
+- **A `clients` line with an extra or unreadable field no longer grants full access.** In
+  0.18.0–0.18.1, any unrecognized third word on a line in `clients` (such as `copy=/srv`,
+  `cp:/srv`, `cp`, or an inline comment `laptop ID # my laptop`) was read as an unrestricted key.
+  See **Removed** above for the exact `clients` rule now (`NAME ID` only).
 
 ### Fixed
 

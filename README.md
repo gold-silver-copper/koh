@@ -3,11 +3,12 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,200 lines of `src/` without its tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust lines in `src/*.rs`, 5,600 including unit tests, down from ~22,000):
 
-- **Layer 1 — Transport & Scoped Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
-  compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files and
-  `--cp`/`--exec` path-scoped keys.
+- **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
+  using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
+  user; any `clients` line that is not `NAME ID` (including an older `cp=`/`exec=` line) grants
+  no access and is ignored (a non-UTF-8 `clients` file is rejected whole).
 - **Layer 2 — Raw Streams & Jobs (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF (SIGHUP on disconnect while
     stdin is still open; a command whose stdin has ended runs on).
@@ -87,7 +88,7 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,200 lines of `src
     (`kitten icat`) shows nothing in a session.
   - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
     --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
-    session's files, for a key with no scope. They read what a script there could. What is
+    session's files. They read what a script there could. What is
     of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
     marks and the text) is read between two looks at the same even `generation`; what is of
     one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
@@ -164,7 +165,7 @@ koh adds nothing to stop these. What happens instead is said.
   does not look there): it starts every session that has ended anew, with whatever `fux` is on
   the path.
 - Don't write `kill` to a session's `ctl` unless you mean it: it hangs up the program for
-  every client. Any key with no scope may; it may run any command.
+  every client. Any allowed key may; it may run any command.
 - Don't look at a session's folder with a `fux` of another version than koh was built with:
   `koh fux view` is the one that reads what koh's holders write.
 

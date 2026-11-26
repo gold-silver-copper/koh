@@ -1,4 +1,4 @@
-//! koh CLI entrypoint: zero-macro parser, unified help, strict exit codes, and `--json`.
+//! koh CLI entrypoint: zero-macro parser, unified help, strict exit codes.
 #![forbid(unsafe_code)]
 
 use std::io::Write as _;
@@ -42,19 +42,12 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let json = words
-        .peek()
-        .is_none_or(|w| !matches!(w.to_str(), Some("rsh" | "exec" | "logs")))
-        && std::env::args_os()
-            .skip(1)
-            .take_while(|a| a != "--")
-            .any(|a| a == "--json");
     let Ok(args) = words
         .map(std::ffi::OsString::into_string)
         .collect::<std::result::Result<Vec<String>, _>>()
     else {
         let err = KohError::usage("arguments must be valid UTF-8");
-        report_err(&err, json);
+        report_err(&err);
         return ExitCode::from(err.code.0);
     };
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -64,7 +57,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             let err = KohError::internal(format!("tokio runtime: {e}"));
-            report_err(&err, json);
+            report_err(&err);
             return ExitCode::from(err.code.0);
         }
     };
@@ -79,18 +72,14 @@ fn main() -> ExitCode {
     match done {
         Ok(code) => ExitCode::from(code.0),
         Err(err) => {
-            report_err(&err, json);
+            report_err(&err);
             ExitCode::from(err.code.0)
         }
     }
 }
 
-fn report_err(err: &KohError, json: bool) {
-    if json {
-        let _ = writeln!(std::io::stdout(), "{}", err.json_line());
-    } else {
-        let _ = writeln!(std::io::stderr(), "koh: {}", err.message);
-    }
+fn report_err(err: &KohError) {
+    let _ = writeln!(std::io::stderr(), "koh: {}", err.message);
 }
 
 fn take_opt(args: &[String], i: &mut usize, flag: &str) -> Result<String> {
@@ -187,18 +176,28 @@ fn cmd_key(args: &[String]) -> Result<Exit> {
     Ok(Exit::OK)
 }
 
-fn cmd_servers(args: &[String]) -> Result<Exit> {
-    let mut key_file = None::<PathBuf>;
-    let mut clean = Vec::new();
+/// `--key-file PATH` wherever it is in `args`, and the words that are not it.
+fn key_file_and_rest(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>)> {
+    let (mut key_file, mut rest) = (None, Vec::new());
     let mut i = 0;
     while let Some(a) = args.get(i).map(String::as_str) {
-        if a == "--key-file" {
-            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
-        } else {
-            clean.push(a.to_string());
+        match a {
+            "--key-file" => key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?)),
+            _ => rest.push(a.to_string()),
         }
         i += 1;
     }
+    Ok((key_file, rest))
+}
+
+/// The words after a subcommand: as many as its usage names, and no more.
+fn words<'a, const N: usize>(clean: &'a [String], usage: &str) -> Result<&'a [String; N]> {
+    let words = clean.get(1..).unwrap_or_default();
+    words.try_into().map_err(|_| KohError::usage(usage))
+}
+
+fn cmd_servers(args: &[String]) -> Result<Exit> {
+    let (key_file, clean) = key_file_and_rest(args)?;
     let mut list = load_servers(key_file.as_deref())?;
     match clean.first().map(String::as_str) {
         None => {
@@ -246,9 +245,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            let name = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh servers rm NAME"))?;
+            let [name] = words(&clean, "usage: koh servers rm NAME")?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -257,12 +254,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
             save_servers(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            let old = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
-            let new = clean
-                .get(2)
-                .ok_or_else(|| KohError::usage("usage: koh servers rename OLD NEW"))?;
+            let [old, new] = words(&clean, "usage: koh servers rename OLD NEW")?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no server named {old:?}")));
@@ -280,17 +272,7 @@ fn cmd_servers(args: &[String]) -> Result<Exit> {
 }
 
 fn cmd_clients(args: &[String]) -> Result<Exit> {
-    let mut key_file = None::<PathBuf>;
-    let mut clean = Vec::new();
-    let mut i = 0;
-    while let Some(a) = args.get(i).map(String::as_str) {
-        if a == "--key-file" {
-            key_file = Some(PathBuf::from(take_opt(args, &mut i, a)?));
-        } else {
-            clean.push(a.to_string());
-        }
-        i += 1;
-    }
+    let (key_file, clean) = key_file_and_rest(args)?;
     let mut list = load_clients(key_file.as_deref(), |n, line| {
         let _ = writeln!(
             std::io::stderr(),
@@ -304,12 +286,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             }
         }
         Some("add") => {
-            const USAGE: &str = "usage: koh clients add NAME ID";
-            let name = clean.get(1).ok_or_else(|| KohError::usage(USAGE))?;
-            let id_s = clean.get(2).ok_or_else(|| KohError::usage(USAGE))?;
-            if let Some(extra) = clean.get(3) {
-                return Err(KohError::usage(format!("unexpected argument {extra:?}")));
-            }
+            let [name, id_s] = words(&clean, "usage: koh clients add NAME ID")?;
             validate_peer_name(name)?;
             let id = parse_endpoint_id(id_s)?;
             list.retain(|e| e.name != *name);
@@ -320,9 +297,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rm") => {
-            let name = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh clients rm NAME"))?;
+            let [name] = words(&clean, "usage: koh clients rm NAME")?;
             let before = list.len();
             list.retain(|e| e.name != *name);
             if list.len() == before {
@@ -331,12 +306,7 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             save_clients(key_file.as_deref(), &list)?;
         }
         Some("rename") => {
-            let old = clean
-                .get(1)
-                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
-            let new = clean
-                .get(2)
-                .ok_or_else(|| KohError::usage("usage: koh clients rename OLD NEW"))?;
+            let [old, new] = words(&clean, "usage: koh clients rename OLD NEW")?;
             validate_peer_name(new)?;
             let Some(entry) = list.iter_mut().find(|e| e.name == *old) else {
                 return Err(KohError::failed(format!("no client named {old:?}")));
@@ -402,7 +372,6 @@ fn parse_common_dial(args: &[String], i: &mut usize, opts: &mut DialOptions) -> 
             );
         }
         "--relay-url" => opts.relay = Some(parse_relay_url(&take_opt(args, i, a)?)?),
-        "--json" => opts.json = true,
         _ => return Ok(false),
     }
     Ok(true)
@@ -419,7 +388,7 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
             argv.extend_from_slice(args.get(i + 1..).unwrap_or_default());
             break;
         }
-        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
+        if parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
@@ -472,7 +441,7 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
         if a == "--" || !a.starts_with('-') {
             break;
         }
-        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
+        if parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
@@ -532,16 +501,7 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
     let client = Client::connect(&server, &opts, false).await?;
     let done = client.run_job(name, argv, cwd).await;
     client.close().await;
-    let info = done?;
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::to_string(&info).unwrap_or_default()
-        );
-    } else {
-        let _ = writeln!(std::io::stdout(), "{}", info.name);
-    }
+    let _ = writeln!(std::io::stdout(), "{}", done?.name);
     Ok(Exit::OK)
 }
 
@@ -568,24 +528,14 @@ async fn cmd_jobs(args: &[String]) -> Result<Exit> {
     let client = Client::connect(&server, &opts, false).await?;
     let list = client.jobs(name).await;
     client.close().await;
-    let list = list?;
-    if opts.json {
+    // (`fux::plain`: a control character in a peer's text is a `?`, so no field holds a tab.)
+    for j in &list? {
+        let [name, state, command] = [&j.name, &j.state, &j.command].map(|f| fux::plain(f));
         let _ = writeln!(
             std::io::stdout(),
-            "{}",
-            serde_json::to_string(&list).unwrap_or_default()
+            "{name}\t{state}\t{}s\t{command}",
+            j.age_secs
         );
-    } else {
-        for j in &list {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}\t{}\t{}s\t{}",
-                j.name,
-                j.state,
-                j.age_secs,
-                j.command
-            );
-        }
     }
     Ok(Exit::OK)
 }
@@ -597,7 +547,7 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
     let mut i = 0;
     while i < args.len() {
         let a = args.get(i).map(String::as_str).unwrap_or_default();
-        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
+        if parse_common_dial(args, &mut i, &mut opts)? {
             i += 1;
             continue;
         }
@@ -663,13 +613,7 @@ async fn cmd_kill(args: &[String]) -> Result<Exit> {
     let info = client.kill_job(name, sig).await;
     client.close().await;
     let info = info?;
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::to_string(&info).unwrap_or_default()
-        );
-    } else if info.state != "running" {
+    if info.state != "running" {
         let _ = writeln!(
             std::io::stderr(),
             "koh: job {} is not running ({})",
@@ -734,19 +678,8 @@ async fn cmd_wait(args: &[String]) -> Result<Exit> {
     };
     client.close().await;
     let res = res?;
-
-    if opts.json {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            serde_json::to_string(&res).unwrap_or_default()
-        );
-    } else {
-        if !res.tail.is_empty() {
-            let _ = std::io::stdout().write_all(res.tail.as_bytes());
-        }
-        let _ = writeln!(std::io::stderr(), "· {}", res.detail);
-    }
+    let _ = std::io::stdout().write_all(res.tail.as_bytes());
+    let _ = writeln!(std::io::stderr(), "· {}", res.detail);
     Ok(Exit(u8::try_from(res.exit).unwrap_or(1)))
 }
 
@@ -772,36 +705,29 @@ async fn cmd_sessions(args: &[String], output: bool) -> Result<Exit> {
     }
     let Some(server) = server.filter(|_| session.is_some() == output) else {
         return Err(KohError::usage(match output {
-            true => "usage: koh output SERVER --session NAME [--last] [--json]",
-            false => "usage: koh sessions SERVER [--json]",
+            true => "usage: koh output SERVER --session NAME [--last]",
+            false => "usage: koh sessions SERVER",
         }));
     };
     let client = Client::connect(&server, &opts, false).await?;
     let said = match &session {
-        Some(session) => client.output(session.clone(), last).await.map(|text| {
-            let json = || serde_json::json!({ "session": session, "output": text });
-            if opts.json {
-                format!("{}\n", json())
-            } else {
-                text
-            }
-        }),
-        None => client.sessions().await.map(|list| match opts.json {
-            true => serde_json::to_string(&list).unwrap_or_default() + "\n",
-            false => list.iter().map(listed).collect(),
-        }),
+        Some(session) => client.output(session.clone(), last).await,
+        None => client
+            .sessions()
+            .await
+            .map(|list| list.iter().map(listed).collect()),
     };
     client.close().await;
     let _ = std::io::stdout().write_all(said?.as_bytes());
     Ok(Exit::OK)
 }
 
-/// A session as a line of `koh sessions`.
+/// A session as a line of `koh sessions` (its texts `fux::plain`, as a job's).
 fn listed(s: &SessionInfo) -> String {
     let attached = if s.attached { "attached" } else { "detached" };
     let busy = if s.running_command { "busy" } else { "idle" };
     let last = s.last_exit.map_or("-".to_string(), |code| code.to_string());
-    let (name, state, title) = (&s.name, &s.state, &s.title);
+    let [name, state, title] = [&s.name, &s.state, &s.title].map(|f| fux::plain(f));
     format!(
         "{name}\t{attached}\t{state}\t{busy}\texit={last}\t{}x{}\t{title}\n",
         s.cols, s.rows

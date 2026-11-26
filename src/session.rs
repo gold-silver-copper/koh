@@ -107,7 +107,7 @@ pub(crate) fn named_in(
 }
 
 pub(crate) fn not_found(what: String) -> KohError {
-    KohError::new(Exit::NOT_FOUND, "not_found", what)
+    KohError::new(Exit::NOT_FOUND, what)
 }
 
 /// What `state` says became of a pane's program. It runs only while a holder lives:
@@ -121,7 +121,7 @@ pub(crate) fn state_of(said: Option<String>, alive: bool) -> String {
 }
 
 /// A session as its folder says it is, read of one round of its holder's writing.
-fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
+fn info(dir: &Path, attached: bool) -> SessionInfo {
     let ((alive, state, size, title, marks), _) = pane::together(dir, lives, || {
         let line = |name| pane::line(dir, name);
         let size = line("size").unwrap_or_default();
@@ -143,8 +143,6 @@ fn info(dir: &Path, written: SystemTime, attached: bool) -> SessionInfo {
         title: title.unwrap_or_default(),
         running_command: alive && marks.busy,
         last_exit: marks.ended.and_then(|(_, code, _)| code),
-        age_secs: written.elapsed().map_or(0, |age| age.as_secs()),
-        pane_dir: dir.display().to_string(),
     }
 }
 
@@ -252,7 +250,7 @@ impl Sessions {
         });
         let mut panes: Vec<_> = panes.collect();
         panes.sort();
-        let info = |(written, dir, attached): (_, PathBuf, _)| info(&dir, written, attached);
+        let info = |(_, dir, attached): (SystemTime, PathBuf, _)| info(&dir, attached);
         pooled(move || panes.into_iter().map(info).collect()).await
     }
 
@@ -290,19 +288,16 @@ impl Sessions {
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         // (More seconds than the clock has are no limit, as for a job: `after`.)
         let until = seconds.map(|s| after(Timer::now(), Duration::from_secs(s)));
-        let (timed_out, (exit, detail, text)) = loop {
+        let (exit, detail, text) = loop {
             let look = dir.clone();
             if let Some(ended) = pooled(move || looked(&look, run, asked)).await? {
-                break (false, ended);
+                break ended;
             }
             if until.is_some_and(|until| Timer::now() >= until) {
                 let shown = dir.clone();
                 let ours = move || (run_of(&shown) == Some(run)).then(|| screen(&shown));
                 let shown = pooled(ours).await?.unwrap_or_default();
-                break (
-                    true,
-                    (i32::from(Exit::TIMEOUT.0), "timed out".into(), shown),
-                );
+                break (i32::from(Exit::TIMEOUT.0), "timed out".into(), shown);
             }
             tokio::select! {
                 _ = send.stopped() => return Ok(()),
@@ -310,7 +305,6 @@ impl Sessions {
             }
         };
         let waited = WaitResult {
-            timed_out,
             exit,
             tail: String::new(),
             detail,
@@ -353,7 +347,7 @@ impl Sessions {
                 let why = format!(
                     "server busy: it keeps at most {most} sessions (--max-sessions), and all are running or attached"
                 );
-                KohError::new(Exit::BUSY, "busy", why)
+                KohError::new(Exit::BUSY, why)
             })?;
             Some(oldest)
         } else {
@@ -652,7 +646,6 @@ pub(crate) async fn start(
     env: &[(&str, String)],
     cwd: &Path,
 ) -> Result<PathBuf> {
-    let cannot = |code, why: String| KohError::new(code, "cannot_start", why);
     let said = tokio::process::Command::new(exe)
         .args(["fux", "start"])
         .args(out.then_some("--out"))
@@ -665,7 +658,7 @@ pub(crate) async fn start(
         .output()
         .await
         .map_err(|e| {
-            cannot(
+            KohError::new(
                 Exit::CANNOT_START,
                 format!("cannot run {}: {e}", exe.display()),
             )
@@ -683,12 +676,12 @@ pub(crate) async fn start(
         } else {
             Exit::CANNOT_START
         };
-        return Err(cannot(code, format!("nothing was started: {why}")));
+        return Err(KohError::new(code, format!("nothing was started: {why}")));
     }
     let dir = PathBuf::from(String::from_utf8_lossy(&said.stdout).trim_end());
     (dir.parent() == Some(workspace))
         .then_some(dir.clone())
-        .ok_or_else(|| cannot(Exit::CANNOT_START, format!("no pane at {}", dir.display())))
+        .ok_or_else(|| KohError::new(Exit::CANNOT_START, format!("no pane at {}", dir.display())))
 }
 
 fn io_error(e: std::io::Error) -> KohError {

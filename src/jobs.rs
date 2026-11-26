@@ -66,8 +66,6 @@ fn info(dir: &Path) -> JobInfo {
         .map_or(0, |d| d.as_secs());
     JobInfo {
         name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
-        pid: field("pid ").parse().unwrap_or(0),
-        exit: exit_of(&state),
         state,
         age_secs,
         command: field("command ").into(),
@@ -259,12 +257,11 @@ impl Jobs {
         let (dir, run, _, file) = self.open_run(name).await?;
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         let deadline = timeout_secs.map(|s| after(Timer::now(), Duration::from_secs(s)));
-        let (timed_out, exit, detail) =
-            match self.until_ended(&dir, run, deadline, send, None).await? {
-                PollEnd::ClientGone => return Ok(()),
-                PollEnd::State(st, code) => (false, code.unwrap_or(1), st),
-                PollEnd::TimedOut => (true, i32::from(Exit::TIMEOUT.0), "timed out".into()),
-            };
+        let (exit, detail) = match self.until_ended(&dir, run, deadline, send, None).await? {
+            PollEnd::ClientGone => return Ok(()),
+            PollEnd::State(st, code) => (code.unwrap_or(1), st),
+            PollEnd::TimedOut => (i32::from(Exit::TIMEOUT.0), "timed out".into()),
+        };
         let tail = pooled(move || -> Result<String> {
             let (from, len) = tail_range(&file, lines, WAIT_TAIL_CAP as u64).map_err(read_err)?;
             let mut raw = vec![0u8; (len - from) as usize];
@@ -274,12 +271,7 @@ impl Jobs {
             Ok(tail)
         })
         .await??;
-        let waited = WaitResult {
-            timed_out,
-            exit,
-            tail,
-            detail,
-        };
+        let waited = WaitResult { exit, tail, detail };
         send_msg(send, &waited, MAX_FRAME).await
     }
 

@@ -21,12 +21,14 @@ Raw commands (no PTY; separate stdout/stderr; stdin EOF; group hangup on disconn
             (only --key-file, --direct, --relay-url, -- before HOST; ssh flags like -l/-p/-o exit 2)
 
 Headless persistent jobs (terminal-less fux panes in STATE/fux/koh-jobs; survive koh serve restarts):
-  koh run SERVER [--name NAME] [-C DIR] [--json] -- PROG ARG...
-  koh jobs SERVER [NAME] [--json]
+  koh run SERVER [--name NAME] [-C DIR] -- PROG ARG...   prints the job's name
+  koh jobs SERVER [NAME]
+            a line a job: name, state (running, exited N, killed N, hungup, lost WHY, or ended
+            where nothing says how), age in seconds (`12s`), command
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
-  koh wait SERVER NAME [--tail N] [--timeout SECS] [--json]                 (a job; a session: below)
+  koh wait SERVER NAME [--tail N] [--timeout SECS]          (a job; a session: below)
             (wait and logs -f exit 1 with "that job was started anew" if NAME is restarted meanwhile)
-  koh kill SERVER NAME [--signal TERM|KILL|INT|HUP|1..31] [--json]
+  koh kill SERVER NAME [--signal TERM|KILL|INT|HUP|1..31]
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
 `koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):
@@ -40,15 +42,26 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             what is typed then is held (64 KiB), and Ctrl-] . leaves then too.
   koh fux ...                                    fux itself, the one that reads koh's panes
             (it and `koh hold` run on this machine, and ask no server)
-  koh sessions SERVER [--json]
-            each session as its folder on the server says it is, the oldest first: name, attached
-            or detached, what became of its program (running, exited N, killed N, hungup, or
-            ended where nothing says how), busy while a command runs, the last command's exit
-            code, size, title
-  koh output SERVER --session NAME [--last] [--json]
+  koh sessions SERVER
+            a line a session as its folder on the server says it is, the oldest first: name,
+            attached or detached, what became of its program (as a job's state), busy while
+            a command runs or idle, the last command's exit code (`exit=N`, `exit=-` for
+            none), size (`80x24`), title
+            A line of `jobs` and of `sessions` is its fields with one tab between each, and
+            ends with LF, for scripts: the fields before the last are kept for good, in this
+            order, and the last (the command; the title) is the rest of the line, `$NF` to
+            `awk -F '\t'` (split on tabs, not on blanks: a state has a space, and a job with no
+            command or a session with no title still has its last field, empty). No field
+            holds a tab, a CR or an LF: koh prints a control character in any of them as `?`.
+            (U+2028 and U+2029 are no control characters and are printed as they are: split
+            records on LF alone, as awk does, not with Python's `splitlines()`.) So
+            `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'` holds. A job's
+            exit status is in its state (`exited N`), or is `koh wait`'s; a session's folder
+            is the folder `koh serve` printed, then the session's name.
+  koh output SERVER --session NAME [--last]
             the screen it shows; with --last what its last command printed, from where its
             output began to where it ended (a line break is added to a last line without one)
-  koh wait SERVER --session NAME [--timeout SECS] [--json]
+  koh wait SERVER --session NAME [--timeout SECS]
             for the first command that ends there after it was asked (so ask before you type
             the command): prints what that one printed and exits with its code. Or until the
             session ends: its screen, and its program's status as `koh connect` gives it.
@@ -57,7 +70,7 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             has the lines for bash, and nearly the same three as a script over the files.)
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL
-                --json on run, jobs, wait, kill, sessions, output (and errors, not exec/rsh/logs)
+                Errors go to stderr (`koh: ...`), and the exit code below says which kind.
 Exit codes: 0 ok, 1 failed (or write error), 2 usage, 3 unreachable, 4 refused, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 128+N signal (141 broken pipe),
             255 koh internal error (or exec link lost / no exit status after connecting).

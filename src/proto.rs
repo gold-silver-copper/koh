@@ -95,13 +95,10 @@ pub struct SessionInfo {
     pub cols: usize,
     pub rows: usize,
     pub title: String,
-    /// The shell's last mark is `output`.
+    /// The holder lives and the shell's last mark is `output`.
     pub running_command: bool,
     /// The code of the last `end` mark, if the shell gave one.
     pub last_exit: Option<u8>,
-    /// Since `status` was written, which is when the session started.
-    pub age_secs: u64,
-    pub pane_dir: String,
 }
 
 /// Asks for a stream of a session, which is a fux pane on the server: answered `Ok`, then
@@ -154,18 +151,13 @@ pub struct Attached {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
-    Err {
-        code: u8,
-        kind: String,
-        message: String,
-    },
+    Err { code: u8, message: String },
 }
 
 impl Reply {
     pub fn from_err(err: &KohError) -> Self {
         Self::Err {
             code: err.code.0,
-            kind: err.kind.to_string(),
             message: err.message.clone(),
         }
     }
@@ -173,11 +165,7 @@ impl Reply {
     pub fn into_result(self) -> Result<()> {
         match self {
             Self::Ok => Ok(()),
-            Self::Err {
-                code,
-                kind,
-                message,
-            } => Err(KohError::new(exit_of(code), kind_of(&kind), message)),
+            Self::Err { code, message } => Err(KohError::new(exit_of(code), message)),
         }
     }
 }
@@ -194,9 +182,7 @@ pub enum ExecServerMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobInfo {
     pub name: String,
-    pub pid: u32,
     pub state: String,
-    pub exit: Option<i32>,
     pub age_secs: u64,
     pub command: String,
 }
@@ -215,7 +201,6 @@ pub enum LogMsg {
 /// Result of `WaitJob` and of `WaitSession`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WaitResult {
-    pub timed_out: bool,
     pub exit: i32,
     pub tail: String,
     pub detail: String,
@@ -238,20 +223,6 @@ fn exit_of(code: u8) -> Exit {
         Exit(code)
     } else {
         Exit::FAILED
-    }
-}
-
-/// A kind a peer named, as one of ours: an error's kind is a fixed word.
-fn kind_of(kind: &str) -> &'static str {
-    match kind {
-        "refused" => "refused",
-        "usage" => "usage",
-        "unreachable" => "unreachable",
-        "busy" => "busy",
-        "not_found" => "not_found",
-        "cannot_start" => "cannot_start",
-        "failed" => "failed",
-        _ => "remote",
     }
 }
 
@@ -415,7 +386,6 @@ mod tests {
         for (said, code) in told.into_iter().zip(taken) {
             let answer = Reply::Err {
                 code: said,
-                kind: "failed".to_string(),
                 message: "it stopped".to_string(),
             };
             assert_eq!(answer.into_result().unwrap_err().code, Exit(code), "{said}");

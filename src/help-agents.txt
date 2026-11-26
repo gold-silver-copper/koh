@@ -1,10 +1,12 @@
 
 Recipes: a session's files, for whoever would rather script than ask.
 A session is a fux pane: a folder of plain files on the server, in the folder `koh serve`
-printed (`koh sessions SERVER --json` has each one's as `pane_dir`). `koh sessions`, `koh
-output` and `koh wait --session` read those files there and no more; the script below is
-nearly the same as sh, for `koh exec` or for a script of your own on the server (where it is
-not the same, its comments say: `last` cuts whole lines, `wait` prints the last output):
+printed (`sessions dir:`: `$XDG_RUNTIME_DIR/koh/fux/koh-sessions`, or with no
+`XDG_RUNTIME_DIR` the temporary directory's `koh-UID/fux/koh-sessions`), and named
+as `koh sessions` names it. `koh sessions`, `koh output` and `koh wait --session` read
+those files there and no more; the script below is nearly the same as sh, for `koh exec`
+or for a script of your own on the server (where it is not the same, its comments say:
+`last` cuts whole lines, `wait` prints the last output):
 
   koh help-agents | sed -n '/^#!/,$p' | koh rsh SERVER 'cat > sessions.sh'
   koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed
@@ -33,7 +35,7 @@ list() { # NAME <tab> alive|ended <tab> STATE <tab> COLSxROWS <tab> busy|idle <t
     [ -f "$p/status" ] || continue
     if alive "$p"; then a=alive; else a=ended; fi
     cols=0 rows=0; { read -r cols rows < "$p/size"; } 2> /dev/null   # (a pane that has only begun has none yet)
-    # A command runs when the last mark is `output`: after `command` the shell waits at its prompt.
+    # A command runs while the holder lives and the last mark is `output`: after `command` the shell waits at its prompt.
     work=$(awk -v a=$a '$3 == "end" { code = $4 } { last = $3 }
       END { if (code == "") code = "-"; printf "%s\t%s", (a == "alive" && last == "output" ? "busy" : "idle"), code }' "$p/marks" 2> /dev/null) || work=$(printf 'idle\t-')
     printf '%s\t%s\t%s\t%sx%s\t%s\t%s\n' "${p##*/}" "$a" "$(cat "$p/state" 2>/dev/null)" "$cols" "$rows" "$work" "$(cat "$p/title" 2>/dev/null)"

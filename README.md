@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust lines in `src/*.rs`, 5,500 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,760 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
@@ -43,8 +43,8 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     must outlive it); output written by a leftover process after the leader exits may appear in
     `out` later (`koh logs --all`) and not in a `koh logs -f` that already ended. `koh kill`
     writes `kill N` to the pane's `ctl` FIFO and reaches a job only while its holder lives; a
-    holder killed with `-9` leaves its program running, while `koh jobs` and `koh wait` report
-    `ended` with exit 1. Run one `koh serve` per state directory (two servers for the same user
+    holder killed with `-9` leaves its program running, while `koh jobs` lists the job as
+    `ended` (exit 0) and `koh wait` reports `ended` with exit 1. Run one `koh serve` per state directory (two servers for the same user
     sharing the default state directory share the jobs folder and do not coordinate starts).
     `koh serve` no longer needs `kill(1)` or `id(1)` on its `PATH`.
 - **Layer 3 — Sessions are `fux` panes:**
@@ -109,16 +109,17 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     the corner instead). A program that draws with the Kitty graphics protocol alone
     (`kitten icat`) shows nothing in a session.
   - `koh sessions SERVER`, `koh output SERVER --session NAME [--last]` and `koh wait SERVER
-    --session NAME [--timeout SECS]` (each with `--json`) are answered on the server from a
+    --session NAME [--timeout SECS]` are answered on the server from a
     session's files. They read what a script there could. What is
     of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
     marks and the text) is read between two looks at the same even `generation`; what is of
     one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
     replaces a file whole. A session lives while its holder has the lock on its folder.
-    - `sessions` lists each folder that has a `status`, the oldest first: its name, whether a
-      client is attached, what `state` says became of its program (`running` only while the
-      holder lives; `ended` where none does and nothing says how), whether a command runs,
-      the last command's exit code, the size and the title.
+    - `sessions` lists each pane with a valid name, a `run` and a `status`, the oldest first:
+      its name, whether a client is attached, what `state` says became of its program
+      (`running` only while the holder lives; `ended` where none does and nothing says how),
+      whether a command runs, the last command's exit code, the size and the title: a line a
+      session, the fields separated by tabs, as `koh help` says.
     - `output` is the screen the session shows. With `--last` it is what the last command
       that has ended printed: the text from where its output began to where it ended, out of
       `history.1`, `history` and the main screen, each line whole however the screen wrapped
@@ -134,7 +135,7 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
       `--tail` are not said with `--session` (exit 2).
     - `--last`, `wait` and "a command runs" go by the marks a shell puts at its prompts (OSC
       133): `prompt`, `command`, `output`, `end` in the pane's `marks`. A command runs while
-      the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
+      the holder lives and the last mark is `output`. `fux` numbers a pane's marks (`marks.dropped` and a mark's
       line in `marks`): a command has ended when an `end` is there with a higher number than
       the last `end` had when the wait was asked. Where a mark is on the screen is not
       asked, so a screen that scrolls, has a line inserted or is cleared ends nothing, and
@@ -240,7 +241,7 @@ koh adds nothing to stop these. What happens instead is said.
   came and went unread)`, more marks came between two of its looks than a pane keeps (a
   thousand: some 250 commands inside a tenth of a second, a script's doing). The first
   command that ended is then no longer listed: what it gives is the oldest that is, its code
-  and its output, and it says so on that line (`detail`, with `--json`).
+  and its output, and it says so on the line it prints on stderr.
 - End the sessions that a koh built on a `fux` before 0.43.2 started, if you `koh wait` on
   them: such a session's holder does not number its marks (its folder has no
   `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh

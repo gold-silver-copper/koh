@@ -190,7 +190,6 @@ pub fn hold_for_serving(explicit: Option<&Path>) -> Result<File> {
         Ok(()) => Ok(lock),
         Err(fs::TryLockError::WouldBlock) => Err(KohError::new(
             Exit::BUSY,
-            "busy",
             format!(
                 "another koh server is serving with the key {}: stop that one, or give this one \
                  a key of its own (--key-file)",

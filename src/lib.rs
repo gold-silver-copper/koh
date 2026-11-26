@@ -30,52 +30,37 @@ impl Exit {
     pub const INTERNAL: Self = Self(255);
 }
 
-/// Structured koh error carrying exit code and machine-readable kind for `--json`.
+/// What went wrong: the exit code it gives, and the line koh prints on stderr.
 #[derive(Debug)]
 pub struct KohError {
     pub code: Exit,
-    pub kind: &'static str,
     pub message: String,
 }
 
 impl KohError {
-    pub fn new(code: Exit, kind: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            kind,
-            message: message.into(),
-        }
+    pub fn new(code: Exit, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self { code, message }
     }
 
     pub fn usage(msg: impl Into<String>) -> Self {
-        Self::new(Exit::USAGE, "usage", msg)
+        Self::new(Exit::USAGE, msg)
     }
 
     pub fn unreachable(msg: impl Into<String>) -> Self {
-        Self::new(Exit::UNREACHABLE, "unreachable", msg)
+        Self::new(Exit::UNREACHABLE, msg)
     }
 
     pub fn refused(msg: impl Into<String>) -> Self {
-        Self::new(Exit::REFUSED, "refused", msg)
+        Self::new(Exit::REFUSED, msg)
     }
 
     pub fn failed(msg: impl Into<String>) -> Self {
-        Self::new(Exit::FAILED, "failed", msg)
+        Self::new(Exit::FAILED, msg)
     }
 
     pub fn internal(msg: impl Into<String>) -> Self {
-        Self::new(Exit::INTERNAL, "internal", msg)
-    }
-
-    pub fn json_line(&self) -> String {
-        serde_json::json!({
-            "error": {
-                "kind": self.kind,
-                "message": self.message,
-                "code": self.code.0,
-            }
-        })
-        .to_string()
+        Self::new(Exit::INTERNAL, msg)
     }
 }
 

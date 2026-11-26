@@ -12,7 +12,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 
 use crate::keys::Route;
 use crate::proto::{ALPN, CloseCode, KeyProof, MAX_PROOF, recv_msg, send_msg};
-use crate::{KohError, Result};
+use crate::{Exit, KohError, Result};
 
 const PROOF_LABEL: &[u8] = b"koh/21 client proof";
 
@@ -137,11 +137,7 @@ fn refused(err: &ConnectError) -> bool {
 }
 
 fn busy() -> KohError {
-    KohError::new(
-        crate::Exit::BUSY,
-        "busy",
-        "server busy: too many connections at once",
-    )
+    KohError::new(Exit::BUSY, "server busy: too many connections at once")
 }
 
 fn proof_payload(conn: &Connection) -> Result<Vec<u8>> {

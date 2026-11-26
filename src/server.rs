@@ -110,14 +110,10 @@ struct ServerState {
 
 impl ServerState {
     fn authorize(&self, id: EndpointId) -> Result<()> {
-        if self.extra_allow.contains(&id) {
-            return Ok(());
-        }
-        let clients = load_clients(self.key_file.as_deref(), |_, _| {})?;
-        if clients.iter().any(|c| c.id == id) {
-            return Ok(());
-        }
-        Err(KohError::refused("client key is not in clients list"))
+        let listed = || load_clients(self.key_file.as_deref(), |_, _| {});
+        (self.extra_allow.contains(&id) || listed()?.iter().any(|c| c.id == id))
+            .then_some(())
+            .ok_or_else(|| KohError::refused("client key is not in clients list"))
     }
 }
 
@@ -404,11 +400,8 @@ async fn dispatch(
 
 pub(crate) fn check_cmd<'a>(argv: &'a [String], cwd: &Path) -> Result<(&'a str, &'a [String])> {
     if !cwd.is_dir() {
-        return Err(KohError::new(
-            Exit::CANNOT_START,
-            "cannot_start",
-            format!("no such directory: {}", cwd.display()),
-        ));
+        let missing = format!("no such directory: {}", cwd.display());
+        return Err(KohError::new(Exit::CANNOT_START, missing));
     }
     argv.split_first()
         .map(|(p, a)| (p.as_str(), a))
@@ -438,7 +431,7 @@ async fn handle_exec(
             } else {
                 Exit::CANNOT_START
             };
-            KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
+            KohError::new(code, format!("spawn exec: {e}"))
         })?;
     let pgid = child.id();
 

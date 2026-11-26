@@ -130,11 +130,18 @@ impl Aside {
             .map(|()| Self(Some(aside)))
     }
 
-    /// Puts the folder back at `dir`; if rename fails, disarms drop so it stays on disk.
-    pub(crate) fn restore(mut self, dir: &std::path::Path) {
-        if let Some(aside) = self.0.take() {
-            let _ = std::fs::rename(aside, dir);
+    /// Puts the folder back at `dir`; if rename fails, disarms drop so it stays on disk and
+    /// returns its retained path with the error.
+    pub(crate) fn restore(
+        mut self,
+        dir: &std::path::Path,
+    ) -> std::result::Result<(), (std::path::PathBuf, std::io::Error)> {
+        if let Some(aside) = self.0.take()
+            && let Err(e) = std::fs::rename(&aside, dir)
+        {
+            return Err((aside, e));
         }
+        Ok(())
     }
 }
 
@@ -163,4 +170,28 @@ pub fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     let tmp = path.with_file_name(format!(".{name}.new"));
     std::fs::write(&tmp, data)?;
     std::fs::rename(tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aside_restore_failure_reports_retained_path_and_keeps_files() {
+        let base = std::env::temp_dir().join(format!("koh-aside-{}", std::process::id()));
+        let dir = base.join("keep");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("log"), b"saved").ok();
+        let old = Aside::of(&dir);
+        assert!(old.is_some());
+        std::fs::create_dir_all(dir.join("blocker")).ok();
+        let res = old.map(|a| a.restore(&dir));
+        assert!(matches!(res, Some(Err(_))));
+        if let Some(Err((kept, _))) = res {
+            let text = fuxix::open_regular(kept.join("log")).and_then(std::io::read_to_string);
+            assert_eq!(text.ok().as_deref(), Some("saved"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

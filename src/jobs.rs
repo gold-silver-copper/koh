@@ -122,9 +122,14 @@ impl JobManager {
         })();
         let mut child = match started {
             Ok(child) => child,
-            Err(err) => {
-                if let Some(old) = old {
-                    old.restore(&dir);
+            Err(mut err) => {
+                if let Some(old) = old
+                    && let Err((kept, e)) = old.restore(&dir)
+                {
+                    err.message.push_str(&format!(
+                        "; earlier job folder could not be put back ({e}) and is kept at {}",
+                        kept.display()
+                    ));
                 }
                 return Err(err);
             }

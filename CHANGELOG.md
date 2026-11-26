@@ -52,8 +52,8 @@ binary, its tests and the fuzz targets share code, and any release may change it
   pipe to the remote shell open until the remote shell exits (dropping the tokio runtime waited on
   a blocked read of stdin). `koh exec` and `koh rsh` now shut down the runtime in the background
   after their output has been flushed and the connection closed, and wait on readiness (`poll`) if
-  a caller such as macOS `openrsync` passes non-blocking stdin/stdout descriptors instead of
-  treating `EAGAIN` as EOF or dropping output. Only clients need this.
+  a caller such as macOS `openrsync` passes non-blocking stdin/stdout/stderr descriptors instead of
+  treating `EAGAIN` as EOF or dropping streamed (non-`--json`) output. Only clients need this.
 - **`koh cp --delete` is now refused unless the source is a single directory (push and pull).**
   Previously, `koh cp --delete one.txt box:dir/` deleted every other entry in `dir`, and
   `koh cp --delete one.txt box:` deleted everything else in the remote home directory; pulling a
@@ -67,8 +67,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   directory with an empty log, wiping the earlier job's log. On a failed start, the new job
   directory is removed and any earlier job's directory is put back, leaving its log and listing
   intact (and leaving no directory when there was no earlier job). If putting the earlier
-  directory back itself fails, koh keeps it on disk and reports both the start error and the
-  retained path with the start's exit status. Only servers need this.
+  directory back itself fails, koh keeps it on disk, points the earlier job's record at it so
+  `jobs`, `logs`, and `wait` still read the true log by name, and reports both the start error and
+  the retained path with the start's exit status. Only servers need this.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started

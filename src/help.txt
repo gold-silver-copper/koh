@@ -13,7 +13,7 @@ Keys & peers:
             (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
              and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
-Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
+Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop while stdin is open):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...
   koh exec SERVER [--sync DIR] [-C DIR] [--json] --sh 'SHELL LINE'
   koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)

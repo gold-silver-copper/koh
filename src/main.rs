@@ -12,7 +12,7 @@ use koh::keys::{
     parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
     validate_peer_name,
 };
-use koh::proto::SessionInfo;
+use koh::proto::{MAX_CTRL, Request, SessionInfo, encode};
 use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
@@ -549,7 +549,18 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    run_exec(host, &opts, vec![words.join(" ")], None, true, None, vec![]).await
+    let line = words.join(" ");
+    let req = Request::Exec {
+        argv: vec![line.clone()],
+        cwd: None,
+        shell: true,
+    };
+    if encode(&req, MAX_CTRL).is_err() {
+        return Err(KohError::usage(format!(
+            "command exceeds maximum size ({MAX_CTRL} bytes)"
+        )));
+    }
+    run_exec(host, &opts, vec![line], None, true, None, vec![]).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {

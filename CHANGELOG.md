@@ -23,7 +23,7 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`,
   `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
   now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
-  joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the `exec` request (`koh/21`),
+  joins `WORD…` with spaces, and runs them with `/bin/sh -c --` over the `exec` request (`koh/21`),
   preserving stdout, stderr, and the remote exit status; non-terminal stdin is forwarded, and
   terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url` (and `--`) are
   accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.) are refused
@@ -62,6 +62,35 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
 
 ### Fixed
 
+- **`koh exec` and `koh rsh` now behave as a real pipe in both directions and hang up the remote
+  command whenever the client goes.** Seven defects in `exec` / `rsh` were eliminated by
+  rebuilding the pump with independent input/output paths, raw stdin bytes on the stream, and a
+  single peer-disconnect watcher:
+  - *Orphan remote commands after stdin ended (including interrupted `rsync --partial`):*
+    Previously, once local stdin reached EOF (such as `</dev/null`), disconnecting the client did
+    not hang up the remote command, and interrupting `rsync --partial` could leave a remote rsync
+    alive for ~20 s to rename its partial file over a later run. Now the server watches the
+    stream through drain and exit, sends SIGHUP to the command's process group (then SIGKILL
+    after 2 s if still alive) whenever the client disconnects or `koh serve` shuts down cleanly,
+    and `koh` closes the connection immediately on `INT`, `TERM`, `HUP`, or `USR1` (exiting
+    `128 + N`).
+  - *Deadlock when both sides write megabytes at once:* Previously, a server-side write to child
+    stdin could block the same loop that drained child stdout/stderr. Now stdin and output are
+    pumped independently, so multi-megabyte bidirectional transfers complete without stalling.
+  - *Never-ending producers under `| head`:* Previously, closing `koh`'s stdout pipe was ignored,
+    so `koh exec box -- yes | head -1` never returned and left the producer running on the
+    server. Now a broken pipe on stdout or stderr exits `141` at once and closes the link so the
+    remote producer is hung up.
+  - *Exit 3 ("unreachable") after a command started:* Previously, losing the connection mid-exec
+    reported exit `3` as if the server had never been reached. Now exit `3` is only when `koh`
+    never reached the server; losing the link after connecting exits `255`.
+  - *Silent success when writing to `koh`'s own stdout/stderr failed:* Previously, write errors
+    such as `>/dev/full` were ignored and `koh` exited `0`. Now non-pipe write failures exit `1`.
+  - *Shell commands starting with `-`:* Previously, `--sh LINE` and `koh rsh` ran `/bin/sh -c
+    LINE` without `--`, so a command starting with `-` was parsed as a shell option. Now the
+    client expands `--sh` and `rsh` to `/bin/sh -c -- LINE`.
+  - *Silent exit `0` when the stream ended without an exit status:* Previously, a truncated stream
+    defaulted to exit `0`. Now a stream that ends without an exit status exits `255`.
 - **`koh exec` and `koh rsh` now exit as soon as the remote command ends, even if local stdin
   stays open.** Previously, `(sleep 8) | koh exec box -- echo hi` printed `hi` and waited 8 seconds
   until stdin closed, and `rsync` over koh hung at the end of a transfer because `rsync` keeps its

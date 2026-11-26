@@ -13,10 +13,10 @@ Keys & peers:
             (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
              and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
-Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop while stdin is open):
+Raw commands (no PTY; separate stdout/stderr; stdin EOF; group hangup on disconnect):
   koh exec SERVER [-C DIR] -- PROG ARG...
   koh exec SERVER [-C DIR] --sh 'SHELL LINE'
-  koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)
+  koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c --)
             rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
             GIT_SSH_COMMAND='koh rsh' git clone box:repo.git
             tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
@@ -59,8 +59,9 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL
                 --json on run, jobs, wait, kill, sessions, output (and errors, not exec/rsh/logs)
-Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused, 75 busy,
-            124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
+Exit codes: 0 ok, 1 failed (or write error), 2 usage, 3 unreachable, 4 refused, 75 busy,
+            124 timeout, 126 cannot start, 127 not found, 128+N signal (141 broken pipe),
+            255 koh internal error (or exec link lost / no exit status after start).
             (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote
             command's exit status.)
             `koh serve` exits 75 when another `koh serve` already holds its key.

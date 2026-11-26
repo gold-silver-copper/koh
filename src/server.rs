@@ -132,7 +132,8 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
-    /// Closes the endpoint and waits for connection tasks (and active exec hangups) to finish.
+    /// Closes the endpoint, waits for connection tasks (and active exec hangups) to finish,
+    /// and lets go of the key.
     pub async fn shutdown(mut self) {
         self.endpoint.close().await;
         let _ = (&mut self.task).await;
@@ -537,35 +538,34 @@ async fn handle_exec(
     let pgid = child.id();
 
     let stdin = child.stdin.take();
-    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
     let input = async move {
         if let Some(mut pipe) = stdin {
             let _ = tokio::io::copy(&mut recv, &mut pipe).await;
         }
+        drop(recv);
+        std::future::pending::<()>().await
     };
     let stopped = send.stopped();
     let output = async {
-        send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+        send_msg(send, &Reply::Ok, MAX_CTRL).await.ok()?;
+        let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
         let (mut out, mut err) = (vec![0u8; 32 << 10], vec![0u8; 32 << 10]);
         loop {
             let msg = tokio::select! {
                 slice = exec_pipe(&mut stdout, &mut out), if stdout.is_some() => {
-                    slice?.map(|bytes| ExecServerMsg::Stdout(bytes.to_vec()))
+                    slice.ok()?.map(ExecServerMsg::Stdout)
                 }
                 slice = exec_pipe(&mut stderr, &mut err), if stderr.is_some() => {
-                    slice?.map(|bytes| ExecServerMsg::Stderr(bytes.to_vec()))
+                    slice.ok()?.map(ExecServerMsg::Stderr)
                 }
                 else => break,
             };
             if let Some(msg) = msg {
-                send_msg(send, &msg, MAX_CHUNK).await?;
+                send_msg(send, &msg, MAX_CHUNK).await.ok()?;
             }
         }
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| KohError::internal(format!("wait exec: {e}")))?;
-        Ok::<_, KohError>(
+        let status = child.wait().await.ok()?;
+        Some(
             status
                 .code()
                 .or_else(|| status.signal().map(|s| 128 + s))
@@ -574,13 +574,10 @@ async fn handle_exec(
     };
     let done = tokio::select! {
         _ = stopped => None,
-        done = output => Some(done),
-        // Stdin EOF closes only the child's stdin pipe; it must not disarm `stopped`.
-        _ = async { input.await; std::future::pending::<()>().await } => None,
+        done = output => done,
+        () = input => None,
     };
-    drop(stdout);
-    drop(stderr);
-    if let Some(Ok(code)) = done {
+    if let Some(code) = done {
         let _ = send_msg(send, &ExecServerMsg::Exit(code), MAX_CTRL).await;
     } else {
         hang_up(pgid, &mut child).await;
@@ -588,39 +585,30 @@ async fn handle_exec(
     Ok(())
 }
 
-async fn exec_pipe<'a, R: tokio::io::AsyncRead + Unpin>(
+async fn exec_pipe<R: tokio::io::AsyncRead + Unpin>(
     pipe: &mut Option<R>,
-    buf: &'a mut [u8],
-) -> Result<Option<&'a [u8]>> {
+    buf: &mut [u8],
+) -> std::io::Result<Option<Vec<u8>>> {
     if let Some(reader) = pipe {
-        let n = reader
-            .read(buf)
-            .await
-            .map_err(|e| KohError::internal(format!("read exec pipe: {e}")))?;
+        let n = reader.read(buf).await?;
         if n > 0 {
-            return Ok(buf.get(..n));
+            return Ok(buf.get(..n).map(<[u8]>::to_vec));
         }
     }
     *pipe = None;
     Ok(None)
 }
 
-/// Hangs up the command of a client that has gone: SIGHUP to its group, and SIGKILL if it is
-/// still there `HANGUP_WAIT` later; keeps the leader unreaped until the last signal.
+/// Hangs up the command of a client that has gone: SIGHUP to its group, `HANGUP_WAIT`,
+/// SIGKILL to its group, then reaps the leader (kept unreaped until the last signal so
+/// its number stays pinned as the group's id).
 async fn hang_up(pgid: Option<u32>, child: &mut tokio::process::Child) {
     let Some(pid) = pgid else { return };
-    for sig in [1, 9] {
-        if let Err(err) = crate::jobs::signal_group(pid, sig).await
-            && !matches!(child.try_wait(), Ok(Some(_)))
-        {
-            let said = format!("koh: a command whose client went was not hung up: {err}");
-            let _ = writeln!(std::io::stderr(), "{said}");
-        }
-        if tokio::time::timeout(HANGUP_WAIT, child.wait())
-            .await
-            .is_ok()
-        {
-            return;
-        }
+    if let Err(err) = crate::jobs::signal_group(pid, 1).await {
+        let said = format!("koh: a command whose client went was not hung up: {err}");
+        let _ = writeln!(std::io::stderr(), "{said}");
     }
+    tokio::time::sleep(HANGUP_WAIT).await;
+    let _ = crate::jobs::signal_group(pid, 9).await;
+    let _ = child.wait().await;
 }

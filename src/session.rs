@@ -62,24 +62,22 @@ pub(crate) fn lives(dir: &Path) -> bool {
     matches!(asked, Ok(Err(TryLockError::WouldBlock)))
 }
 
-/// How a run ended, if it has: what `state` says became of its program; or 1 where nothing
-/// says and no holder is left, or the folder is gone or another run's. Once the lock is seen
-/// free, `state` is read once more under the same run identity so a reader caught between the
-/// final state write and the holder letting go still reads the real exit code.
-pub(crate) fn ended(dir: &Path, run: Run) -> Option<i32> {
-    ended_with(dir, run, lives)
+/// Reads a pane's state by probing `is_alive` BEFORE reading `state`: once the lock is seen
+/// free, the holder has already published its final `state`.
+pub(crate) fn state_now(dir: &Path, is_alive: impl FnOnce(&Path) -> bool) -> String {
+    let alive = is_alive(dir);
+    state_of(pane::line(dir, "state"), alive)
 }
 
-fn ended_with(dir: &Path, run: Run, is_alive: impl FnOnce(&Path) -> bool) -> Option<i32> {
-    let code = || {
-        (run_of(dir) == Some(run)).then(|| pane::line(dir, "state").and_then(|s| pane::code(&s)))
-    };
-    match code() {
-        None => Some(1),
-        Some(Some(c)) => Some(c),
-        Some(None) if is_alive(dir) => None,
-        Some(None) => code().flatten().or(Some(1)),
+/// How a run ended, if it has: `None` while running, `Some(Ok(state))` once ended (`exited N`,
+/// `killed S`, or `ended`), `Some(Err(()))` if its folder is gone or now another run's.
+/// Probes `lives` before `state` and checks `run` after `state`.
+pub(crate) fn ended(dir: &Path, run: Run) -> Option<std::result::Result<String, ()>> {
+    let state = state_now(dir, lives);
+    if run_of(dir) != Some(run) {
+        return Some(Err(()));
     }
+    (state != "running").then_some(Ok(state))
 }
 
 pub(crate) fn not_found(what: String) -> KohError {
@@ -219,19 +217,8 @@ impl Sessions {
         &self.dir
     }
 
-    /// This binary, used to start fux holders and viewers.
-    pub(crate) fn exe(&self) -> &Path {
-        &self.exe
-    }
-
     fn streams(&self) -> MutexGuard<'_, HashMap<(Run, u64), Stream>> {
         self.streams.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Every folder that counts as a session, and of one that is a pane its run and when its
-    /// `status` was written: by that time one is newer than another.
-    fn folders(&self) -> Vec<(PathBuf, Option<(Run, SystemTime)>)> {
-        panes_in(&self.dir)
     }
 
     /// The folder of the session `name` and its run: a pane's, or there is no such session.
@@ -246,7 +233,7 @@ impl Sessions {
     /// `koh sessions`: every session as its folder says it is, the oldest first, and whether
     /// a client has a stream of it.
     pub async fn list(&self) -> Result<Vec<SessionInfo>> {
-        let panes = self.folders().into_iter().filter_map(|(dir, pane)| {
+        let panes = panes_in(&self.dir).into_iter().filter_map(|(dir, pane)| {
             let (run, written) = pane?;
             let attached = self.streams().keys().any(|(streamed, _)| *streamed == run);
             Some((written, dir, attached))
@@ -320,32 +307,13 @@ impl Sessions {
         send_pieces(send, &text).await
     }
 
-    /// Starts a pane for the session that is asked for, and gives its folder.
-    async fn start(&self, asked: &Attach, cwd: &Path) -> Result<PathBuf> {
-        // (Before the program is started: it may ask for a colour as its first act.)
-        self.told(asked);
-        let shell = [self.shell.clone()];
-        let argv = if asked.argv.is_empty() {
-            &shell[..]
-        } else {
-            &asked.argv[..]
-        };
-        // (A size fux would refuse is the nearest it takes: a pane is 1 to 500 each way.)
-        let size = [
-            ("COLUMNS", asked.size.cols.clamp(1, 500).to_string()),
-            ("LINES", asked.size.rows.clamp(1, 500).to_string()),
-        ];
-        let name = asked.name.as_deref().unwrap_or("");
-        start(&self.exe, &self.dir, name, false, argv, &size, cwd).await
-    }
-
     /// The folder of the session that is asked for, found or started. With a name, the session
     /// of that name, started if there is none. With none, the newest that lives; or a new
     /// one, always if `new` or a program was given. A new one is one more folder: with `max`
     /// there, the oldest that has ended and has no client goes for it, once it has started.
     async fn find(&self, asked: &Attach, cwd: &Path) -> Result<PathBuf> {
         let one = self.starting.lock().await;
-        let folders = self.folders();
+        let folders = panes_in(&self.dir);
         let wanted = asked.name.as_ref().map(|name| self.dir.join(name));
         let newest = || {
             let living = folders.iter().filter(|(dir, _)| lives(dir));
@@ -379,7 +347,19 @@ impl Sessions {
         } else {
             None
         };
-        let started = self.start(asked, cwd).await?;
+        self.told(asked);
+        let shell = [self.shell.clone()];
+        let argv = if asked.argv.is_empty() {
+            &shell[..]
+        } else {
+            &asked.argv[..]
+        };
+        let size = [
+            ("COLUMNS", asked.size.cols.clamp(1, 500).to_string()),
+            ("LINES", asked.size.rows.clamp(1, 500).to_string()),
+        ];
+        let name = asked.name.as_deref().unwrap_or("");
+        let started = start(&self.exe, &self.dir, name, false, argv, &size, cwd).await?;
         // (Only now that the new one runs does the old one go; and what it held is removed
         // with nothing held, where no other request waits for it: the next start does not
         // either, for the folder has no session's name any more.)
@@ -620,7 +600,9 @@ impl Sessions {
         // runs on and the viewer was told to leave. (One that failed says nothing: the client
         // comes again.)
         if let (true, Ok(Ok(status))) = (left, gone) {
-            let code = ended(&dir, run).or(status.success().then_some(0));
+            let code = ended(&dir, run)
+                .map(|r| r.ok().and_then(|s| pane::code(&s)).unwrap_or(1))
+                .or(status.success().then_some(0));
             if let Some(code) = code {
                 send_msg(send, &ViewOutput::Exit(code), VIEW_FRAME).await?;
             }
@@ -641,15 +623,15 @@ pub(crate) fn panes_in(root: &Path) -> Vec<(PathBuf, Option<(Run, SystemTime)>)>
         })
         .map(|e| {
             let dir = e.path();
-            let written = fs::metadata(dir.join("status")).and_then(|s| s.modified());
-            let pane = run_of(&dir).zip(written.ok());
-            (dir, pane)
+            let written = fs::metadata(dir.join("status"))
+                .and_then(|s| s.modified())
+                .ok();
+            (dir.clone(), run_of(&dir).zip(written))
         })
         .collect()
 }
 
-/// Starts a pane with `exe` as fux, `koh fux start [--out] WORKSPACE/NAME -- PROGRAM` (no
-/// name: fux's first free number), in `cwd` with `env` added, and gives the folder fux printed.
+/// Starts a pane (`koh fux start [--out] WORKSPACE/NAME -- PROGRAM`) in `cwd` with `env`.
 pub(crate) async fn start(
     exe: &Path,
     workspace: &Path,
@@ -660,25 +642,26 @@ pub(crate) async fn start(
     cwd: &Path,
 ) -> Result<PathBuf> {
     let cannot = |code, why: String| KohError::new(code, "cannot_start", why);
-    let mut fux = tokio::process::Command::new(exe);
-    fux.args(["fux", "start"])
+    let said = tokio::process::Command::new(exe)
+        .args(["fux", "start"])
         .args(out.then_some("--out"))
         .arg(workspace.join(name))
         .arg("--")
         .args(argv)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
-        .stdin(Stdio::null());
-    let said = fux.output().await.map_err(|e| {
-        cannot(
-            Exit::CANNOT_START,
-            format!("cannot run {}: {e}", exe.display()),
-        )
-    })?;
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            cannot(
+                Exit::CANNOT_START,
+                format!("cannot run {}: {e}", exe.display()),
+            )
+        })?;
     if !said.status.success() {
         let why = String::from_utf8_lossy(&said.stderr);
         let why = why.trim().trim_start_matches("fux: ");
-        // fux names the folder it made for a program it could not start: remove it.
         if let Some((f, _)) = why.split_once(": cannot start ")
             && Path::new(f).parent() == Some(workspace)
         {
@@ -692,14 +675,9 @@ pub(crate) async fn start(
         return Err(cannot(code, format!("nothing was started: {why}")));
     }
     let dir = PathBuf::from(String::from_utf8_lossy(&said.stdout).trim_end());
-    if dir.parent() == Some(workspace) {
-        Ok(dir)
-    } else {
-        Err(cannot(
-            Exit::CANNOT_START,
-            format!("no pane at {}", dir.display()),
-        ))
-    }
+    (dir.parent() == Some(workspace))
+        .then_some(dir.clone())
+        .ok_or_else(|| cannot(Exit::CANNOT_START, format!("no pane at {}", dir.display())))
 }
 
 fn io_error(e: std::io::Error) -> KohError {
@@ -801,32 +779,25 @@ mod tests {
         fs::write(dir.join("state"), "running\n").unwrap();
         assert_eq!(ended(&dir, 7), None);
         fs::write(dir.join("state"), "killed 9\n").unwrap();
-        assert_eq!(ended(&dir, 7), Some(137));
-        // A holder that is gone and said nothing: 1. Another run under the name, or none: 1.
+        assert_eq!(ended(&dir, 7), Some(Ok("killed 9".into())));
+        // A holder that is gone and said nothing: "ended". Another run under the name, or none: Err.
         drop(holder);
         fs::write(dir.join("state"), "running\n").unwrap();
-        assert_eq!(ended(&dir, 7), Some(1));
+        assert_eq!(ended(&dir, 7), Some(Ok("ended".into())));
         assert_eq!(
             (ended(&dir, 8), ended(&tmp.join("none"), 7)),
-            (Some(1), Some(1))
+            (Some(Err(())), Some(Err(())))
         );
-        let _ = fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn ended_rereads_state_after_holder_releases_lock() {
-        let tmp = scratch("ended-race");
-        let dir = tmp.join("j");
-        pane(&dir, 7);
-        fs::write(dir.join("state"), "running\n").unwrap();
-        // Simulate holder writing final state and dropping its lock between the first state
-        // check and the lock probe: `ended` must report 0, not 1.
-        let dir_hook = dir.clone();
-        let code = ended_with(&dir, 7, move |_| {
-            fs::write(dir_hook.join("state"), "exited 0\n").unwrap();
-            false
-        });
-        assert_eq!(code, Some(0));
+        // Lock must be probed BEFORE reading `state`: if the holder publishes `exited 0` and
+        // unlocks right as we probe, `state_now` must read `exited 0`, never `ended`.
+        let d = dir.clone();
+        assert_eq!(
+            state_now(&dir, move |_| {
+                fs::write(d.join("state"), "exited 0\n").unwrap();
+                false
+            }),
+            "exited 0"
+        );
         let _ = fs::remove_dir_all(tmp);
     }
 
@@ -879,7 +850,7 @@ mod tests {
             names.collect::<Vec<_>>()
         };
         let aside = names();
-        assert!(!dir.exists() && sessions.folders().is_empty());
+        assert!(!dir.exists() && panes_in(sessions.dir()).is_empty());
         assert!(
             matches!(aside.as_slice(), [name] if name.starts_with('.')
                 && sessions.dir().join(name).join("status").is_file()),

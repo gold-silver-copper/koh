@@ -164,8 +164,12 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_string());
-    let sessions = Sessions::new(&base, max_sessions, default_shell, opts.session_exe)?;
-    let jobs = Jobs::new(&base, sessions.exe())?;
+    let exe = opts
+        .session_exe
+        .map_or_else(std::env::current_exe, Ok)
+        .map_err(|e| KohError::failed(format!("no path to koh: {e}")))?;
+    let sessions = Sessions::new(&base, max_sessions, default_shell, Some(exe.clone()))?;
+    let jobs = Jobs::new(&base, &exe)?;
     let sessions_dir = sessions.dir().to_path_buf();
 
     let state = Arc::new(ServerState {
@@ -398,7 +402,7 @@ async fn dispatch(
     }
 }
 
-fn build_command(argv: &[String], cwd: &Path) -> Result<std::process::Command> {
+pub(crate) fn check_cmd<'a>(argv: &'a [String], cwd: &Path) -> Result<(&'a str, &'a [String])> {
     if !cwd.is_dir() {
         return Err(KohError::new(
             Exit::CANNOT_START,
@@ -406,12 +410,9 @@ fn build_command(argv: &[String], cwd: &Path) -> Result<std::process::Command> {
             format!("no such directory: {}", cwd.display()),
         ));
     }
-    let Some((prog, args)) = argv.split_first() else {
-        return Err(KohError::usage("missing command"));
-    };
-    let mut cmd = std::process::Command::new(prog);
-    cmd.args(args).current_dir(cwd);
-    Ok(cmd)
+    argv.split_first()
+        .map(|(p, a)| (p.as_str(), a))
+        .ok_or_else(|| KohError::usage("missing command"))
 }
 
 /// Raw non-PTY exec: separate stdout/stderr, raw stdin, and group hangup whenever the client goes.
@@ -421,7 +422,9 @@ async fn handle_exec(
     send: &mut SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
-    let mut std_cmd = build_command(argv, cwd)?;
+    let (prog, args) = check_cmd(argv, cwd)?;
+    let mut std_cmd = std::process::Command::new(prog);
+    std_cmd.args(args).current_dir(cwd);
     fuxix::new_session(&mut std_cmd, false);
     let mut child = tokio::process::Command::from(std_cmd)
         .stdin(Stdio::piped())

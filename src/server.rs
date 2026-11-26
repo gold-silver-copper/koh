@@ -404,11 +404,8 @@ async fn dispatch(
 
 pub(crate) fn check_cmd<'a>(argv: &'a [String], cwd: &Path) -> Result<(&'a str, &'a [String])> {
     if !cwd.is_dir() {
-        return Err(KohError::new(
-            Exit::CANNOT_START,
-            "cannot_start",
-            format!("no such directory: {}", cwd.display()),
-        ));
+        let missing = format!("no such directory: {}", cwd.display());
+        return Err(KohError::new(Exit::CANNOT_START, missing));
     }
     argv.split_first()
         .map(|(p, a)| (p.as_str(), a))
@@ -438,7 +435,7 @@ async fn handle_exec(
             } else {
                 Exit::CANNOT_START
             };
-            KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
+            KohError::new(code, format!("spawn exec: {e}"))
         })?;
     let pgid = child.id();
 

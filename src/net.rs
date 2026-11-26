@@ -139,7 +139,6 @@ fn refused(err: &ConnectError) -> bool {
 fn busy() -> KohError {
     KohError::new(
         crate::Exit::BUSY,
-        "busy",
         "server busy: too many connections at once",
     )
 }

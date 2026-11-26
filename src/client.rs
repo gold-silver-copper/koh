@@ -34,7 +34,6 @@ pub struct DialOptions {
     pub key_file: Option<PathBuf>,
     pub direct: Option<SocketAddr>,
     pub relay: Option<RelayUrl>,
-    pub json: bool,
 }
 
 /// Which session `koh connect` asks for: one by its name, started if there is none of it; or

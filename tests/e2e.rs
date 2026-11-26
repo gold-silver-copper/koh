@@ -129,22 +129,6 @@ fn raw_exec_binary_streams_stdin_eof_and_exit_code() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(out.stdout, b"hello stdin\n");
     assert!(out.stderr.is_empty());
-
-    // --json is refused on byte-stream commands (exec and logs), on stderr.
-    for args in [
-        &["exec", &host.id, "--direct", &addr, "--json", "--", "true"][..],
-        &["logs", &host.id, "--direct", &addr, "j", "--json"][..],
-    ] {
-        let res = host
-            .koh(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .unwrap();
-        assert_eq!(res.status.code(), Some(2), "{args:?}");
-        assert!(res.stdout.is_empty(), "{args:?}");
-        assert!(!res.stderr.is_empty(), "{args:?}");
-    }
 }
 
 #[tokio::test]
@@ -169,8 +153,7 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     assert_eq!(info.name, "long");
 
     let wait_res = client.wait_job("long".into(), 200, Some(10)).await.unwrap();
-    assert!(!wait_res.timed_out);
-    assert_eq!(wait_res.exit, 7);
+    assert_eq!((wait_res.exit, wait_res.detail.as_str()), (7, "exited 7"));
     assert!(wait_res.tail.contains(&long_line));
 
     let mut raw_log = Vec::new();
@@ -198,14 +181,14 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
         .await
         .unwrap();
     let timed = client.wait_job("srv".into(), 10, Some(1)).await.unwrap();
-    assert!(timed.timed_out && timed.exit == 124);
+    assert_eq!((timed.exit, timed.detail.as_str()), (124, "timed out"));
 
     let jobs = client.jobs(None).await.unwrap();
     assert_eq!(jobs.len(), 2);
 
     let _ = client.kill_job("srv".into(), 9).await.unwrap();
     let killed = client.wait_job("srv".into(), 10, Some(5)).await.unwrap();
-    assert!(!killed.timed_out && killed.exit != 0);
+    assert_eq!((killed.exit, killed.detail.as_str()), (137, "killed 9"));
 
     client.close().await;
     srv.shutdown().await;
@@ -230,7 +213,7 @@ async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
         .wait_job("brief".into(), 10, Some(u64::MAX))
         .await
         .unwrap();
-    assert!(!waited.timed_out && waited.exit == 3, "{waited:?}");
+    assert_eq!(waited.exit, 3, "{waited:?}");
     assert_eq!(client.jobs(None).await.unwrap().len(), 1);
 
     client.close().await;
@@ -467,14 +450,6 @@ fn cli_help_keys_and_peer_lists() {
         .output()
         .unwrap();
     assert!(String::from_utf8_lossy(&list.stdout).contains("box "));
-
-    // Usage error with --json emits structured JSON and exit code 2.
-    let bad = Command::new(bin)
-        .args(["unknown-cmd", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(bad.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bad.stdout).contains("\"kind\":\"usage\""));
 }
 
 #[tokio::test]
@@ -2427,76 +2402,67 @@ fn sessions_lists_what_the_folders_say() {
         fs::read_to_string(host.pane("dead").join("state")).unwrap(),
         "running\n"
     );
-    let list = || -> Vec<serde_json::Value> {
-        let (code, list, said) = host.asked("sessions", &["--json"]);
+    // A line a session, its fields after one tab each: name, attached or detached, state,
+    // busy or idle, exit=N or exit=-, COLSxROWS, and the title, the rest of the line.
+    let list = || -> Vec<Vec<String>> {
+        let (code, list, said) = host.asked("sessions", &[]);
         assert_eq!(code, Some(0), "{said}");
-        serde_json::from_str(&list).unwrap()
+        let fields = |line: &str| line.split('\t').map(String::from).collect::<Vec<_>>();
+        list.lines().map(fields).collect()
     };
-    let of = |name: &str, what: &str| {
+    let of = |name: &str, field: usize| {
         let list = list();
-        let session = list.iter().find(|session| session["name"] == name);
-        session.unwrap_or_else(|| panic!("no {name} in {list:?}"))[what].clone()
+        let session = list.iter().find(|session| session[0] == name);
+        session.unwrap_or_else(|| panic!("no {name} in {list:?}"))[field].clone()
     };
-    // Each by its name, the oldest first; where it is, its size and whether a client has it.
-    let names: Vec<_> = list().iter().map(|s| s["name"].clone()).collect();
+    // Each by its name, the oldest first; its size and whether a client has it.
+    let names: Vec<_> = list().iter().map(|s| s[0].clone()).collect();
     assert_eq!(names, ["live", "done", "dead"]);
-    assert_eq!(of("live", "pane_dir"), pane.to_str().unwrap());
+    assert_eq!(of("live", 5), "80x24");
     assert_eq!(
-        (of("live", "cols"), of("live", "rows")),
-        (80.into(), 24.into())
-    );
-    assert_eq!(
-        (of("live", "attached"), of("done", "attached")),
-        (true.into(), false.into())
+        (of("live", 1), of("done", 1)),
+        ("attached".into(), "detached".into())
     );
     // What became of each program is what `state` says; but only a session whose holder lives
     // runs: of the one that was killed nothing says how it ended.
-    let states = ["live", "done", "dead"].map(|name| of(name, "state"));
+    let states = ["live", "done", "dead"].map(|name| of(name, 2));
     assert_eq!(states, ["running", "exited 7", "ended"]);
     // At a prompt no command runs: the last mark is where what is typed begins. One runs from
     // where its output begins (the last mark is `output`) to its end, which has its code.
-    assert_eq!(of("live", "running_command"), false);
+    assert_eq!(of("live", 3), "idle");
     let gate = host.tmp.0.join("gate");
     let waits = format!(
         "sh -c 'until [ -e {} ]; do sleep 0.1; done; exit 5'\n",
         gate.display()
     );
     fs::write(pane.join("in"), waits).unwrap();
-    until("the command runs", || of("live", "running_command") == true);
+    until("the command runs", || of("live", 3) == "busy");
     assert!(
         fs::read_to_string(pane.join("marks"))
             .unwrap()
             .ends_with(" output\n")
     );
     fs::write(&gate, "").unwrap();
-    until("the command has ended", || {
-        of("live", "running_command") == false
-    });
-    assert_eq!(of("live", "last_exit"), 5);
+    until("the command has ended", || of("live", 3) == "idle");
+    assert_eq!(
+        (of("live", 4), of("done", 4)),
+        ("exit=5".into(), "exit=-".into())
+    );
     // A session whose holder is gone runs no command, whatever its marks say: the last mark
     // of the one that was killed is still the `output` of the command it ran.
     assert_eq!(
-        (of("done", "running_command"), of("dead", "running_command")),
-        (false.into(), false.into())
+        (of("done", 3), of("dead", 3)),
+        ("idle".into(), "idle".into())
     );
-    // The client leaves: the session is not attached. As a line for a person to read.
+    // A title the program gave a tab is still the last field: a title has no control character.
+    fs::write(pane.join("in"), "printf '\\033]2;a\\tb\\007'\n").unwrap();
+    until("the title is set", || {
+        list()[0].len() == 7 && of("live", 6) == "ab"
+    });
+    // The client leaves: the session is not attached.
     signal(&live.koh.id().to_string(), "-TERM");
     assert_eq!(live.ends(), Some(0));
-    until("the session has no client", || {
-        of("live", "attached") == false
-    });
-    let (code, lines, said) = host.asked("sessions", &[]);
-    assert_eq!(code, Some(0), "{said}");
-    let lines: Vec<&str> = lines.lines().collect();
-    assert_eq!(lines.len(), 3, "{lines:?}");
-    assert!(
-        lines[0].starts_with("live\tdetached\trunning\tidle\texit=5\t80x24\t"),
-        "{lines:?}"
-    );
-    assert!(
-        lines[1].starts_with("done\tdetached\texited 7\tidle\texit=-\t80x24\t"),
-        "{lines:?}"
-    );
+    until("the session has no client", || of("live", 1) == "detached");
 }
 
 #[test]
@@ -2558,16 +2524,9 @@ fn output_last_is_the_last_commands_output_across_history() {
     );
     let history = fs::read_to_string(pane.join("history")).unwrap();
     assert!(history.ends_with("line-19\n") && rows.contains("line-20\n"));
-    // Without `--last` it is the screen that is shown; `--json` has it as one value.
+    // Without `--last` it is the screen that is shown.
     let (code, shown, said) = host.asked("output", &["--session", "1"]);
     assert_eq!((code, shown.as_str()), (Some(0), rows.as_str()), "{said}");
-    let (code, json, said) = host.asked("output", &["--session", "1", "--last", "--json"]);
-    assert_eq!(code, Some(0), "{said}");
-    let json: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(
-        json,
-        serde_json::json!({ "session": "1", "output": printed })
-    );
     // A name that is no session's is not found.
     let (code, _, said) = host.asked("output", &["--session", "none"]);
     assert_eq!(code, Some(127), "{said}");
@@ -2589,15 +2548,10 @@ fn wait_session_returns_the_commands_code_or_124() {
     let pane = host.session("s", &marking_shell(&host), "$");
     // No command ends: when the time given is over it is 124, with the screen as it is.
     let began = Instant::now();
-    let (code, waited, said) = host.asked("wait", &["--session", "s", "--timeout", "1", "--json"]);
-    assert_eq!(code, Some(124), "{said}");
+    let (code, waited, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
+    assert_eq!((code, said.as_str()), (Some(124), "· timed out\n"));
     assert!(began.elapsed() >= Duration::from_secs(1));
-    let waited: serde_json::Value = serde_json::from_str(&waited).unwrap();
-    assert_eq!(
-        (&waited["timed_out"], &waited["exit"]),
-        (&true.into(), &124.into())
-    );
-    assert_eq!(waited["tail"], screen(&pane));
+    assert_eq!(waited, screen(&pane));
     // A wait returns when one more command has ended than when it was asked, with that
     // command's code and what it printed. (When the server takes the request the test cannot
     // see: it types one command after the other until the wait has returned. Each prints a
@@ -3228,15 +3182,14 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
             .unwrap();
         assert_eq!(res.status.code(), Some(2), "{flag}");
     }
-    let bad_json = Command::new(env!("CARGO_BIN_EXE_koh"))
+    let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
         .arg("servers")
         .arg(OsStr::from_bytes(b"\xff"))
-        .arg("--json")
         .output()
         .unwrap();
-    assert_eq!(bad_json.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
-    assert!(bad_json.stderr.is_empty());
+    assert_eq!(not_utf8.status.code(), Some(2));
+    assert!(not_utf8.stdout.is_empty());
+    assert_eq!(not_utf8.stderr, b"koh: arguments must be valid UTF-8\n");
 
     // `rm` on a skipped name fails and leaves the file unchanged; `add`, `rename`, and `rm` of
     // accepted names warn about skipped lines on stderr and rewrite from accepted lines only.
@@ -4531,6 +4484,30 @@ fn job_multi_megabyte_log_streams_exact_content() {
     assert!(
         whole.stdout == expected.as_bytes(),
         "streamed log content mismatch"
+    );
+}
+
+#[test]
+fn jobs_lists_a_line_a_job_the_command_last() {
+    let host = Host::start("job-list", &[]);
+    let args = ["--name", "tabbed", "--", "sh", "-c", "exit 3", "a\tb"];
+    assert_eq!(job_cmd(&host, "run", &args, 10).stdout, b"tabbed\n");
+    let waited = job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 15);
+    assert_eq!(waited.status.code(), Some(3));
+    // Name, state, age and the command, the rest of the line: a tab in it is shown as `?`.
+    let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 10).stdout).unwrap();
+    let fields: Vec<&str> = listed.strip_suffix('\n').unwrap().split('\t').collect();
+    let [name, state, age, command] = fields[..] else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(
+        (name, state, command),
+        ("tabbed", "exited 3", "sh -c exit 3 a?b")
+    );
+    assert!(
+        age.strip_suffix('s')
+            .is_some_and(|n| n.parse::<u64>().is_ok()),
+        "{age}"
     );
 }
 

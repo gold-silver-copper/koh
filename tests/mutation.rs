@@ -37,9 +37,7 @@ fn seeds() -> Vec<Vec<u8>> {
     let text = |s: &str| s.to_string();
     let job = JobInfo {
         name: text("build"),
-        pid: 4242,
         state: text("exited 0"),
-        exit: Some(0),
         age_secs: 9,
         command: text("make -j4"),
     };
@@ -52,8 +50,6 @@ fn seeds() -> Vec<Vec<u8>> {
         title: text("sh"),
         running_command: false,
         last_exit: Some(0),
-        age_secs: 5,
-        pane_dir: text("/tmp/koh/fux/koh-sessions/1"),
     };
     let run = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdef_u128;
     vec![
@@ -110,7 +106,6 @@ fn seeds() -> Vec<Vec<u8>> {
         bytes(&Reply::Ok),
         bytes(&Reply::Err {
             code: 75,
-            kind: text("busy"),
             message: text("server busy"),
         }),
         bytes(&ExecServerMsg::Stdout(b"out".to_vec())),
@@ -125,7 +120,6 @@ fn seeds() -> Vec<Vec<u8>> {
         bytes(&vec![job.clone(), job]),
         bytes(&vec![session.clone(), session]),
         bytes(&WaitResult {
-            timed_out: true,
             exit: 124,
             tail: text("tail"),
             detail: text("timed out"),

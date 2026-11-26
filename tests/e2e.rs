@@ -4753,35 +4753,44 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
     );
     assert_eq!(reader.join().unwrap(), b"hello\nworld\n");
 
-    // Non-blocking stdout: 1.5 MiB (exceeds default Unix socket buffers) with a delayed
-    // small-buffer reader arrives whole.
-    let (mut peer, sock) = UnixStream::pair().unwrap();
-    sock.set_nonblocking(true).unwrap();
-    let cmd = "awk 'BEGIN { for (i = 0; i < 15000; i++) printf \"%099d\\n\", i }'; exit 19";
-    let mut child = host
-        .koh(&["rsh", "--direct", &addr, &host.id, cmd])
-        .stdin(OwnedFd::from(sock.try_clone().unwrap()))
-        .stdout(OwnedFd::from(sock))
-        .spawn()
-        .unwrap();
-    peer.shutdown(Shutdown::Write).unwrap();
-    let reader = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        let mut out = Vec::new();
-        let mut buf = [0u8; 256];
-        while let Ok(n @ 1..) = peer.read(&mut buf) {
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    });
-    let st = wait_child(&mut child, 15, "nonblock stdout");
-    let out = reader.join().unwrap();
-    assert_eq!(st.code(), Some(19));
+    // Non-blocking stdout and stderr: 1.5 MiB (exceeds default Unix socket buffers) with a
+    // delayed small-buffer reader arrives whole on each stream.
     let expected: Vec<u8> = (0..15000)
         .flat_map(|i| format!("{i:099}\n").into_bytes())
         .collect();
-    assert_eq!(out.len(), expected.len());
-    assert_eq!(out, expected);
+    for (to_stderr, code) in [(false, 19), (true, 17)] {
+        let (mut peer, sock) = UnixStream::pair().unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let redir = if to_stderr { " >&2" } else { "" };
+        let cmd = format!(
+            "awk 'BEGIN {{ for (i = 0; i < 15000; i++) printf \"%099d\\n\", i }}'{redir}; exit {code}"
+        );
+        let mut child_cmd = host.koh(&["rsh", "--direct", &addr, &host.id, &cmd]);
+        if to_stderr {
+            child_cmd.stderr(OwnedFd::from(sock));
+        } else {
+            child_cmd
+                .stdin(OwnedFd::from(sock.try_clone().unwrap()))
+                .stdout(OwnedFd::from(sock));
+        }
+        let mut child = child_cmd.spawn().unwrap();
+        drop(child_cmd);
+        peer.shutdown(Shutdown::Write).unwrap();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let mut out = Vec::new();
+            let mut buf = [0u8; 256];
+            while let Ok(n @ 1..) = peer.read(&mut buf) {
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        });
+        let st = wait_child(&mut child, 15, "nonblock output");
+        let out = reader.join().unwrap();
+        assert_eq!(st.code(), Some(code));
+        assert_eq!(out.len(), expected.len());
+        assert_eq!(out, expected);
+    }
 }
 
 #[test]
@@ -4827,6 +4836,22 @@ fn rsh_options_rsync_and_git() {
              grep -Fq usage e"
         ),
     );
+
+    // Joined rsh line over MAX_CTRL (1 MiB) exits 2 (usage), where the OS allows spawning it.
+    let big_word = "x".repeat(130);
+    let mut over = host.koh(&["rsh", "box"]);
+    for _ in 0..9000 {
+        over.arg(&big_word);
+    }
+    if let Ok(out) = over
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        assert_eq!(out.status.code(), Some(2));
+        assert!(out.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+    }
 
     let (src, dst) = (host.tmp.0.join("src"), host.tmp.0.join("home/dst"));
     fs::create_dir_all(src.join("sub")).unwrap();

@@ -455,9 +455,12 @@ fn cli_help_keys_and_peer_lists() {
         let mut koh = Command::new(bin);
         koh.env("KOH_CONFIG_DIR", &tmp.0)
             .args(["servers", "rm", "box"]);
-        koh.args(more).status().unwrap().code()
+        let out = koh.args(more).output().unwrap();
+        (out.status.code(), out.stdout, out.stderr)
     };
-    assert_eq!((rm(&["extra"]), rm(&[])), (Some(2), Some(0)));
+    let usage = b"koh: usage: koh servers rm NAME\n".to_vec();
+    assert_eq!(rm(&["extra"]), (Some(2), Vec::new(), usage));
+    assert_eq!(rm(&[]).0, Some(0));
 }
 
 #[tokio::test]
@@ -2468,6 +2471,10 @@ fn sessions_lists_what_the_folders_say() {
     until("the title is set", || title() == "ab\n");
     let line = &list()[0];
     assert_eq!((line.len(), line[6].as_str()), (7, "ab"), "{line:?}");
+    // One a holder that is gone left with a tab in it is printed with `?`, as a job's command.
+    fs::write(killed.join("title"), "a\tb\n").unwrap();
+    let line = &list()[2];
+    assert_eq!((line.len(), line[6].as_str()), (7, "a?b"), "{line:?}");
     // The client leaves: the session is not attached.
     signal(&live.koh.id().to_string(), "-TERM");
     assert_eq!(live.ends(), Some(0));
@@ -4512,6 +4519,7 @@ fn jobs_lists_a_line_a_job_the_command_last() {
         .join("koh-jobs/tabbed/status");
     for written in ["a?b", "a\tb"] {
         let was = fs::read_to_string(&status).unwrap();
+        assert!(was.contains("command sh -c exit 3 a?b\n"), "{was:?}");
         fs::write(&status, was.replace("a?b", written)).unwrap();
         let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 10).stdout).unwrap();
         let fields: Vec<&str> = listed.strip_suffix('\n').unwrap().split('\t').collect();

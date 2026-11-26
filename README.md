@@ -38,10 +38,14 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust
     `fux`'s first free number (`1`, `2`, …); starting an ended name removes its old folder and log
     first, also if the new program cannot be started. Each job's `out` file grows without bound:
     remove ended job folders yourself or start the name anew. When a job's program ends, anything
-    it left in its process group is hung up (`nohup`/`setsid` for processes that must outlive it).
-    `koh kill` writes `kill N` to the pane's `ctl` FIFO and reaches a job only while its holder
-    lives; a holder killed with `-9` leaves its job running and listed as it was. `koh serve` no
-    longer needs `kill(1)` or `id(1)` on its `PATH`.
+    it left in its process group is hung up (`nohup`/`setsid` for processes that must outlive it);
+    output written by a leftover process after the leader exits may appear in `out` later
+    (`koh logs --all`) and not in a `koh logs -f` that already ended. `koh kill` writes `kill N`
+    to the pane's `ctl` FIFO and reaches a job only while its holder lives; a holder killed with
+    `-9` leaves its program running, while `koh jobs` and `koh wait` report `ended` with exit 1.
+    Run one `koh serve` per state directory (two servers for the same user sharing the default
+    state directory share the jobs folder and do not coordinate starts). `koh serve` no longer
+    needs `kill(1)` or `id(1)` on its `PATH`.
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`

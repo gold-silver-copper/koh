@@ -40,15 +40,21 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   - Logs stream in fixed-size chunks on both server and client without reading whole files into
     memory, and tails seek backwards in blocks.
   - When a job's program ends, processes left in its process group are hung up (use `nohup` or
-    `setsid` for processes that must outlive it).
+    `setsid` for processes that must outlive it); output written by a leftover process after the
+    leader exits may appear in `out` later (`koh logs --all`) and not in a `logs -f` that already
+    ended.
   - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
-    lives (signals outside `1..31` exit 2); a holder killed with `-9` leaves its job running and
-    listed as it was.
+    lives (signals outside `1..31` exit 2); without `--json`, `koh kill` prints
+    `koh: job NAME is not running (STATE)` on stderr when the job was not running (exit 0
+    unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` and
+    `koh wait` report `ended` with exit 1.
   - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
     name anew (starting an ended name removes its old folder first, also if the new program fails
     to start).
   - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number (`1`,
     `2`, …) instead of `j1`, `j2`, …; `koh jobs` shows the command as `fux`'s `status` formats it.
+  - Session start failures (sharing the same `fux start` helper) now report `nothing was started: …`
+    instead of `no session was started: …` (exit 126 unchanged).
 
 ### Removed
 

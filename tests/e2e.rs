@@ -173,7 +173,12 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     assert_eq!(wait_res.exit, 7);
     assert!(wait_res.tail.contains(&long_line));
 
-    let (raw_log, state, exit, _) = client.logs("long".into(), None, true, false).await.unwrap();
+    let mut raw_log = Vec::new();
+    let (state, exit, _) = client
+        .logs_to("long".into(), None, true, false, &mut raw_log)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(state, "exited 7");
     assert_eq!(exit, Some(7));
     assert!(String::from_utf8_lossy(&raw_log).contains(&long_line));
@@ -4521,71 +4526,61 @@ fn job_survives_serve_kill_and_restart() {
 }
 
 #[test]
-fn a_fifty_mb_job_log_streams_exact_bytes() {
-    let host = Host::start("job-50mb", &[]);
+fn job_multi_megabyte_log_streams_exact_content() {
+    let host = Host::start("job-multimb", &[]);
     let addr = host.addr();
-    let bytes: usize = 50 * 1024 * 1024;
+    // ~3.39 MiB (>50 64 KiB chunks) of unique numbered lines: any dropped, duplicated, or
+    // reordered chunk fails the content check without starving neighbour tests on CI.
+    let expected: String = (1..=500_000).map(|n| format!("{n}\n")).collect();
 
-    let started = run_bounded(
-        &mut host.koh(&[
-            "run",
-            &host.id,
-            "--direct",
-            &addr,
-            "--name",
-            "biglog",
-            "--",
-            "/bin/sh",
-            "-c",
-            "dd if=/dev/zero bs=1048576 count=50 2>/dev/null; printf '\\nEND_MARKER\\n'",
-        ]),
-        10,
-        "koh run 50MB",
+    assert!(
+        run_bounded(
+            &mut host.koh(&[
+                "run", &host.id, "--direct", &addr, "--name", "seqlog", "--", "seq", "1", "500000",
+            ]),
+            10,
+            "koh run seq 500000",
+        )
+        .status
+        .success()
     );
-    assert!(started.status.success());
     let waited = run_bounded(
         &mut host.koh(&[
             "wait",
             &host.id,
             "--direct",
             &addr,
-            "biglog",
+            "seqlog",
             "--tail",
-            "1",
+            "3",
             "--timeout",
-            "30",
+            "20",
         ]),
-        35,
-        "koh wait 50MB",
+        25,
+        "koh wait seqlog",
     );
-    assert!(
-        waited.status.success(),
-        "wait failed: {:?}; stderr={}",
-        waited.status,
-        String::from_utf8_lossy(&waited.stderr)
-    );
-    assert_eq!(waited.stdout, b"END_MARKER\n");
+    assert!(waited.status.success());
+    assert_eq!(waited.stdout, b"499998\n499999\n500000\n");
 
-    // Stream all 50 MB + 12 bytes without buffering into a Vec.
-    let mut child = host
-        .koh(&["logs", &host.id, "--direct", &addr, "biglog", "--all"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out = child.stdout.take().unwrap();
-    let counter = std::thread::spawn(move || {
-        let mut buf = vec![0u8; 64 << 10];
-        let mut total = 0usize;
-        while let Ok(n @ 1..) = out.read(&mut buf) {
-            total += n;
-        }
-        total
-    });
-    let st = wait_child(&mut child, 30, "koh logs --all 50MB");
-    let got = counter.join().unwrap();
-    assert!(st.success(), "logs --all failed: {st:?}");
-    assert_eq!(got, bytes + b"\nEND_MARKER\n".len());
+    let tailed = run_bounded(
+        &mut host.koh(&["logs", &host.id, "--direct", &addr, "seqlog", "--tail", "5"]),
+        15,
+        "koh logs --tail 5",
+    );
+    assert!(tailed.status.success());
+    assert_eq!(tailed.stdout, b"499996\n499997\n499998\n499999\n500000\n");
+
+    let whole = run_bounded(
+        &mut host.koh(&["logs", &host.id, "--direct", &addr, "seqlog", "--all"]),
+        25,
+        "koh logs --all seqlog",
+    );
+    assert!(whole.status.success());
+    assert_eq!(whole.stdout.len(), expected.len());
+    assert!(
+        whole.stdout == expected.as_bytes(),
+        "streamed log content mismatch"
+    );
 }
 
 #[test]
@@ -4759,4 +4754,363 @@ fn job_leader_exit_hangs_up_group_child() {
     assert!(waited.status.success());
     assert_eq!(waited.stdout, b"done\n");
     guard.dead_within(5, "straggler child left by job leader");
+}
+
+#[test]
+fn job_reader_never_mixes_replacement_run() {
+    let host = Host::start("job-replace-race", &[]);
+    let addr = host.addr();
+    let jobs_dir = host.sessions.parent().unwrap().join("koh-jobs");
+
+    // Start two running jobs: `rep` (OLD_RUN) and `rep_new` (NEW_RUN). Attach `logs -f` and
+    // `wait` to `rep`, then replace `rep`'s folder with `rep_new`'s while both readers are in
+    // their poll sleep. Neither reader may print NEW_RUN, report "running", or exit 0.
+    for (name, msg) in [("rep", "OLD_RUN"), ("rep_new", "NEW_RUN")] {
+        assert!(
+            run_bounded(
+                &mut host.koh(&[
+                    "run",
+                    &host.id,
+                    "--direct",
+                    &addr,
+                    "--name",
+                    name,
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    &format!("printf '{msg}\\n'; sleep 30"),
+                ]),
+                10,
+                name,
+            )
+            .status
+            .success()
+        );
+        let out = jobs_dir.join(name).join("out");
+        until("marker written", || {
+            fs::read(&out)
+                .unwrap_or_default()
+                .starts_with(msg.as_bytes())
+        });
+    }
+
+    let mut follower = host
+        .koh(&["logs", &host.id, "--direct", &addr, "rep", "-f"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (seen, mut f_stdout_pipe) = read_exact_bounded::<8, _>(
+        follower.stdout.take().unwrap(),
+        &mut follower,
+        10,
+        "OLD_RUN",
+    );
+    assert_eq!(&seen, b"OLD_RUN\n");
+
+    let mut waiter = host
+        .koh(&[
+            "wait",
+            &host.id,
+            "--direct",
+            &addr,
+            "rep",
+            "--tail",
+            "5",
+            "--timeout",
+            "10",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(120));
+
+    // Kill old `rep` holder via ctl, wait for its lock to drop so `remove_dir_all` does not
+    // race its final `state.tmp` write, then swap `rep_new` into `rep` in < 1 ms so both
+    // `follower` and `waiter` wake up to a brand-new run under the same name.
+    let pane = jobs_dir.join("rep");
+    if let Ok(mut ctl) = fuxix::open_fifo(pane.join("ctl")) {
+        let _ = ctl.write_all(b"kill 9\n");
+    }
+    until("old rep holder dropped lock", || {
+        !matches!(
+            fuxix::open(&pane, false).map(|f| f.try_lock_shared()),
+            Ok(Err(fs::TryLockError::WouldBlock))
+        )
+    });
+    fs::remove_dir_all(&pane).unwrap();
+    fs::rename(jobs_dir.join("rep_new"), &pane).unwrap();
+
+    let f_st = wait_child(&mut follower, 10, "follower after replace");
+    let mut f_rest = Vec::new();
+    let _ = f_stdout_pipe.read_to_end(&mut f_rest);
+    let f_out = follower.wait_with_output().unwrap();
+    let w_st = wait_child(&mut waiter, 10, "waiter after replace");
+    let w_out = waiter.wait_with_output().unwrap();
+    let f_stdout = String::from_utf8_lossy(&f_rest);
+    let f_stderr = String::from_utf8_lossy(&f_out.stderr);
+    let w_stdout = String::from_utf8_lossy(&w_out.stdout);
+    let w_stderr = String::from_utf8_lossy(&w_out.stderr);
+
+    assert!(
+        !f_stdout.contains("NEW_RUN")
+            && !f_stderr.contains("running")
+            && f_st.code() == Some(1)
+            && f_stderr.contains("started anew"),
+        "follower mixed replacement: status={f_st:?} stdout={f_stdout:?} stderr={f_stderr:?}"
+    );
+    assert!(
+        w_stdout.contains("OLD_RUN")
+            && !w_stdout.contains("NEW_RUN")
+            && !w_stderr.contains("running")
+            && w_st.code() == Some(1)
+            && w_stderr.contains("started anew"),
+        "waiter mixed replacement: status={w_st:?} stdout={w_stdout:?} stderr={w_stderr:?}"
+    );
+}
+
+#[test]
+fn job_logs_broken_pipe_write_error_and_non_utf8_wait_tail() {
+    let host = Host::start("job-io-edge", &[]);
+    let addr = host.addr();
+
+    // 1. `logs -f` piped to a consumer that reads 1 byte and closes its pipe ends with 141.
+    assert!(
+        run_bounded(
+            &mut host.koh(&[
+                "run",
+                &host.id,
+                "--direct",
+                &addr,
+                "--name",
+                "chatter",
+                "--",
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 2000 ]; do printf 'LINE-%04d\\n' $i; sleep 0.02; i=$((i+1)); done",
+            ]),
+            10,
+            "run chatter",
+        )
+        .status
+        .success()
+    );
+    let mut follow = host
+        .koh(&["logs", &host.id, "--direct", &addr, "chatter", "-f"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (byte, stdout) =
+        read_exact_bounded::<1, _>(follow.stdout.take().unwrap(), &mut follow, 10, "first byte");
+    assert_eq!(&byte, b"L");
+    drop(stdout);
+    let st = wait_child(&mut follow, 10, "logs -f after closed stdout pipe");
+    assert_eq!(
+        st.code(),
+        Some(141),
+        "expected exit 141 on EPIPE, got {st:?}"
+    );
+    let _ = run_bounded(
+        &mut host.koh(&[
+            "kill", &host.id, "--direct", &addr, "chatter", "--signal", "9",
+        ]),
+        10,
+        "kill chatter",
+    );
+
+    // 2. Non-UTF-8 output (~3 MiB of 0xff, expanding to ~9 MiB > MAX_FRAME if uncapped) still
+    // delivers the job's real exit status (7) on `wait --tail 1`.
+    assert!(
+        run_bounded(
+            &mut host.koh(&[
+                "run",
+                &host.id,
+                "--direct",
+                &addr,
+                "--name",
+                "binff",
+                "--",
+                "/bin/sh",
+                "-c",
+                "dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\\000' '\\377'; exit 7",
+            ]),
+            15,
+            "run binff",
+        )
+        .status
+        .success()
+    );
+    let waited = run_bounded(
+        &mut host.koh(&[
+            "wait",
+            &host.id,
+            "--direct",
+            &addr,
+            "binff",
+            "--tail",
+            "1",
+            "--timeout",
+            "20",
+        ]),
+        25,
+        "wait binff",
+    );
+    assert_eq!(
+        waited.status.code(),
+        Some(7),
+        "expected exit 7 on 3 MiB 0xff wait tail, got {:?}; stderr={}",
+        waited.status,
+        String::from_utf8_lossy(&waited.stderr)
+    );
+
+    // 3. Non-EPIPE stdout write failure (/dev/full on Linux) exits 1, not 0.
+    #[cfg(target_os = "linux")]
+    {
+        let full = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut child = host
+            .koh(&["logs", &host.id, "--direct", &addr, "binff", "--all"])
+            .stdout(std::process::Stdio::from(full))
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let st = wait_child(&mut child, 10, "logs to /dev/full");
+        assert_eq!(
+            st.code(),
+            Some(1),
+            "expected exit 1 writing logs to /dev/full, got {st:?}"
+        );
+    }
+}
+
+#[test]
+fn job_run_name_lifecycle_and_start_errors() {
+    let host = Host::start("job-lifecycle", &[]);
+    let addr = host.addr();
+
+    // Unnamed jobs take fux's first free numbers (1, 2).
+    let n1 = run_bounded(
+        &mut host.koh(&["run", &host.id, "--direct", &addr, "--", "true"]),
+        10,
+        "unnamed 1",
+    );
+    let n2 = run_bounded(
+        &mut host.koh(&["run", &host.id, "--direct", &addr, "--", "true"]),
+        10,
+        "unnamed 2",
+    );
+    assert!(n1.status.success() && n2.status.success());
+    assert_eq!(String::from_utf8_lossy(&n1.stdout).trim(), "1");
+    assert_eq!(String::from_utf8_lossy(&n2.stdout).trim(), "2");
+
+    // Running name is refused; once ended, the same name is replaced cleanly.
+    assert!(
+        run_bounded(
+            &mut host.koh(&[
+                "run", &host.id, "--direct", &addr, "--name", "dup", "--", "sleep", "30",
+            ]),
+            10,
+            "start dup",
+        )
+        .status
+        .success()
+    );
+    let refused = run_bounded(
+        &mut host.koh(&[
+            "run", &host.id, "--direct", &addr, "--name", "dup", "--", "true",
+        ]),
+        10,
+        "refuse running dup",
+    );
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already running"));
+
+    assert!(
+        run_bounded(
+            &mut host.koh(&["kill", &host.id, "--direct", &addr, "dup", "--signal", "9"]),
+            10,
+            "kill dup",
+        )
+        .status
+        .success()
+    );
+    let _ = run_bounded(
+        &mut host.koh(&[
+            "wait",
+            &host.id,
+            "--direct",
+            &addr,
+            "dup",
+            "--timeout",
+            "10",
+        ]),
+        15,
+        "wait dup",
+    );
+    assert!(
+        run_bounded(
+            &mut host.koh(&[
+                "run", &host.id, "--direct", &addr, "--name", "dup", "--", "echo", "second",
+            ]),
+            10,
+            "replace ended dup",
+        )
+        .status
+        .success()
+    );
+    let w = run_bounded(
+        &mut host.koh(&[
+            "wait",
+            &host.id,
+            "--direct",
+            &addr,
+            "dup",
+            "--timeout",
+            "10",
+        ]),
+        15,
+        "wait replaced dup",
+    );
+    assert!(w.status.success());
+    assert_eq!(w.stdout, b"second\n");
+
+    // Missing executable -> exit 127 (no folder left behind); missing cwd -> exit 126.
+    let nf = run_bounded(
+        &mut host.koh(&[
+            "run",
+            &host.id,
+            "--direct",
+            &addr,
+            "--name",
+            "nf",
+            "--",
+            "/no/such/koh-job-prog",
+        ]),
+        10,
+        "missing prog",
+    );
+    assert_eq!(nf.status.code(), Some(127));
+    assert!(!host.sessions.parent().unwrap().join("koh-jobs/nf").exists());
+
+    let nc = run_bounded(
+        &mut host.koh(&[
+            "run",
+            &host.id,
+            "--direct",
+            &addr,
+            "-C",
+            "/no/such/koh-job-dir",
+            "--name",
+            "nc",
+            "--",
+            "true",
+        ]),
+        10,
+        "missing cwd",
+    );
+    assert_eq!(nc.status.code(), Some(126));
 }

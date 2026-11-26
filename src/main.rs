@@ -522,11 +522,7 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     let mut opts = DialOptions::default();
     let mut i = 0;
     while let Some(a) = args.get(i).map(String::as_str) {
-        if a == "--" {
-            i += 1;
-            break;
-        }
-        if !a.starts_with('-') {
+        if a == "--" || !a.starts_with('-') {
             break;
         }
         if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
@@ -537,6 +533,10 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
             "rsh does not support option {a:?} (only --key-file, --direct, --relay-url before HOST)"
         )));
     }
+    let dial = args.get(..i).unwrap_or_default();
+    if args.get(i).map(String::as_str) == Some("--") {
+        i += 1;
+    }
     let Some(host) = args.get(i) else {
         return Err(KohError::usage(USAGE));
     };
@@ -544,13 +544,8 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    let client = Client::connect(host, &opts, false).await?;
-    let done = client
-        .exec(vec![words.join(" ")], None, true, None, false)
-        .await;
-    client.close().await;
-    let (code, _, _) = done?;
-    Ok(Exit(u8::try_from(code).unwrap_or(1)))
+    let line = [host.clone(), "--sh".into(), words.join(" ")];
+    cmd_exec(&[dial, &line].concat()).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {

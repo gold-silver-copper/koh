@@ -95,7 +95,7 @@ pub struct SessionInfo {
     pub cols: usize,
     pub rows: usize,
     pub title: String,
-    /// The shell's last mark is `output`.
+    /// The holder lives and the shell's last mark is `output`.
     pub running_command: bool,
     /// The code of the last `end` mark, if the shell gave one.
     pub last_exit: Option<u8>,

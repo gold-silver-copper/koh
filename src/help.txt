@@ -47,12 +47,14 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             attached or detached, what became of its program (as a job's state), busy while
             a command runs or idle, the last command's exit code (`exit=N`, `exit=-` for
             none), size (`80x24`), title
-            A line of `jobs` and of `sessions` is its fields with one tab between each, for
-            scripts: the fields before the last are kept for good, in this order, and the last
-            (the command; the title) is the rest of the line, `$NF` to `awk -F '\t'` (split on
-            tabs, not on blanks: a state has a space, and a job with no command or a session
-            with no title still has its last field, empty). No field holds a tab or a line
-            end: koh prints a control character in any of them as `?`. So
+            A line of `jobs` and of `sessions` is its fields with one tab between each, and
+            ends with LF, for scripts: the fields before the last are kept for good, in this
+            order, and the last (the command; the title) is the rest of the line, `$NF` to
+            `awk -F '\t'` (split on tabs, not on blanks: a state has a space, and a job with no
+            command or a session with no title still has its last field, empty). No field
+            holds a tab, a CR or an LF: koh prints a control character in any of them as `?`.
+            (U+2028 and U+2029 are no control characters and are printed as they are: split
+            records on LF alone, as awk does, not with Python's `splitlines()`.) So
             `koh jobs SERVER | awk -F '\t' '$1 == "build" && $2 == "running"'` holds. A job's
             exit status is in its state (`exited N`), or is `koh wait`'s; a session's folder
             is the folder `koh serve` printed, then the session's name.

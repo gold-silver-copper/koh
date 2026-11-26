@@ -8,9 +8,11 @@ not a multi-user service.
 ## What koh is
 
 A server (`koh serve`) is reached by its Ed25519 endpoint id over [iroh](https://iroh.computer)
-QUIC, directly or through relays. Every request is one QUIC stream that begins with a proof of
-the client's key: a signature over keying material exported from that TLS session, so a proof
-cannot be replayed on another connection (`src/net.rs`). The server then looks the key up in
+QUIC, directly or through relays. Each client process dials from a fresh endpoint key of its
+own, so parallel processes of one client do not collide on a relay or at the server. Every
+request is one QUIC stream that begins with a proof of the client's key: a signature over keying
+material exported from that TLS session, so a proof cannot be replayed on another connection
+(`src/net.rs`). The server ignores the connection's own endpoint id, looks the proved key up in
 its `clients` file, read anew for each request, or among `--allow` (`src/server.rs`,
 `authorize`), and only then reads the request.
 
@@ -128,6 +130,13 @@ have it show another pane, another workspace, or run a script.
   that cannot open a terminal.
 - A scope is read with each request, so narrowing or removing a key takes effect on its next
   request; what it already started goes on.
+- In `clients`, only an absent scope grants unrestricted access, and `DIR` after `cp=` or
+  `exec=` is read verbatim to the end of the line (spaces preserved, no trailing trim, no
+  inline `#` comments). A line with an unrecognized scope or no `DIR` (`cp=`, `exec=`) is
+  skipped and gives that client nothing; `koh clients` names each skipped line on stderr with
+  its line number, and the next `koh clients add`, `rm`, or `rename` writes the file without
+  it. `koh clients add` refuses a `DIR` that is empty, is not UTF-8, or contains `\n` or `\r`
+  (exit 2).
 
 ## 4. A server a client dials
 

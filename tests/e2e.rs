@@ -1255,7 +1255,7 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     let key = tmp.0.join("server.key");
     let (tell, told) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        tell.send(koh::keys::load_clients(Some(&key)).map(|list| list.len()))
+        tell.send(koh::keys::load_clients(Some(&key), |_, _| {}).map(|list| list.len()))
     });
     let read = told.recv_timeout(Duration::from_secs(5));
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
@@ -4382,4 +4382,188 @@ async fn an_end_is_seen_where_a_prompt_drawn_again_left_a_full_file_short() {
     // (What it printed went with the clear, unless the wait looked before that.)
     assert_eq!(waited(wait).await.0, 77);
     client.close().await;
+}
+
+#[tokio::test]
+async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
+    let tmp = TempDir::new("ephemeral-dial");
+    let key = new_key(&tmp, "client.key");
+    let (srv, route) = boot_server(&tmp, vec![key.public()], ServeOptions::default()).await;
+    let dial = || Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false);
+
+    let (a, b) = (dial().await.unwrap(), dial().await.unwrap());
+    assert!(srv.endpoint.remote_info(key.public()).await.is_none());
+    let (r1, r2) = tokio::join!(a.jobs(None), b.jobs(None));
+    assert!(r1.unwrap().is_empty() && r2.unwrap().is_empty());
+    a.close().await;
+    b.close().await;
+
+    let cfg = koh::net::transport_config(false);
+    let (e1, _, _) = koh::net::connect_server(srv.endpoint_id, route.clone(), cfg.clone())
+        .await
+        .unwrap();
+    let (e2, _, _) = koh::net::connect_server(srv.endpoint_id, route, cfg)
+        .await
+        .unwrap();
+    assert_ne!(e1.id(), key.public());
+    assert_ne!(e2.id(), key.public());
+    assert_ne!(e1.id(), e2.id());
+    assert!(srv.endpoint.remote_info(e1.id()).await.is_some());
+    assert!(srv.endpoint.remote_info(e2.id()).await.is_some());
+    e1.close().await;
+    e2.close().await;
+    srv.shutdown().await;
+}
+
+#[test]
+fn clients_file_scopes_fail_closed_and_preserve_spaces() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let tmp = TempDir::new("clients-parse");
+    let (key, file) = (tmp.0.join("server.key"), tmp.0.join("clients"));
+    let k = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    let cp = |p: &str| Scope::Cp(p.into());
+    let ex = |p: &str| Scope::Exec(p.into());
+    let rows = [
+        ("# comment".into(), None),
+        (String::new(), None),
+        (format!("full {k}"), Some(("full", Scope::Full))),
+        (format!("ws {k}   "), Some(("ws", Scope::Full))),
+        (format!("cp {k} cp=/srv"), Some(("cp", cp("/srv")))),
+        (format!("sp {k}\tcp=/a  b "), Some(("sp", cp("/a  b ")))),
+        (format!("ex {k} exec=~/a b"), Some(("ex", ex("~/a b")))),
+        (format!("h {k} cp=/a # n"), Some(("h", cp("/a # n")))),
+        (format!("cr {k} cp=/c d\r"), Some(("cr", cp("/c d")))),
+        (format!("t1 {k} copy=/srv"), None),
+        (format!("t2 {k} cp:/srv"), None),
+        (format!("t3 {k} cp"), None),
+        (format!("t4 {k} cp="), None),
+        (format!("t5 {k} exec="), None),
+        (format!("t6 {k} --cp /srv\x1b[2K"), None),
+        ("bad_id notakey cp=/srv".into(), None),
+        ("lone_word".into(), None),
+    ];
+    let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
+    fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
+
+    let mut skipped = Vec::new();
+    let entries =
+        koh::keys::load_clients(Some(&key), |n, l| skipped.push((n, l.to_string()))).unwrap();
+    let want: Vec<_> = rows.iter().filter_map(|(_, w)| w.clone()).collect();
+    let got: Vec<_> = entries
+        .iter()
+        .map(|e| (e.name.as_str(), e.scope.clone()))
+        .collect();
+    assert_eq!(got, want);
+    let skipped_want: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (l, w))| w.is_none() && !l.is_empty() && !l.starts_with('#'))
+        .map(|(i, (l, _))| (i + 1, l.clone()))
+        .collect();
+    assert_eq!(skipped, skipped_want);
+
+    let cli = |args: &[&str]| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_koh"));
+        c.arg("clients").arg("--key-file").arg(&key).args(args);
+        c
+    };
+    let out = cli(&[]).output().unwrap();
+    assert!(out.status.success());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    for (name, _) in &want {
+        assert!(stdout.contains(&format!("{name} ")), "{stdout}");
+    }
+    assert_eq!(stderr.lines().count(), skipped_want.len(), "{stderr}");
+    for (n, line) in &skipped_want {
+        let expected =
+            format!("koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}");
+        assert!(stderr.contains(&expected), "missing {expected} in {stderr}");
+    }
+
+    let injected = format!("/a\nevil {k}");
+    for flag in ["--cp", "--exec"] {
+        for bad in [b"".as_slice(), injected.as_bytes(), b"/a\rb", b"/a\xffb"] {
+            let res = cli(&["add", "bad", &k.to_string(), flag])
+                .arg(OsStr::from_bytes(bad))
+                .output()
+                .unwrap();
+            assert_eq!(res.status.code(), Some(2), "{flag} {bad:?}");
+        }
+    }
+    let bad_json = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .arg("servers")
+        .arg(OsStr::from_bytes(b"\xff"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(bad_json.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
+    assert!(bad_json.stderr.is_empty());
+    // Trailing CRs on the last line without LF are line endings, not DIR, and survive a rename.
+    fs::write(&file, format!("lead {k}\nlast {k} cp=/x\r\r")).unwrap();
+    assert_eq!(
+        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
+        cp("/x")
+    );
+    assert!(
+        cli(&["rename", "lead", "renamed"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        koh::keys::load_clients(Some(&key), |_, _| {}).unwrap()[1].scope,
+        cp("/x")
+    );
+
+    // Hand-written bare CR in another line does not block `koh clients rm`.
+    fs::write(&file, format!("raw {k} cp=/a\rb\nother {k}\n")).unwrap();
+    assert!(cli(&["rm", "other"]).status().unwrap().success());
+}
+
+#[tokio::test]
+async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
+    let tmp = TempDir::new("clients-enforce");
+    let (dir_a, dir_ab) = (tmp.0.join("a"), tmp.0.join("a b"));
+    for d in [&tmp.0.join("srv_cfg"), &dir_a, &dir_ab] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let srv_key = tmp.0.join("srv_cfg/server.key");
+    let valid = new_key(&tmp, "v.key");
+    let typo = new_key(&tmp, "t.key");
+    let cp_key = new_key(&tmp, "c.key");
+    let mut add = Command::new(env!("CARGO_BIN_EXE_koh"));
+    add.args(["clients", "--key-file"]).arg(&srv_key);
+    add.args(["add", "cpbot", &cp_key.public().to_string(), "--cp"])
+        .arg(&dir_ab);
+    assert!(add.status().unwrap().success());
+    let mut text = fs::read_to_string(tmp.0.join("srv_cfg/clients")).unwrap();
+    text.push_str(&format!(
+        "typo {} copy=/srv\nvalid {}\n",
+        typo.public(),
+        valid.public()
+    ));
+    fs::write(tmp.0.join("srv_cfg/clients"), text).unwrap();
+
+    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
+    let t = dial(typo).await.unwrap();
+    let v = dial(valid).await.unwrap();
+    let c = dial(cp_key).await.unwrap();
+    assert_eq!(t.jobs(None).await.unwrap_err().code, Exit::REFUSED);
+    assert!(v.jobs(None).await.unwrap().is_empty());
+    let f = tmp.0.join("f.txt");
+    fs::write(&f, "hi").unwrap();
+    let push = |d: &Path| c.cp_push(&f, d.display().to_string(), vec![], false, false, false);
+    assert_eq!(push(&dir_a).await.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(push(&dir_ab).await.unwrap().added, vec!["f.txt"]);
+    for cl in [t, v, c] {
+        cl.close().await;
+    }
+    srv.shutdown().await;
 }

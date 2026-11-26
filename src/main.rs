@@ -43,8 +43,15 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let json = args.iter().any(|a| a == "--json");
+    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    let Ok(args) = words
+        .map(std::ffi::OsString::into_string)
+        .collect::<std::result::Result<Vec<String>, _>>()
+    else {
+        let err = KohError::usage("arguments must be valid UTF-8");
+        report_err(&err, json);
+        return ExitCode::from(err.code.0);
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -278,7 +285,14 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
         }
         i += 1;
     }
-    let mut list = load_clients(key_file.as_deref())?;
+    let mut list = load_clients(key_file.as_deref(), |n, line| {
+        if clean.is_empty() {
+            let _ = writeln!(
+                std::io::stderr(),
+                "koh: clients:{n}: ignored, not NAME ID [cp=DIR|exec=DIR]: {line:?}"
+            );
+        }
+    })?;
     match clean.first().map(String::as_str) {
         None => {
             for e in &list {
@@ -303,8 +317,19 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
             let mut j = 3;
             while let Some(a) = clean.get(j).map(String::as_str) {
                 match a {
-                    "--cp" => scope = Scope::Cp(PathBuf::from(take_opt(&clean, &mut j, a)?)),
-                    "--exec" => scope = Scope::Exec(PathBuf::from(take_opt(&clean, &mut j, a)?)),
+                    "--cp" | "--exec" => {
+                        let dir = take_opt(&clean, &mut j, a)?;
+                        if dir.is_empty() || dir.contains(['\n', '\r']) {
+                            return Err(KohError::usage(format!(
+                                "{a} directory cannot be empty or contain a line break"
+                            )));
+                        }
+                        scope = if a == "--cp" {
+                            Scope::Cp(PathBuf::from(dir))
+                        } else {
+                            Scope::Exec(PathBuf::from(dir))
+                        };
+                    }
                     _ => return Err(KohError::usage(format!("unexpected argument {a:?}"))),
                 }
                 j += 1;

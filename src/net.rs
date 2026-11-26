@@ -74,16 +74,15 @@ pub async fn bind_server(
         .map_err(|e| KohError::failed(format!("bind server endpoint: {e}")))
 }
 
-/// Binds a client endpoint and connects to `server_id` (optionally via direct `SocketAddr` or custom relay).
+/// Binds a client endpoint with a fresh key of its own and connects to `server_id` (optionally via
+/// direct `SocketAddr` or custom relay). The client's key is proved on each stream, not used as the
+/// endpoint's id, so several processes of one client do not collide on a relay or at the server.
 pub async fn connect_server(
-    secret: SecretKey,
     server_id: EndpointId,
     route: Option<Route>,
     config: QuicTransportConfig,
 ) -> Result<(Endpoint, EndpointAddr, Connection)> {
-    let mut builder = Endpoint::builder(presets::N0)
-        .secret_key(secret.clone())
-        .transport_config(config);
+    let mut builder = Endpoint::builder(presets::N0).transport_config(config);
     let mut addr = EndpointAddr::new(server_id);
     match route {
         Some(Route::Direct(sock)) => {

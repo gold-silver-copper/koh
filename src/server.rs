@@ -113,7 +113,7 @@ impl ServerState {
         if self.extra_allow.contains(&id) {
             return Ok(Scope::Full);
         }
-        let clients: Vec<ClientEntry> = load_clients(self.key_file.as_deref())?;
+        let clients: Vec<ClientEntry> = load_clients(self.key_file.as_deref(), |_, _| {})?;
         if let Some(entry) = clients.into_iter().find(|c| c.id == id) {
             return Ok(entry.scope);
         }

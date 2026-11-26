@@ -346,8 +346,12 @@ pub fn save_servers(key_file: Option<&Path>, entries: &[ServerEntry]) -> Result<
         .map_err(|e| KohError::failed(format!("write servers: {e}")))
 }
 
-/// Loads allowed `clients` list beside `server.key`.
-pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
+/// Loads allowed `clients` list beside `server.key`, calling `on_skipped(line_number, line)` for
+/// every non-blank, non-comment line that could not be parsed.
+pub fn load_clients(
+    key_file: Option<&Path>,
+    mut on_skipped: impl FnMut(usize, &str),
+) -> Result<Vec<ClientEntry>> {
     let path = config_dir(key_file)?.join(Role::Server.list_file());
     let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
         Ok(t) => t,
@@ -355,22 +359,32 @@ pub fn load_clients(key_file: Option<&Path>) -> Result<Vec<ClientEntry>> {
         Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
     };
     let mut out = Vec::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim_end_matches('\r');
+        let rest = line.trim_start();
+        if rest.is_empty() || rest.starts_with('#') {
             continue;
         }
-        let mut parts = trimmed.split_whitespace();
-        let (Some(name), Some(id_str)) = (parts.next(), parts.next()) else {
+        let Some((name, rest)) = rest.split_once(char::is_whitespace) else {
+            on_skipped(i + 1, line);
             continue;
         };
+        let rest = rest.trim_start();
+        let (id_str, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
         let Ok(id) = id_str.parse::<EndpointId>() else {
+            on_skipped(i + 1, line);
             continue;
         };
-        let scope = match parts.next().and_then(|w| w.split_once('=')) {
-            Some(("cp", dir)) => Scope::Cp(PathBuf::from(dir)),
-            Some(("exec", dir)) => Scope::Exec(PathBuf::from(dir)),
-            _ => Scope::Full,
+        let scope = match rest.trim_start() {
+            "" => Scope::Full,
+            field => match field.split_once('=') {
+                Some(("cp", dir)) if !dir.is_empty() => Scope::Cp(PathBuf::from(dir)),
+                Some(("exec", dir)) if !dir.is_empty() => Scope::Exec(PathBuf::from(dir)),
+                _ => {
+                    on_skipped(i + 1, line);
+                    continue;
+                }
+            },
         };
         out.push(ClientEntry {
             name: name.to_string(),

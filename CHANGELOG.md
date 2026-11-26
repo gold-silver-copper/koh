@@ -15,6 +15,34 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Security
+
+- **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
+  with spaces is read back as it was written.** In 0.18.0–0.18.1, any third word on a line in
+  `clients` that was not `cp=DIR` or `exec=DIR` (a typo such as `copy=/srv`, `cp:/srv`, `cp`,
+  or an inline comment like `laptop ID # my laptop`, which was a full key in 0.18.1 and is now
+  a line not taken) was read as an unscoped key that could run anything; and a `DIR` containing
+  a space (`koh clients add NAME ID --cp "/a b"`) was split at the first space and enforced as
+  `/a` instead of `/a b`. Now the scope is everything after the endpoint id to the end of the
+  line verbatim (no trim at its end and no `#` comment after it): only an absent scope grants
+  full access, and a line whose scope is unrecognized or has no `DIR` (`cp=` or `exec=`, which
+  0.18.1 read as the home directory) is skipped and gives that client nothing without locking
+  out valid entries. `koh clients` names each skipped line on stderr with its line number, and
+  the next `koh clients add`, `rm`, or `rename` rewrites the file without it; `koh serve` logs
+  nothing per request. `koh clients add` refuses a `--cp` or `--exec` `DIR` that is empty, is
+  not UTF-8, or contains `\n` or `\r` (exit 2). The on-disk format is unchanged for every line
+  0.18.1 wrote correctly. Only servers need this.
+
+### Fixed
+
+- **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
+  rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
+  parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started
+  at once, one could end with `cannot reach server: timed out`, and parallel `koh wait` calls
+  lost their connections. Each client process now dials from a fresh key of its own and proves
+  `client.key` on each stream (`KeyProof`), and the server authorizes solely by that proved key.
+  Only clients need this.
+
 ## [0.18.1] — 2026-11-25
 
 The protocol is 0.18.0's (`koh/20`): only a server needs this one.

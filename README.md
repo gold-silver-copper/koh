@@ -220,7 +220,7 @@ koh adds nothing to stop these. What happens instead is said.
 ## Quick start
 
 ```sh
-# Client: print endpoint id
+# Client: print the client id the server should allow
 koh id
 
 # Server: allow client and start serving

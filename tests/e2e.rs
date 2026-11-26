@@ -4676,6 +4676,26 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
         "printf 'rsh-hi\\n'; exit 11",
     ]);
     assert_eq!((rc, out.as_slice()), (Some(11), b"rsh-hi\n".as_slice()));
+
+    // At the lowest open-fd limit where `koh exec` can bind, both stdout and stderr arrive
+    // without needing spare descriptors to duplicate them.
+    box_sh(
+        &host,
+        "found=0
+         for n in 10 11 12 13 14 15 16 18 20 24 32; do
+           set +e
+           (ulimit -n \"$n\" 2>/dev/null && exec koh exec box -- /bin/sh -c 'printf O; printf E >&2') >o 2>e
+           rc=$?
+           set -e
+           if [ \"$rc\" = 0 ]; then
+             found=1
+             [ \"$(cat o)\" = O ]
+             [ \"$(cat e)\" = E ]
+             break
+           fi
+         done
+         [ \"$found\" = 1 ]",
+    );
 }
 
 #[test]
@@ -4683,13 +4703,15 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
 
     let host = Host::start("nonblock-sock", &[]);
     let addr = host.addr();
 
-    // Non-blocking stdin: delayed second write must not be cut off by WouldBlock -> EOF.
+    // Non-blocking stdin: send second line only after first has been echoed; wait for child first.
     let (mut peer, sock) = UnixStream::pair().unwrap();
     sock.set_nonblocking(true).unwrap();
+    let mut peer_r = peer.try_clone().unwrap();
     let mut child = host
         .koh(&[
             "exec",
@@ -4705,17 +4727,31 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
         .stdout(OwnedFd::from(sock))
         .spawn()
         .unwrap();
+    let (echoed_tx, echoed_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let mut notified = false;
+        while let Ok(n @ 1..) = peer_r.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+            if !notified && got.starts_with(b"hello\n") {
+                notified = true;
+                let _ = echoed_tx.send(());
+            }
+        }
+        got
+    });
     peer.write_all(b"hello\n").unwrap();
-    std::thread::sleep(Duration::from_millis(250));
+    echoed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first line was not echoed");
     peer.write_all(b"world\n").unwrap();
     peer.shutdown(Shutdown::Write).unwrap();
-    let mut got = Vec::new();
-    peer.read_to_end(&mut got).unwrap();
     assert_eq!(
         wait_child(&mut child, 10, "nonblock stdin").code(),
         Some(37)
     );
-    assert_eq!(got, b"hello\nworld\n");
+    assert_eq!(reader.join().unwrap(), b"hello\nworld\n");
 
     // Non-blocking stdout: 1.5 MiB (exceeds default Unix socket buffers) with a delayed
     // small-buffer reader arrives whole.
@@ -4752,9 +4788,11 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
 fn rsh_options_rsync_and_git() {
     let host = Host::start("rsh-e2e", &[]);
     let direct_cmd = format!(
-        "[ \"$(koh rsh --direct {} {} printf ok)\" = ok ]
+        "koh rsh --direct {} {} printf ok >o
+         [ \"$(cat o)\" = ok ]
          koh servers add -box {} --direct {}
-         [ \"$(koh rsh -- -box printf ok)\" = ok ]",
+         koh rsh -- -box printf ok >o
+         [ \"$(cat o)\" = ok ]",
         host.addr(),
         host.id,
         host.id,
@@ -4767,8 +4805,10 @@ fn rsh_options_rsync_and_git() {
              [ \"$rc\" = 9 ]
              [ \"$(cat o)\" = out ]
              [ \"$(cat e)\" = err ]
-             [ \"$(printf 'in\\n' | koh rsh box cat)\" = in ]
-             [ \"$(koh rsh -- box printf %s --json)\" = --json ]
+             printf 'in\\n' | koh rsh box cat >o
+             [ \"$(cat o)\" = in ]
+             koh rsh -- box printf %s --json >o
+             [ \"$(cat o)\" = --json ]
              {direct_cmd}
              for f in -G -o -l -p --json; do
                set +e; koh rsh \"$f\" box --json >o 2>e; rc=$?; set -e
@@ -4919,10 +4959,13 @@ fn failed_run_preserves_existing_job_and_leaves_no_orphan() {
          set -e
          [ \"$rc1\" = 127 ]
          [ \"$rc2\" = 126 ]
-         [ \"$(koh logs box keep --all)\" = kept ]
-         koh jobs box keep | grep -Fq 'keep	exited 0'
+         koh logs box keep --all >o
+         [ \"$(cat o)\" = kept ]
+         koh jobs box keep >o
+         grep -Fq 'keep	exited 0' o
          koh run box --name keep -- /bin/sh -c 'printf \"new\\n\"' >/dev/null
          koh wait box keep --timeout 10 >/dev/null
-         [ \"$(koh logs box keep --all)\" = new ]",
+         koh logs box keep --all >o
+         [ \"$(cat o)\" = new ]",
     );
 }

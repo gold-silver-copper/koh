@@ -39,13 +39,11 @@ pub enum Request {
     Exec {
         argv: Vec<String>,
         cwd: Option<String>,
-        shell: bool,
     },
     Run {
         name: Option<String>,
         argv: Vec<String>,
         cwd: Option<String>,
-        shell: bool,
     },
     Jobs {
         name: Option<String>,
@@ -190,12 +188,6 @@ pub enum ExecServerMsg {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit(i32),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ExecClientMsg {
-    Stdin(Vec<u8>),
-    Eof,
 }
 
 /// Job summary returned by `Run` / `Jobs`.
@@ -408,40 +400,6 @@ pub async fn recv_msg<T: DeserializeOwned>(stream: &mut RecvStream, max: usize) 
     recv_msg_opt(stream, max)
         .await?
         .ok_or_else(|| KohError::unreachable("connection closed before response"))
-}
-
-/// Spawns a dedicated reader task so callers can use `mpsc::Receiver::recv()` safely inside
-/// `tokio::select!` without ever cancelling a half-read length-prefixed frame.
-/// Stops promptly and drops the stream as soon as the caller drops the receiver.
-pub fn spawn_msg_reader<T>(
-    mut stream: RecvStream,
-    max: usize,
-) -> tokio::sync::mpsc::Receiver<Result<T>>
-where
-    T: DeserializeOwned + Send + 'static,
-{
-    let (tx, rx) = tokio::sync::mpsc::channel(16);
-    tokio::spawn(async move {
-        loop {
-            let msg = tokio::select! {
-                () = tx.closed() => break,
-                res = recv_msg_opt::<T>(&mut stream, max) => res,
-            };
-            match msg {
-                Ok(Some(msg)) => {
-                    if tx.send(Ok(msg)).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-            }
-        }
-    });
-    rx
 }
 
 #[cfg(test)]

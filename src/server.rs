@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::AsyncReadExt as _;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
@@ -24,8 +24,8 @@ use crate::keys::{
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::proto::{
-    CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
-    Request, encode, recv_msg, send_msg, send_pieces, spawn_msg_reader,
+    CloseCode, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply, Request, encode,
+    recv_msg, send_msg, send_pieces,
 };
 use crate::session::Sessions;
 use crate::{Exit, KohError, Result, after};
@@ -62,6 +62,9 @@ const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// How long the requests of a connection that is gone have to end by themselves, before they
 /// are ended: the connection keeps its place until none is left.
 const LEFT_WAIT: Duration = Duration::from_secs(5);
+
+/// How long an `exec` command whose client left has after SIGHUP before its group gets SIGKILL.
+const HANGUP_WAIT: Duration = Duration::from_secs(2);
 
 /// The CLI's default for `--max-connections`.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
@@ -129,12 +132,10 @@ pub struct RunningServer {
 }
 
 impl RunningServer {
-    /// Stops taking connections, lets go of the key and closes the endpoint.
+    /// Closes the endpoint and waits for connection tasks (and active exec hangups) to finish.
     pub async fn shutdown(mut self) {
-        self.task.abort();
-        // (Until what took connections is gone, and the lock with it: the key is free when this returns.)
-        let _ = (&mut self.task).await;
         self.endpoint.close().await;
+        let _ = (&mut self.task).await;
     }
 }
 
@@ -199,11 +200,17 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let ep_accept = endpoint.clone();
     let task = tokio::spawn(async move {
         let _serving = serving;
-        while let Some(incoming) = ep_accept.accept().await {
+        let mut connections = JoinSet::new();
+        loop {
+            let incoming = tokio::select! {
+                Some(_) = connections.join_next() => continue,
+                incoming = ep_accept.accept() => incoming,
+            };
+            let Some(incoming) = incoming else { break };
             let came = Instant::now();
             if let Ok(place) = places.clone().try_acquire_owned() {
                 let (st, prove_by) = (state.clone(), after(came, state.proof_timeout));
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     // (A handshake that is dropped is gone: the transport closes it.)
                     if let Ok(Ok(conn)) = timeout_at(prove_by, incoming.into_future()).await {
                         handle_connection(conn, st, prove_by).await;
@@ -211,7 +218,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
                     drop(place);
                 });
             } else if let Ok(place) = turned_away.clone().try_acquire_owned() {
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let told_by = after(came, BUSY_WAIT);
                     if let Ok(Ok(conn)) = timeout_at(told_by, incoming.into_future()).await {
                         // (Once the client has connected and asks, so that it reads why.)
@@ -224,6 +231,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
                 incoming.refuse();
             }
         }
+        while connections.join_next().await.is_some() {}
     });
 
     Ok(RunningServer {
@@ -352,20 +360,15 @@ async fn dispatch(
     recv: RecvStream,
 ) -> Result<()> {
     match req {
-        Request::Exec { argv, cwd, shell } => {
+        Request::Exec { argv, cwd } => {
             let dir = resolve_cwd(cwd.as_deref())?;
-            handle_exec(&argv, &dir, shell, send, recv).await
+            handle_exec(&argv, &dir, send, recv).await
         }
-        Request::Run {
-            name,
-            argv,
-            cwd,
-            shell,
-        } => {
+        Request::Run { name, argv, cwd } => {
             let dir = resolve_cwd(cwd.as_deref())?;
             // (A start is file work and a process made: not on a thread that serves requests.)
             let jobs = state.jobs.clone();
-            let start = move || JobManager::start(&jobs, name, &argv, &dir, shell);
+            let start = move || JobManager::start(&jobs, name, &argv, &dir);
             let started = tokio::task::spawn_blocking(start).await;
             let info = started.map_err(|_| KohError::internal("a job's start"))??;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
@@ -508,132 +511,116 @@ async fn dispatch(
     }
 }
 
-/// Raw non-PTY exec: separate stdout/stderr, binary-clean, stdin EOF, and SIGHUP on client drop.
+/// Raw non-PTY exec: separate stdout/stderr, raw stdin, and group hangup whenever the client goes.
 async fn handle_exec(
     argv: &[String],
     cwd: &Path,
-    shell: bool,
     send: &mut SendStream,
-    recv: RecvStream,
+    mut recv: RecvStream,
 ) -> Result<()> {
-    let mut std_cmd = crate::jobs::build_command(argv, cwd, shell)?;
+    let mut std_cmd = crate::jobs::build_command(argv, cwd)?;
     fuxix::new_session(&mut std_cmd, false);
-    let mut cmd = tokio::process::Command::from(std_cmd);
-    cmd.stdin(Stdio::piped())
+    let mut child = tokio::process::Command::from(std_cmd)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().map_err(|e| {
-        let code = if e.kind() == std::io::ErrorKind::NotFound {
-            Exit::NOT_FOUND
-        } else {
-            Exit::CANNOT_START
-        };
-        KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
-    })?;
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                Exit::NOT_FOUND
+            } else {
+                Exit::CANNOT_START
+            };
+            KohError::new(code, "cannot_start", format!("spawn exec: {e}"))
+        })?;
     let pgid = child.id();
-    send_msg(send, &Reply::Ok, MAX_CTRL).await?;
 
-    let mut child_stdin = child.stdin.take();
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<ExecServerMsg>(32);
-
-    // (The two that read what the command writes are this request's own, and end with it.)
-    let mut pipes = JoinSet::new();
-    let tx1 = out_tx.clone();
-    pipes.spawn(async move {
-        if let Some(mut out) = child_stdout.take() {
-            let mut buf = vec![0u8; 32 << 10];
-            while let Ok(n @ 1..) = out.read(&mut buf).await {
-                if let Some(slice) = buf.get(..n)
-                    && tx1
-                        .send(ExecServerMsg::Stdout(slice.to_vec()))
-                        .await
-                        .is_err()
-                {
-                    break;
-                }
-            }
+    let stdin = child.stdin.take();
+    let (mut stdout, mut stderr) = (child.stdout.take(), child.stderr.take());
+    let input = async move {
+        if let Some(mut pipe) = stdin {
+            let _ = tokio::io::copy(&mut recv, &mut pipe).await;
         }
-    });
-    let tx2 = out_tx.clone();
-    pipes.spawn(async move {
-        if let Some(mut err) = child_stderr.take() {
-            let mut buf = vec![0u8; 32 << 10];
-            while let Ok(n @ 1..) = err.read(&mut buf).await {
-                if let Some(slice) = buf.get(..n)
-                    && tx2
-                        .send(ExecServerMsg::Stderr(slice.to_vec()))
-                        .await
-                        .is_err()
-                {
-                    break;
-                }
-            }
-        }
-    });
-    drop(out_tx);
-
-    let mut disconnected = false;
-    let mut stdin_open = true;
-    let mut stdin_rx = spawn_msg_reader::<ExecClientMsg>(recv, MAX_CHUNK);
-    loop {
-        tokio::select! {
-            msg = out_rx.recv() => {
-                match msg {
-                    Some(m) => {
-                        if send_msg(send, &m, MAX_CHUNK).await.is_err() {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-            ev = stdin_rx.recv(), if stdin_open => {
-                match ev {
-                    Some(Ok(ExecClientMsg::Stdin(bytes))) => {
-                        if let Some(stdin) = child_stdin.as_mut() {
-                            let _ = stdin.write_all(&bytes).await;
-                        }
-                    }
-                    Some(Ok(ExecClientMsg::Eof)) => {
-                        stdin_open = false;
-                        drop(child_stdin.take());
-                    }
-                    Some(Err(_)) | None => {
-                        disconnected = true;
-                        drop(child_stdin.take());
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // (What the command writes from here on is read by nobody: its two readers end at what
-    // they read next, and do not wait with it for room that will not come.)
-    drop(out_rx);
-    // (Its client is gone, so that it could not be hung up is told to whoever reads what the
-    // server says.)
-    if disconnected
-        && let Some(pid) = pgid
-        && let Err(err) = crate::jobs::signal_group(pid, 1).await
-    {
-        let said = format!("koh: a command whose client went was not hung up: {err}");
-        let _ = writeln!(std::io::stderr(), "{said}");
-    }
-    while pipes.join_next().await.is_some() {}
-    let code = match child.wait().await {
-        Ok(status) => status
-            .code()
-            .or_else(|| status.signal().map(|s| 128 + s))
-            .unwrap_or(1),
-        Err(_) => 1,
     };
-    if !disconnected {
+    let stopped = send.stopped();
+    let output = async {
+        send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+        let (mut out, mut err) = (vec![0u8; 32 << 10], vec![0u8; 32 << 10]);
+        loop {
+            let msg = tokio::select! {
+                slice = exec_pipe(&mut stdout, &mut out), if stdout.is_some() => {
+                    slice?.map(|bytes| ExecServerMsg::Stdout(bytes.to_vec()))
+                }
+                slice = exec_pipe(&mut stderr, &mut err), if stderr.is_some() => {
+                    slice?.map(|bytes| ExecServerMsg::Stderr(bytes.to_vec()))
+                }
+                else => break,
+            };
+            if let Some(msg) = msg {
+                send_msg(send, &msg, MAX_CHUNK).await?;
+            }
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| KohError::internal(format!("wait exec: {e}")))?;
+        Ok::<_, KohError>(
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(1),
+        )
+    };
+    let done = tokio::select! {
+        _ = stopped => None,
+        done = output => Some(done),
+        // Stdin EOF closes only the child's stdin pipe; it must not disarm `stopped`.
+        _ = async { input.await; std::future::pending::<()>().await } => None,
+    };
+    drop(stdout);
+    drop(stderr);
+    if let Some(Ok(code)) = done {
         let _ = send_msg(send, &ExecServerMsg::Exit(code), MAX_CTRL).await;
+    } else {
+        hang_up(pgid, &mut child).await;
     }
     Ok(())
+}
+
+async fn exec_pipe<'a, R: tokio::io::AsyncRead + Unpin>(
+    pipe: &mut Option<R>,
+    buf: &'a mut [u8],
+) -> Result<Option<&'a [u8]>> {
+    if let Some(reader) = pipe {
+        let n = reader
+            .read(buf)
+            .await
+            .map_err(|e| KohError::internal(format!("read exec pipe: {e}")))?;
+        if n > 0 {
+            return Ok(buf.get(..n));
+        }
+    }
+    *pipe = None;
+    Ok(None)
+}
+
+/// Hangs up the command of a client that has gone: SIGHUP to its group, and SIGKILL if it is
+/// still there `HANGUP_WAIT` later; keeps the leader unreaped until the last signal.
+async fn hang_up(pgid: Option<u32>, child: &mut tokio::process::Child) {
+    let Some(pid) = pgid else { return };
+    for sig in [1, 9] {
+        if let Err(err) = crate::jobs::signal_group(pid, sig).await
+            && !matches!(child.try_wait(), Ok(Some(_)))
+        {
+            let said = format!("koh: a command whose client went was not hung up: {err}");
+            let _ = writeln!(std::io::stderr(), "{said}");
+        }
+        if tokio::time::timeout(HANGUP_WAIT, child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
 }

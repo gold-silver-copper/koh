@@ -39,10 +39,8 @@ pub struct KohError {
 
 impl KohError {
     pub fn new(code: Exit, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-        }
+        let message = message.into();
+        Self { code, message }
     }
 
     pub fn usage(msg: impl Into<String>) -> Self {

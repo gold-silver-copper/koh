@@ -745,7 +745,8 @@ dependencies = [
 [[package]]
 name = "fux"
 version = "0.44.0"
-source = "git+https://github.com/gold-silver-copper/fux?rev=2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2#2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d31dd25e0a2155a1a4aa034a215513ca8c1bc8769966e821452493df20bcb42b"
 dependencies = [
  "fux-vt",
  "fuxix",
@@ -754,12 +755,14 @@ dependencies = [
 [[package]]
 name = "fux-vt"
 version = "0.20.1"
-source = "git+https://github.com/gold-silver-copper/fux?rev=2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2#2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d945717c5b69d719b73ba95cf4b97e307fdc0a89a8b08a8366f4444dc13e8115"
 
 [[package]]
 name = "fuxix"
 version = "0.13.0"
-source = "git+https://github.com/gold-silver-copper/fux?rev=2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2#2fb7acc29d26fb1db2342c3c70e9d3d9d78360e2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6573134ccab5b238816f4985de4f66f2f731047a645f3958a6379b0cce0f1ed"
 
 [[package]]
 name = "generator"

@@ -406,7 +406,8 @@ impl Client {
                     dry_run,
                 })
                 .await?;
-            let part = send_tree(src, excludes, preserve_root, delete, &mut send, &mut recv).await?;
+            let part =
+                send_tree(src, excludes, preserve_root, delete, &mut send, &mut recv).await?;
             total.merge(part);
         }
         Ok(total)

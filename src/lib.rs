@@ -125,7 +125,9 @@ impl Aside {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let aside = dir.with_file_name(format!(".gone.{}.{nth}", std::process::id()));
-        std::fs::rename(dir, &aside).ok().map(|()| Self(Some(aside)))
+        std::fs::rename(dir, &aside)
+            .ok()
+            .map(|()| Self(Some(aside)))
     }
 
     /// Puts the folder back at `dir`; if rename fails, disarms drop so it stays on disk.

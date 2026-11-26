@@ -1,390 +1,343 @@
-//! Headless persistent background jobs backed by raw append-only log files
-//! (no PTY, no 80-column wrapping, no 4 MiB screen truncation).
+//! Jobs backed by terminal-less fux panes (`fux start --out`) in `STATE/fux/koh-jobs/NAME`.
+//! `koh serve` keeps no in-memory job table: the pane folders are the jobs, so jobs survive
+//! restarts of `koh serve` and logs stream in fixed-size chunks without reading whole files.
 
-use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Read as _;
-use std::os::unix::process::ExitStatusExt as _;
+use std::fs::{self, DirBuilder, File};
+use std::io::{ErrorKind, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, FileExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use tokio::sync::watch;
+use fux::run_of;
+use iroh::endpoint::SendStream;
 use tokio::time::Instant as Timer;
 
-use crate::proto::{JobInfo, WaitResult};
-use crate::{Aside, Exit, KohError, Result, after, atomic_write, is_safe_name};
+use crate::pane;
+use crate::proto::{
+    JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply, WaitResult, send_msg, session_name,
+};
+use crate::session::{ended, lives, not_found, panes_in, pooled, start, state_of};
+use crate::{Exit, KohError, Result, after};
 
-struct JobRecord {
-    name: String,
-    pid: u32,
-    command: String,
+/// Chunk size for streaming logs and seeking backwards for tails.
+const PIECE: usize = 64 << 10;
+
+/// Maximum tail bytes packed into a single `WaitResult` (`MAX_FRAME` minus framing headroom).
+const WAIT_TAIL_CAP: u64 = (MAX_FRAME - 4096) as u64;
+
+pub struct Jobs {
     dir: PathBuf,
-    started: Instant,
-    state_tx: watch::Sender<(String, Option<i32>)>,
+    exe: PathBuf,
+    starting: tokio::sync::Mutex<()>,
 }
 
-/// Manages detached headless jobs on the server.
-pub struct JobManager {
-    root: PathBuf,
-    next_id: u32,
-    jobs: BTreeMap<String, Arc<JobRecord>>,
+/// Reads a job's summary from its folder (`lives` checked before `state` so a freshly-unlocked
+/// folder always observes the holder's final `state`).
+fn info(dir: &Path) -> JobInfo {
+    let status =
+        String::from_utf8_lossy(&pane::read(dir, "status").unwrap_or_default()).into_owned();
+    let field = |key: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let state = state_of(pane::line(dir, "state"), lives(dir));
+    let age_secs = fs::metadata(dir.join("status"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| SystemTime::now().duration_since(at).ok())
+        .map_or(0, |d| d.as_secs());
+    JobInfo {
+        name: dir.file_name().unwrap_or_default().to_string_lossy().into(),
+        pid: field("pid ").parse().unwrap_or(0),
+        exit: pane::code(&state).or((state == "ended").then_some(1)),
+        state,
+        age_secs,
+        command: field("command "),
+    }
 }
 
-pub type JobStateRx = watch::Receiver<(String, Option<i32>)>;
-
-pub struct JobHandle {
-    pub log_path: PathBuf,
-    pub state_rx: JobStateRx,
-    pub started: Instant,
+fn read_piece(file: &File, from: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut got = 0;
+    while let Some(rest) = buf.get_mut(got..)
+        && !rest.is_empty()
+    {
+        match file.read_at(rest, from + got as u64) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
 }
 
-impl JobManager {
-    pub fn new(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&root)
-            .map_err(|e| KohError::failed(format!("mkdir {}: {e}", root.display())))?;
+/// Finds `(start_offset, file_len)` for the last `lines` lines by scanning backwards in `PIECE`
+/// blocks, bounded to at most `max_bytes` from the end.
+fn tail_range(file: &File, lines: usize, max_bytes: u64) -> std::io::Result<(u64, u64)> {
+    let len = file.metadata().map_or(0, |m| m.len());
+    if lines == 0 {
+        return Ok((len, len));
+    }
+    let (floor, mut found, mut end) = (len.saturating_sub(max_bytes), 0usize, len);
+    while end > floor {
+        let from = end.saturating_sub(PIECE as u64).max(floor);
+        let piece = read_piece(file, from, (end - from) as usize)?;
+        for (i, &byte) in piece.iter().enumerate().rev() {
+            let at = from + i as u64;
+            if byte == b'\n' && at + 1 < len {
+                found += 1;
+                if found == lines {
+                    return Ok((at + 1, len));
+                }
+            }
+        }
+        end = from;
+    }
+    Ok((floor, len))
+}
+
+impl Jobs {
+    pub fn new(state: &Path, exe: &Path) -> Result<Self> {
+        let dir = state.join("fux").join("koh-jobs");
+        let dir = DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&dir)
+            .and_then(|()| fs::canonicalize(&dir))
+            .map_err(|e| KohError::failed(format!("koh-jobs: {e}")))?;
         Ok(Self {
-            root,
-            next_id: 1,
-            jobs: BTreeMap::new(),
+            dir,
+            exe: exe.to_path_buf(),
+            starting: tokio::sync::Mutex::new(()),
         })
     }
 
-    pub fn start(
-        mgr: &Arc<Mutex<Self>>,
+    fn named(&self, name: &str) -> Result<(PathBuf, u128)> {
+        let dir = session_name(name).then(|| self.dir.join(name));
+        dir.filter(|d| d.join("status").is_file())
+            .and_then(|d| Some((d.clone(), run_of(&d)?)))
+            .ok_or_else(|| not_found(format!("no job named {name:?}")))
+    }
+
+    /// `koh run`: starts a `--out` pane under `name` (removing an ended folder first) or fux's
+    /// first free number.
+    pub async fn run(
+        &self,
         name: Option<String>,
-        argv: &[String],
+        argv: Vec<String>,
         cwd: &Path,
     ) -> Result<JobInfo> {
-        // What an older job of the name left, to be removed with the lock let go: it is named
-        // here, before the lock, so it is dropped after it however this returns.
-        let mut _old = None;
-        let mut guard = mgr
-            .lock()
-            .map_err(|_| KohError::internal("job lock poisoned"))?;
-        let job_name = match name {
-            Some(n) => {
-                if !is_safe_name(&n) {
-                    return Err(KohError::usage(format!("invalid job name {n:?}")));
-                }
-                if let Some(existing) = guard.jobs.get(&n)
-                    && existing.state_tx.borrow().0 == "running"
-                {
-                    return Err(KohError::failed(format!("job {n:?} is already running")));
-                }
-                n
+        if !name.as_deref().is_none_or(session_name) {
+            return Err(KohError::usage(format!("invalid job name {name:?}")));
+        }
+        if !cwd.is_dir() {
+            return Err(KohError::new(
+                Exit::CANNOT_START,
+                "cannot_start",
+                format!("no such directory: {}", cwd.display()),
+            ));
+        }
+        if argv.is_empty() {
+            return Err(KohError::usage("missing command"));
+        }
+        let name = name.unwrap_or_default();
+        let _one = self.starting.lock().await;
+        if !name.is_empty() {
+            let dir = self.dir.join(&name);
+            if lives(&dir) {
+                return Err(KohError::failed(format!("job {name:?} is already running")));
             }
-            None => loop {
-                let cand = format!("j{}", guard.next_id);
-                guard.next_id = guard.next_id.wrapping_add(1);
-                if !guard.jobs.contains_key(&cand) {
-                    break cand;
-                }
-            },
-        };
-        let dir = guard.root.join(&job_name);
-        _old = Aside::of(&dir);
-        fs::create_dir_all(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+            let _ = fs::remove_dir_all(&dir);
+        }
+        let dir = start(&self.exe, &self.dir, &name, true, &argv, &[], cwd).await?;
+        pooled(move || info(&dir)).await
+    }
 
-        let log_path = dir.join("log");
-        let log_out = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&log_path)
-            .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
-        let log_err = log_out
-            .try_clone()
-            .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
-
-        let mut cmd = build_command(argv, cwd)?;
-        fuxix::new_session(&mut cmd, false);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::from(log_out))
-            .stderr(Stdio::from(log_err));
-
-        let mut child = cmd.spawn().map_err(|e| {
-            let code = if e.kind() == std::io::ErrorKind::NotFound {
-                Exit::NOT_FOUND
-            } else {
-                Exit::CANNOT_START
-            };
-            KohError::new(code, "cannot_start", format!("spawn job: {e}"))
-        })?;
-        let pid = child.id();
-        let command_str = argv.join(" ");
-        let _ = atomic_write(&dir.join("state"), b"running\n");
-        let _ = atomic_write(
-            &dir.join("meta"),
-            format!("pid {pid}\ncommand {command_str}\n").as_bytes(),
-        );
-
-        let (state_tx, _) = watch::channel(("running".to_string(), None));
-        let rec = Arc::new(JobRecord {
-            name: job_name.clone(),
-            pid,
-            command: command_str.clone(),
-            dir: dir.clone(),
-            started: Instant::now(),
-            state_tx,
-        });
-        guard.jobs.insert(job_name.clone(), rec.clone());
-        drop(guard);
-
-        let dir_wait = dir.clone();
-        std::thread::spawn(move || {
-            let (state, code) = match child.wait() {
-                Ok(status) => {
-                    if let Some(c) = status.code() {
-                        (format!("exited {c}"), Some(c))
-                    } else if let Some(sig) = status.signal() {
-                        (format!("killed {sig}"), Some(128 + sig))
-                    } else {
-                        ("exited 1".to_string(), Some(1))
-                    }
-                }
-                Err(e) => (format!("lost {e}"), Some(1)),
-            };
-            let _ = atomic_write(&dir_wait.join("state"), format!("{state}\n").as_bytes());
-            let _ = rec.state_tx.send_replace((state, code));
-        });
-
-        Ok(JobInfo {
-            name: job_name,
-            pid,
-            state: "running".into(),
-            exit: None,
-            age_secs: 0,
-            command: command_str,
+    /// `koh jobs`: lists all jobs oldest-first, or the named job.
+    pub async fn list(&self, name: Option<String>) -> Result<Vec<JobInfo>> {
+        if let Some(name) = name {
+            let (dir, _) = self.named(&name)?;
+            return pooled(move || vec![info(&dir)]).await;
+        }
+        let root = self.dir.clone();
+        pooled(move || {
+            let mut jobs: Vec<_> = panes_in(&root)
+                .into_iter()
+                .filter_map(|(dir, pane)| Some((pane?.1, dir)))
+                .collect();
+            jobs.sort();
+            jobs.into_iter().map(|(_, dir)| info(&dir)).collect()
         })
-    }
-
-    pub fn list(&self, filter: Option<&str>) -> Result<Vec<JobInfo>> {
-        if let Some(name) = filter {
-            let rec = self.jobs.get(name).ok_or_else(|| {
-                KohError::new(
-                    Exit::NOT_FOUND,
-                    "not_found",
-                    format!("no job named {name:?}"),
-                )
-            })?;
-            return Ok(vec![record_info(rec)]);
-        }
-        Ok(self.jobs.values().map(|r| record_info(r)).collect())
-    }
-
-    pub fn get(&self, name: &str) -> Result<JobHandle> {
-        let rec = self.jobs.get(name).ok_or_else(|| {
-            KohError::new(
-                Exit::NOT_FOUND,
-                "not_found",
-                format!("no job named {name:?}"),
-            )
-        })?;
-        Ok(JobHandle {
-            log_path: rec.dir.join("log"),
-            state_rx: rec.state_tx.subscribe(),
-            started: rec.started,
-        })
-    }
-
-    /// Signals the process group of job `name` (a number that is no signal's is SIGTERM's), and
-    /// tells of the job as it then is. The lock is held only to find the job: kill(1) is waited
-    /// for with nothing held. That it failed is an error unless the group has gone (all of it:
-    /// a job's first process may end and leave others), for then nothing is there to signal.
-    pub async fn kill(mgr: &Arc<Mutex<Self>>, name: &str, sig: i32) -> Result<JobInfo> {
-        let rec = {
-            let guard = mgr
-                .lock()
-                .map_err(|_| KohError::internal("job lock poisoned"))?;
-            guard.jobs.get(name).cloned().ok_or_else(|| {
-                KohError::new(
-                    Exit::NOT_FOUND,
-                    "not_found",
-                    format!("no job named {name:?}"),
-                )
-            })?
-        };
-        let signal = if (1..32).contains(&sig) { sig } else { 15 };
-        if let Err(err) = signal_group(rec.pid, signal).await
-            && group_is_there(rec.pid).await
-        {
-            return Err(err);
-        }
-        Ok(record_info(&rec))
-    }
-}
-
-/// How long a program koh runs for what it does or says (kill(1), id(1)) is given.
-const DONE_IN: Duration = Duration::from_secs(5);
-
-fn not_done(program: &str, args: &[String], why: impl std::fmt::Display) -> KohError {
-    KohError::failed(format!("{program} {}: {why}", args.join(" ")))
-}
-
-/// Runs `program` with `args` to its end, waited for by the caller alone and for `DONE_IN` at
-/// most. That it could not be run or was not done in time is an error; what it then says of
-/// itself, failure too, is the caller's to read.
-async fn ran(program: &str, args: &[String]) -> Result<std::process::Output> {
-    let mut command = tokio::process::Command::new(program);
-    command.args(args).stdin(Stdio::null()).kill_on_drop(true);
-    match tokio::time::timeout(DONE_IN, command.output()).await {
-        Ok(Ok(done)) => Ok(done),
-        Ok(Err(e)) => Err(not_done(program, args, e)),
-        Err(_) => {
-            let why = format!("not done in {} s", DONE_IN.as_secs());
-            Err(not_done(program, args, why))
-        }
-    }
-}
-
-/// Runs `program` with `args` and gives what it wrote. That it says it failed is an error too,
-/// with what it said: what a program wrote before it failed is not its answer.
-pub(crate) async fn run(program: &str, args: &[String]) -> Result<Vec<u8>> {
-    let done = ran(program, args).await?;
-    if done.status.success() {
-        return Ok(done.stdout);
-    }
-    let said = String::from_utf8_lossy(&done.stderr);
-    let why = format!("{} {}", done.status, said.trim());
-    Err(not_done(program, args, why))
-}
-
-/// Runs kill(1) with `args`: std has no call that signals a process group, and the groups koh
-/// starts are its own to end, as anyone would end them.
-async fn kill(args: &[String]) -> Result<()> {
-    run("kill", args).await.map(drop)
-}
-
-/// Whether kill(1) can be run: a server that cannot run it ends no job and hangs up no command,
-/// and had better say so as it starts than do nothing when asked.
-pub(crate) async fn can_kill() -> Result<()> {
-    kill(&["-0".into(), std::process::id().to_string()])
         .await
-        .map_err(|err| {
-            KohError::failed(format!(
-                "koh serve needs kill(1) on its PATH, to end jobs and commands ({})",
-                err.message
-            ))
-        })
-}
-
-/// Whether the process group `pgid` is there, as `kill -0` tells it. Only its saying no is a
-/// no: a kill(1) that could not be asked has told of nothing that went.
-async fn group_is_there(pgid: u32) -> bool {
-    let asked = ran("kill", &["-0".into(), "--".into(), format!("-{pgid}")]).await;
-    !asked.is_ok_and(|said| !said.status.success())
-}
-
-/// Sends `signal` to the process group `pgid`.
-pub(crate) async fn signal_group(pgid: u32, signal: i32) -> Result<()> {
-    // (-0 is the caller's own group, and -1 every process there is.)
-    if pgid < 2 {
-        return Err(KohError::failed(format!(
-            "no process group {pgid} of a job"
-        )));
     }
-    kill(&[format!("-{signal}"), "--".into(), format!("-{pgid}")]).await
-}
 
-fn record_info(rec: &JobRecord) -> JobInfo {
-    let (state, exit) = rec.state_tx.borrow().clone();
-    JobInfo {
-        name: rec.name.clone(),
-        pid: rec.pid,
-        state,
-        exit,
-        age_secs: rec.started.elapsed().as_secs(),
-        command: rec.command.clone(),
-    }
-}
-
-/// Builds a `std::process::Command` from argv and working directory.
-pub fn build_command(argv: &[String], cwd: &Path) -> Result<Command> {
-    if !cwd.is_dir() {
-        return Err(KohError::new(
-            Exit::CANNOT_START,
-            "cannot_start",
-            format!("no such directory: {}", cwd.display()),
-        ));
-    }
-    let Some((prog, args)) = argv.split_first() else {
-        return Err(KohError::usage("missing command"));
-    };
-    let mut cmd = Command::new(prog);
-    cmd.args(args).current_dir(cwd);
-    Ok(cmd)
-}
-
-/// Reads the last `tail_lines` lines (or all bytes if `tail_lines == None`) of a job log file.
-pub fn read_log_tail(path: &Path, tail_lines: Option<usize>) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    fuxix::open_regular(path)
-        .and_then(|mut log| log.read_to_end(&mut data))
-        .map_err(|e| KohError::failed(format!("read log: {e}")))?;
-    let Some(n) = tail_lines else {
-        return Ok(data);
-    };
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let mut lines = 0usize;
-    let mut start = data.len();
-    for (i, &b) in data.iter().enumerate().rev() {
-        if b == b'\n' && i + 1 < data.len() {
-            lines += 1;
-            if lines >= n {
-                start = i + 1;
-                break;
+    /// `koh kill`: writes `kill N` non-blockingly to `ctl` so the holder signals its program's
+    /// process group. Never signals a PID read from a file.
+    pub async fn kill(&self, name: &str, signal: i32) -> Result<JobInfo> {
+        if !(1..32).contains(&signal) {
+            return Err(KohError::usage(format!("invalid signal {signal}")));
+        }
+        let (dir, run) = self.named(name)?;
+        pooled(move || {
+            if ended(&dir, run).is_none() {
+                match fuxix::open_fifo(dir.join("ctl")) {
+                    Ok(mut ctl) => {
+                        if let Err(e) = ctl.write_all(format!("kill {signal}\n").as_bytes())
+                            && e.kind() != ErrorKind::BrokenPipe
+                        {
+                            return Err(KohError::failed(format!("kill -{signal}: {e}")));
+                        }
+                    }
+                    // ENOENT or ENXIO (6 on Linux and macOS): holder is already gone.
+                    Err(e) if e.kind() == ErrorKind::NotFound || e.raw_os_error() == Some(6) => {}
+                    Err(e) => return Err(KohError::failed(format!("kill -{signal}: {e}"))),
+                }
             }
-        }
-        start = i;
+            Ok(info(&dir))
+        })
+        .await?
     }
-    Ok(data.get(start..).unwrap_or_default().to_vec())
-}
 
-/// Waits for a job to finish, up to `timeout_secs`: more of them than the clock has is no limit
-/// (`after`).
-pub async fn wait_job(
-    log_path: PathBuf,
-    mut state_rx: watch::Receiver<(String, Option<i32>)>,
-    tail: usize,
-    timeout_secs: Option<u64>,
-) -> Result<WaitResult> {
-    let deadline = timeout_secs.map(|s| after(Timer::now(), Duration::from_secs(s)));
-
-    loop {
-        let (state, exit) = state_rx.borrow().clone();
-        if state != "running" {
-            let tail_bytes = read_log_tail(&log_path, Some(tail)).unwrap_or_default();
-            return Ok(WaitResult {
-                timed_out: false,
-                exit: exit.unwrap_or(1),
-                tail: String::from_utf8_lossy(&tail_bytes).into_owned(),
-                detail: state,
-            });
-        }
-
-        if let Some(dl) = deadline
-            && Timer::now() >= dl
+    /// `koh logs`: streams `out` from the tail offset (or 0 for `--all`) in 64 KiB chunks,
+    /// optionally following until the job ends.
+    pub async fn logs(
+        &self,
+        name: &str,
+        lines: Option<usize>,
+        all: bool,
+        follow: bool,
+        send: &mut SendStream,
+    ) -> Result<()> {
+        let (dir, run) = self.named(name)?;
+        let path = dir.join("out");
+        send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+        let (file, offset, snap) = pooled(move || -> Result<(Arc<File>, u64, u64)> {
+            let file = fuxix::open_regular(&path)
+                .map_err(|e| KohError::failed(format!("read log: {e}")))?;
+            let (from, snap) = match if all { None } else { lines.or(Some(200)) } {
+                None => (0, file.metadata().map_or(0, |m| m.len())),
+                Some(n) => tail_range(&file, n, u64::MAX)
+                    .map_err(|e| KohError::failed(format!("read log: {e}")))?,
+            };
+            Ok((Arc::new(file), from, snap))
+        })
+        .await??;
+        let out = Some((file, offset, (!follow).then_some(snap)));
+        if self
+            .until_ended(&dir, run, None, send, out)
+            .await?
+            .is_none()
         {
-            let tail_bytes = read_log_tail(&log_path, Some(tail)).unwrap_or_default();
-            return Ok(WaitResult {
-                timed_out: true,
-                exit: i32::from(Exit::TIMEOUT.0),
-                tail: String::from_utf8_lossy(&tail_bytes).into_owned(),
-                detail: "timed out".into(),
-            });
+            return Ok(());
         }
+        let job = pooled(move || info(&dir)).await?;
+        send_msg(
+            send,
+            &LogMsg::Done {
+                state: job.state,
+                exit: job.exit,
+                age_secs: job.age_secs,
+            },
+            MAX_CTRL,
+        )
+        .await
+    }
 
-        let sleep = Duration::from_millis(200);
-        let wait_for = deadline.map_or(sleep, |dl| {
-            dl.saturating_duration_since(Timer::now()).min(sleep)
-        });
-        tokio::select! {
-            _ = state_rx.changed() => {}
-            () = tokio::time::sleep(wait_for) => {}
+    /// `koh wait`: waits until the job ends or `timeout_secs` elapses, then returns the tail.
+    pub async fn wait(
+        &self,
+        name: &str,
+        lines: usize,
+        timeout_secs: Option<u64>,
+        send: &mut SendStream,
+    ) -> Result<()> {
+        let (dir, run) = self.named(name)?;
+        let out = dir.join("out");
+        send_msg(send, &Reply::Ok, MAX_CTRL).await?;
+        let deadline = timeout_secs.map(|s| after(Timer::now(), Duration::from_secs(s)));
+        let Some(outcome) = self.until_ended(&dir, run, deadline, send, None).await? else {
+            return Ok(());
+        };
+        let (timed_out, exit, detail) = match outcome {
+            Some(code) => {
+                let d = dir.clone();
+                (false, code, pooled(move || info(&d).state).await?)
+            }
+            None => (true, i32::from(Exit::TIMEOUT.0), "timed out".into()),
+        };
+        let last = pooled(move || {
+            fuxix::open_regular(&out)
+                .and_then(|f| {
+                    let (from, len) = tail_range(&f, lines, WAIT_TAIL_CAP)?;
+                    read_piece(&f, from, (len - from) as usize)
+                })
+                .unwrap_or_default()
+        })
+        .await?;
+        let waited = WaitResult {
+            timed_out,
+            exit,
+            tail: String::from_utf8_lossy(&last).into_owned(),
+            detail,
+        };
+        send_msg(send, &waited, MAX_FRAME).await
+    }
+
+    /// Shared poll loop for `logs`, `logs -f`, and `wait`: streams chunks from `out` (if any)
+    /// until snapshot EOF, job end, `deadline`, or client disconnect (`send.stopped()`).
+    async fn until_ended(
+        &self,
+        dir: &Path,
+        run: u128,
+        deadline: Option<Timer>,
+        send: &mut SendStream,
+        mut out: Option<(Arc<File>, u64, Option<u64>)>,
+    ) -> Result<Option<Option<i32>>> {
+        loop {
+            let d = dir.to_path_buf();
+            let reading = out.as_ref().map(|(f, at, lim)| (Arc::clone(f), *at, *lim));
+            let (was, chunk) = pooled(move || {
+                // Check `ended` BEFORE reading `out`: the holder drains `out` before writing
+                // final `state`, so once `was` is `Some`, no more bytes can arrive.
+                let was = ended(&d, run);
+                let chunk = reading.and_then(|(f, at, lim)| {
+                    let want = lim
+                        .map_or(PIECE as u64, |e| e.saturating_sub(at))
+                        .min(PIECE as u64);
+                    (want > 0)
+                        .then(|| read_piece(&f, at, want as usize).unwrap_or_default())
+                        .filter(|bytes| !bytes.is_empty())
+                });
+                (was, chunk)
+            })
+            .await?;
+            if let Some(chunk) = chunk {
+                if let Some((_, at, _)) = out.as_mut() {
+                    *at += chunk.len() as u64;
+                }
+                send_msg(send, &LogMsg::Data(chunk), MAX_CHUNK).await?;
+                continue;
+            }
+            if matches!(out, Some((_, _, Some(_)))) || was.is_some() {
+                return Ok(Some(was));
+            }
+            if deadline.is_some_and(|dl| Timer::now() >= dl) {
+                return Ok(Some(None));
+            }
+            let sleep = Duration::from_millis(25);
+            let wait_for = deadline.map_or(sleep, |dl| {
+                dl.saturating_duration_since(Timer::now()).min(sleep)
+            });
+            tokio::select! {
+                _ = send.stopped() => return Ok(None),
+                () = tokio::time::sleep(wait_for) => {}
+            }
         }
     }
 }

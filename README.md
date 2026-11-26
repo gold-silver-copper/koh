@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust lines in `src/*.rs`, 5,600 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,900 non-test Rust lines in `src/*.rs`, 5,500 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
@@ -29,9 +29,19 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust
     needs rsync's `-s` (push and pull; koh requires UTF-8 command-line arguments). When the server
     cannot receive the close (as above), an interrupted `rsync --partial` can outlive the client
     until the idle timeout and rename its piece over a later run.
-  - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
-    log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
-    which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
+  - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by terminal-less
+    `fux` panes (`koh fux start --out`) in `STATE/fux/koh-jobs/NAME`, beside `koh-sessions` (not
+    listed by `koh sessions`, not counted by `--max-sessions`), with raw append-only `out` logs
+    streamed in fixed-size blocks (no 80-column wrapping, no screen truncation). `koh serve` keeps
+    no job state in memory: jobs survive `koh serve` being restarted, and not a reboot (they live
+    in the runtime directory). Job names follow `fux`'s pane-name rule and unnamed jobs take
+    `fux`'s first free number (`1`, `2`, …); starting an ended name removes its old folder and log
+    first, also if the new program cannot be started. Each job's `out` file grows without bound:
+    remove ended job folders yourself or start the name anew. When a job's program ends, anything
+    it left in its process group is hung up (`nohup`/`setsid` for processes that must outlive it).
+    `koh kill` writes `kill N` to the pane's `ctl` FIFO and reaches a job only while its holder
+    lives; a holder killed with `-9` leaves its job running and listed as it was. `koh serve` no
+    longer needs `kill(1)` or `id(1)` on its `PATH`.
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`

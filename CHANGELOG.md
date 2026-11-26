@@ -30,8 +30,31 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   with exit 2. A request exceeding the 1 MiB control frame bound is refused with exit 2 when it is
   sent (a server that cannot be reached is exit 3 first).
 
+### Changed
+
+- **Headless jobs are now terminal-less `fux` panes (`fux start --out`) in
+  `STATE/fux/koh-jobs/NAME`; `koh serve` keeps no jobs in memory** (built on `fux` 0.44.0,
+  `fux-vt` 0.20.1, and `fuxix` 0.13.0):
+  - Jobs survive `koh serve` being restarted, and not a reboot (they live in the runtime
+    directory).
+  - Logs stream in fixed-size chunks on both server and client without reading whole files into
+    memory, and tails seek backwards in blocks.
+  - When a job's program ends, processes left in its process group are hung up (use `nohup` or
+    `setsid` for processes that must outlive it).
+  - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
+    lives (signals outside `1..31` exit 2); a holder killed with `-9` leaves its job running and
+    listed as it was.
+  - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
+    name anew (starting an ended name removes its old folder first, also if the new program fails
+    to start).
+  - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number (`1`,
+    `2`, …) instead of `j1`, `j2`, …; `koh jobs` shows the command as `fux`'s `status` formats it.
+
 ### Removed
 
+- **Runtime dependence on external `kill(1)` and `id(1)`:** `koh serve` no longer requires
+  `kill(1)` or `id(1)` on its `PATH` (it reads its uid via `fuxix::uid()`, hangs up `exec` groups
+  via `fuxix::signal_to`, and signals jobs through each pane's `ctl` FIFO).
 - **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the direct `blake3` dependency**
   (wire protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
   `rsync -e 'koh rsh'` (push and pull) or `tar | koh rsh` instead.

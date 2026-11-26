@@ -10,8 +10,6 @@ Keys & peers:
   koh clients [add NAME ID | rm NAME | rename OLD NEW]  (lines with an extra field after ID are ignored)
   koh serve [--direct BIND] [--allow ID]... [--shell PROG] [--no-relay]
             [--max-connections N] [--max-sessions N]   (1 to 65535, 64 each; past them a client exits 75)
-            (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
-             and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; group hangup on disconnect):
   koh exec SERVER [-C DIR] -- PROG ARG...
@@ -22,12 +20,12 @@ Raw commands (no PTY; separate stdout/stderr; stdin EOF; group hangup on disconn
             tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
             (only --key-file, --direct, --relay-url, -- before HOST; ssh flags like -l/-p/-o exit 2)
 
-Headless persistent jobs (raw append-only logs; outlive koh and network drops):
+Headless persistent jobs (terminal-less fux panes in STATE/fux/koh-jobs; survive koh serve restarts):
   koh run SERVER [--name NAME] [-C DIR] [--json] -- PROG ARG...
   koh jobs SERVER [NAME] [--json]
   koh logs SERVER NAME [--tail N | --all] [-f|--follow]
   koh wait SERVER NAME [--tail N] [--timeout SECS] [--json]                 (a job; a session: below)
-  koh kill SERVER NAME [--signal TERM|KILL|INT|HUP] [--json]
+  koh kill SERVER NAME [--signal TERM|KILL|INT|HUP|1..31] [--json]
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
 `koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):

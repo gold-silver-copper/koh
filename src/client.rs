@@ -290,6 +290,20 @@ impl Client {
         all: bool,
         follow: bool,
     ) -> Result<(Vec<u8>, String, Option<i32>, u64)> {
+        let mut buf = Vec::new();
+        let (state, exit, age) = self.logs_to(name, tail, all, follow, &mut buf).await?;
+        Ok((buf, state, exit, age))
+    }
+
+    /// Streams job logs directly to `out` without buffering the whole log in memory.
+    pub async fn logs_to(
+        &self,
+        name: String,
+        tail: Option<usize>,
+        all: bool,
+        follow: bool,
+        mut out: impl std::io::Write,
+    ) -> Result<(String, Option<i32>, u64)> {
         let (_, mut recv) = self
             .request(&Request::Logs {
                 name,
@@ -298,18 +312,13 @@ impl Client {
                 follow,
             })
             .await?;
-        let mut buf = Vec::new();
-        let mut final_state = String::new();
-        let mut final_exit = None;
-        let mut age = 0u64;
+        let (mut final_state, mut final_exit, mut age) = (String::new(), None, 0u64);
         while let Some(msg) = recv_msg_opt::<LogMsg>(&mut recv, MAX_CHUNK).await? {
             match msg {
                 LogMsg::Data(bytes) => {
+                    let _ = out.write_all(&bytes);
                     if follow {
-                        let _ = std::io::stdout().write_all(&bytes);
-                        let _ = std::io::stdout().flush();
-                    } else {
-                        buf.extend_from_slice(&bytes);
+                        let _ = out.flush();
                     }
                 }
                 LogMsg::Done {
@@ -324,7 +333,8 @@ impl Client {
                 }
             }
         }
-        Ok((buf, final_state, final_exit, age))
+        let _ = out.flush();
+        Ok((final_state, final_exit, age))
     }
 
     pub async fn kill_job(&self, name: String, signal: i32) -> Result<JobInfo> {
@@ -1102,7 +1112,10 @@ fn reconnect_delay(attempt: u32) -> Duration {
 /// Parses a signal name or number for `koh kill --signal`.
 pub fn parse_signal(s: &str) -> Result<i32> {
     if let Ok(n) = s.parse::<i32>() {
-        return Ok(n);
+        if (1..32).contains(&n) {
+            return Ok(n);
+        }
+        return Err(KohError::usage(format!("invalid signal {s:?} (use 1..31)")));
     }
     match s.to_ascii_uppercase().trim_start_matches("SIG") {
         "HUP" => Ok(1),

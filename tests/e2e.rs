@@ -5107,3 +5107,92 @@ fn cp_delete_refuses_non_directory_source_push_and_pull() {
     assert_eq!(fs::read(local_dir.join("fresh.txt")).unwrap(), b"fresh\n");
     assert!(!local_dir.join("keep_local.txt").exists());
 }
+
+#[test]
+fn failed_run_preserves_existing_job_log_and_listing() {
+    let host = Host::start("run-keep-job", &[]);
+    save_box_server(&host);
+
+    let run_cli = |args: &[&str]| {
+        host.koh(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    let out = run_cli(&[
+        "run",
+        "box",
+        "--name",
+        "keep",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'kept-log-line\\n'",
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+
+    let waited = run_cli(&["wait", "box", "keep", "--timeout", "10"]);
+    assert_eq!(waited.status.code(), Some(0));
+
+    let logs_before = run_cli(&["logs", "box", "keep", "--all"]);
+    assert_eq!(logs_before.status.code(), Some(0));
+    assert_eq!(logs_before.stdout, b"kept-log-line\n");
+
+    let jobs_before = run_cli(&["jobs", "box", "keep"]);
+    assert_eq!(jobs_before.status.code(), Some(0));
+    let listing_before = String::from_utf8_lossy(&jobs_before.stdout).into_owned();
+    assert!(listing_before.contains("keep\texited 0\t"), "{listing_before}");
+    assert!(listing_before.contains("kept-log-line"), "{listing_before}");
+
+    // Failed replacement (missing program -> 127) must leave `keep` untouched.
+    let bad_bin = run_cli(&["run", "box", "--name", "keep", "--", "/no/such/binary"]);
+    assert_eq!(bad_bin.status.code(), Some(127));
+
+    // Failed replacement (missing cwd -> 126) must also leave `keep` untouched.
+    let bad_cwd = run_cli(&[
+        "run",
+        "box",
+        "-C",
+        "/no/such/koh/dir",
+        "--name",
+        "keep",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo nope",
+    ]);
+    assert_eq!(bad_cwd.status.code(), Some(126));
+
+    let logs_after = run_cli(&["logs", "box", "keep", "--all"]);
+    assert_eq!(logs_after.status.code(), Some(0));
+    assert_eq!(
+        logs_after.stdout,
+        b"kept-log-line\n",
+        "previous job log was wiped by failed run"
+    );
+
+    let jobs_after = run_cli(&["jobs", "box", "keep"]);
+    assert_eq!(jobs_after.status.code(), Some(0));
+    let listing_after = String::from_utf8_lossy(&jobs_after.stdout);
+    assert!(listing_after.contains("keep\texited 0\t"), "{listing_after}");
+    assert!(listing_after.contains("kept-log-line"), "{listing_after}");
+
+    // A valid replacement afterward still works.
+    let ok_replace = run_cli(&[
+        "run",
+        "box",
+        "--name",
+        "keep",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'replaced-log\\n'",
+    ]);
+    assert_eq!(ok_replace.status.code(), Some(0));
+    assert_eq!(run_cli(&["wait", "box", "keep", "--timeout", "10"]).status.code(), Some(0));
+    let logs_new = run_cli(&["logs", "box", "keep", "--all"]);
+    assert_eq!(logs_new.status.code(), Some(0));
+    assert_eq!(logs_new.stdout, b"replaced-log\n");
+}

@@ -58,9 +58,10 @@ impl JobManager {
         cwd: &Path,
         shell: bool,
     ) -> Result<JobInfo> {
-        // What an older job of the name left, to be removed with the lock let go: it is named
-        // here, before the lock, so it is dropped after it however this returns.
+        // What an older job of the name left (or a staging dir from a failed start), to be
+        // removed with the lock let go: named before the lock so it drops after it however this returns.
         let mut _old = None;
+        let mut _stage = None;
         let mut guard = mgr
             .lock()
             .map_err(|_| KohError::internal("job lock poisoned"))?;
@@ -84,22 +85,23 @@ impl JobManager {
                 }
             },
         };
+        let mut cmd = build_command(argv, cwd, shell)?;
         let dir = guard.root.join(&job_name);
-        _old = Aside::of(&dir);
-        fs::create_dir_all(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+        let stage = Aside::stage(&dir)
+            .map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+        let stage_dir = stage.path().to_path_buf();
+        _stage = Some(stage);
 
-        let log_path = dir.join("log");
         let log_out = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&log_path)
+            .open(stage_dir.join("log"))
             .map_err(|e| KohError::failed(format!("create job log: {e}")))?;
         let log_err = log_out
             .try_clone()
             .map_err(|e| KohError::failed(format!("clone log fd: {e}")))?;
 
-        let mut cmd = build_command(argv, cwd, shell)?;
         fuxix::new_session(&mut cmd, false);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::from(log_out))
@@ -115,11 +117,14 @@ impl JobManager {
         })?;
         let pid = child.id();
         let command_str = argv.join(" ");
-        let _ = atomic_write(&dir.join("state"), b"running\n");
+        let _ = atomic_write(&stage_dir.join("state"), b"running\n");
         let _ = atomic_write(
-            &dir.join("meta"),
+            &stage_dir.join("meta"),
             format!("pid {pid}\ncommand {command_str}\n").as_bytes(),
         );
+        _old = Aside::of(&dir);
+        fs::rename(&stage_dir, &dir)
+            .map_err(|e| KohError::failed(format!("commit job dir: {e}")))?;
 
         let (state_tx, _) = watch::channel(("running".to_string(), None));
         let rec = Arc::new(JobRecord {

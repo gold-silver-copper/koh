@@ -120,12 +120,27 @@ pub(crate) fn after(from: tokio::time::Instant, long: std::time::Duration) -> to
 pub(crate) struct Aside(std::path::PathBuf);
 
 impl Aside {
-    /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
-    pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
+    fn next(dir: &std::path::Path, tag: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let aside = dir.with_file_name(format!(".gone.{}.{nth}", std::process::id()));
+        dir.with_file_name(format!(".{tag}.{}.{nth}", std::process::id()))
+    }
+
+    /// `dir` put aside; `None` if it was not (nothing is there, as a rule), and then it is as it was.
+    pub(crate) fn of(dir: &std::path::Path) -> Option<Self> {
+        let aside = Self::next(dir, "gone");
         std::fs::rename(dir, &aside).ok().map(|()| Self(aside))
+    }
+
+    /// A fresh empty sibling beside `dir`, removed on drop unless renamed into place.
+    pub(crate) fn stage(dir: &std::path::Path) -> std::io::Result<Self> {
+        let path = Self::next(dir, "starting");
+        std::fs::create_dir_all(&path)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
     }
 }
 

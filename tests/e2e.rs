@@ -3255,7 +3255,6 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
         (String::new(), None),
         (format!("full {k}"), Some("full")),
         (format!("ws {k}   "), Some("ws")),
-        (format!("cr {k}\r"), Some("cr")),
         (format!("cp {k} cp=/srv"), None),
         (format!("ex {k} exec=~/a b"), None),
         (format!("t1 {k} copy=/srv"), None),
@@ -3263,9 +3262,11 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
         (format!("t3 {k} --cp /srv\x1b[2K"), None),
         ("bad_id notakey".into(), None),
         ("lone_word".into(), None),
+        (format!("cr {k}\r"), Some("cr")),
     ];
     let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
-    fs::write(&file, format!("{}\n", text.join("\n"))).unwrap();
+    // No trailing LF: exercises a bare trailing `\r` on the last line.
+    fs::write(&file, text.join("\n")).unwrap();
 
     let mut skipped = Vec::new();
     let entries =
@@ -3317,50 +3318,58 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
     assert!(String::from_utf8_lossy(&bad_json.stdout).contains("\"kind\":\"usage\""));
     assert!(bad_json.stderr.is_empty());
 
-    // A skipped line does not block `koh clients rm`, which rewrites the file without it.
-    fs::write(&file, format!("old {k} cp=/srv\nother {k}\n")).unwrap();
+    // `rm` on a skipped name fails and leaves the file unchanged; `add`, `rename`, and `rm` of
+    // accepted names warn about skipped lines on stderr and rewrite from accepted lines only.
+    let before = format!("old {k} cp=/srv\nother {k}\n");
+    fs::write(&file, &before).unwrap();
+    let rm_old = cli(&["rm", "old"]).output().unwrap();
+    assert!(!rm_old.status.success());
+    let rm_err = String::from_utf8_lossy(&rm_old.stderr);
+    assert!(rm_err.contains("koh: clients:1: ignored") && rm_err.contains("no client named"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    let added = cli(&["add", "alice", &k.to_string()]).output().unwrap();
+    assert!(added.status.success());
+    assert!(String::from_utf8_lossy(&added.stderr).contains("koh: clients:1: ignored"));
+    assert!(cli(&["rename", "alice", "bob"]).status().unwrap().success());
+    let names: Vec<_> = koh::keys::load_clients(Some(&key), |_, _| {})
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(names, ["other", "bob"]);
     assert!(cli(&["rm", "other"]).status().unwrap().success());
-    assert!(fs::read_to_string(&file).unwrap().is_empty());
+    assert_eq!(fs::read_to_string(&file).unwrap(), format!("bob {k}\n"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     let tmp = TempDir::new("clients-enforce");
-    fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
-    let srv_key = tmp.0.join("srv_cfg/server.key");
+    let bot_cfg = tmp.0.join("bot_cfg");
+    let crun = tmp.0.join("crun");
+    for d in [tmp.0.join("srv_cfg"), bot_cfg.clone(), crun.clone()] {
+        fs::create_dir_all(d).unwrap();
+    }
     let valid = new_key(&tmp, "v.key");
-    let cp_key = new_key(&tmp, "cp.key");
+    let cp_key = load_or_create_key(Role::Client, Some(&bot_cfg.join("client.key"))).unwrap();
     let exec_key = new_key(&tmp, "ex.key");
     let typo = new_key(&tmp, "t.key");
-    let text = format!(
-        "cpbot {} cp=/srv\nexecbot {} exec=/srv\ntypo {} copy=/srv\nvalid {}\n",
+    let clients_file = tmp.0.join("srv_cfg/clients");
+    let skipped_only = format!(
+        "cpbot {} cp=/srv\nexecbot {} exec=/srv\ntypo {} copy=/srv\nold_valid {} cp=/srv\n",
         cp_key.public(),
         exec_key.public(),
         typo.public(),
         valid.public()
     );
-    fs::write(tmp.0.join("srv_cfg/clients"), text).unwrap();
-
-    let list = Command::new(env!("CARGO_BIN_EXE_koh"))
-        .args(["clients", "--key-file"])
-        .arg(&srv_key)
-        .output()
-        .unwrap();
-    assert!(list.status.success());
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&list.stdout),
-        String::from_utf8_lossy(&list.stderr),
-    );
-    assert!(stdout.contains(&format!("valid {}", valid.public())));
-    for (n, name) in [(1, "cpbot"), (2, "execbot"), (3, "typo")] {
-        assert!(!stdout.contains(name), "{stdout}");
-        assert!(
-            stderr.contains(&format!("koh: clients:{n}: ignored, not NAME ID:")),
-            "{stderr}"
-        );
-    }
+    fs::write(
+        &clients_file,
+        format!("{skipped_only}valid {}\n", valid.public()),
+    )
+    .unwrap();
 
     let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let addr = srv.direct_addr.unwrap().to_string();
+    let srv_id = srv.endpoint_id.to_string();
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
     let marker = tmp.0.join("ran");
     let touch = format!("touch {}", marker.display());
@@ -3373,14 +3382,25 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
                 .code,
             Exit::REFUSED
         );
-        assert_eq!(cl.jobs(None).await.unwrap_err().code, Exit::REFUSED);
         cl.close().await;
     }
     assert!(!marker.exists(), "refused key ran a command");
 
+    // Refused `koh connect` via the binary exits 4 promptly (no infinite retry) and creates no session.
+    let mut terminal = InTerminal::connect(
+        &bot_cfg,
+        &crun,
+        &[&srv_id, "--direct", &addr, "--session", "s"],
+    );
+    assert_eq!(terminal.ends(), Some(4), "refused connect must exit 4");
+    assert_eq!(names_in(&tmp.0.join("state/fux/koh-sessions")), [""; 0]);
+
+    // Same id on a skipped line and a good line is allowed; removing the good line revokes it.
     let v = dial(valid).await.unwrap();
     assert!(v.jobs(None).await.unwrap().is_empty());
     assert_eq!(v.exec(vec!["true".into()], None, false).await.unwrap(), 0);
+    fs::write(&clients_file, &skipped_only).unwrap();
+    assert_eq!(v.jobs(None).await.unwrap_err().code, Exit::REFUSED);
     v.close().await;
     srv.shutdown().await;
 }

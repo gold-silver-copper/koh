@@ -283,13 +283,17 @@ impl Client {
         recv_msg(&mut recv, MAX_CTRL).await
     }
 
-    pub async fn logs(
+    /// Streams job logs directly to `out`. Returns `Ok(Some((state, exit, age_secs)))` from
+    /// `Done`, or `Ok(None)` if `out` hit `BrokenPipe` (caller exits 141). Other write/flush
+    /// errors exit 1; stream EOF without `Done` exits 255.
+    pub async fn logs_to(
         &self,
         name: String,
         tail: Option<usize>,
         all: bool,
         follow: bool,
-    ) -> Result<(Vec<u8>, String, Option<i32>, u64)> {
+        mut out: impl std::io::Write,
+    ) -> Result<Option<(String, Option<i32>, u64)>> {
         let (_, mut recv) = self
             .request(&Request::Logs {
                 name,
@@ -298,18 +302,22 @@ impl Client {
                 follow,
             })
             .await?;
-        let mut buf = Vec::new();
-        let mut final_state = String::new();
-        let mut final_exit = None;
-        let mut age = 0u64;
+        let fail = |e: std::io::Error| {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                Ok(None)
+            } else {
+                Err(KohError::failed(format!("write: {e}")))
+            }
+        };
         while let Some(msg) = recv_msg_opt::<LogMsg>(&mut recv, MAX_CHUNK).await? {
             match msg {
                 LogMsg::Data(bytes) => {
-                    if follow {
-                        let _ = std::io::stdout().write_all(&bytes);
-                        let _ = std::io::stdout().flush();
-                    } else {
-                        buf.extend_from_slice(&bytes);
+                    let wrote = out
+                        .write_all(&bytes)
+                        .and_then(|()| if follow { out.flush() } else { Ok(()) });
+                    if let Err(e) = wrote {
+                        let _ = recv.stop(0u32.into());
+                        return fail(e);
                     }
                 }
                 LogMsg::Done {
@@ -317,14 +325,14 @@ impl Client {
                     exit,
                     age_secs,
                 } => {
-                    final_state = state;
-                    final_exit = exit;
-                    age = age_secs;
-                    break;
+                    return match out.flush() {
+                        Ok(()) => Ok(Some((state, exit, age_secs))),
+                        Err(e) => fail(e),
+                    };
                 }
             }
         }
-        Ok((buf, final_state, final_exit, age))
+        Err(KohError::internal("log stream ended without status"))
     }
 
     pub async fn kill_job(&self, name: String, signal: i32) -> Result<JobInfo> {

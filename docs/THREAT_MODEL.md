@@ -155,8 +155,8 @@ A wrong endpoint id, or a host someone else now controls.
 - **A command's output from it** (`koh exec`, `koh logs`), and what it says a session shows
   or printed (`koh output`, `koh wait --session`), is written to the client's stdout and
   stderr as it came, as ssh writes it: escape sequences included, if those are a terminal.
-  What is printed at the end (`koh output`, a `wait`, `koh logs` without `-f`) is held whole
-  until then, as much as the server sends.
+  What is printed at the end (`koh output`, a `wait`) is held whole until then, as much as the
+  server sends; `koh logs` streams chunks directly to stdout as they arrive.
 - **It learns** what is typed into a session and reaches it (what was typed while there
   was no link too, on return; not what was lost with a link), the terminal's size in cells
   and pixels, its `TERM`, the keyboard flags it takes and its foreground, background and
@@ -175,12 +175,12 @@ Not defended against: koh trusts the machines it runs on. The key file is 0600 i
 that koh makes 0700 and refuses if group or others may write to it; whose directory it is, koh
 does not check, and a key that is a symlink is read as the file it leads to (`src/keys.rs`).
 Sessions and jobs' logs are kept in the server's state: `$XDG_RUNTIME_DIR/koh`; where that is
-not set, the system's temporary directory under `koh-UID` (the number `id -u` gives), which koh
+not set, the system's temporary directory under `koh-UID` (the effective user id), which koh
 does not check the ownership of. A state directory that is there is taken as it is; the
-sessions' folder beneath it (`fux/koh-sessions`) is made 0700 where koh makes it, and a
-pane's folder 0700 by fux. Anything that runs as the server's user can type into a session,
-resize it, hang it up and remove it, and start a pane there that koh takes for a session:
-the files are the interface. A session's holder is no child of `koh serve` and is not ended
-with it; nor is a session's viewer when `koh serve` is killed outright: it reads the end of
-its terminal and leaves. A viewer's folder (`fux/.view.PID`) is in the server's state; a
-viewer has no keys there. On a client a session leaves nothing.
+sessions' and jobs' folders beneath it (`fux/koh-sessions` and `fux/koh-jobs`) are made 0700
+where koh makes them, and a pane's folder 0700 by fux. Anything that runs as the server's user
+can type into a session, resize it, hang it up and remove it, and start a pane there that koh
+takes for a session: the files are the interface. A session's holder is no child of `koh serve`
+and is not ended with it; nor is a session's viewer when `koh serve` is killed outright: it
+reads the end of its terminal and leaves. A viewer's folder (`fux/.view.PID`) is in the server's
+state; a viewer has no keys there. On a client a session leaves nothing.

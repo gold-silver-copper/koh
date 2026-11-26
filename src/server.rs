@@ -1,14 +1,13 @@
 //! `koh serve`: QUIC listener, TLS-bound client auth,
 //! raw exec, headless jobs, and sessions, which are fux panes (`session`).
 
-use std::fs;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::EndpointId;
@@ -18,14 +17,14 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout_at};
 
-use crate::jobs::JobManager;
+use crate::jobs::Jobs;
 use crate::keys::{
     Role, expand_home, hold_for_serving, home_dir, load_clients, load_or_create_key,
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::proto::{
-    CloseCode, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply, Request, encode,
-    recv_msg, send_msg, send_pieces,
+    CloseCode, ExecServerMsg, MAX_CHUNK, MAX_CTRL, Reply, Request, encode, recv_msg, send_msg,
+    send_pieces,
 };
 use crate::session::Sessions;
 use crate::{Exit, KohError, Result, after};
@@ -104,7 +103,7 @@ impl Default for ServeOptions {
 struct ServerState {
     key_file: Option<PathBuf>,
     extra_allow: Vec<EndpointId>,
-    jobs: Arc<Mutex<JobManager>>,
+    jobs: Jobs,
     sessions: Sessions,
     proof_timeout: Duration,
 }
@@ -151,7 +150,6 @@ impl Drop for RunningServer {
 pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     let max_connections = cap("--max-connections", opts.max_connections)?;
     let max_sessions = cap("--max-sessions", opts.max_sessions)?;
-    crate::jobs::can_kill().await?;
     let secret = load_or_create_key(Role::Server, opts.key_file.as_deref())?;
     let serving = hold_for_serving(opts.key_file.as_deref())?;
     let endpoint_id = secret.public();
@@ -161,16 +159,17 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
     };
     let direct_addr = endpoint.bound_sockets().into_iter().next();
 
-    let base = match opts.state_dir {
-        Some(dir) => dir,
-        None => default_state_dir().await?,
-    };
-    let jobs = Arc::new(Mutex::new(JobManager::new(base.join("jobs"))?));
+    let base = opts.state_dir.unwrap_or_else(default_state_dir);
     let default_shell = opts
         .shell
         .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
         .unwrap_or_else(|| "/bin/sh".to_string());
-    let sessions = Sessions::new(&base, max_sessions, default_shell, opts.session_exe)?;
+    let exe = opts
+        .session_exe
+        .map_or_else(std::env::current_exe, Ok)
+        .map_err(|e| KohError::failed(format!("no path to koh: {e}")))?;
+    let sessions = Sessions::new(&base, max_sessions, default_shell, exe.clone())?;
+    let jobs = Jobs::new(&base, exe)?;
     let sessions_dir = sessions.dir().to_path_buf();
 
     let state = Arc::new(ServerState {
@@ -259,25 +258,14 @@ pub async fn run_serve(opts: ServeOptions) -> Result<()> {
 }
 
 /// Where jobs and sessions are kept when no `--state-dir` says: in the user's runtime directory,
-/// or else in the temporary directory under the user's number, as id(1) tells it. (std does not
-/// tell who runs this process, and no file that was already there is evidence of it.)
-async fn default_state_dir() -> Result<PathBuf> {
+/// or else in the temporary directory under the effective user id (`fuxix::uid`).
+fn default_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
         && !dir.is_empty()
     {
-        return Ok(PathBuf::from(dir).join("koh"));
+        return PathBuf::from(dir).join("koh");
     }
-    let failed = |why: String| {
-        let what = "XDG_RUNTIME_DIR is not set, and `id -u` did not say whose state this is";
-        KohError::failed(format!("{what}: {why}"))
-    };
-    let said = crate::jobs::run("id", &["-u".into()]).await;
-    let said = said.map_err(|err| failed(err.message))?;
-    let uid: u32 = String::from_utf8_lossy(&said)
-        .trim()
-        .parse()
-        .map_err(|_| failed("it said no number".into()))?;
-    Ok(std::env::temp_dir().join(format!("koh-{uid}")))
+    std::env::temp_dir().join(format!("koh-{}", fuxix::uid()))
 }
 
 /// Serves a connection's requests until it is gone. It is closed if by `prove_by` (so long after
@@ -367,22 +355,12 @@ async fn dispatch(
         }
         Request::Run { name, argv, cwd } => {
             let dir = resolve_cwd(cwd.as_deref())?;
-            // (A start is file work and a process made: not on a thread that serves requests.)
-            let jobs = state.jobs.clone();
-            let start = move || JobManager::start(&jobs, name, &argv, &dir);
-            let started = tokio::task::spawn_blocking(start).await;
-            let info = started.map_err(|_| KohError::internal("a job's start"))??;
+            let info = state.jobs.run(name, argv, &dir).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }
         Request::Jobs { name } => {
-            let list = {
-                let guard = state
-                    .jobs
-                    .lock()
-                    .map_err(|_| KohError::internal("jobs lock"))?;
-                guard.list(name.as_deref())?
-            };
+            let list = state.jobs.list(name).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &list, MAX_CTRL).await
         }
@@ -391,80 +369,9 @@ async fn dispatch(
             tail,
             all,
             follow,
-        } => {
-            let handle = {
-                let guard = state
-                    .jobs
-                    .lock()
-                    .map_err(|_| KohError::internal("jobs lock"))?;
-                guard.get(&name)?
-            };
-            let (log_path, mut rx, started) = (handle.log_path, handle.state_rx, handle.started);
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let initial =
-                crate::jobs::read_log_tail(&log_path, if all { None } else { tail.or(Some(200)) })?;
-            let mut offset = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
-            if !initial.is_empty() {
-                for chunk in initial.chunks(64 << 10) {
-                    send_msg(send, &LogMsg::Data(chunk.to_vec()), MAX_CHUNK).await?;
-                }
-            }
-            if follow {
-                loop {
-                    let meta_len = fs::metadata(&log_path).map(|m| m.len()).unwrap_or(offset);
-                    if meta_len > offset
-                        && let Ok(mut f) = fuxix::open_regular(&log_path)
-                    {
-                        use std::io::{Read as _, Seek as _, SeekFrom};
-                        if f.seek(SeekFrom::Start(offset)).is_ok() {
-                            let mut buf = vec![0u8; 64 << 10];
-                            while let Ok(n @ 1..) = f.read(&mut buf) {
-                                if let Some(slice) = buf.get(..n) {
-                                    send_msg(send, &LogMsg::Data(slice.to_vec()), MAX_CHUNK)
-                                        .await?;
-                                }
-                                offset += n as u64;
-                            }
-                        }
-                    }
-                    let (st, exit) = rx.borrow().clone();
-                    if st != "running" {
-                        send_msg(
-                            send,
-                            &LogMsg::Done {
-                                state: st,
-                                exit,
-                                age_secs: started.elapsed().as_secs(),
-                            },
-                            MAX_CTRL,
-                        )
-                        .await?;
-                        break;
-                    }
-                    tokio::select! {
-                        _ = rx.changed() => {}
-                        // (A client that has left is followed for no longer.)
-                        _ = send.stopped() => return Ok(()),
-                        () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
-                    }
-                }
-            } else {
-                let (st, exit) = rx.borrow().clone();
-                send_msg(
-                    send,
-                    &LogMsg::Done {
-                        state: st,
-                        exit,
-                        age_secs: started.elapsed().as_secs(),
-                    },
-                    MAX_CTRL,
-                )
-                .await?;
-            }
-            Ok(())
-        }
+        } => state.jobs.logs(&name, tail, all, follow, send).await,
         Request::Kill { name, signal } => {
-            let info = JobManager::kill(&state.jobs, &name, signal).await?;
+            let info = state.jobs.kill(&name, signal).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
         }
@@ -472,24 +379,7 @@ async fn dispatch(
             name,
             tail,
             timeout_secs,
-        } => {
-            let handle = {
-                let guard = state
-                    .jobs
-                    .lock()
-                    .map_err(|_| KohError::internal("jobs lock"))?;
-                guard.get(&name)?
-            };
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let waited =
-                crate::jobs::wait_job(handle.log_path, handle.state_rx, tail, timeout_secs);
-            // (A client that has left is waited for no longer.)
-            let res = tokio::select! {
-                res = waited => res?,
-                _ = send.stopped() => return Ok(()),
-            };
-            send_msg(send, &res, MAX_FRAME).await
-        }
+        } => state.jobs.wait(&name, tail, timeout_secs, send).await,
         Request::Attach(asked) => {
             let dir = resolve_cwd(asked.cwd.as_deref())?;
             state.sessions.attach(asked, &dir, send, recv).await
@@ -512,6 +402,19 @@ async fn dispatch(
     }
 }
 
+pub(crate) fn check_cmd<'a>(argv: &'a [String], cwd: &Path) -> Result<(&'a str, &'a [String])> {
+    if !cwd.is_dir() {
+        return Err(KohError::new(
+            Exit::CANNOT_START,
+            "cannot_start",
+            format!("no such directory: {}", cwd.display()),
+        ));
+    }
+    argv.split_first()
+        .map(|(p, a)| (p.as_str(), a))
+        .ok_or_else(|| KohError::usage("missing command"))
+}
+
 /// Raw non-PTY exec: separate stdout/stderr, raw stdin, and group hangup whenever the client goes.
 async fn handle_exec(
     argv: &[String],
@@ -519,7 +422,9 @@ async fn handle_exec(
     send: &mut SendStream,
     mut recv: RecvStream,
 ) -> Result<()> {
-    let mut std_cmd = crate::jobs::build_command(argv, cwd)?;
+    let (prog, args) = check_cmd(argv, cwd)?;
+    let mut std_cmd = std::process::Command::new(prog);
+    std_cmd.args(args).current_dir(cwd);
     fuxix::new_session(&mut std_cmd, false);
     let mut child = tokio::process::Command::from(std_cmd)
         .stdin(Stdio::piped())
@@ -603,12 +508,14 @@ async fn exec_pipe<R: tokio::io::AsyncRead + Unpin>(
 /// SIGKILL to its group, then reaps the leader (kept unreaped until the last signal so
 /// its number stays pinned as the group's id).
 async fn hang_up(pgid: Option<u32>, child: &mut tokio::process::Child) {
-    let Some(pid) = pgid else { return };
-    if let Err(err) = crate::jobs::signal_group(pid, 1).await {
+    let Some(pid) = pgid.and_then(|p| i32::try_from(p).ok()).filter(|&p| p > 1) else {
+        return;
+    };
+    if let Err(err) = fuxix::signal_to(-pid, 1) {
         let said = format!("koh: a command whose client went was not hung up: {err}");
         let _ = writeln!(std::io::stderr(), "{said}");
     }
     tokio::time::sleep(HANGUP_WAIT).await;
-    let _ = crate::jobs::signal_group(pid, 9).await;
+    let _ = fuxix::signal_to(-pid, 9);
     let _ = child.wait().await;
 }

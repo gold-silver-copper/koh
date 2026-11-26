@@ -623,12 +623,13 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
         ));
     };
     let client = Client::connect(&server, &opts, follow).await?;
-    let done = client.logs(name, tail, all, follow).await;
+    let done = client
+        .logs_to(name, tail, all, follow, std::io::stdout())
+        .await;
     client.close().await;
-    let (bytes, state, exit, age) = done?;
-    if !follow {
-        let _ = std::io::stdout().write_all(&bytes);
-    }
+    let Some((state, exit, age)) = done? else {
+        return Ok(Exit(141));
+    };
     let _ = writeln!(std::io::stderr(), "· {state} {age}s");
     Ok(if follow {
         Exit(u8::try_from(exit.unwrap_or(0)).unwrap_or(1))
@@ -667,6 +668,13 @@ async fn cmd_kill(args: &[String]) -> Result<Exit> {
             std::io::stdout(),
             "{}",
             serde_json::to_string(&info).unwrap_or_default()
+        );
+    } else if info.state != "running" {
+        let _ = writeln!(
+            std::io::stderr(),
+            "koh: job {} is not running ({})",
+            info.name,
+            info.state
         );
     }
     Ok(Exit::OK)

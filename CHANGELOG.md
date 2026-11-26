@@ -30,8 +30,41 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
   with exit 2. A request exceeding the 1 MiB control frame bound is refused with exit 2 when it is
   sent (a server that cannot be reached is exit 3 first).
 
+### Changed
+
+- **Headless jobs are now terminal-less `fux` panes (`fux start --out`) in
+  `STATE/fux/koh-jobs/NAME`; `koh serve` keeps no jobs in memory** (built on `fux` 0.44.0,
+  `fux-vt` 0.20.1, and `fuxix` 0.13.0):
+  - Jobs survive `koh serve` being restarted, and not a reboot (they live in the runtime
+    directory).
+  - Logs stream in fixed-size chunks on both server and client without reading whole files into
+    memory, and tails seek backwards in blocks.
+  - When a job's program ends, processes left in its process group are hung up (use `nohup` or
+    `setsid` for processes that must outlive it); output written by a leftover process after the
+    leader exits may appear in `out` later (`koh logs --all`) and not in a `logs -f` that already
+    ended.
+  - `koh kill` sends `kill N` over the pane's `ctl` FIFO and reaches a job only while its holder
+    lives (signals outside `1..31` exit 2); without `--json`, `koh kill` prints
+    `koh: job NAME is not running (STATE)` on stderr when the job was not running (exit 0
+    unchanged). A holder killed with `-9` leaves its program running, while `koh jobs` and
+    `koh wait` report `ended` with exit 1.
+  - Each job's `out` log grows without bound: remove ended job folders yourself or start the same
+    name anew (starting an ended name removes its old folder once the request passes validation,
+    also if the new program then fails to start).
+  - `koh wait` and `koh logs -f` on a job whose name is started anew meanwhile now print
+    `that job was started anew` and exit 1 (keeping the old job's output, never the replacement's;
+    previously `wait` returned the old job's exit status).
+  - Job names follow `fux`'s pane-name rule; unnamed jobs get `fux`'s first free number
+    (`1`–`9999`, failing once 9,999 unnamed folders are kept) instead of `j1`, `j2`, …; `koh jobs`
+    shows the command as `fux`'s `status` formats it.
+  - Session start failures (sharing the same `fux start` helper) now report `nothing was started: …`
+    instead of `no session was started: …` (exit 126 unchanged).
+
 ### Removed
 
+- **Runtime dependence on external `kill(1)` and `id(1)`:** `koh serve` no longer requires
+  `kill(1)` or `id(1)` on its `PATH` (it reads its uid via `fuxix::uid()`, hangs up `exec` groups
+  via `fuxix::signal_to`, and signals jobs through each pane's `ctl` FIFO).
 - **`koh cp`, `--sync` / `--exclude` on `exec` and `run`, and the direct `blake3` dependency**
   (wire protocol bumped from `koh/20` to `koh/21`, including the TLS key-proof label): use
   `rsync -e 'koh rsh'` (push and pull) or `tar | koh rsh` instead.

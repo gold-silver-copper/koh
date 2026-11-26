@@ -65,6 +65,7 @@ async fn boot_pair(
         allow: vec![client_key.public()],
         shell: Some("/bin/sh".into()),
         state_dir: Some(state_dir.clone()),
+        session_exe: Some(PathBuf::from(env!("CARGO_BIN_EXE_koh"))),
         disable_relay: true,
         quiet: true,
         ..ServeOptions::default()
@@ -172,7 +173,12 @@ async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     assert_eq!(wait_res.exit, 7);
     assert!(wait_res.tail.contains(&long_line));
 
-    let (raw_log, state, exit, _) = client.logs("long".into(), None, true, false).await.unwrap();
+    let mut raw_log = Vec::new();
+    let (state, exit, _) = client
+        .logs_to("long".into(), None, true, false, &mut raw_log)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(state, "exited 7");
     assert_eq!(exit, Some(7));
     assert!(String::from_utf8_lossy(&raw_log).contains(&long_line));
@@ -508,12 +514,16 @@ async fn boot_server(
     more: ServeOptions,
 ) -> (koh::server::RunningServer, Option<Route>) {
     fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
+    let session_exe = more
+        .session_exe
+        .or_else(|| Some(PathBuf::from(env!("CARGO_BIN_EXE_koh"))));
     let srv = start_server(ServeOptions {
         key_file: Some(tmp.0.join("srv_cfg/server.key")),
         direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
         allow,
         shell: Some("/bin/sh".into()),
         state_dir: Some(tmp.0.join("state")),
+        session_exe,
         disable_relay: true,
         quiet: true,
         ..more
@@ -1052,24 +1062,15 @@ impl Served {
 }
 
 #[tokio::test]
-async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job_was_not_signalled()
-{
-    let tmp = TempDir::new("kill-helper");
+async fn koh_serve_keeps_its_state_under_its_user_without_kill_or_id() {
+    let tmp = TempDir::new("no-helpers");
     let key = new_key(&tmp, "client.key");
-    let bin = tmp.0.join("bin");
-    fs::create_dir_all(&bin).unwrap();
+    let empty = tmp.0.join("empty-bin");
+    fs::create_dir_all(&empty).unwrap();
 
-    // With no kill(1) to run, a server could end no job and hang up no command: it says so as
-    // it starts, and does not start.
-    let mut none = Served::start(&tmp, &bin, key.public(), true);
-    let said = none.says("listening:").unwrap_err();
-    assert!(said.contains("kill"), "{said}");
-    assert_eq!(none.server.wait().unwrap().code(), Some(1));
-
-    // With no runtime directory, its state is in the temporary directory under the number of
-    // the user who runs it (here, the owner of what this test made).
-    let all = std::env::var_os("PATH").unwrap();
-    let mut plain = Served::start(&tmp, std::path::Path::new(&all), key.public(), false);
+    // Neither kill(1) nor id(1) is needed on PATH: `koh serve` uses fuxix::uid() for its default
+    // state directory and talks to job holders over `ctl` instead of spawning kill(1).
+    let mut plain = Served::start(&tmp, &empty, key.public(), false);
     let (mine, state) = (
         fs::metadata(&tmp.0).unwrap().uid(),
         fs::canonicalize(&tmp.0).unwrap(),
@@ -1078,76 +1079,6 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
         plain.says("sessions dir:").unwrap(),
         format!("{}/koh-{mine}/fux/koh-sessions", state.display())
     );
-    drop(plain);
-
-    // A kill(1) that takes two seconds and then fails. (Asked whether a process or a group
-    // is there, `kill -0`, it is the real one.)
-    let fake = |then: &str| {
-        format!("#!/bin/sh\n[ \"$1\" = -0 ] && exec /bin/kill \"$@\"\n{then}exit 42\n")
-    };
-    script(&bin.join("kill"), &fake("/bin/sleep 2\n"));
-    let mut served = Served::start(&tmp, &bin, key.public(), true);
-    let id: iroh::EndpointId = served.says("koh server id:").unwrap().parse().unwrap();
-    let addr: SocketAddr = served.says("listening:").unwrap().parse().unwrap();
-    let client = Client::connect_direct(key, id, Some(Route::Direct(addr)), false)
-        .await
-        .unwrap();
-    let sleep = vec!["/bin/sleep".to_string(), "300".into()];
-    let job = client.run_job(Some("j".into()), sleep, None).await.unwrap();
-    served.started.push(job.pid);
-
-    // While it runs, the server answers others: nothing waits for kill(1) but who asked for it.
-    let others = async {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let asked = std::time::Instant::now();
-        let jobs = client.jobs(None).await.unwrap();
-        (jobs, asked.elapsed())
-    };
-    let (killed, (jobs, waited)) = tokio::join!(client.kill_job("j".into(), 15), others);
-    assert!(waited < Duration::from_secs(1), "{waited:?}");
-    assert_eq!(jobs[0].state, "running");
-    // And a job that was not signalled is not reported as signalled.
-    let err = killed.unwrap_err();
-    assert_eq!(err.code, Exit::FAILED, "{err:?}");
-    assert!(err.message.contains("kill"), "{err:?}");
-
-    // A job whose first process has ended and left another behind in its group: the job says
-    // it has ended, and the group is what `koh kill` is for. Not signalled, it is not reported
-    // as signalled; once it has gone, there is nothing to signal and nothing to report.
-    script(&bin.join("kill"), &fake(""));
-    let left = tmp.0.join("left.pid");
-    let line = format!("/bin/sleep 300 & echo $! > {}", left.display());
-    client
-        .run_job(
-            Some("o".into()),
-            vec!["/bin/sh".into(), "-c".into(), "--".into(), line],
-            None,
-        )
-        .await
-        .unwrap();
-    let ended = client.wait_job("o".into(), 10, Some(10)).await;
-    assert!(!ended.unwrap().timed_out);
-    let pid = fs::read_to_string(&left).unwrap().trim().to_string();
-    served.started.push(pid.parse().unwrap());
-    let there = |pid: &str| {
-        let mut asked = Command::new("kill");
-        asked.args(["-0", pid]).stderr(std::process::Stdio::null());
-        asked.status().unwrap().success()
-    };
-    assert!(there(&pid));
-    let err = client.kill_job("o".into(), 15).await.unwrap_err();
-    assert_eq!(err.code, Exit::FAILED, "{err:?}");
-    assert!(there(&pid));
-    assert!(Command::new("kill").arg(&pid).status().unwrap().success());
-    for _ in 0..500 {
-        if !there(&pid) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(client.kill_job("o".into(), 15).await.unwrap().name, "o");
-
-    client.close().await;
 }
 
 #[test]
@@ -1162,25 +1093,6 @@ fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
     assert_eq!(read.public(), made.public());
 }
 
-#[tokio::test]
-async fn koh_serve_does_not_take_its_user_from_an_id_that_failed() {
-    // With no runtime directory the server asks id(1) whose state it keeps. An id(1) that says
-    // a number and then that it failed has told nothing: the server says so and does not start.
-    let tmp = TempDir::new("id-failed");
-    let key = new_key(&tmp, "client.key");
-    let bin = tmp.0.join("bin");
-    fs::create_dir_all(&bin).unwrap();
-    script(&bin.join("id"), "#!/bin/sh\necho 42424\nexit 42\n");
-    let mut path = bin.into_os_string();
-    path.push(":");
-    path.push(std::env::var_os("PATH").unwrap());
-    let mut served = Served::start(&tmp, std::path::Path::new(&path), key.public(), false);
-    let said = served.says("sessions dir:").unwrap_err();
-    assert!(said.contains("id -u"), "{said}");
-    assert_eq!(served.server.wait().unwrap().code(), Some(1));
-    assert!(!tmp.0.join("koh-42424").exists());
-}
-
 /// `koh` run with `args` and a runtime directory: how it ended, and what it said on its
 /// standard output and its standard error.
 fn koh(runtime: &Path, args: &[&str]) -> (Option<i32>, String, String) {
@@ -1189,16 +1101,6 @@ fn koh(runtime: &Path, args: &[&str]) -> (Option<i32>, String, String) {
     let said = koh.stdin(std::process::Stdio::null()).output().unwrap();
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
     (said.status.code(), text(&said.stdout), text(&said.stderr))
-}
-
-/// Writes a script that is then run. A shell of its own writes it: written by the test itself,
-/// the file is open for writing in whatever another test starts at that moment, until that
-/// runs its own program, and a script that is open for writing is not run ("Text file busy").
-fn script(path: &Path, text: &str) {
-    let writes = "printf %s \"$1\" > \"$0\" && chmod 755 \"$0\"";
-    let mut shell = Command::new("sh");
-    let written = shell.args(["-c", writes]).arg(path).arg(text).status();
-    assert!(written.unwrap().success(), "{}", path.display());
 }
 
 /// What `ps` says of a process under one of its headings.
@@ -1323,6 +1225,13 @@ impl Drop for Host {
             let folder = fuxix::open(pane.path(), false).map(|folder| folder.try_lock_shared());
             if matches!(folder, Ok(Err(fs::TryLockError::WouldBlock))) {
                 signal(&holder_of(&pane.path()), "-KILL");
+            }
+        }
+        if let Some(jobs) = self.sessions.parent().map(|fux| fux.join("koh-jobs")) {
+            for pane in fs::read_dir(jobs).into_iter().flatten().flatten() {
+                if let Ok(mut ctl) = fuxix::open_fifo(pane.path().join("ctl")) {
+                    let _ = ctl.write_all(b"kill 9\n");
+                }
             }
         }
     }
@@ -1727,7 +1636,7 @@ async fn a_session_is_a_pane_kept_by_koh_hold_and_shown_by_a_viewer_on_the_serve
     });
     assert!(locked() && fs::read_to_string(pane.join("state")).unwrap() == "running\n");
     assert_eq!(names_in(&host.tmp.0.join("crun")), [""; 0]);
-    assert_eq!(names_in(&state), ["fux", "jobs"]);
+    assert_eq!(names_in(&state), ["fux"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1951,7 +1860,10 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
     }
     assert_eq!(
         (names_in(&session), names_in(&host.sessions)),
-        (vec!["koh-sessions".to_string()], vec![])
+        (
+            vec!["koh-jobs".to_string(), "koh-sessions".to_string()],
+            vec![]
+        )
     );
     let none = ["/no/such/koh-test-program".to_string()];
     for name in [Some("dead"), None] {
@@ -1994,7 +1906,7 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
     let ended = tokio::time::timeout(Duration::from_secs(10), drawn(&mut from)).await;
     assert_eq!(ended.expect("the stream lived on").1, None);
     until("its viewer is gone", || viewers(&host).is_empty());
-    assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux", "jobs"]);
+    assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux"]);
     client.close().await;
 }
 
@@ -4520,4 +4432,452 @@ fn exec_serve_shutdown_with_hup_ignoring_exec_and_live_session() {
     guard.dead_within(10, "HUP-ignoring exec after serve SIGTERM");
     tty.types(b"\x1d.");
     let _ = tty.ends();
+}
+
+fn job_cmd(host: &Host, sub: &str, args: &[&str], secs: u64) -> std::process::Output {
+    let addr = host.addr();
+    let mut full = vec![sub, &host.id, "--direct", &addr];
+    full.extend_from_slice(args);
+    run_bounded(&mut host.koh(&full), secs, sub)
+}
+
+#[test]
+fn job_survives_serve_kill_and_restart() {
+    let mut host = Host::start("job-restart", &[]);
+    let addr = host.addr();
+    let go = host.tmp.0.join("go");
+    let go_arg = go.display().to_string();
+
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &[
+                "--name",
+                "persist",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo before; while [ ! -f \"$1\" ]; do sleep 0.05; done; echo after; exit 7",
+                "_",
+                &go_arg,
+            ],
+            10,
+        )
+        .status
+        .success()
+    );
+
+    // Kill `koh serve` outright and start it again on the same key and state directory.
+    host.stop_by("-KILL");
+    host.serve();
+
+    // Start `logs -f` from a fresh client while the job is still running, then release it.
+    let mut follow = host
+        .koh(&[
+            "logs", &host.id, "--direct", &addr, "persist", "--all", "--follow",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (first, mut follow_out) = read_exact_bounded::<7, _>(
+        follow.stdout.take().unwrap(),
+        &mut follow,
+        10,
+        "logs -f before after restart",
+    );
+    assert_eq!(&first, b"before\n");
+    fs::write(&go, b"go\n").unwrap();
+
+    let mut rest = Vec::new();
+    let f_st = wait_child(&mut follow, 10, "koh logs -f after restart");
+    let _ = follow_out.read_to_end(&mut rest);
+    assert_eq!(f_st.code(), Some(7));
+    assert_eq!(
+        [first.as_slice(), rest.as_slice()].concat(),
+        b"before\nafter\n"
+    );
+
+    let waited = job_cmd(&host, "wait", &["persist", "--tail", "10"], 10);
+    assert_eq!(waited.status.code(), Some(7));
+    assert_eq!(waited.stdout, b"before\nafter\n");
+}
+
+#[test]
+fn job_multi_megabyte_log_streams_exact_content() {
+    let host = Host::start("job-multimb", &[]);
+    // ~3.39 MiB (>50 64 KiB chunks) of unique numbered lines: any dropped, duplicated, or
+    // reordered chunk fails the content check without starving neighbour tests on CI.
+    let expected: String = (1..=500_000).map(|n| format!("{n}\n")).collect();
+
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &["--name", "seqlog", "--", "seq", "1", "500000"],
+            10
+        )
+        .status
+        .success()
+    );
+    assert!(
+        job_cmd(&host, "wait", &["seqlog", "--timeout", "20"], 25)
+            .status
+            .success()
+    );
+    let whole = job_cmd(&host, "logs", &["seqlog", "--all"], 25);
+    assert!(whole.status.success());
+    assert!(
+        whole.stdout == expected.as_bytes(),
+        "streamed log content mismatch"
+    );
+}
+
+#[test]
+fn job_kill_ctl_default_invalid_and_ended() {
+    let host = Host::start("job-kill-ctl", &[]);
+
+    assert!(
+        job_cmd(&host, "run", &["--name", "dflt", "--", "sleep", "60"], 10)
+            .status
+            .success()
+    );
+    assert!(job_cmd(&host, "kill", &["dflt"], 10).status.success());
+    assert_eq!(
+        job_cmd(&host, "wait", &["dflt", "--timeout", "10"], 15)
+            .status
+            .code(),
+        Some(143)
+    );
+
+    // Signal 0 (outside what ctl takes) is a usage error (exit 2).
+    assert_eq!(
+        job_cmd(&host, "kill", &["dflt", "--signal", "0"], 10)
+            .status
+            .code(),
+        Some(2)
+    );
+
+    // Killing an already-ended job exits 0 and says so on stderr.
+    let ended = job_cmd(&host, "kill", &["dflt"], 10);
+    assert!(ended.status.success());
+    assert!(String::from_utf8_lossy(&ended.stderr).contains("not running"));
+}
+
+#[test]
+fn job_leader_exit_hangs_up_group_child() {
+    let host = Host::start("job-child-hup", &[]);
+    let pid_file = host.tmp.0.join("straggler.pid");
+    let mut guard = KillPid::new(pid_file.clone());
+    let pid_arg = pid_file.display().to_string();
+
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &[
+                "--name",
+                "spawner",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 60 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo done",
+                "_",
+                &pid_arg,
+            ],
+            10,
+        )
+        .status
+        .success()
+    );
+    let waited = job_cmd(&host, "wait", &["spawner", "--timeout", "10"], 15);
+    assert!(waited.status.success() && waited.stdout == b"done\n");
+    guard.dead_within(5, "straggler child left by job leader");
+}
+
+#[test]
+fn job_reader_never_mixes_replacement_run() {
+    let host = Host::start("job-replace-race", &[]);
+    let addr = host.addr();
+    let jobs_dir = host.sessions.parent().unwrap().join("koh-jobs");
+
+    for (name, msg) in [("rep", "OLD_RUN"), ("rep_new", "NEW_RUN")] {
+        let script = format!("printf '{msg}\\n'; sleep 30");
+        assert!(
+            job_cmd(
+                &host,
+                "run",
+                &["--name", name, "--", "/bin/sh", "-c", &script],
+                10
+            )
+            .status
+            .success()
+        );
+        let out = jobs_dir.join(name).join("out");
+        until("marker written", || {
+            fs::read(&out)
+                .unwrap_or_default()
+                .starts_with(msg.as_bytes())
+        });
+    }
+
+    // Start `wait` first, then `logs -f` and wait until `OLD_RUN\n` arrives (synchronizing on
+    // server acceptance without a fixed sleep) before killing `rep` and swapping `rep_new` in.
+    let mut waiter = host
+        .koh(&[
+            "wait",
+            &host.id,
+            "--direct",
+            &addr,
+            "rep",
+            "--tail",
+            "5",
+            "--timeout",
+            "2",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut follower = host
+        .koh(&["logs", &host.id, "--direct", &addr, "rep", "-f"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (seen, mut f_stdout_pipe) = read_exact_bounded::<8, _>(
+        follower.stdout.take().unwrap(),
+        &mut follower,
+        10,
+        "OLD_RUN",
+    );
+    assert_eq!(&seen, b"OLD_RUN\n");
+
+    let pane = jobs_dir.join("rep");
+    if let Ok(mut ctl) = fuxix::open_fifo(pane.join("ctl")) {
+        let _ = ctl.write_all(b"kill 9\n");
+    }
+    until("old rep holder dropped lock", || {
+        !matches!(
+            fuxix::open(&pane, false).map(|f| f.try_lock_shared()),
+            Ok(Err(fs::TryLockError::WouldBlock))
+        )
+    });
+    fs::remove_dir_all(&pane).unwrap();
+    fs::rename(jobs_dir.join("rep_new"), &pane).unwrap();
+
+    let f_st = wait_child(&mut follower, 10, "follower after replace");
+    let mut f_rest = Vec::new();
+    let _ = f_stdout_pipe.read_to_end(&mut f_rest);
+    let f_out = follower.wait_with_output().unwrap();
+    let w_st = wait_child(&mut waiter, 10, "waiter after replace");
+    let w_out = waiter.wait_with_output().unwrap();
+    let (f_stdout, f_stderr) = (
+        String::from_utf8_lossy(&f_rest),
+        String::from_utf8_lossy(&f_out.stderr),
+    );
+    let (w_stdout, w_stderr) = (
+        String::from_utf8_lossy(&w_out.stdout),
+        String::from_utf8_lossy(&w_out.stderr),
+    );
+
+    let ok_old = |code: Option<i32>, err: &str| {
+        !err.contains("running")
+            && ((code == Some(1) && err.contains("started anew")) || code == Some(137))
+    };
+    assert!(
+        !f_stdout.contains("NEW_RUN") && ok_old(f_st.code(), &f_stderr),
+        "follower mixed replacement: status={f_st:?} stdout={f_stdout:?} stderr={f_stderr:?}"
+    );
+    let waiter_ok = (w_stdout.contains("OLD_RUN")
+        && !w_stdout.contains("NEW_RUN")
+        && ok_old(w_st.code(), &w_stderr))
+        || (w_st.code() == Some(127) && w_stdout.is_empty())
+        || (w_stdout.contains("NEW_RUN")
+            && !w_stdout.contains("OLD_RUN")
+            && w_st.code() == Some(124)
+            && w_stderr.contains("timed out"));
+    assert!(
+        waiter_ok,
+        "waiter mixed replacement: status={w_st:?} stdout={w_stdout:?} stderr={w_stderr:?}"
+    );
+}
+
+#[test]
+fn job_logs_broken_pipe_and_non_utf8_wait_tail() {
+    let host = Host::start("job-io-edge", &[]);
+    let addr = host.addr();
+
+    // 1. `logs -f` piped to a consumer that reads 1 byte and closes its pipe ends with 141.
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &[
+                "--name",
+                "chatter",
+                "--",
+                "/bin/sh",
+                "-c",
+                "i=0; while [ $i -lt 500 ]; do printf 'LINE-%04d\\n' $i; sleep 0.02; i=$((i+1)); done",
+            ],
+            10,
+        )
+        .status
+        .success()
+    );
+    let mut follow = host
+        .koh(&["logs", &host.id, "--direct", &addr, "chatter", "-f"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (byte, stdout) =
+        read_exact_bounded::<1, _>(follow.stdout.take().unwrap(), &mut follow, 10, "first byte");
+    assert_eq!(&byte, b"L");
+    drop(stdout);
+    assert_eq!(
+        wait_child(&mut follow, 10, "logs -f after closed stdout pipe").code(),
+        Some(141)
+    );
+    let _ = job_cmd(&host, "kill", &["chatter", "--signal", "9"], 10);
+
+    // 2. Non-UTF-8 output (~3 MiB of 0xff, expanding to ~9 MiB > MAX_FRAME if uncapped) still
+    // delivers the job's real exit status (7) on `wait --tail 1`.
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &[
+                "--name",
+                "binff",
+                "--",
+                "/bin/sh",
+                "-c",
+                "dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\\000' '\\377'; exit 7",
+            ],
+            15,
+        )
+        .status
+        .success()
+    );
+    assert_eq!(
+        job_cmd(
+            &host,
+            "wait",
+            &["binff", "--tail", "1", "--timeout", "20"],
+            25
+        )
+        .status
+        .code(),
+        Some(7)
+    );
+}
+
+#[test]
+fn job_run_name_lifecycle_and_start_errors() {
+    let host = Host::start("job-lifecycle", &[]);
+
+    // Running name is refused; once ended, the same name is replaced cleanly.
+    assert!(
+        job_cmd(&host, "run", &["--name", "dup", "--", "sleep", "30"], 10)
+            .status
+            .success()
+    );
+    let refused = job_cmd(&host, "run", &["--name", "dup", "--", "true"], 10);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already running"));
+
+    assert!(
+        job_cmd(&host, "kill", &["dup", "--signal", "9"], 10)
+            .status
+            .success()
+    );
+    let _ = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 15);
+    assert!(
+        job_cmd(&host, "run", &["--name", "dup", "--", "echo", "second"], 10)
+            .status
+            .success()
+    );
+    let w = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 15);
+    assert!(w.status.success() && w.stdout == b"second\n");
+
+    // Missing executable -> exit 127 (no folder left behind); missing cwd -> exit 126.
+    assert_eq!(
+        job_cmd(
+            &host,
+            "run",
+            &["--name", "nf", "--", "/no/such/koh-job-prog"],
+            10
+        )
+        .status
+        .code(),
+        Some(127)
+    );
+    assert!(!host.sessions.parent().unwrap().join("koh-jobs/nf").exists());
+    assert_eq!(
+        job_cmd(
+            &host,
+            "run",
+            &["-C", "/no/such/koh-job-dir", "--name", "nc", "--", "true"],
+            10,
+        )
+        .status
+        .code(),
+        Some(126)
+    );
+}
+
+#[test]
+fn job_logs_follow_ends_when_leftover_child_keeps_writing() {
+    let host = Host::start("job-follow-leftover", &[]);
+    let addr = host.addr();
+    let pid_file = host.tmp.0.join("yes.pid");
+    let _guard = KillPid::new(pid_file.clone());
+    let pid_arg = pid_file.display().to_string();
+
+    // Leader spawns a HUP-ignoring `yes` that keeps appending to `out`, then exits 3.
+    // `logs -f --tail 10` must observe the leader's exit and end with 3 instead of hanging.
+    assert!(
+        job_cmd(
+            &host,
+            "run",
+            &[
+                "--name",
+                "noisy",
+                "--",
+                "/bin/sh",
+                "-c",
+                "trap '' HUP; yes & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exit 3",
+                "_",
+                &pid_arg,
+            ],
+            10,
+        )
+        .status
+        .success()
+    );
+    until("yes pid written", || pid_file.is_file());
+
+    let mut follow = host
+        .koh(&[
+            "logs", &host.id, "--direct", &addr, "noisy", "--tail", "10", "-f",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = follow.stdout.take().unwrap();
+    let drainer = std::thread::spawn(move || {
+        let mut buf = [0u8; 64 << 10];
+        let mut n = 0usize;
+        while let Ok(k @ 1..) = out.read(&mut buf) {
+            n += k;
+        }
+        n
+    });
+    let st = wait_child(&mut follow, 10, "logs -f with noisy leftover child");
+    assert!(drainer.join().unwrap() > 0);
+    assert_eq!(st.code(), Some(3));
 }

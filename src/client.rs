@@ -27,7 +27,7 @@ use crate::proto::{
     MAX_FRAME, Reply, Request, SessionInfo, SyncSummary, VIEW_FRAME, ViewInput, ViewOutput,
     ViewSize, WaitResult, decode, recv_msg, recv_msg_opt, recv_pieces, send_msg, session_name,
 };
-use crate::sync::{ONE_DIRECTORY, receive_tree, send_tree};
+use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
 
 #[derive(Clone, Debug, Default)]
@@ -56,16 +56,17 @@ pub struct Client {
     conn: Connection,
 }
 
-/// Reads from `r`, waiting on `POLLIN` if the caller passed a non-blocking fd (e.g. macOS openrsync).
-fn read_wait(
-    mut r: impl std::io::Read + std::os::fd::AsFd,
-    buf: &mut [u8],
-) -> std::io::Result<usize> {
+/// Retries `op` on `Interrupted`/`WouldBlock`, waiting on `event` when the fd is non-blocking.
+fn io_wait<W: std::os::fd::AsFd, T>(
+    w: &mut W,
+    event: i16,
+    mut op: impl FnMut(&mut W) -> std::io::Result<T>,
+) -> std::io::Result<T> {
     loop {
-        match r.read(buf) {
+        match op(w) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                fuxix::wait([(Some(r.as_fd()), fuxix::POLLIN)], -1)?;
+                fuxix::wait([(Some(w.as_fd()), event)], -1)?;
             }
             other => return other,
         }
@@ -74,24 +75,13 @@ fn read_wait(
 
 /// Writes all of `bytes` to `w` and flushes, waiting on `POLLOUT` if non-blocking.
 fn write_wait(mut w: impl std::io::Write + std::os::fd::AsFd, mut bytes: &[u8]) {
-    loop {
-        let res = if bytes.is_empty() {
-            w.flush().map(|()| 0)
-        } else {
-            w.write(bytes)
-        };
-        match res {
-            Ok(0) => break,
+    while !bytes.is_empty() {
+        match io_wait(&mut w, fuxix::POLLOUT, |w| w.write(bytes)) {
+            Ok(0) | Err(_) => return,
             Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if fuxix::wait([(Some(w.as_fd()), fuxix::POLLOUT)], -1).is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
         }
     }
+    let _ = io_wait(&mut w, fuxix::POLLOUT, std::io::Write::flush);
 }
 
 /// A session's text as it was sent, in pieces: what of it is no UTF-8 is shown as U+FFFD.
@@ -219,7 +209,8 @@ impl Client {
                 let mut buf = vec![0u8; 32 << 10];
                 loop {
                     let read = tokio::task::spawn_blocking(move || {
-                        let n = read_wait(std::io::stdin().lock(), &mut buf);
+                        let mut stdin = std::io::stdin().lock();
+                        let n = io_wait(&mut stdin, fuxix::POLLIN, |s| s.read(&mut buf));
                         (n, buf)
                     })
                     .await;
@@ -428,7 +419,7 @@ impl Client {
             return Err(KohError::usage("cp requires at least one source"));
         }
         if local_srcs.len() > 1 && delete {
-            return Err(KohError::usage(ONE_DIRECTORY));
+            return Err(KohError::usage("--delete requires a single source"));
         }
         let preserve_root = local_srcs.len() > 1;
         let mut total = SyncSummary {
@@ -485,7 +476,7 @@ impl Client {
             return Err(KohError::usage("cp requires at least one source"));
         }
         if remote_srcs.len() > 1 && delete {
-            return Err(KohError::usage(ONE_DIRECTORY));
+            return Err(KohError::usage("--delete requires a single source"));
         }
         let preserve_root = remote_srcs.len() > 1;
         let mut total = SyncSummary {

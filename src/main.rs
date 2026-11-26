@@ -14,7 +14,6 @@ use koh::keys::{
 };
 use koh::proto::SessionInfo;
 use koh::server::{ServeOptions, cap, run_serve};
-use koh::sync::ONE_DIRECTORY;
 use koh::{Exit, KohError, Result};
 
 const HELP: &str = include_str!("help.txt");
@@ -442,12 +441,7 @@ fn parse_common_dial(args: &[String], i: &mut usize, opts: &mut DialOptions) -> 
 }
 
 async fn cmd_exec(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut cwd, mut sync_dir, mut sh_line) = (
         None::<String>,
         None::<String>,
@@ -893,7 +887,7 @@ async fn cmd_cp(args: &[String]) -> Result<Exit> {
         ));
     };
     if delete && srcs.len() > 1 {
-        return Err(KohError::usage(ONE_DIRECTORY));
+        return Err(KohError::usage("--delete requires a single source"));
     }
     let summary = if let Some((server, rpath)) = split_remote(dst) {
         if srcs.iter().any(|s| split_remote(s).is_some()) {

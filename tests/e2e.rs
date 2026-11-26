@@ -4717,10 +4717,11 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
     );
     assert_eq!(got, b"hello\nworld\n");
 
-    // Non-blocking stdout: 300,000 bytes with a delayed small-buffer reader arrive whole.
+    // Non-blocking stdout: 1.5 MiB (exceeds default Unix socket buffers) with a delayed
+    // small-buffer reader arrives whole.
     let (mut peer, sock) = UnixStream::pair().unwrap();
     sock.set_nonblocking(true).unwrap();
-    let cmd = "awk 'BEGIN { for (i = 0; i < 3000; i++) printf \"%099d\\n\", i }'; exit 19";
+    let cmd = "awk 'BEGIN { for (i = 0; i < 15000; i++) printf \"%099d\\n\", i }'; exit 19";
     let mut child = host
         .koh(&["rsh", "--direct", &addr, &host.id, cmd])
         .stdin(OwnedFd::from(sock.try_clone().unwrap()))
@@ -4740,7 +4741,7 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
     let st = wait_child(&mut child, 15, "nonblock stdout");
     let out = reader.join().unwrap();
     assert_eq!(st.code(), Some(19));
-    let expected: Vec<u8> = (0..3000)
+    let expected: Vec<u8> = (0..15000)
         .flat_map(|i| format!("{i:099}\n").into_bytes())
         .collect();
     assert_eq!(out.len(), expected.len());

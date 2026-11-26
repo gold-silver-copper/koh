@@ -70,10 +70,11 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
     Previously, once local stdin reached EOF (such as `</dev/null`), disconnecting the client did
     not hang up the remote command, and interrupting `rsync --partial` could leave a remote rsync
     alive for ~20 s to rename its partial file over a later run. Now the server watches the
-    stream through drain and exit, sends SIGHUP to the command's process group (then SIGKILL
-    after 2 s if still alive) whenever the client disconnects or `koh serve` shuts down cleanly,
-    and `koh` closes the connection immediately on `INT`, `TERM`, `HUP`, or `USR1` (exiting
-    `128 + N`).
+    stream through drain and exit, sends SIGHUP to the command's process group, waits 2 s, sends
+    SIGKILL to the group, and then reaps the leader whenever the client disconnects or `koh serve`
+    shuts down cleanly, and `koh` closes the connection immediately on `INT`, `TERM`, `HUP`, or
+    `USR1` (exiting `128 + N`, including while `Reply::Ok` is in flight or local stdout is
+    blocked).
   - *Deadlock when both sides write megabytes at once:* Previously, a server-side write to child
     stdin could block the same loop that drained child stdout/stderr. Now stdin and output are
     pumped independently, so multi-megabyte bidirectional transfers complete without stalling.
@@ -88,9 +89,14 @@ The protocol is `koh/21` (up from `koh/20`): upgrade both client and server toge
     such as `>/dev/full` were ignored and `koh` exited `0`. Now non-pipe write failures exit `1`.
   - *Shell commands starting with `-`:* Previously, `--sh LINE` and `koh rsh` ran `/bin/sh -c
     LINE` without `--`, so a command starting with `-` was parsed as a shell option. Now the
-    client expands `--sh` and `rsh` to `/bin/sh -c -- LINE`.
+    client expands `--sh` and `rsh` to `/bin/sh -c -- LINE` (including `koh run --sh LINE`, which
+    therefore appears as `/bin/sh -c -- LINE` in `koh jobs`).
   - *Silent exit `0` when the stream ended without an exit status:* Previously, a truncated stream
     defaulted to exit `0`. Now a stream that ends without an exit status exits `255`.
+  - *Graceful `koh serve` shutdown:* `koh serve` told to end (`SIGINT`/`SIGTERM`) now closes its
+    endpoint and waits for active connections to tear down (up to ~5 s, or ~2 s for a live
+    session) before releasing its server key lock and exiting, so active `exec` commands are hung
+    up cleanly on shutdown.
 - **`koh exec` and `koh rsh` now exit as soon as the remote command ends, even if local stdin
   stays open.** Previously, `(sleep 8) | koh exec box -- echo hi` printed `hi` and waited 8 seconds
   until stdin closed, and `rsync` over koh hung at the end of a transfer because `rsync` keeps its

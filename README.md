@@ -11,11 +11,13 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 5,000 non-test Rust
   no access and is ignored (a non-UTF-8 `clients` file is rejected whole).
 - **Layer 2 — Raw Streams & Jobs (no PTY):**
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, and process-group hangup
-    (SIGHUP, then SIGKILL after 2 s if still alive) whenever the client disconnects, loses its
-    stdout/stderr pipe (EPIPE, exit 141), or receives INT/TERM/HUP/USR1 (exit 128+N), or when
-    `koh serve` stops cleanly—whether or not stdin has already ended. A client killed with `-9`
-    or a machine that vanishes is noticed only when the link's idle timeout runs out (about
-    15–20 s). A child that leaves the command's process group is not signalled on hangup.
+    (SIGHUP to the group, a 2 s wait, then SIGKILL to the group before reaping the leader, so
+    every hangup takes 2 s and HUP-ignoring group members are killed too) whenever the client
+    disconnects, loses its stdout/stderr pipe (EPIPE, exit 141), or receives INT/TERM/HUP/USR1
+    (exit 128+N), or when `koh serve` stops cleanly—whether or not stdin has already ended. A
+    client killed with `-9` or a machine that vanishes is noticed only when the link's idle
+    timeout runs out (about 15–20 s). A child that leaves the command's process group is not
+    signalled on hangup.
   - `koh rsh HOST WORD…`: ssh's argument shape over `exec` (`WORD…` joined with spaces and run via
     `/bin/sh -c --` on the server; same streams and remote exit status), so `rsync -e 'koh rsh'`
     and `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,

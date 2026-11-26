@@ -15,6 +15,17 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Added
+
+- **`koh rsh HOST WORD…` lets `rsync` and `git` run directly over koh.** Commands such as
+  `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`,
+  `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
+  now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
+  joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the existing `exec` request
+  (`koh/20`), preserving stdout, stderr, stdin, and the remote exit status. Only `--key-file`,
+  `--direct`, and `--relay-url` (and `--`) are accepted before `HOST`; ssh flags that koh cannot
+  honour (`-l`, `-p`, `-o`, etc.) are refused with exit 2. Only clients need this.
+
 ### Security
 
 - **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
@@ -35,6 +46,23 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ### Fixed
 
+- **A koh client now exits as soon as the remote command ends, even if its own stdin stays open.**
+  Previously, `(sleep 8) | koh exec box -- echo hi` printed `hi` and waited 8 seconds until stdin
+  closed, and `rsync` over koh hung at the end of a transfer because `rsync` keeps its pipe to the
+  remote shell open until the remote shell exits (dropping the tokio runtime waited on a blocked
+  read of stdin). Client commands now shut down the runtime in the background after all output,
+  terminal restoration, and connection close have completed. Only clients need this.
+- **`koh cp --delete` is now refused unless the source is a single directory (push and pull).**
+  Previously, `koh cp --delete one.txt box:dir/` deleted every other entry in `dir`, and
+  `koh cp --delete one.txt box:` deleted everything else in the remote home directory; pulling a
+  single file with `--delete` did the same to the local destination. Both now exit 2 with a
+  message explaining why and leave the destination untouched. Clients enforce this for push;
+  servers enforce this for pull.
+- **A `koh run --name NAME` that cannot start now leaves an earlier job of that name as it was.**
+  Previously, `koh run box --name keep -- /no/such` exited 127 after already replacing `keep`'s
+  directory with an empty log, wiping the earlier job's log. The new job is now staged beside the
+  target directory and renamed into place only after the command spawns, leaving the prior job's
+  log and listing intact on failure. Only servers need this.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started

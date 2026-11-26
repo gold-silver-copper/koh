@@ -6,7 +6,7 @@ output` and `koh wait --session` read those files there and no more; the script 
 nearly the same as sh, for `koh exec` or for a script of your own on the server (where it is
 not the same, its comments say: `last` cuts whole lines, `wait` prints the last output):
 
-  koh help-agents | sed -n '/^#!/,$p' > sessions.sh && koh cp sessions.sh SERVER:
+  koh help-agents | sed -n '/^#!/,$p' | koh exec SERVER -- sh -c 'cat > sessions.sh'
   koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed
   koh exec SERVER -- sh sessions.sh wait DIR/NAME 60  and `screen`, `last` likewise
 

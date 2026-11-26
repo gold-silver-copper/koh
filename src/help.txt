@@ -16,6 +16,11 @@ Keys & peers:
 Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...
   koh exec SERVER [--sync DIR] [-C DIR] [--json] --sh 'SHELL LINE'
+  koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)
+            rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
+            GIT_SSH_COMMAND='koh rsh' git clone box:repo.git
+            tar -cf - src | koh exec box -- tar -xf - -C dst
+            (only --key-file, --direct, --relay-url before HOST; ssh flags like -l/-p/-o exit 2)
 
 Headless persistent jobs (raw append-only logs; outlive koh and network drops):
   koh run SERVER [--name NAME] [--sync DIR] [-C DIR] [--json] -- PROG ARG...
@@ -59,6 +64,6 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
 Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
-            (`exec`, `wait`, `logs -f` and `connect` exit with the remote
+            (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote
             command's exit status.)
             `koh serve` exits 75 when another `koh serve` already holds its key.

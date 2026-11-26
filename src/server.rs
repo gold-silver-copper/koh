@@ -168,8 +168,8 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
         .session_exe
         .map_or_else(std::env::current_exe, Ok)
         .map_err(|e| KohError::failed(format!("no path to koh: {e}")))?;
-    let sessions = Sessions::new(&base, max_sessions, default_shell, Some(exe.clone()))?;
-    let jobs = Jobs::new(&base, &exe)?;
+    let sessions = Sessions::new(&base, max_sessions, default_shell, exe.clone())?;
+    let jobs = Jobs::new(&base, exe)?;
     let sessions_dir = sessions.dir().to_path_buf();
 
     let state = Arc::new(ServerState {

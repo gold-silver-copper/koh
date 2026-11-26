@@ -69,15 +69,41 @@ pub(crate) fn state_now(dir: &Path, is_alive: impl FnOnce(&Path) -> bool) -> Str
     state_of(pane::line(dir, "state"), alive)
 }
 
-/// How a run ended, if it has: `None` while running, `Some(Ok(state))` once ended (`exited N`,
-/// `killed S`, or `ended`), `Some(Err(()))` if its folder is gone or now another run's.
-/// Probes `lives` before `state` and checks `run` after `state`.
+/// How a run ended, if it has: `None` while its holder lives and `state` is `running` or `hungup`,
+/// `Some(Ok(state))` once ended (`exited N`, `killed S`, or `ended`), `Some(Err(()))` if its
+/// folder is gone or now another run's. Probes `lives` before `state` and checks `run` after.
 pub(crate) fn ended(dir: &Path, run: Run) -> Option<std::result::Result<String, ()>> {
-    let state = state_now(dir, lives);
+    let alive = lives(dir);
+    let state = state_of(pane::line(dir, "state"), alive);
     if run_of(dir) != Some(run) {
         return Some(Err(()));
     }
-    (state != "running").then_some(Ok(state))
+    (!(alive && matches!(state.as_str(), "running" | "hungup"))).then_some(Ok(state))
+}
+
+/// Creates and canonicalizes `STATE/fux/<name>` with mode `0700`.
+pub(crate) fn workspace_dir(state: &Path, name: &str) -> Result<PathBuf> {
+    let dir = state.join("fux").join(name);
+    DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(&dir)
+        .and_then(|()| fs::canonicalize(&dir))
+        .map_err(|e| KohError::failed(format!("{}: {e}", dir.display())))
+}
+
+/// Looks up a valid pane-named folder and its `run` under `root`.
+pub(crate) fn named_in(
+    root: &Path,
+    name: &str,
+    need_status: bool,
+    what: String,
+) -> Result<(PathBuf, Run)> {
+    session_name(name)
+        .then(|| root.join(name))
+        .filter(|d| !need_status || d.join("status").is_file())
+        .and_then(|d| Some((d.clone(), run_of(&d)?)))
+        .ok_or_else(|| not_found(what))
 }
 
 pub(crate) fn not_found(what: String) -> KohError {
@@ -181,16 +207,8 @@ impl Sessions {
     /// The sessions kept beneath the state directory `state`, `max` of them at most, each a new
     /// one running `shell` unless its client names a program. `exe` is this binary where the
     /// process is another (a test's): it is run as fux, as a holder and as a viewer.
-    pub fn new(state: &Path, max: usize, shell: String, exe: Option<PathBuf>) -> Result<Self> {
-        let failed =
-            |at: &Path, e: std::io::Error| KohError::failed(format!("{}: {e}", at.display()));
-        let dir = state.join("fux").join("koh-sessions");
-        // (What is made is the owner's alone; what is there is taken as it is. Its whole path,
-        // as fux prints a pane's.)
-        let made = DirBuilder::new().mode(0o700).recursive(true).create(&dir);
-        let dir = made
-            .and_then(|()| fs::canonicalize(&dir))
-            .map_err(|e| failed(&dir, e))?;
+    pub fn new(state: &Path, max: usize, shell: String, exe: PathBuf) -> Result<Self> {
+        let dir = workspace_dir(state, "koh-sessions")?;
         // A viewer's folder that no viewer reads the FIFO of was left by one that was killed
         // (with its `koh serve`, as a rule): it goes. A viewer that lives keeps its own.
         let session = dir.parent().unwrap_or(&dir);
@@ -200,9 +218,8 @@ impl Sessions {
                 let _ = fs::remove_dir_all(left.path());
             }
         }
-        let exe = exe.map_or_else(std::env::current_exe, Ok);
         Ok(Self {
-            exe: exe.map_err(|e| KohError::failed(format!("no path to koh: {e}")))?,
+            exe,
             dir,
             max,
             shell,
@@ -221,13 +238,8 @@ impl Sessions {
         self.streams.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The folder of the session `name` and its run: a pane's, or there is no such session.
-    /// (A name that is none is no path.)
     fn named(&self, name: &str) -> Result<(PathBuf, Run)> {
-        let dir = session_name(name).then(|| self.dir.join(name));
-        let pane = dir.and_then(|dir| Some((run_of(&dir)?, dir)));
-        let pane = pane.map(|(run, dir)| (dir, run));
-        pane.ok_or_else(|| not_found(format!("no session {name}")))
+        named_in(&self.dir, name, false, format!("no session {name}"))
     }
 
     /// `koh sessions`: every session as its folder says it is, the oldest first, and whether
@@ -348,11 +360,10 @@ impl Sessions {
             None
         };
         self.told(asked);
-        let shell = [self.shell.clone()];
         let argv = if asked.argv.is_empty() {
-            &shell[..]
+            std::slice::from_ref(&self.shell)
         } else {
-            &asked.argv[..]
+            &asked.argv
         };
         let size = [
             ("COLUMNS", asked.size.cols.clamp(1, 500).to_string()),
@@ -832,7 +843,7 @@ mod tests {
     #[test]
     fn a_session_a_client_has_a_seat_on_does_not_go_and_one_that_went_has_no_seat() {
         let tmp = scratch("goes");
-        let sessions = Sessions::new(&tmp, 2, "sh".into(), None).unwrap();
+        let sessions = Sessions::new(&tmp, 2, "sh".into(), PathBuf::new()).unwrap();
         let dir = sessions.dir().join("1");
         pane(&dir, 7);
         // Chosen to go for a new one, with no client; one came before it went: it stays. A
@@ -874,7 +885,7 @@ mod tests {
         drop(fuxix::fifo(dead.join("ctl")).unwrap());
         let _reads = fuxix::fifo(living.join("ctl")).unwrap();
         fs::create_dir_all(session.join("koh-sessions/kept")).unwrap();
-        Sessions::new(&tmp, 2, "sh".into(), None).unwrap();
+        Sessions::new(&tmp, 2, "sh".into(), PathBuf::new()).unwrap();
         assert!(!dead.exists() && living.join("3").is_dir());
         assert!(session.join("koh-sessions/kept").is_dir());
         let _ = fs::remove_dir_all(tmp);

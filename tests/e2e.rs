@@ -4649,9 +4649,13 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
 fn rsh_options_rsync_and_git() {
     let host = Host::start("rsh-e2e", &[]);
     let direct_cmd = format!(
-        "[ \"$(koh rsh --direct {} {} printf ok)\" = ok ]",
+        "[ \"$(koh rsh --direct {} {} printf ok)\" = ok ]
+         koh servers add -box {} --direct {}
+         [ \"$(koh rsh -- -box printf ok)\" = ok ]",
         host.addr(),
-        host.id
+        host.id,
+        host.id,
+        host.addr(),
     );
     box_sh(
         &host,

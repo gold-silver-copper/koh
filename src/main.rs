@@ -490,7 +490,19 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
         }
     };
 
-    let client = Client::connect(&server, &opts, false).await?;
+    run_exec(&server, &opts, argv, cwd, shell, sync_dir, excludes).await
+}
+
+async fn run_exec(
+    server: &str,
+    opts: &DialOptions,
+    argv: Vec<String>,
+    mut cwd: Option<String>,
+    shell: bool,
+    sync_dir: Option<PathBuf>,
+    excludes: Vec<String>,
+) -> Result<Exit> {
+    let client = Client::connect(server, opts, false).await?;
     let done = async {
         if let Some(dir) = sync_dir {
             let (remote_dir, _) =
@@ -533,7 +545,6 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
             "rsh does not support option {a:?} (only --key-file, --direct, --relay-url before HOST)"
         )));
     }
-    let dial = args.get(..i).unwrap_or_default();
     if args.get(i).map(String::as_str) == Some("--") {
         i += 1;
     }
@@ -544,8 +555,7 @@ async fn cmd_rsh(args: &[String]) -> Result<Exit> {
     if words.is_empty() {
         return Err(KohError::usage(USAGE));
     }
-    let line = [host.clone(), "--sh".into(), words.join(" ")];
-    cmd_exec(&[dial, &line].concat()).await
+    run_exec(host, &opts, vec![words.join(" ")], None, true, None, vec![]).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {

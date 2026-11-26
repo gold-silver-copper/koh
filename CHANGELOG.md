@@ -51,7 +51,9 @@ binary, its tests and the fuzz targets share code, and any release may change it
   until stdin closed, and `rsync` over koh hung at the end of a transfer because `rsync` keeps its
   pipe to the remote shell open until the remote shell exits (dropping the tokio runtime waited on
   a blocked read of stdin). `koh exec` and `koh rsh` now shut down the runtime in the background
-  after their output has been flushed and the connection closed. Only clients need this.
+  after their output has been flushed and the connection closed, and wait on readiness (`poll`) if
+  a caller such as macOS `openrsync` passes non-blocking stdin/stdout descriptors instead of
+  treating `EAGAIN` as EOF or dropping output. Only clients need this.
 - **`koh cp --delete` is now refused unless the source is a single directory (push and pull).**
   Previously, `koh cp --delete one.txt box:dir/` deleted every other entry in `dir`, and
   `koh cp --delete one.txt box:` deleted everything else in the remote home directory; pulling a

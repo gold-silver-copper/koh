@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
-use tokio::io::AsyncReadExt as _;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant as Timer;
@@ -55,6 +54,39 @@ pub struct Client {
     /// Where the server is, for a connection made anew on the same endpoint.
     addr: EndpointAddr,
     conn: Connection,
+}
+
+/// Reads from `r`, waiting on `POLLIN` if the caller passed a non-blocking fd (e.g. macOS openrsync).
+fn read_wait(
+    mut r: impl std::io::Read + std::os::fd::AsFd,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    loop {
+        match r.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                fuxix::wait([(Some(r.as_fd()), fuxix::POLLIN)], -1)?;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Writes all of `bytes` to an unbuffered fd, waiting on `POLLOUT` if non-blocking.
+fn write_wait(mut w: &File, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match w.write(bytes) {
+            Ok(0) => break,
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if fuxix::wait([(Some(w.as_fd()), fuxix::POLLOUT)], -1).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// A session's text as it was sent, in pieces: what of it is no UTF-8 is shown as U+FFFD.
@@ -179,12 +211,17 @@ impl Client {
                 }
                 let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
             } else if !std::io::stdin().is_terminal() {
-                let mut stdin = tokio::io::stdin();
                 let mut buf = vec![0u8; 32 << 10];
                 loop {
-                    match stdin.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
+                    let read = tokio::task::spawn_blocking(move || {
+                        let n = read_wait(std::io::stdin().lock(), &mut buf);
+                        (n, buf)
+                    })
+                    .await;
+                    match read {
+                        Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => break,
+                        Ok((Ok(n), b)) => {
+                            buf = b;
                             if let Some(slice) = buf.get(..n)
                                 && send_msg(
                                     &mut send,
@@ -197,7 +234,6 @@ impl Client {
                                 return;
                             }
                         }
-                        Err(_) => break,
                     }
                 }
                 let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
@@ -207,6 +243,13 @@ impl Client {
             let _ = send.finish();
         });
 
+        let raw_fd = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().ok().map(File::from);
+        let out_fd = (!capture_json)
+            .then(|| raw_fd(std::io::stdout().as_fd()))
+            .flatten();
+        let err_fd = (!capture_json)
+            .then(|| raw_fd(std::io::stderr().as_fd()))
+            .flatten();
         let mut cap_out = Vec::new();
         let mut cap_err = Vec::new();
         let mut exit_code = 0i32;
@@ -215,17 +258,15 @@ impl Client {
                 ExecServerMsg::Stdout(bytes) => {
                     if capture_json {
                         cap_out.extend_from_slice(&bytes);
-                    } else {
-                        let _ = std::io::stdout().write_all(&bytes);
-                        let _ = std::io::stdout().flush();
+                    } else if let Some(ref f) = out_fd {
+                        write_wait(f, &bytes);
                     }
                 }
                 ExecServerMsg::Stderr(bytes) => {
                     if capture_json {
                         cap_err.extend_from_slice(&bytes);
-                    } else {
-                        let _ = std::io::stderr().write_all(&bytes);
-                        let _ = std::io::stderr().flush();
+                    } else if let Some(ref f) = err_fd {
+                        write_wait(f, &bytes);
                     }
                 }
                 ExecServerMsg::Exit(code) => {

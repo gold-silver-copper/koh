@@ -1,5 +1,5 @@
-//! Identity keys, peer lists (`servers` and `clients`), scoped authorization,
-//! and QR rendering — compatible with existing `~/.config/koh/` files.
+//! Identity keys, peer lists (`servers` and `clients`), and scoped authorization —
+//! compatible with existing `~/.config/koh/` files.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -8,7 +8,6 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt 
 use std::path::{Component, Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
-use qrcode::{QrCode, render::unicode};
 
 use crate::{Exit, KohError, Result, atomic_write, is_safe_name};
 
@@ -440,17 +439,4 @@ pub fn validate_peer_name(name: &str) -> Result<()> {
     } else {
         Err(KohError::usage(format!("invalid name {name:?}")))
     }
-}
-
-/// Renders an endpoint ID as a compact Unicode half-block QR code for terminal display.
-pub fn render_qr(id: &EndpointId) -> String {
-    QrCode::new(id.to_string().as_bytes())
-        .map(|code| {
-            code.render::<unicode::Dense1x2>()
-                .dark_color(unicode::Dense1x2::Light)
-                .light_color(unicode::Dense1x2::Dark)
-                .quiet_zone(true)
-                .build()
-        })
-        .unwrap_or_default()
 }

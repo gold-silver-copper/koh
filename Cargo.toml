@@ -6,7 +6,7 @@ rust-version = "1.95"
 license = "MIT"
 authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
-description = "Ultra-minimal peer-to-peer remote shell, jobs, delta sync, and fux sessions over iroh QUIC"
+description = "Ultra-minimal peer-to-peer remote shell, jobs, and fux sessions over iroh QUIC"
 readme = "README.md"
 keywords = ["mosh", "shell", "terminal", "iroh", "fux"]
 categories = ["command-line-utilities", "network-programming"]
@@ -14,14 +14,12 @@ include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md", "/docs/THREAT_MO
 
 [dependencies]
 anyhow = "1.0.104"
-blake3 = "1.8.7"
 fux = "0.43.5"
 # (fux's own reader of a colour: the same crate fux 0.43.5 has, and no other in the lockfile.)
 fux-vt = "0.20.1"
 fuxix = "0.12.0"
 iroh = "=1.3.0"
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
-qrcode = { version = "=0.14.1", default-features = false }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.53.2", features = ["full"] }

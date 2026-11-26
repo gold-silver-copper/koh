@@ -1,5 +1,5 @@
 //! `koh serve`: QUIC listener, TLS-bound client auth, scoped authorization,
-//! raw exec, headless jobs, delta sync, and sessions, which are fux panes (`session`).
+//! raw exec, headless jobs, and sessions, which are fux panes (`session`).
 
 use std::fs;
 use std::io::Write as _;
@@ -21,15 +21,14 @@ use tokio::time::{Instant, timeout_at};
 use crate::jobs::JobManager;
 use crate::keys::{
     ClientEntry, Role, Scope, expand_home, hold_for_serving, home_dir, load_clients,
-    load_or_create_key, render_qr,
+    load_or_create_key,
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::proto::{
     CloseCode, ExecClientMsg, ExecServerMsg, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
-    Request, SyncMsg, encode, recv_msg, send_msg, send_pieces, spawn_msg_reader,
+    Request, encode, recv_msg, send_msg, send_pieces, spawn_msg_reader,
 };
 use crate::session::Sessions;
-use crate::sync::{receive_tree, send_tree};
 use crate::{Exit, KohError, Result, after};
 
 pub struct ServeOptions {
@@ -188,7 +187,6 @@ pub async fn start_server(opts: ServeOptions) -> Result<RunningServer> {
             let _ = writeln!(err, "listening:     {addr}");
         }
         let _ = writeln!(err, "sessions dir:  {}", sessions_dir.display());
-        let _ = writeln!(err, "{}", render_qr(&endpoint_id));
     }
 
     // A connection holds one of `max_connections` places from when it is taken up here, before
@@ -356,7 +354,7 @@ async fn dispatch(
     scope: Scope,
     state: &ServerState,
     send: &mut SendStream,
-    mut recv: RecvStream,
+    recv: RecvStream,
 ) -> Result<()> {
     match req {
         Request::Exec { argv, cwd, shell } => {
@@ -478,7 +476,6 @@ async fn dispatch(
         }
         Request::WaitJob {
             name,
-            text,
             tail,
             timeout_secs,
         } => {
@@ -492,49 +489,13 @@ async fn dispatch(
             };
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             let waited =
-                crate::jobs::wait_job(handle.log_path, handle.state_rx, text, tail, timeout_secs);
+                crate::jobs::wait_job(handle.log_path, handle.state_rx, tail, timeout_secs);
             // (A client that has left is waited for no longer.)
             let res = tokio::select! {
                 res = waited => res?,
                 _ = send.stopped() => return Ok(()),
             };
             send_msg(send, &res, MAX_FRAME).await
-        }
-        Request::CpPush {
-            dst,
-            excludes,
-            delete,
-            preserve_mtime,
-            dry_run,
-        } => {
-            let dst = expand_home(Path::new(&dst))?;
-            scope.check_cp(&dst)?;
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let landed = receive_tree(
-                &dst,
-                &excludes,
-                delete,
-                preserve_mtime,
-                dry_run,
-                send,
-                &mut recv,
-            )
-            .await;
-            say_failure(send, landed).await;
-            Ok(())
-        }
-        Request::CpPull {
-            src,
-            excludes,
-            preserve_root,
-            ..
-        } => {
-            let src = expand_home(Path::new(&src))?;
-            scope.check_cp(&src)?;
-            send_msg(send, &Reply::Ok, MAX_CTRL).await?;
-            let sent = send_tree(&src, &excludes, preserve_root, send, &mut recv).await;
-            say_failure(send, sent).await;
-            Ok(())
         }
         Request::Attach(asked) => {
             scope.check_full()?;
@@ -561,14 +522,6 @@ async fn dispatch(
             scope.check_full()?;
             state.sessions.wait(&session, timeout_secs, send).await
         }
-    }
-}
-
-/// Tells the other end of a copy why this end stopped: the answer to its request was sent
-/// before the copy began, so the reason goes as a message of the copy.
-async fn say_failure<T>(send: &mut SendStream, done: Result<T>) {
-    if let Err(err) = done {
-        let _ = send_msg(send, &SyncMsg::Failed((&err).into()), MAX_CTRL).await;
     }
 }
 

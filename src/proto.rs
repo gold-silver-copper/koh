@@ -1,4 +1,4 @@
-//! Wire protocol for koh/20 over iroh QUIC bidirectional streams.
+//! Wire protocol for koh/21 over iroh QUIC bidirectional streams.
 //! Every message is length-prefixed (`u32` big-endian) postcard with strict byte bounds.
 
 use iroh::endpoint::{RecvStream, SendStream};
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Exit, KohError, Result};
 
 /// ALPN for koh v2 (fux-backed) protocol.
-pub const ALPN: &[u8] = b"koh/20";
+pub const ALPN: &[u8] = b"koh/21";
 
 pub const MAX_PROOF: usize = 512;
 pub const MAX_CTRL: usize = 1 << 20; // 1 MiB
@@ -76,24 +76,8 @@ pub enum Request {
     },
     WaitJob {
         name: String,
-        text: Option<String>,
         tail: usize,
         timeout_secs: Option<u64>,
-    },
-    CpPush {
-        dst: String,
-        excludes: Vec<String>,
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-    },
-    CpPull {
-        src: String,
-        excludes: Vec<String>,
-        delete: bool,
-        preserve_mtime: bool,
-        dry_run: bool,
-        preserve_root: bool,
     },
     Attach(Attach),
     /// The three that read a session's folder on the server (`pane`), after `Attach`, whose
@@ -259,60 +243,6 @@ pub struct WaitResult {
     pub detail: String,
 }
 
-/// Delta sync file entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncEntry {
-    pub path: String,
-    pub size: u64,
-    pub mtime_secs: i64,
-    pub mode: u32,
-    pub hash: [u8; 32],
-    pub is_dir: bool,
-}
-
-/// Delta sync wire messages.
-#[derive(Debug, Serialize, Deserialize)]
-pub enum SyncMsg {
-    Manifest(Vec<SyncEntry>),
-    Need(Vec<String>),
-    FileStart {
-        path: String,
-        size: u64,
-        mtime_secs: i64,
-        mode: u32,
-    },
-    FileChunk(Vec<u8>),
-    FileEnd,
-    Summary(SyncSummary),
-    /// The end that could not go on says why.
-    Failed(Failure),
-}
-
-/// Why an end of a copy stopped, as its own caller would be told: the exit code, kind and words.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Failure {
-    pub code: u8,
-    pub kind: String,
-    pub message: String,
-}
-
-impl From<&KohError> for Failure {
-    fn from(err: &KohError) -> Self {
-        Self {
-            code: err.code.0,
-            kind: err.kind.to_string(),
-            // (A message quotes paths a peer sent: it stays well inside a control message.)
-            message: err.message.chars().take(4096).collect(),
-        }
-    }
-}
-
-impl From<Failure> for KohError {
-    fn from(said: Failure) -> Self {
-        Self::new(exit_of(said.code), kind_of(&said.kind), said.message)
-    }
-}
-
 /// The exit code a peer gave for what went wrong, as one of koh's own for a failure: a peer cannot
 /// make a failure exit 0, or with a code koh does not have.
 fn exit_of(code: u8) -> Exit {
@@ -345,27 +275,6 @@ fn kind_of(kind: &str) -> &'static str {
         "cannot_start" => "cannot_start",
         "failed" => "failed",
         _ => "remote",
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SyncSummary {
-    pub added: Vec<String>,
-    pub updated: Vec<String>,
-    pub deleted: Vec<String>,
-    pub unchanged: usize,
-    pub bytes_transferred: u64,
-    pub dry_run: bool,
-}
-
-impl SyncSummary {
-    pub fn merge(&mut self, other: Self) {
-        self.added.extend(other.added);
-        self.updated.extend(other.updated);
-        self.deleted.extend(other.deleted);
-        self.unchanged += other.unchanged;
-        self.bytes_transferred += other.bytes_transferred;
-        self.dry_run |= other.dry_run;
     }
 }
 
@@ -436,19 +345,23 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8], max: usize) -> Result<T> {
     }
 }
 
-/// Encode and write one length-prefixed postcard frame.
-pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usize) -> Result<()> {
-    let bytes = encode(value, max)?;
+/// Write one length-prefixed frame whose body is already encoded.
+pub async fn send_frame(stream: &mut SendStream, bytes: &[u8]) -> Result<()> {
     let len = u32::try_from(bytes.len()).map_err(|_| KohError::internal("message too large"))?;
     stream
         .write_all(&len.to_be_bytes())
         .await
         .map_err(|e| KohError::unreachable(format!("write length: {e}")))?;
     stream
-        .write_all(&bytes)
+        .write_all(bytes)
         .await
         .map_err(|e| KohError::unreachable(format!("write body: {e}")))?;
     Ok(())
+}
+
+/// Encode and write one length-prefixed postcard frame.
+pub async fn send_msg<T: Serialize>(stream: &mut SendStream, value: &T, max: usize) -> Result<()> {
+    send_frame(stream, &encode(value, max)?).await
 }
 
 /// Read and decode one length-prefixed postcard frame, returning `Ok(None)` on clean EOF.
@@ -557,19 +470,12 @@ mod tests {
         let told = [0, 1, 2, 3, 4, 5, 75, 124, 126, 127, 200, 255];
         let taken = [1, 1, 2, 3, 4, 1, 75, 124, 126, 127, 1, 255];
         for (said, code) in told.into_iter().zip(taken) {
-            let (kind, message) = ("failed".to_string(), "it stopped".to_string());
             let answer = Reply::Err {
                 code: said,
-                kind: kind.clone(),
-                message: message.clone(),
+                kind: "failed".to_string(),
+                message: "it stopped".to_string(),
             };
             assert_eq!(answer.into_result().unwrap_err().code, Exit(code), "{said}");
-            let failure = Failure {
-                code: said,
-                kind,
-                message,
-            };
-            assert_eq!(KohError::from(failure).code, Exit(code), "{said}");
         }
     }
 }

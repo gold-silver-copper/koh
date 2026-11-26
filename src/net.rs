@@ -14,7 +14,7 @@ use crate::keys::Route;
 use crate::proto::{ALPN, CloseCode, KeyProof, MAX_PROOF, recv_msg, send_msg};
 use crate::{KohError, Result};
 
-const PROOF_LABEL: &[u8] = b"koh/20 client proof";
+const PROOF_LABEL: &[u8] = b"koh/21 client proof";
 
 /// What koh asks of QUIC on every endpoint it binds but a session's client's: a connection that
 /// waits long (`waiting`: a server's, a `wait`'s) may be silent for 30 s, any other for 15.

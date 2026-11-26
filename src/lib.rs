@@ -1,4 +1,4 @@
-//! koh: ultra-minimal peer-to-peer remote shell, headless jobs, delta sync,
+//! koh: ultra-minimal peer-to-peer remote shell, headless jobs,
 //! and interactive fux sessions over iroh QUIC.
 #![forbid(unsafe_code)]
 
@@ -10,7 +10,6 @@ mod pane;
 pub mod proto;
 pub mod server;
 mod session;
-pub mod sync;
 
 use std::fmt;
 

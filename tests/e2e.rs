@@ -8,10 +8,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering::SeqCst},
-};
 
 use iroh::endpoint::{RecvStream, SendStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -87,46 +83,71 @@ async fn boot_pair(
     (tmp, srv, client, client_key, state_dir)
 }
 
-#[tokio::test]
-async fn raw_exec_binary_streams_stdin_eof_and_exit_code() {
-    let (_tmp, srv, client, _, _) = boot_pair("exec").await;
+#[test]
+fn raw_exec_binary_streams_stdin_eof_and_exit_code() {
+    let host = Host::start("exec", &[]);
+    let addr = host.addr();
 
     // Separate stdout/stderr, binary NUL byte preserved (no PTY mangling), exit code 42.
-    let (code, out, err) = client
-        .exec(
-            vec!["printf 'out\\000line\\n'; printf 'errline\\n' >&2; exit 42".into()],
-            Some("/tmp".into()),
-            true,
-            None,
-            true,
-        )
-        .await
+    let out = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "-C",
+            "/tmp",
+            "--sh",
+            "printf 'out\\000line\\n'; printf 'errline\\n' >&2; exit 42",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .unwrap();
-    assert_eq!(code, 42);
-    assert_eq!(out, b"out\0line\n");
-    assert_eq!(err, b"errline\n");
+    assert_eq!(out.status.code(), Some(42));
+    assert_eq!(out.stdout, b"out\0line\n");
+    assert_eq!(out.stderr, b"errline\n");
 
     // Stdin forwarding + clean EOF.
-    let (code, out, err) = client
-        .exec(
-            vec!["cat".into()],
-            Some("/tmp".into()),
-            false,
-            Some(b"hello stdin\n".to_vec()),
-            true,
-        )
-        .await
+    let mut child = host
+        .koh(&[
+            "exec", &host.id, "--direct", &addr, "-C", "/tmp", "--", "cat",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(out, b"hello stdin\n");
-    assert!(err.is_empty());
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"hello stdin\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"hello stdin\n");
+    assert!(out.stderr.is_empty());
 
-    client.close().await;
-    srv.shutdown().await;
+    // --json is refused on byte-stream commands (exec and logs), on stderr.
+    for args in [
+        &["exec", &host.id, "--direct", &addr, "--json", "--", "true"][..],
+        &["logs", &host.id, "--direct", &addr, "j", "--json"][..],
+    ] {
+        let res = host
+            .koh(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(res.status.code(), Some(2), "{args:?}");
+        assert!(res.stdout.is_empty(), "{args:?}");
+        assert!(!res.stderr.is_empty(), "{args:?}");
+    }
 }
 
 #[tokio::test]
-async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
+async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
     let (tmp, srv, client, _, _) = boot_pair("jobs").await;
 
     // 200-char line must NOT be wrapped at 80 columns (raw append-only log, no PTY).
@@ -142,10 +163,7 @@ async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
         .unwrap();
     assert_eq!(info.name, "long");
 
-    let wait_res = client
-        .wait_job("long".into(), None, 200, Some(10))
-        .await
-        .unwrap();
+    let wait_res = client.wait_job("long".into(), 200, Some(10)).await.unwrap();
     assert!(!wait_res.timed_out);
     assert_eq!(wait_res.exit, 7);
     assert!(wait_res.tail.contains(&long_line));
@@ -155,36 +173,24 @@ async fn headless_jobs_raw_logs_wait_text_timeout_and_kill() {
     assert_eq!(exit, Some(7));
     assert!(String::from_utf8_lossy(&raw_log).contains(&long_line));
 
-    // Wait for --text, timeout 124, and kill.
+    // Timeout 124 and kill.
     let _ = client
         .run_job(
             Some("srv".into()),
-            vec!["printf 'BOOTING\\n'; sleep 0.05; printf 'LISTENING\\n'; sleep 60".into()],
+            vec!["printf 'BOOTING\\n'; sleep 60".into()],
             Some(tmp.0.display().to_string()),
             true,
         )
         .await
         .unwrap();
-    let matched = client
-        .wait_job("srv".into(), Some("LISTENING".into()), 50, Some(5))
-        .await
-        .unwrap();
-    assert!(!matched.timed_out && matched.exit == 0);
-
-    let timed = client
-        .wait_job("srv".into(), Some("NEVER_APPEARS".into()), 10, Some(1))
-        .await
-        .unwrap();
+    let timed = client.wait_job("srv".into(), 10, Some(1)).await.unwrap();
     assert!(timed.timed_out && timed.exit == 124);
 
     let jobs = client.jobs(None).await.unwrap();
     assert_eq!(jobs.len(), 2);
 
     let _ = client.kill_job("srv".into(), 9).await.unwrap();
-    let killed = client
-        .wait_job("srv".into(), None, 10, Some(5))
-        .await
-        .unwrap();
+    let killed = client.wait_job("srv".into(), 10, Some(5)).await.unwrap();
     assert!(!killed.timed_out && killed.exit != 0);
 
     client.close().await;
@@ -202,7 +208,7 @@ async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
         .unwrap();
     // More seconds than the clock has: the job is waited for to its end, and the server serves on.
     let waited = client
-        .wait_job("brief".into(), None, 10, Some(u64::MAX))
+        .wait_job("brief".into(), 10, Some(u64::MAX))
         .await
         .unwrap();
     assert!(!waited.timed_out && waited.exit == 3, "{waited:?}");
@@ -225,7 +231,6 @@ async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_
     let (wait, follow) = (
         Request::WaitJob {
             name: name(),
-            text: Some("NEVER_APPEARS".into()),
             tail: 10,
             timeout_secs: None,
         },
@@ -246,229 +251,6 @@ async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_
     }
 
     client.kill_job(name(), 9).await.unwrap();
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn delta_cp_push_pull_exclude_delete_dry_run_and_preserve() {
-    let (tmp, srv, client, _, _) = boot_pair("cp").await;
-    let src = tmp.0.join("src");
-    let dst = tmp.0.join("dst");
-    let back = tmp.0.join("back");
-    fs::create_dir_all(src.join("sub")).unwrap();
-    fs::create_dir_all(src.join("target")).unwrap();
-    fs::write(src.join("a.txt"), "alpha").unwrap();
-    fs::write(src.join("sub/b.txt"), "beta").unwrap();
-    fs::write(src.join("target/ignored.o"), "skipme").unwrap();
-
-    // First push: excludes `target`.
-    let s1 = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            vec!["target".into()],
-            false,
-            true,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(s1.added.len(), 2);
-    assert!(!dst.join("target").exists());
-    assert_eq!(fs::read_to_string(dst.join("sub/b.txt")).unwrap(), "beta");
-    // -p preserved mtime.
-    assert_eq!(
-        fs::metadata(src.join("a.txt")).unwrap().mtime(),
-        fs::metadata(dst.join("a.txt")).unwrap().mtime()
-    );
-
-    // Second push unchanged -> 0 bytes transferred!
-    let s2 = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            vec!["target".into()],
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(s2.unchanged, 2);
-    assert_eq!(s2.bytes_transferred, 0);
-
-    // Dry-run with an extra remote file + --delete reports deletion without removing it.
-    fs::write(dst.join("extra.txt"), "stale").unwrap();
-    let dry = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            vec!["target".into()],
-            true,
-            false,
-            true,
-        )
-        .await
-        .unwrap();
-    assert_eq!(dry.deleted, vec!["extra.txt".to_string()]);
-    assert!(dst.join("extra.txt").exists());
-
-    // Real --delete removes extra.txt.
-    let del = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            vec!["target".into()],
-            true,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(del.deleted, vec!["extra.txt".to_string()]);
-    assert!(!dst.join("extra.txt").exists());
-
-    // Pull back to `back`.
-    let pull = client
-        .cp_pull(
-            dst.display().to_string(),
-            &back,
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(pull.added.len(), 2);
-    assert_eq!(fs::read_to_string(back.join("a.txt")).unwrap(), "alpha");
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn multi_source_cp_push_and_pull_files_and_dirs() {
-    let (tmp, srv, client, _, _) = boot_pair("multicp").await;
-    let src_root = tmp.0.join("src");
-    let remote_dst = tmp.0.join("remote_dst");
-    let local_out = tmp.0.join("local_out");
-    fs::create_dir_all(src_root.join("d1")).unwrap();
-    fs::create_dir_all(src_root.join("d2")).unwrap();
-    fs::write(src_root.join("top.txt"), "top").unwrap();
-    fs::write(src_root.join("d1/one.txt"), "one").unwrap();
-    fs::write(src_root.join("d2/two.txt"), "two").unwrap();
-
-    // Multi-source push: 1 file + 2 directories into one remote destination dir.
-    let pushed = client
-        .cp_push_many(
-            &[
-                src_root.join("top.txt"),
-                src_root.join("d1"),
-                src_root.join("d2"),
-            ],
-            &remote_dst.display().to_string(),
-            &[],
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(pushed.added.len(), 3);
-    assert_eq!(
-        fs::read_to_string(remote_dst.join("top.txt")).unwrap(),
-        "top"
-    );
-    assert_eq!(
-        fs::read_to_string(remote_dst.join("d1/one.txt")).unwrap(),
-        "one"
-    );
-    assert_eq!(
-        fs::read_to_string(remote_dst.join("d2/two.txt")).unwrap(),
-        "two"
-    );
-
-    // --delete with multiple sources is refused with Usage error (push AND pull).
-    let del_err = client
-        .cp_push_many(
-            &[src_root.join("d1"), src_root.join("d2")],
-            &remote_dst.display().to_string(),
-            &[],
-            true,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(del_err.code, Exit::USAGE);
-
-    let pull_del_err = client
-        .cp_pull_many(
-            &[
-                remote_dst.join("d1").display().to_string(),
-                remote_dst.join("d2").display().to_string(),
-            ],
-            &local_out,
-            &[],
-            true,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(pull_del_err.code, Exit::USAGE);
-
-    // Multi-source --dry-run reports additions without creating local_out.
-    let dry_pull = client
-        .cp_pull_many(
-            &[
-                remote_dst.join("top.txt").display().to_string(),
-                remote_dst.join("d1").display().to_string(),
-            ],
-            &local_out,
-            &[],
-            false,
-            false,
-            true,
-        )
-        .await
-        .unwrap();
-    assert!(dry_pull.dry_run);
-    assert_eq!(dry_pull.added.len(), 2);
-    assert!(!local_out.exists());
-
-    // Multi-source pull: 1 remote file + 2 remote dirs into one local dir.
-    let pulled = client
-        .cp_pull_many(
-            &[
-                remote_dst.join("top.txt").display().to_string(),
-                remote_dst.join("d1").display().to_string(),
-                remote_dst.join("d2").display().to_string(),
-            ],
-            &local_out,
-            &[],
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(pulled.added.len(), 3);
-    assert_eq!(
-        fs::read_to_string(local_out.join("top.txt")).unwrap(),
-        "top"
-    );
-    assert_eq!(
-        fs::read_to_string(local_out.join("d1/one.txt")).unwrap(),
-        "one"
-    );
-    assert_eq!(
-        fs::read_to_string(local_out.join("d2/two.txt")).unwrap(),
-        "two"
-    );
-
     client.close().await;
     srv.shutdown().await;
 }
@@ -643,8 +425,7 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
     assert_eq!(err.code, Exit::REFUSED, "expected exit 4, got {err:?}");
     stranger.close().await;
 
-    // 2. cp-scoped key cannot exec (exit 4) and cannot cp outside allowed_dir (exit 4),
-    //    but CAN cp inside allowed_dir!
+    // 2. cp-scoped key cannot exec (exit 4).
     let cpbot = Client::connect_direct(
         cp_only_key,
         srv.endpoint_id,
@@ -658,44 +439,10 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
             vec!["true".into()],
             Some(allowed_dir.display().to_string()),
             false,
-            None,
-            true,
         )
         .await
         .unwrap_err();
     assert_eq!(exec_err.code, Exit::REFUSED);
-
-    let local_file = tmp.0.join("payload.txt");
-    fs::write(&local_file, "hi").unwrap();
-    let escape_err = cpbot
-        .cp_push(
-            &local_file,
-            outside_dir.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(escape_err.code, Exit::REFUSED);
-
-    let ok = cpbot
-        .cp_push(
-            &local_file,
-            allowed_dir.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(ok.added, vec!["payload.txt".to_string()]);
-    assert_eq!(
-        fs::read_to_string(allowed_dir.join("payload.txt")).unwrap(),
-        "hi"
-    );
 
     cpbot.close().await;
     srv.shutdown().await;
@@ -742,27 +489,21 @@ fn cli_help_keys_and_peer_lists() {
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stdout).contains("\"kind\":\"usage\""));
 
-    // Multi-source `cp --delete` MUST fail with usage (exit 2) BEFORE dialing any server.
-    let del_multi = Command::new(bin)
-        .env("KOH_CONFIG_DIR", &tmp.0)
-        .args(["cp", "--delete", "a", "b", "nosuch:dst", "--json"])
-        .output()
-        .unwrap();
-    assert_eq!(del_multi.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&del_multi.stdout).contains("\"kind\":\"usage\""));
-
-    // Mixing remote sources with remote destination or mismatched servers fails with exit 2.
-    let mixed = Command::new(bin)
-        .args(["cp", "box:a", "box:b", "box:dst"])
-        .output()
-        .unwrap();
-    assert_eq!(mixed.status.code(), Some(2));
-
-    let diff_srv = Command::new(bin)
-        .args(["cp", "box1:a", "box2:b", "."])
-        .output()
-        .unwrap();
-    assert_eq!(diff_srv.status.code(), Some(2));
+    // Removed spellings are ordinary usage errors (exit 2).
+    for removed in [
+        &["cp", "a", "box:dst"][..],
+        &["id", "--qr"][..],
+        &["wait", "box", "j", "--text", "ok"][..],
+        &["exec", "box", "--sync", ".", "--", "true"][..],
+        &["run", "box", "--sync", ".", "--", "true"][..],
+    ] {
+        let res = Command::new(bin)
+            .env("KOH_CONFIG_DIR", &tmp.0)
+            .args(removed)
+            .output()
+            .unwrap();
+        assert_eq!(res.status.code(), Some(2), "{removed:?}");
+    }
 }
 
 /// A server with one `--cp DIR` key, and that key's client.
@@ -810,173 +551,6 @@ async fn boot_scoped(
         .await
         .unwrap();
     (tmp, srv, client, allowed, outside)
-}
-
-#[tokio::test]
-async fn a_scoped_copy_is_held_by_the_text_of_its_path_and_a_symlink_leads_where_it_leads() {
-    use std::os::unix::fs::symlink;
-    let (tmp, srv, client, allowed, outside) = boot_scoped("symlink").await;
-    let push = |src: PathBuf, dst: PathBuf, delete: bool| {
-        let (client, dst) = (&client, dst.display().to_string());
-        async move {
-            client
-                .cp_push(&src, dst, Vec::new(), delete, false, false)
-                .await
-        }
-    };
-
-    // A path that says by its text that it is beneath DIR is taken, and the file system says
-    // where it is: a symlink on the way is followed, in the path the client names and in the
-    // tree that lands.
-    symlink(&outside, allowed.join("link")).unwrap();
-    let through = tmp.0.join("through");
-    fs::create_dir_all(through.join("link")).unwrap();
-    fs::write(through.join("link/x"), "through the tree").unwrap();
-    push(through, allowed.clone(), false).await.unwrap();
-    assert_eq!(
-        fs::read_to_string(outside.join("x")).unwrap(),
-        "through the tree"
-    );
-    let file = tmp.0.join("y");
-    fs::write(&file, "through the path").unwrap();
-    push(file, allowed.join("link"), false).await.unwrap();
-    assert_eq!(
-        fs::read_to_string(outside.join("y")).unwrap(),
-        "through the path"
-    );
-
-    // `--delete` goes by what a tree that is read holds, and a symlink is not read: it stays,
-    // and so does what is beyond it.
-    let empty = tmp.0.join("empty");
-    fs::create_dir_all(&empty).unwrap();
-    push(empty, allowed.clone(), true).await.unwrap();
-    assert!(allowed.join("link").is_symlink());
-    assert_eq!(names_in(&outside), ["x", "y"]);
-
-    // A file lands under a name of its own and is then renamed: a symlink where it lands is
-    // replaced by it, and the file the symlink led to is as it was. That file has the same
-    // bytes here, and the copy must not find the file "unchanged" for that: what is where a
-    // file lands is the symlink, and a symlink is not the file.
-    fs::write(outside.join("target"), "same").unwrap();
-    symlink(outside.join("target"), allowed.join("final")).unwrap();
-    let onto = tmp.0.join("onto");
-    fs::create_dir_all(&onto).unwrap();
-    fs::write(onto.join("final"), "same").unwrap();
-    let done = push(onto, allowed.clone(), false).await.unwrap();
-    assert_eq!(done.unchanged, 0, "compared with the file beyond DIR/final");
-    assert!(!allowed.join("final").is_symlink());
-    assert_eq!(fs::read_to_string(allowed.join("final")).unwrap(), "same");
-    assert_eq!(fs::read_to_string(outside.join("target")).unwrap(), "same");
-
-    // A tree with directories lands, and no temporary file is left beside what landed.
-    let nested = tmp.0.join("nested");
-    fs::create_dir_all(nested.join("a/b")).unwrap();
-    fs::write(nested.join("a/b/c.txt"), "deep").unwrap();
-    let landed = push(nested, allowed.join("sub/tree"), false).await.unwrap();
-    assert_eq!(landed.added, vec!["a/b/c.txt".to_string()]);
-    assert_eq!(names_in(&allowed.join("sub/tree/a/b")), ["c.txt"]);
-
-    // Reading is the same: a symlink in a tree is not sent, as a file or as a directory, and a
-    // path that names a file through one reaches that file.
-    fs::write(outside.join("secret"), "secret").unwrap();
-    symlink(&outside, allowed.join("sub/tree/out")).unwrap();
-    symlink(outside.join("secret"), allowed.join("sub/tree/a/s")).unwrap();
-    let pull = |src: PathBuf, to: &str| {
-        let (client, to) = (&client, tmp.0.join(to));
-        async move {
-            let src = src.display().to_string();
-            let done = client
-                .cp_pull(src, &to, Vec::new(), false, false, false)
-                .await;
-            (done.unwrap(), to)
-        }
-    };
-    let (whole, to) = pull(allowed.join("sub/tree"), "whole").await;
-    assert_eq!(whole.added, vec!["a/b/c.txt".to_string()]);
-    assert_eq!(names_in(&to), ["a"]);
-    assert_eq!(names_in(&to.join("a")), ["b"]);
-    // The client's own destination is as its file system has it too: a symlink there is
-    // followed.
-    let (local, beyond) = (tmp.0.join("local"), tmp.0.join("beyond"));
-    fs::create_dir_all(&local).unwrap();
-    fs::create_dir_all(&beyond).unwrap();
-    symlink(&beyond, local.join("a")).unwrap();
-    pull(allowed.join("sub/tree"), "local").await;
-    assert_eq!(fs::read_to_string(beyond.join("b/c.txt")).unwrap(), "deep");
-    let (named, to) = pull(allowed.join("sub/tree/out/secret"), "named").await;
-    assert_eq!(named.added, vec!["secret".to_string()]);
-    assert_eq!(fs::read_to_string(to.join("secret")).unwrap(), "secret");
-
-    // The text is what holds: a path that does not begin with DIR is refused, though a symlink
-    // would have led it there.
-    symlink(&allowed, outside.join("in")).unwrap();
-    let file = tmp.0.join("z");
-    fs::write(&file, "z").unwrap();
-    let err = push(file, outside.join("in"), false).await.unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!allowed.join("z").exists());
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn cp_receiver_bounds_the_manifest_and_takes_only_the_files_it_asked_for() {
-    use koh::proto::{SyncEntry, SyncMsg};
-    let (tmp, srv, client, _, _) = boot_pair("cp-bounds").await;
-    let dst = tmp.0.join("dst");
-    let entry = |path: String| SyncEntry {
-        path,
-        size: 1,
-        mtime_secs: 0,
-        mode: 0o644,
-        hash: [0; 32],
-        is_dir: false,
-    };
-    let push = |dry_run| Request::CpPush {
-        dst: dst.display().to_string(),
-        excludes: Vec::new(),
-        delete: false,
-        preserve_mtime: false,
-        dry_run,
-    };
-
-    // One file more than a tree may hold.
-    let (mut send, mut recv) = client.request(&push(true)).await.unwrap();
-    let many = (0..=100_000).map(|n| entry(format!("f{n}"))).collect();
-    send_msg(&mut send, &SyncMsg::Manifest(many), MAX_CTRL * 8)
-        .await
-        .unwrap();
-    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-    assert!(
-        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
-        "{answer:?}"
-    );
-
-    // A file the receiver did not ask for.
-    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
-    let manifest = SyncMsg::Manifest(vec![entry("asked".into())]);
-    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
-    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-    assert!(matches!(&need, SyncMsg::Need(n) if n == &["asked".to_string()]));
-    let start = SyncMsg::FileStart {
-        path: "unasked".into(),
-        size: 1,
-        mtime_secs: 0,
-        mode: 0o644,
-    };
-    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
-    let _ = send_msg(&mut send, &SyncMsg::FileChunk(vec![b'!']), MAX_CHUNK).await;
-    let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
-    let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-    assert!(
-        matches!(&answer, SyncMsg::Failed(why) if why.code == 4),
-        "{answer:?}"
-    );
-    assert!(!dst.join("unasked").exists());
-
-    client.close().await;
-    srv.shutdown().await;
 }
 
 #[tokio::test]
@@ -1261,158 +835,6 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn a_tree_that_takes_long_to_hash_holds_up_nothing_else_the_server_serves() {
-    use koh::proto::{SyncEntry, SyncMsg};
-    let (tmp, srv, client, _, _) = boot_pair("cp-beside").await;
-    // As much of nothing as takes about half a second to hash here (8 MiB to 2 GiB): long to
-    // hash, and nothing to make.
-    let began = Instant::now();
-    blake3::hash(&vec![0u8; 8 << 20]);
-    let eighth = began.elapsed().as_micros().max(1) as u64;
-    let (size, tree) = (
-        (8u64 << 20) * (500_000 / eighth).clamp(1, 256),
-        tmp.0.join("tree"),
-    );
-    fs::create_dir_all(&tree).unwrap();
-    let big = fs::File::create(tree.join("big")).unwrap();
-    big.set_len(size).unwrap();
-    // The server is in this process, and one thread serves all its requests: what else that
-    // thread serves stands in for another client's link. It wakes every two milliseconds.
-    let woken = Arc::new(AtomicUsize::new(0));
-    let wakes = woken.clone();
-    let beside = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            wakes.fetch_add(1, SeqCst);
-        }
-    });
-    // It went on waking while the server hashed: for a quarter of that time at the least.
-    // (Held up, it wakes a few times in all: the hashing is nearly all the time there is.)
-    let went_on = |what: &str, began: Instant, woke: usize| {
-        let took = began.elapsed();
-        let awake = Duration::from_millis(2) * (woken.load(SeqCst) - woke) as u32;
-        assert!(awake >= took / 4, "{what}: awake for {awake:?} of {took:?}");
-    };
-
-    // A pull: the server hashes the tree before it sends its list. (Nothing is made here.)
-    let (began, woke) = (Instant::now(), woken.load(SeqCst));
-    let (from, to) = (tree.display().to_string(), tmp.0.join("back"));
-    let pulled = client.cp_pull(from.clone(), &to, vec![], false, false, true);
-    assert_eq!(pulled.await.unwrap().added, ["big"]);
-    went_on("a pull", began, woke);
-
-    // A push of a file as long as the one that is there: the server hashes its own to compare.
-    let push = Request::CpPush {
-        dst: from,
-        excludes: Vec::new(),
-        delete: false,
-        preserve_mtime: false,
-        dry_run: true,
-    };
-    let (mut send, mut recv) = client.request(&push).await.unwrap();
-    let entry = SyncEntry {
-        path: "big".into(),
-        size,
-        mtime_secs: 0,
-        mode: 0o644,
-        hash: [0; 32],
-        is_dir: false,
-    };
-    let (began, woke) = (Instant::now(), woken.load(SeqCst));
-    let list = SyncMsg::Manifest(vec![entry]);
-    send_msg(&mut send, &list, MAX_CTRL).await.unwrap();
-    let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-    assert!(matches!(need, SyncMsg::Need(..)), "{need:?}");
-    went_on("a push", began, woke);
-
-    beside.abort();
-    client.close().await;
-    srv.shutdown().await;
-}
-
-/// `dirs` directories, one inside the other, with a file `f` in the innermost: its path beneath `root`.
-fn deep(root: &std::path::Path, dirs: usize) -> PathBuf {
-    let inner = (0..dirs).fold(root.to_path_buf(), |at, _| at.join("d"));
-    fs::create_dir_all(&inner).unwrap();
-    fs::write(inner.join("f"), "deep").unwrap();
-    inner.join("f")
-}
-
-#[tokio::test]
-async fn a_tree_is_copied_to_128_directories_deep_on_both_ends_and_no_deeper() {
-    let (tmp, srv, client, _, _) = boot_pair("depth").await;
-    let dst = tmp.0.join("dst");
-    let push = |src: &[PathBuf], delete: bool| {
-        let (client, dst, src) = (&client, dst.display().to_string(), src.to_vec());
-        async move {
-            client
-                .cp_push_many(&src, &dst, &[], delete, false, false)
-                .await
-        }
-    };
-    // A file 128 directories beneath its tree is copied: that is the bound, on both ends.
-    let fits = tmp.0.join("fits");
-    let file = deep(&fits, 128);
-    let landed = push(std::slice::from_ref(&fits), false).await.unwrap();
-    assert_eq!(landed.added.len(), 1);
-    let there = dst.join(file.strip_prefix(&fits).unwrap());
-    assert_eq!(fs::read_to_string(there).unwrap(), "deep");
-
-    // One more is too deep. The end that reads it says so plainly (exit 1: nothing was refused,
-    // its own tree is too deep), before it sends anything.
-    let over = tmp.0.join("over");
-    deep(&over, 129);
-    let err = push(&[over], false).await.unwrap_err();
-    assert_eq!(err.code, Exit::FAILED, "{err:?}");
-    assert!(
-        err.message.contains("more than 128 directories deep"),
-        "{err:?}"
-    );
-
-    // Sent beside another tree, a tree's own name is one of the 128.
-    let (keep, one, two) = (tmp.0.join("keep"), tmp.0.join("one"), tmp.0.join("two"));
-    fs::create_dir_all(&keep).unwrap();
-    fs::write(keep.join("keep"), "new").unwrap();
-    deep(&one, 127);
-    deep(&two, 128);
-    assert_eq!(
-        push(&[keep.clone(), one], false).await.unwrap().added.len(),
-        2
-    );
-    let err = push(&[keep.clone(), two], false).await.unwrap_err();
-    assert!(
-        err.message.contains("more than 128 directories deep"),
-        "{err:?}"
-    );
-
-    // With --delete the receiving end reads its own tree too, by the same bound, before it
-    // removes anything: a destination that is too deep stops the copy, and nothing has gone.
-    let pruned = tmp.0.join("pruned");
-    deep(&pruned, 129);
-    fs::write(pruned.join("zzz"), "stays").unwrap();
-    let err = client
-        .cp_push(
-            &keep,
-            pruned.display().to_string(),
-            Vec::new(),
-            true,
-            false,
-            false,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, Exit::FAILED, "{err:?}");
-    assert!(
-        err.message.contains("more than 128 directories deep"),
-        "{err:?}"
-    );
-    assert_eq!(fs::read_to_string(pruned.join("zzz")).unwrap(), "stays");
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
 #[tokio::test]
 async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
     let tmp = TempDir::new("cap-range");
@@ -1621,40 +1043,6 @@ async fn boot_server_on(
     .await
 }
 
-#[tokio::test]
-async fn a_file_that_cannot_be_read_is_replaced_when_its_size_says_it_differs() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let (tmp, srv, client, _, _) = boot_pair("unreadable").await;
-    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
-    fs::create_dir_all(&src).unwrap();
-    fs::create_dir_all(&dst).unwrap();
-    fs::write(src.join("f"), "the new contents").unwrap();
-    fs::write(dst.join("f"), "old").unwrap();
-    fs::set_permissions(dst.join("f"), fs::Permissions::from_mode(0o000)).unwrap();
-
-    // The file there is of another size, so it differs, and nobody needs to read it to know:
-    // it is replaced, as a file in a directory one may write to can be.
-    let done = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(done.updated, vec!["f".to_string()]);
-    assert_eq!(
-        fs::read_to_string(dst.join("f")).unwrap(),
-        "the new contents"
-    );
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
 /// The names in `dir`, in order.
 fn names_in(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
@@ -1666,166 +1054,7 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_hostile_sender_lands_nothing_and_leaves_no_temporary_file() {
-    use koh::proto::{SyncEntry, SyncMsg};
-    let (tmp, srv, client, _, _) = boot_pair("hostile-sender").await;
-    let dst = tmp.0.join("dst");
-    fs::create_dir_all(&dst).unwrap();
-    fs::write(dst.join("there"), "before").unwrap();
-    let entry = |path: &str, size: u64| SyncEntry {
-        path: path.to_string(),
-        size,
-        mtime_secs: 0,
-        mode: 0o644,
-        hash: [0; 32],
-        is_dir: false,
-    };
-    let push = |delete| Request::CpPush {
-        dst: dst.display().to_string(),
-        excludes: Vec::new(),
-        delete,
-        preserve_mtime: false,
-        dry_run: false,
-    };
-    let refused = |answer: &SyncMsg| matches!(answer, SyncMsg::Failed(why) if why.code == 4);
-
-    // A path that is not plain names beneath the tree, in the manifest or at a file's start,
-    // with --delete or without: refused, and the destination is as it was (--delete has removed
-    // nothing: every path is looked at before anything goes).
-    for path in ["../x", "/x", "a//b", "a/./b", "a/../x", "", "a/"] {
-        for delete in [false, true] {
-            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
-            let manifest = SyncMsg::Manifest(vec![entry("ok", 1), entry(path, 1)]);
-            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
-            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-            assert!(refused(&answer), "manifest {path:?} {delete}: {answer:?}");
-
-            let (mut send, mut recv) = client.request(&push(delete)).await.unwrap();
-            let manifest = SyncMsg::Manifest(vec![entry("there", 9)]);
-            send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
-            let need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-            assert!(matches!(&need, SyncMsg::Need(asked) if asked == &["there".to_string()]));
-            let start = SyncMsg::FileStart {
-                path: path.to_string(),
-                size: 1,
-                mtime_secs: 0,
-                mode: 0o644,
-            };
-            send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
-            let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-            assert!(refused(&answer), "start {path:?} {delete}: {answer:?}");
-            assert_eq!(names_in(&dst), ["there"], "{path:?} {delete}");
-            assert_eq!(names_in(&tmp.0).iter().filter(|n| *n == "x").count(), 0);
-        }
-    }
-    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
-
-    // A file that is longer or shorter than its sender said: the copy fails, the file that was
-    // there is as it was, and nothing is left beside it.
-    for sent in [&b"too long"[..], b"sh"] {
-        let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
-        let manifest = SyncMsg::Manifest(vec![entry("there", 4)]);
-        send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
-        let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-        let start = SyncMsg::FileStart {
-            path: "there".to_string(),
-            size: 4,
-            mtime_secs: 0,
-            mode: 0o644,
-        };
-        send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
-        let _ = send_msg(&mut send, &SyncMsg::FileChunk(sent.to_vec()), MAX_CHUNK).await;
-        let _ = send_msg(&mut send, &SyncMsg::FileEnd, MAX_CTRL).await;
-        let answer: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-        assert!(
-            matches!(&answer, SyncMsg::Failed(why) if why.code == 1 && why.message.contains("size mismatch")),
-            "{answer:?}"
-        );
-        assert_eq!(names_in(&dst), ["there"]);
-        assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
-    }
-
-    // A copy cut off in the middle of a file: while it runs, the bytes are in a file of another
-    // name beside where they land; once the sender is gone, that file is too.
-    let (mut send, mut recv) = client.request(&push(false)).await.unwrap();
-    let manifest = SyncMsg::Manifest(vec![entry("there", 1 << 20)]);
-    send_msg(&mut send, &manifest, MAX_CTRL).await.unwrap();
-    let _need: SyncMsg = recv_msg(&mut recv, MAX_CTRL * 4).await.unwrap();
-    let start = SyncMsg::FileStart {
-        path: "there".to_string(),
-        size: 1 << 20,
-        mtime_secs: 0,
-        mode: 0o644,
-    };
-    send_msg(&mut send, &start, MAX_CTRL).await.unwrap();
-    let part = SyncMsg::FileChunk(vec![7; 4096]);
-    send_msg(&mut send, &part, MAX_CHUNK).await.unwrap();
-    let partial = |dst: &std::path::Path| names_in(dst).iter().any(|n| n.starts_with(".koh-"));
-    let until = |want: bool, dst: PathBuf| async move {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while partial(&dst) != want {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-    };
-    until(true, dst.clone())
-        .await
-        .expect("its bytes were being written within 5 s");
-    drop((send, recv));
-    client.close().await;
-    until(false, dst.clone())
-        .await
-        .expect("the temporary file was gone within 5 s");
-    assert_eq!(names_in(&dst), ["there"]);
-    assert_eq!(fs::read_to_string(dst.join("there")).unwrap(), "before");
-
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_file_that_has_a_staging_name_is_not_written_over() {
-    let (tmp, srv, client, _, _) = boot_pair("staging-name").await;
-    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
-    fs::create_dir_all(&src).unwrap();
-    fs::create_dir_all(&dst).unwrap();
-    // A file is written as `.koh-PID-N.tmp` beside where it lands, N counted up by the process
-    // that writes it (here this one). Three of every four such names are files of someone
-    // else's: wherever the count stands, eight files in a row meet some of them, and a free
-    // name is never more than four tries away.
-    let pid = std::process::id();
-    let theirs: Vec<PathBuf> = (0..4096u32)
-        .filter(|n| n % 4 != 3)
-        .map(|n| dst.join(format!(".koh-{pid:x}-{n:x}.tmp")))
-        .collect();
-    for path in &theirs {
-        fs::write(path, "theirs").unwrap();
-    }
-    for n in 0..8 {
-        fs::write(src.join(format!("f{n}")), "sent").unwrap();
-    }
-    let done = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(done.added.len(), 8);
-    assert_eq!(fs::read_to_string(dst.join("f7")).unwrap(), "sent");
-    let kept = |path: &PathBuf| fs::read_to_string(path).is_ok_and(|text| text == "theirs");
-    assert_eq!(theirs.iter().filter(|path| !kept(path)).count(), 0);
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_else() {
+async fn an_exec_scoped_key_runs_beneath_its_directory_and_nothing_else() {
     use std::os::unix::fs::symlink;
     let tmp = TempDir::new("exec-scope");
     let (allowed, outside) = (tmp.0.join("allowed"), tmp.0.join("outside"));
@@ -1847,32 +1076,33 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
     let client = Client::connect_direct(key, srv.endpoint_id, route, false)
         .await
         .unwrap();
+    let out_file = tmp.0.join("out");
     let at = |dir: &std::path::Path| Some(dir.display().to_string());
     let pwd = |dir: PathBuf| {
-        let client = &client;
+        let (client, out_file) = (&client, out_file.clone());
         async move {
-            client
-                .exec(vec!["pwd".into()], at(&dir), false, None, true)
-                .await
+            let line = format!("pwd > {}", out_file.display());
+            let code = client.exec(vec![line], at(&dir), true).await?;
+            Ok::<_, koh::KohError>((code, fs::read_to_string(&out_file).unwrap()))
         }
     };
 
     // A command starts in its directory, or in one beneath it, and is any command: this is no
     // sandbox, and the command reaches what the server's user can.
-    let (code, out, _) = pwd(allowed.join("sub")).await.unwrap();
+    let (code, out) = pwd(allowed.join("sub")).await.unwrap();
     assert_eq!(code, 0);
-    assert!(
-        String::from_utf8_lossy(&out)
-            .trim_end()
-            .ends_with("/allowed/sub")
+    assert!(out.trim_end().ends_with("/allowed/sub"));
+    let reach = format!(
+        "cat {} > {}",
+        outside.join("secret").display(),
+        out_file.display()
     );
-    let reach = format!("cat {}", outside.join("secret").display());
     fs::write(outside.join("secret"), "reached").unwrap();
-    let (_, out, _) = client
-        .exec(vec![reach], at(&allowed), true, None, true)
-        .await
-        .unwrap();
-    assert_eq!(out, b"reached");
+    assert_eq!(
+        client.exec(vec![reach], at(&allowed), true).await.unwrap(),
+        0
+    );
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), "reached");
 
     // It does not start elsewhere, and elsewhere is told by the text of the path: a directory
     // that is beneath its own by name and somewhere else in fact (a symlink out of it) is
@@ -1881,13 +1111,9 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         let err = pwd(dir.clone()).await.unwrap_err();
         assert_eq!(err.code, Exit::REFUSED, "{}: {err:?}", dir.display());
     }
-    let (code, out, _) = pwd(allowed.join("out")).await.unwrap();
+    let (code, out) = pwd(allowed.join("out")).await.unwrap();
     assert_eq!(code, 0);
-    assert!(
-        String::from_utf8_lossy(&out)
-            .trim_end()
-            .ends_with("/outside")
-    );
+    assert!(out.trim_end().ends_with("/outside"));
     let job = client
         .run_job(Some("j".into()), vec!["true".into()], at(&allowed), false)
         .await
@@ -1898,31 +1124,10 @@ async fn an_exec_scoped_key_runs_and_copies_beneath_its_directory_and_nothing_el
         .await;
     assert_eq!(nowhere.unwrap_err().code, Exit::REFUSED);
 
-    // It copies beneath its directory as a `--cp` key does.
-    let file = tmp.0.join("payload");
-    fs::write(&file, "copied").unwrap();
-    let push = |dst: PathBuf| {
-        let (client, file) = (&client, file.clone());
-        async move {
-            let dst = dst.display().to_string();
-            client
-                .cp_push(&file, dst, Vec::new(), false, false, false)
-                .await
-        }
-    };
-    push(allowed.join("sub")).await.unwrap();
-    assert_eq!(
-        fs::read_to_string(allowed.join("sub/payload")).unwrap(),
-        "copied"
-    );
-    let err = push(outside.clone()).await.unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-    assert!(!outside.join("payload").exists());
-
     // And it asks for nothing else: no look at jobs, its own among them. (Nor a session:
     // `the_three_commands_are_a_full_keys`.)
     assert_eq!(client.jobs(None).await.unwrap_err().code, Exit::REFUSED);
-    let waited = client.wait_job("j".into(), None, 10, Some(1)).await;
+    let waited = client.wait_job("j".into(), 10, Some(1)).await;
     assert_eq!(waited.unwrap_err().code, Exit::REFUSED);
 
     client.close().await;
@@ -1949,132 +1154,6 @@ async fn a_proof_deadline_too_far_off_for_the_clock_is_no_deadline_and_no_panic(
         client.jobs(None).await.unwrap();
         client.close().await;
     }
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_scoped_copy_reaches_a_tree_however_far_beneath_its_directory() {
-    // The 128 directories are a bound on a path within a tree, as it goes over the wire. The way
-    // from a `--cp DIR` key's directory to the tree is not such a path: it may be any length.
-    let (tmp, srv, client, allowed, _) = boot_scoped("deep-root").await;
-    let root = deep(&allowed, 130).parent().unwrap().to_path_buf();
-    let src = tmp.0.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("f"), "pushed").unwrap();
-    client
-        .cp_push(
-            &src,
-            root.display().to_string(),
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(fs::read_to_string(root.join("f")).unwrap(), "pushed");
-    let back = tmp.0.join("back");
-    client
-        .cp_pull(
-            root.display().to_string(),
-            &back,
-            Vec::new(),
-            false,
-            false,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(fs::read_to_string(back.join("f")).unwrap(), "pushed");
-
-    // Each name on that way is still one plain name: none of them may lead back out.
-    let out = format!("{}/d/../../outside", allowed.display());
-    let err = client
-        .cp_push(&src, out, Vec::new(), false, false, false)
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "{err:?}");
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_destination_that_cannot_be_read_through_is_pruned_of_nothing() {
-    // 144 directories, one in the next, each of a 40-character name: the path of the innermost
-    // is longer than a path may be (and a tree that deep is too deep to copy). `--delete` must
-    // find that out, or fail in the trying, before it removes anything: an entry it cannot look
-    // at is not an entry that is not there.
-    let (tmp, srv, client, _, _) = boot_pair("delete-unreadable").await;
-    let (src, dst) = (tmp.0.join("src"), tmp.0.join("dst"));
-    fs::create_dir_all(&src).unwrap();
-    fs::create_dir_all(&dst).unwrap();
-    fs::write(dst.join("stays"), "stays").unwrap();
-    // (No path can name them all, so they are made as nine chains of 16, which a path can
-    // name, and each chain is then moved to the bottom of the one before it.)
-    let name = "d".repeat(40);
-    let chain = |nth: usize| dst.join(format!("chain{nth}"));
-    let bottom = |nth: usize| (0..16).fold(chain(nth), |at, _| at.join(&name));
-    for nth in 0..9 {
-        fs::create_dir_all(bottom(nth)).unwrap();
-    }
-    for nth in (1..9).rev() {
-        fs::rename(chain(nth).join(&name), bottom(nth - 1).join(&name)).unwrap();
-        fs::remove_dir(chain(nth)).unwrap();
-    }
-
-    let pushed = client
-        .cp_push(
-            &src,
-            dst.display().to_string(),
-            Vec::new(),
-            true,
-            false,
-            false,
-        )
-        .await;
-    assert_eq!(pushed.map(|_| ()).unwrap_err().code, Exit::FAILED);
-    assert_eq!(fs::read_to_string(dst.join("stays")).unwrap(), "stays");
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_destination_that_cannot_be_one_is_not_reported_as_copied_to() {
-    let (tmp, srv, client, allowed, _) = boot_scoped("bad-destination").await;
-    let src = tmp.0.join("src");
-    fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("f"), "sent").unwrap();
-    fs::write(allowed.join("file"), "a file").unwrap();
-    let push = |dst: String, dry_run: bool| {
-        let (client, src) = (&client, src.clone());
-        async move {
-            client
-                .cp_push(&src, dst, Vec::new(), false, false, dry_run)
-                .await
-        }
-    };
-    std::os::unix::fs::symlink(allowed.join("nowhere"), allowed.join("dangling")).unwrap();
-    for dry_run in [true, false] {
-        // A file is no directory to copy into, and a dry run says so as the copy would. Nor is
-        // a symlink that leads nowhere: something is there, and it is not a directory.
-        for name in ["file", "dangling"] {
-            let err = push(allowed.join(name).display().to_string(), dry_run).await;
-            assert_eq!(
-                err.unwrap_err().code,
-                Exit::FAILED,
-                "{name}, dry: {dry_run}"
-            );
-        }
-        // A name with a NUL in it names nothing: by its text it is not a path beneath DIR.
-        let err = push(format!("{}/bad\0name", allowed.display()), dry_run).await;
-        assert_eq!(err.unwrap_err().code, Exit::REFUSED, "dry run: {dry_run}");
-    }
-    assert_eq!(fs::read_to_string(allowed.join("file")).unwrap(), "a file");
-    assert_eq!(names_in(&allowed), ["dangling", "file"]);
-
-    client.close().await;
     srv.shutdown().await;
 }
 
@@ -2219,7 +1298,7 @@ async fn koh_serve_needs_kill_keeps_its_state_under_its_user_and_says_when_a_job
         .run_job(Some("o".into()), vec![line], None, true)
         .await
         .unwrap();
-    let ended = client.wait_job("o".into(), None, 10, Some(10)).await;
+    let ended = client.wait_job("o".into(), 10, Some(10)).await;
     assert!(!ended.unwrap().timed_out);
     let pid = fs::read_to_string(&left).unwrap().trim().to_string();
     served.started.push(pid.parse().unwrap());
@@ -4212,7 +3291,7 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
 fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
     let tmp = TempDir::new("wait-usage");
     // A wait is for a job or for a session; what is a job's alone is not said of a session.
-    for more in [&["build"][..], &["--text", "done"], &["--tail", "5"]] {
+    for more in [&["build"][..], &["--tail", "5"]] {
         let mut args = vec!["wait", "nowhere", "--session", "s"];
         args.extend(more);
         let (code, _, said) = koh(&tmp.0, &args);
@@ -4536,10 +3615,10 @@ async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
     let srv_key = tmp.0.join("srv_cfg/server.key");
     let valid = new_key(&tmp, "v.key");
     let typo = new_key(&tmp, "t.key");
-    let cp_key = new_key(&tmp, "c.key");
+    let exec_key = new_key(&tmp, "c.key");
     let mut add = Command::new(env!("CARGO_BIN_EXE_koh"));
     add.args(["clients", "--key-file"]).arg(&srv_key);
-    add.args(["add", "cpbot", &cp_key.public().to_string(), "--cp"])
+    add.args(["add", "runner", &exec_key.public().to_string(), "--exec"])
         .arg(&dir_ab);
     assert!(add.status().unwrap().success());
     let mut text = fs::read_to_string(tmp.0.join("srv_cfg/clients")).unwrap();
@@ -4554,14 +3633,12 @@ async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
     let t = dial(typo).await.unwrap();
     let v = dial(valid).await.unwrap();
-    let c = dial(cp_key).await.unwrap();
+    let c = dial(exec_key).await.unwrap();
     assert_eq!(t.jobs(None).await.unwrap_err().code, Exit::REFUSED);
     assert!(v.jobs(None).await.unwrap().is_empty());
-    let f = tmp.0.join("f.txt");
-    fs::write(&f, "hi").unwrap();
-    let push = |d: &Path| c.cp_push(&f, d.display().to_string(), vec![], false, false, false);
-    assert_eq!(push(&dir_a).await.unwrap_err().code, Exit::REFUSED);
-    assert_eq!(push(&dir_ab).await.unwrap().added, vec!["f.txt"]);
+    let run_in = |d: &Path| c.exec(vec!["true".into()], Some(d.display().to_string()), false);
+    assert_eq!(run_in(&dir_a).await.unwrap_err().code, Exit::REFUSED);
+    assert_eq!(run_in(&dir_ab).await.unwrap(), 0);
     for cl in [t, v, c] {
         cl.close().await;
     }
@@ -4677,7 +3754,7 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
     ]);
     assert_eq!((rc, out.as_slice()), (Some(11), b"rsh-hi\n".as_slice()));
 
-    // At the lowest open-fd limit where `koh exec` can bind, both stdout and stderr arrive
+    // At every open-fd limit where `koh exec` can bind, both stdout and stderr arrive
     // without needing spare descriptors to duplicate them.
     box_sh(
         &host,
@@ -4691,7 +3768,6 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
              found=1
              [ \"$(cat o)\" = O ]
              [ \"$(cat e)\" = E ]
-             break
            fi
          done
          [ \"$found\" = 1 ]",
@@ -4837,21 +3913,25 @@ fn rsh_options_rsync_and_git() {
         ),
     );
 
-    // Commands over MAX_CTRL (1 MiB) exit 2 (usage) for both rsh and exec, where OS allows spawn.
+    // Commands over MAX_CTRL (1 MiB) exit 2 (usage) for both rsh and exec, skipping only on E2BIG.
     let big_word = "x".repeat(130);
     for head in [&["rsh", "box"][..], &["exec", "box", "--"][..]] {
         let mut over = host.koh(head);
         for _ in 0..9000 {
             over.arg(&big_word);
         }
-        if let Ok(out) = over
+        match over
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
         {
-            assert_eq!(out.status.code(), Some(2));
-            assert!(out.stdout.is_empty());
-            assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+            Ok(out) => {
+                assert_eq!(out.status.code(), Some(2));
+                assert!(out.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ArgumentListTooLong => {}
+            Err(e) => panic!("unexpected spawn error for {head:?}: {e}"),
         }
     }
 

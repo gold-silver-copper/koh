@@ -291,12 +291,10 @@ fn cmd_clients(args: &[String]) -> Result<Exit> {
         i += 1;
     }
     let mut list = load_clients(key_file.as_deref(), |n, line| {
-        if clean.is_empty() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "koh: clients:{n}: ignored, not NAME ID: {line:?}"
-            );
-        }
+        let _ = writeln!(
+            std::io::stderr(),
+            "koh: clients:{n}: ignored, not NAME ID: {line:?}"
+        );
     })?;
     match clean.first().map(String::as_str) {
         None => {

@@ -1,5 +1,4 @@
-//! Identity keys and peer lists (`servers` and `clients`) — compatible with existing
-//! `~/.config/koh/` files.
+//! Identity keys and peer lists (`servers` and `clients`) in `~/.config/koh/`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
@@ -25,13 +24,6 @@ impl Role {
         match self {
             Self::Client => "client.key",
             Self::Server => "server.key",
-        }
-    }
-
-    pub fn list_file(self) -> &'static str {
-        match self {
-            Self::Client => "servers",
-            Self::Server => "clients",
         }
     }
 }
@@ -228,14 +220,18 @@ pub fn parse_relay_url(s: &str) -> Result<RelayUrl> {
         .map_err(|e| KohError::usage(format!("invalid relay url {s:?}: {e}")))
 }
 
+fn read_list(key_file: Option<&Path>, name: &str) -> Result<String> {
+    let path = config_dir(key_file)?.join(name);
+    match fuxix::open(&path, false).and_then(std::io::read_to_string) {
+        Ok(t) => Ok(t),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(KohError::failed(format!("read {}: {e}", path.display()))),
+    }
+}
+
 /// Loads saved `servers` list beside `client.key`.
 pub fn load_servers(key_file: Option<&Path>) -> Result<Vec<ServerEntry>> {
-    let path = config_dir(key_file)?.join(Role::Client.list_file());
-    let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
-    };
+    let text = read_list(key_file, "servers")?;
     let mut out = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -278,7 +274,7 @@ pub fn save_servers(key_file: Option<&Path>, entries: &[ServerEntry]) -> Result<
         }
         text.push('\n');
     }
-    atomic_write(&dir.join(Role::Client.list_file()), text.as_bytes())
+    atomic_write(&dir.join("servers"), text.as_bytes())
         .map_err(|e| KohError::failed(format!("write servers: {e}")))
 }
 
@@ -288,33 +284,20 @@ pub fn load_clients(
     key_file: Option<&Path>,
     mut on_skipped: impl FnMut(usize, &str),
 ) -> Result<Vec<ClientEntry>> {
-    let path = config_dir(key_file)?.join(Role::Server.list_file());
-    let text = match fuxix::open(&path, false).and_then(std::io::read_to_string) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(KohError::failed(format!("read {}: {e}", path.display()))),
-    };
+    let text = read_list(key_file, "clients")?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        let line = line.trim_end_matches('\r');
         let rest = line.trim_start();
         if rest.is_empty() || rest.starts_with('#') {
             continue;
         }
-        let Some((name, rest)) = rest.split_once(char::is_whitespace) else {
+        let mut w = rest.split_whitespace();
+        let (Some(name), Some(Ok(id)), None) =
+            (w.next(), w.next().map(str::parse::<EndpointId>), w.next())
+        else {
             on_skipped(i + 1, line);
             continue;
         };
-        let rest = rest.trim_start();
-        let (id_str, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-        let Ok(id) = id_str.parse::<EndpointId>() else {
-            on_skipped(i + 1, line);
-            continue;
-        };
-        if !rest.trim_start().is_empty() {
-            on_skipped(i + 1, line);
-            continue;
-        }
         out.push(ClientEntry {
             name: name.to_string(),
             id,
@@ -333,7 +316,7 @@ pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<
         text.push_str(&e.id.to_string());
         text.push('\n');
     }
-    atomic_write(&dir.join(Role::Server.list_file()), text.as_bytes())
+    atomic_write(&dir.join("clients"), text.as_bytes())
         .map_err(|e| KohError::failed(format!("write clients: {e}")))
 }
 

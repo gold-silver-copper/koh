@@ -4567,3 +4567,92 @@ async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
     }
     srv.shutdown().await;
 }
+
+#[test]
+fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
+    let host = Host::start("exec-open-stdin", &[]);
+    let addr = host.addr();
+
+    // Case 1: remote prints a line and exits 7 while local stdin pipe stays open.
+    let mut cmd = host.koh(&[
+        "exec",
+        &host.id,
+        "--direct",
+        &addr,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'hello-open-stdin\\n'; exit 7",
+    ]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let _hold_stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = out_thread.join().unwrap();
+    let status = status.expect("koh exec hung with open stdin after remote command ended");
+    assert_eq!(status.code(), Some(7));
+    assert_eq!(out, b"hello-open-stdin\n");
+    drop(_hold_stdin);
+
+    // Case 2: larger stdout (~135 KiB) is not cut short when exiting with open stdin.
+    let mut cmd = host.koh(&[
+        "exec",
+        &host.id,
+        "--direct",
+        &addr,
+        "--",
+        "awk",
+        "BEGIN { for (i = 0; i < 4096; i++) printf \"0123456789abcdef0123456789abcdef\\n\" }",
+    ]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let _hold_stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let out = out_thread.join().unwrap();
+    let status = status.expect("koh exec hung on large stdout with open stdin");
+    assert_eq!(status.code(), Some(0));
+    let expected: Vec<u8> = b"0123456789abcdef0123456789abcdef\n".repeat(4096);
+    assert_eq!(out.len(), expected.len());
+    assert_eq!(out, expected);
+    drop(_hold_stdin);
+}

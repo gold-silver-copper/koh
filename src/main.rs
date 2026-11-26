@@ -63,7 +63,14 @@ fn main() -> ExitCode {
             return ExitCode::from(err.code.0);
         }
     };
-    match rt.block_on(run(args)) {
+    let serving = args.first().map(String::as_str) == Some("serve");
+    let done = rt.block_on(run(args));
+    if !serving {
+        // Every client command has finished its I/O, terminal reset, and connection close before
+        // `run` returns; a blocked read of stdin (or a stuck terminal writer) does not hold exit.
+        rt.shutdown_background();
+    }
+    match done {
         Ok(code) => ExitCode::from(code.0),
         Err(err) => {
             report_err(&err, json);

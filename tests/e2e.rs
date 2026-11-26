@@ -4775,14 +4775,20 @@ fn rsh_runs_joined_words_forwards_streams_and_refuses_ssh_options() {
         assert_eq!(out.status.code(), Some(2), "args={args:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(needle), "args={args:?} stderr={err:?}");
-        assert!(out.stdout.is_empty(), "args={args:?} stdout={:?}", out.stdout);
+        assert!(
+            out.stdout.is_empty(),
+            "args={args:?} stdout={:?}",
+            out.stdout
+        );
     }
 }
 
 #[test]
 fn rsh_rsync_push_delete_exclude_incremental_and_pull() {
     if Command::new("rsync").arg("--version").output().is_err() {
-        eprintln!("skipping rsh_rsync_push_delete_exclude_incremental_and_pull: rsync not installed");
+        eprintln!(
+            "skipping rsh_rsync_push_delete_exclude_incremental_and_pull: rsync not installed"
+        );
         return;
     }
     let host = Host::start("rsh-rsync", &[]);
@@ -4842,8 +4848,14 @@ fn rsh_rsync_push_delete_exclude_incremental_and_pull() {
         fs::read_link(remote_dst.join("link_hello")).unwrap(),
         Path::new("sub/hello.txt")
     );
-    assert!(!remote_dst.join("stray.txt").exists(), "stray.txt was not deleted");
-    assert!(!remote_dst.join("target").exists(), "target was not excluded");
+    assert!(
+        !remote_dst.join("stray.txt").exists(),
+        "stray.txt was not deleted"
+    );
+    assert!(
+        !remote_dst.join("target").exists(),
+        "target was not excluded"
+    );
 
     let ino_before = fs::metadata(remote_dst.join("big.bin")).unwrap().ino();
 
@@ -4949,11 +4961,7 @@ fn rsh_git_push_and_clone() {
     assert!(run_git(&work, &["init"]).status.success());
     fs::write(work.join("hello.txt"), b"hello from git\n").unwrap();
     assert!(run_git(&work, &["add", "hello.txt"]).status.success());
-    assert!(
-        run_git(&work, &["commit", "-m", "init"])
-            .status
-            .success()
-    );
+    assert!(run_git(&work, &["commit", "-m", "init"]).status.success());
 
     let push = run_git(&work, &["push", "box:demo.git", "HEAD:refs/heads/main"]);
     assert!(
@@ -4981,7 +4989,10 @@ fn rsh_git_push_and_clone() {
         String::from_utf8_lossy(&clone.stdout),
         String::from_utf8_lossy(&clone.stderr)
     );
-    assert_eq!(fs::read(cloned.join("hello.txt")).unwrap(), b"hello from git\n");
+    assert_eq!(
+        fs::read(cloned.join("hello.txt")).unwrap(),
+        b"hello from git\n"
+    );
 }
 
 #[test]
@@ -5143,7 +5154,10 @@ fn failed_run_preserves_existing_job_log_and_listing() {
     let jobs_before = run_cli(&["jobs", "box", "keep"]);
     assert_eq!(jobs_before.status.code(), Some(0));
     let listing_before = String::from_utf8_lossy(&jobs_before.stdout).into_owned();
-    assert!(listing_before.contains("keep\texited 0\t"), "{listing_before}");
+    assert!(
+        listing_before.contains("keep\texited 0\t"),
+        "{listing_before}"
+    );
     assert!(listing_before.contains("kept-log-line"), "{listing_before}");
 
     // Failed replacement (missing program -> 127) must leave `keep` untouched.
@@ -5168,15 +5182,17 @@ fn failed_run_preserves_existing_job_log_and_listing() {
     let logs_after = run_cli(&["logs", "box", "keep", "--all"]);
     assert_eq!(logs_after.status.code(), Some(0));
     assert_eq!(
-        logs_after.stdout,
-        b"kept-log-line\n",
+        logs_after.stdout, b"kept-log-line\n",
         "previous job log was wiped by failed run"
     );
 
     let jobs_after = run_cli(&["jobs", "box", "keep"]);
     assert_eq!(jobs_after.status.code(), Some(0));
     let listing_after = String::from_utf8_lossy(&jobs_after.stdout);
-    assert!(listing_after.contains("keep\texited 0\t"), "{listing_after}");
+    assert!(
+        listing_after.contains("keep\texited 0\t"),
+        "{listing_after}"
+    );
     assert!(listing_after.contains("kept-log-line"), "{listing_after}");
 
     // A valid replacement afterward still works.
@@ -5191,7 +5207,12 @@ fn failed_run_preserves_existing_job_log_and_listing() {
         "printf 'replaced-log\\n'",
     ]);
     assert_eq!(ok_replace.status.code(), Some(0));
-    assert_eq!(run_cli(&["wait", "box", "keep", "--timeout", "10"]).status.code(), Some(0));
+    assert_eq!(
+        run_cli(&["wait", "box", "keep", "--timeout", "10"])
+            .status
+            .code(),
+        Some(0)
+    );
     let logs_new = run_cli(&["logs", "box", "keep", "--all"]);
     assert_eq!(logs_new.status.code(), Some(0));
     assert_eq!(logs_new.stdout, b"replaced-log\n");

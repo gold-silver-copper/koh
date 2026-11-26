@@ -87,8 +87,8 @@ impl JobManager {
         };
         let mut cmd = build_command(argv, cwd, shell)?;
         let dir = guard.root.join(&job_name);
-        let stage = Aside::stage(&dir)
-            .map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
+        let stage =
+            Aside::stage(&dir).map_err(|e| KohError::failed(format!("mkdir job dir: {e}")))?;
         let stage_dir = stage.path().to_path_buf();
         _stage = Some(stage);
 

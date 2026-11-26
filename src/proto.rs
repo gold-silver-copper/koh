@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Exit, KohError, Result};
 
-/// ALPN for koh v2 (fux-backed) protocol.
+/// ALPN for the `koh/21` wire protocol.
 pub const ALPN: &[u8] = b"koh/21";
 
 pub const MAX_PROOF: usize = 512;
@@ -33,18 +33,6 @@ pub enum CloseCode {
     Refused = 1,
     Busy = 2,
     Protocol = 3,
-}
-
-impl CloseCode {
-    pub fn from_u64(v: u64) -> Option<Self> {
-        match v {
-            0 => Some(Self::Done),
-            1 => Some(Self::Refused),
-            2 => Some(Self::Busy),
-            3 => Some(Self::Protocol),
-            _ => None,
-        }
-    }
 }
 
 /// Top-level RPC request sent at the start of a QUIC bidirectional stream.
@@ -80,9 +68,9 @@ pub enum Request {
         timeout_secs: Option<u64>,
     },
     Attach(Attach),
-    /// The three that read a session's folder on the server (`pane`), after `Attach`, whose
-    /// number they leave as it was. `Sessions` is answered with a list of `SessionInfo`, in
-    /// pieces as a text is: it is as long as the sessions that are kept make it.
+    /// The three that read a session's folder on the server (`pane`). `Sessions` is answered with
+    /// a list of `SessionInfo`, in pieces as a text is: it is as long as the sessions that are
+    /// kept make it.
     Sessions,
     /// A session's screen, or with `last` what its last command printed: `Ok`, then the text
     /// in pieces of bytes until the stream's end.

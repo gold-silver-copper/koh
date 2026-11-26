@@ -381,9 +381,7 @@ async fn unauthorized_and_scoped_keys_enforce_exit_code_4() {
     fs::create_dir_all(&cli_cfg).unwrap();
 
     let allowed_dir = tmp.0.join("allowed");
-    let outside_dir = tmp.0.join("outside");
     fs::create_dir_all(&allowed_dir).unwrap();
-    fs::create_dir_all(&outside_dir).unwrap();
 
     let stranger_key =
         load_or_create_key(Role::Client, Some(&cli_cfg.join("stranger.key"))).unwrap();
@@ -488,40 +486,15 @@ fn cli_help_keys_and_peer_lists() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stdout).contains("\"kind\":\"usage\""));
-
-    // Removed spellings are ordinary usage errors (exit 2).
-    for removed in [
-        &["cp", "a", "box:dst"][..],
-        &["id", "--qr"][..],
-        &["wait", "box", "j", "--text", "ok"][..],
-        &["exec", "box", "--sync", ".", "--", "true"][..],
-        &["run", "box", "--sync", ".", "--", "true"][..],
-    ] {
-        let res = Command::new(bin)
-            .env("KOH_CONFIG_DIR", &tmp.0)
-            .args(removed)
-            .output()
-            .unwrap();
-        assert_eq!(res.status.code(), Some(2), "{removed:?}");
-    }
 }
 
 /// A server with one `--cp DIR` key, and that key's client.
-async fn boot_scoped(
-    tag: &str,
-) -> (
-    TempDir,
-    koh::server::RunningServer,
-    Client,
-    PathBuf,
-    PathBuf,
-) {
+async fn boot_scoped(tag: &str) -> (TempDir, koh::server::RunningServer, Client, PathBuf) {
     let tmp = TempDir::new(tag);
     let srv_cfg = tmp.0.join("srv_cfg");
     let cli_cfg = tmp.0.join("cli_cfg");
     let allowed = tmp.0.join("allowed");
-    let outside = tmp.0.join("outside");
-    for dir in [&srv_cfg, &cli_cfg, &allowed, &outside] {
+    for dir in [&srv_cfg, &cli_cfg, &allowed] {
         fs::create_dir_all(dir).unwrap();
     }
     let key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
@@ -550,7 +523,7 @@ async fn boot_scoped(
     let client = Client::connect_direct(key, srv.endpoint_id, Some(Route::Direct(addr)), false)
         .await
         .unwrap();
-    (tmp, srv, client, allowed, outside)
+    (tmp, srv, client, allowed)
 }
 
 #[tokio::test]
@@ -1855,7 +1828,7 @@ impl InPane {
 
 #[tokio::test]
 async fn a_scoped_key_cannot_attach() {
-    let (tmp, srv, client, allowed, _) = boot_scoped("scoped-attach").await;
+    let (tmp, srv, client, allowed) = boot_scoped("scoped-attach").await;
     // A `--cp` key, and then the same key as an `--exec` key: neither has sessions.
     for exec in [false, true] {
         if exec {

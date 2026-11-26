@@ -573,12 +573,7 @@ async fn cmd_run(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_jobs(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut name) = (None::<String>, None::<String>);
     let mut i = 0;
     while i < args.len() {
@@ -670,12 +665,7 @@ async fn cmd_logs(args: &[String]) -> Result<Exit> {
 }
 
 async fn cmd_kill(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut name, mut sig) = (None::<String>, None::<String>, 15i32);
     let mut i = 0;
     while i < args.len() {
@@ -839,12 +829,7 @@ fn listed(s: &SessionInfo) -> String {
 
 /// `koh connect`.
 async fn cmd_session(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let mut server = None::<String>;
     let mut asks = ConnectOptions::default();
     let mut i = 0;

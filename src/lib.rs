@@ -63,10 +63,6 @@ impl KohError {
         Self::new(Exit::FAILED, "failed", msg)
     }
 
-    pub fn timeout(msg: impl Into<String>) -> Self {
-        Self::new(Exit::TIMEOUT, "timeout", msg)
-    }
-
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(Exit::INTERNAL, "internal", msg)
     }
@@ -90,15 +86,6 @@ impl fmt::Display for KohError {
 }
 
 impl std::error::Error for KohError {}
-
-impl From<anyhow::Error> for KohError {
-    fn from(err: anyhow::Error) -> Self {
-        match err.downcast::<KohError>() {
-            Ok(ke) => ke,
-            Err(err) => Self::internal(format!("{err:#}")),
-        }
-    }
-}
 
 pub type Result<T> = std::result::Result<T, KohError>;
 

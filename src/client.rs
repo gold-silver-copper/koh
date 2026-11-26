@@ -1094,11 +1094,6 @@ pub fn parse_signal(s: &str) -> Result<i32> {
     }
 }
 
-/// Wait duration helper used by tests & CLI.
-pub fn timeout_duration(secs: Option<u64>) -> Option<Duration> {
-    secs.map(Duration::from_secs)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

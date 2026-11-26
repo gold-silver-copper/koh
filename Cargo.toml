@@ -13,7 +13,6 @@ categories = ["command-line-utilities", "network-programming"]
 include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md", "/docs/THREAT_MODEL.md"]
 
 [dependencies]
-anyhow = "1.0.104"
 fux = "0.43.5"
 # (fux's own reader of a colour: the same crate fux 0.43.5 has, and no other in the lockfile.)
 fux-vt = "0.20.1"

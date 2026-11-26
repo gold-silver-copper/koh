@@ -199,9 +199,11 @@ pub fn close_error(conn: &Connection) -> Option<KohError> {
     else {
         return None;
     };
-    match CloseCode::from_u64(close.error_code.into_inner()) {
-        Some(CloseCode::Refused) => Some(KohError::refused("server refused this client key")),
-        Some(CloseCode::Busy) => Some(busy()),
+    match close.error_code.into_inner() {
+        c if c == CloseCode::Refused as u64 => {
+            Some(KohError::refused("server refused this client key"))
+        }
+        c if c == CloseCode::Busy as u64 => Some(busy()),
         _ => None,
     }
 }

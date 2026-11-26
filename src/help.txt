@@ -19,8 +19,8 @@ Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
   koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)
             rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
             GIT_SSH_COMMAND='koh rsh' git clone box:repo.git
-            tar -cf - src | koh exec box -- tar -xf - -C dst
-            (only --key-file, --direct, --relay-url before HOST; ssh flags like -l/-p/-o exit 2)
+            tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
+            (only --key-file, --direct, --relay-url, -- before HOST; ssh flags like -l/-p/-o exit 2)
 
 Headless persistent jobs (raw append-only logs; outlive koh and network drops):
   koh run SERVER [--name NAME] [--sync DIR] [-C DIR] [--json] -- PROG ARG...
@@ -32,6 +32,7 @@ Headless persistent jobs (raw append-only logs; outlive koh and network drops):
 Delta file sync (blake3 hashes, atomic replace):
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SRC... SERVER:DST
   koh cp [-r] [--delete] [--exclude PAT]... [-p] [--dry-run] [--json] SERVER:SRC... DST
+            (--delete is for one directory: with a file it is refused)
 
 Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh hold`;
 `koh serve` prints the folder, and `koh fux view FOLDER` there shows them all as tabs):

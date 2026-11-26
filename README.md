@@ -12,13 +12,15 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
   - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, SIGHUP on disconnect.
   - `koh rsh HOST WORD…`: ssh's argument shape over `exec` (`WORD…` joined with spaces and run via
     `/bin/sh -c` on the server; same streams and remote exit status), so `rsync -e 'koh rsh'` and
-    `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`, and
-    `--relay-url` before `HOST`; ssh options such as `-l`, `-p`, and `-o` exit 2.
+    `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,
+    `--relay-url`, and `--` before `HOST`; ssh options such as `-l`, `-p`, and `-o` exit 2. If your
+    git configuration sets `ssh.variant = ssh`, pass `git -c ssh.variant=simple` so git does not
+    add `-o`.
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
-  - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete`, `--exclude`,
-    `-p`, `--dry-run`).
+  - `koh cp` / `--sync`: `blake3` delta file sync (single or multi-source, `--delete` of one
+    directory, `--exclude`, `-p`, `--dry-run`).
 - **Layer 3 — Sessions are `fux` panes:**
   - A session is a `fux` pane on the server, in a `fux` session of koh's own beneath its state
     directory (`STATE/fux/koh-sessions/NAME`; `koh serve` prints the folder). `koh` has `fux`
@@ -239,7 +241,7 @@ rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
 rsync -a -e 'koh rsh' box:dst/ dst/
 GIT_SSH_COMMAND='koh rsh' git push box:repo.git HEAD:refs/heads/main
 GIT_SSH_COMMAND='koh rsh' git clone -b main box:repo.git
-tar -cf - src | koh exec box -- tar -xf - -C dst
+tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
 koh run box --name build -- make -j4 && koh wait box build
 koh cp -r --exclude target ./src box:proj/
 koh connect box

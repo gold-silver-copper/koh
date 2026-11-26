@@ -71,8 +71,9 @@ fn main() -> ExitCode {
     let streams_stdin = matches!(args.first().map(String::as_str), Some("exec" | "rsh"));
     let done = rt.block_on(run(args));
     if streams_stdin {
-        // Output has been flushed and the connection closed before `run` returns;
-        // a blocked read of stdin does not hold `exec` or `rsh` after the remote command ends.
+        // On normal completion, output has been flushed and the connection closed before `run`
+        // returns; on a signal, one blocking output write may still be in flight and koh exits
+        // without waiting for it (or for a blocked read of stdin).
         rt.shutdown_background();
     }
     match done {

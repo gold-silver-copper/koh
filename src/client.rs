@@ -235,7 +235,6 @@ impl Client {
                         }
                     }
                 }
-                let _ = send.finish();
             });
             loop {
                 let (is_out, b) = match recv_msg_opt::<ExecServerMsg>(&mut recv, MAX_CHUNK).await {

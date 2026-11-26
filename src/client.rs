@@ -28,7 +28,7 @@ use crate::proto::{
     MAX_FRAME, Reply, Request, SessionInfo, SyncSummary, VIEW_FRAME, ViewInput, ViewOutput,
     ViewSize, WaitResult, decode, recv_msg, recv_msg_opt, recv_pieces, send_msg, session_name,
 };
-use crate::sync::{receive_tree, send_tree};
+use crate::sync::{DELETE_REQUIRES_DIR, check_delete_dir, receive_tree, send_tree};
 use crate::{Exit, KohError, Result};
 
 #[derive(Clone, Debug, Default)]
@@ -388,8 +388,13 @@ impl Client {
         if local_srcs.is_empty() {
             return Err(KohError::usage("cp requires at least one source"));
         }
-        if local_srcs.len() > 1 && delete {
-            return Err(KohError::usage("--delete requires a single source"));
+        if delete {
+            if local_srcs.len() > 1 {
+                return Err(KohError::usage(DELETE_REQUIRES_DIR));
+            }
+            for src in local_srcs {
+                check_delete_dir(src)?;
+            }
         }
         let preserve_root = local_srcs.len() > 1;
         let mut total = SyncSummary {
@@ -445,7 +450,7 @@ impl Client {
             return Err(KohError::usage("cp requires at least one source"));
         }
         if remote_srcs.len() > 1 && delete {
-            return Err(KohError::usage("--delete requires a single source"));
+            return Err(KohError::usage(DELETE_REQUIRES_DIR));
         }
         let preserve_root = remote_srcs.len() > 1;
         let mut total = SyncSummary {

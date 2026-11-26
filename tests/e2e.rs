@@ -4983,3 +4983,127 @@ fn rsh_git_push_and_clone() {
     );
     assert_eq!(fs::read(cloned.join("hello.txt")).unwrap(), b"hello from git\n");
 }
+
+#[test]
+fn cp_delete_refuses_non_directory_source_push_and_pull() {
+    let host = Host::start("cp-delete-file", &[]);
+    save_box_server(&host);
+
+    let local_one = host.tmp.0.join("one.txt");
+    let local_link = host.tmp.0.join("link_one.txt");
+    let local_dir = host.tmp.0.join("local_dir");
+    let local_src_dir = host.tmp.0.join("src_dir");
+    let remote_home = host.tmp.0.join("home");
+    let remote_dir = remote_home.join("remote_dir");
+    let remote_one = remote_home.join("remote_one.txt");
+    let remote_home_keep = remote_home.join("keep_home.txt");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&local_src_dir).unwrap();
+    fs::create_dir_all(&remote_dir).unwrap();
+
+    fs::write(&local_one, b"one\n").unwrap();
+    std::os::unix::fs::symlink(&local_one, &local_link).unwrap();
+    fs::write(local_src_dir.join("fresh.txt"), b"fresh\n").unwrap();
+    fs::write(local_dir.join("keep_local.txt"), b"stay-local\n").unwrap();
+    fs::write(remote_dir.join("keep_remote.txt"), b"stay-remote\n").unwrap();
+    fs::write(&remote_one, b"remote-one\n").unwrap();
+    fs::write(&remote_home_keep, b"stay-home\n").unwrap();
+
+    let run_cp = |args: &[&str]| {
+        host.koh(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .unwrap()
+    };
+
+    // Push a single file with --delete into a remote dir: refused (exit 2), nothing deleted.
+    let out = run_cp(&[
+        "cp",
+        "--delete",
+        &local_one.display().to_string(),
+        "box:remote_dir/",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2, got {:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("directory"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        remote_dir.join("keep_remote.txt").exists(),
+        "keep_remote.txt was deleted!"
+    );
+    assert!(!remote_dir.join("one.txt").exists());
+
+    // Push a single file with --delete to remote home (`box:`): refused (exit 2), home intact.
+    let out = run_cp(&["cp", "--delete", &local_one.display().to_string(), "box:"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(remote_home_keep.exists(), "keep_home.txt was deleted!");
+
+    // Symlink to a file with --delete: refused (exit 2), nothing deleted.
+    let out = run_cp(&[
+        "cp",
+        "--delete",
+        &local_link.display().to_string(),
+        "box:remote_dir/",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(remote_dir.join("keep_remote.txt").exists());
+
+    // Pull a single file with --delete into a local dir: refused (exit 2), nothing deleted.
+    let out = run_cp(&[
+        "cp",
+        "--delete",
+        "box:remote_one.txt",
+        &local_dir.display().to_string(),
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "expected exit 2 on pull, got {:?}\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("directory"),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        local_dir.join("keep_local.txt").exists(),
+        "keep_local.txt was deleted!"
+    );
+    assert!(!local_dir.join("remote_one.txt").exists());
+
+    // Pushing and pulling a single directory with --delete still works.
+    let out = run_cp(&[
+        "cp",
+        "-r",
+        "--delete",
+        &local_src_dir.display().to_string(),
+        "box:remote_dir/",
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(fs::read(remote_dir.join("fresh.txt")).unwrap(), b"fresh\n");
+    assert!(!remote_dir.join("keep_remote.txt").exists());
+
+    let out = run_cp(&[
+        "cp",
+        "-r",
+        "--delete",
+        "box:remote_dir",
+        &local_dir.display().to_string(),
+    ]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(fs::read(local_dir.join("fresh.txt")).unwrap(), b"fresh\n");
+    assert!(!local_dir.join("keep_local.txt").exists());
+}

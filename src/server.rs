@@ -29,7 +29,7 @@ use crate::proto::{
     Request, SyncMsg, encode, recv_msg, send_msg, send_pieces, spawn_msg_reader,
 };
 use crate::session::Sessions;
-use crate::sync::{receive_tree, send_tree};
+use crate::sync::{check_delete_dir, receive_tree, send_tree};
 use crate::{Exit, KohError, Result, after};
 
 pub struct ServeOptions {
@@ -526,11 +526,15 @@ async fn dispatch(
         Request::CpPull {
             src,
             excludes,
+            delete,
             preserve_root,
             ..
         } => {
             let src = expand_home(Path::new(&src))?;
             scope.check_cp(&src)?;
+            if delete {
+                check_delete_dir(&src)?;
+            }
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             let sent = send_tree(&src, &excludes, preserve_root, send, &mut recv).await;
             say_failure(send, sent).await;

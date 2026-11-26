@@ -27,6 +27,17 @@ pub const MAX_FILES: usize = 100_000;
 const MAX_DEPTH: usize = 128;
 const CHUNK_SIZE: usize = 64 << 10;
 
+pub const DELETE_REQUIRES_DIR: &str =
+    "--delete requires one directory as the source; it deletes everything else in the destination";
+
+/// Refuses `--delete` when `path` exists and is not a directory.
+pub fn check_delete_dir(path: &Path) -> Result<()> {
+    if fs::metadata(path).is_ok_and(|m| !m.is_dir()) {
+        return Err(KohError::usage(DELETE_REQUIRES_DIR));
+    }
+    Ok(())
+}
+
 /// Simple glob matcher supporting `*`, `?`, and `**` against relative paths and basenames.
 pub fn matches_exclude(rel: &str, patterns: &[String]) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);

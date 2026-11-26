@@ -73,7 +73,7 @@ Global options: --key-file PATH, --direct IP:PORT, --relay-url URL
                 Errors go to stderr (`koh: ...`), and the exit code below says which kind.
 Exit codes: 0 ok, 1 failed (or write error), 2 usage, 3 unreachable, 4 refused, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 128+N signal (141 broken pipe),
-            255 koh internal error (or exec link lost / no exit status after connecting).
+            255 koh internal error (or exec/logs link lost / no exit status or end after connecting).
             (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote
             command's exit status.)
             `koh serve` exits 75 when another `koh serve` already holds its key.

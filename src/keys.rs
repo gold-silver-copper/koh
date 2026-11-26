@@ -1,11 +1,11 @@
-//! Identity keys, peer lists (`servers` and `clients`), and scoped authorization —
-//! compatible with existing `~/.config/koh/` files.
+//! Identity keys and peer lists (`servers` and `clients`) — compatible with existing
+//! `~/.config/koh/` files.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Read as _;
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use iroh::{EndpointId, RelayUrl, SecretKey};
 
@@ -43,68 +43,6 @@ pub enum Route {
     Relay(RelayUrl),
 }
 
-/// Optional scope restricting an allowed client key in `clients`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Scope {
-    Full,
-    Cp(PathBuf),
-    Exec(PathBuf),
-}
-
-impl Scope {
-    /// Checks whether a path is allowed for copy operations under this scope.
-    pub fn check_cp(&self, target: &Path) -> Result<()> {
-        match self {
-            Self::Full => Ok(()),
-            Self::Cp(root) | Self::Exec(root) => check_beneath(root, target),
-        }
-    }
-
-    /// Checks whether a working directory is allowed for exec/run under this scope.
-    pub fn check_exec(&self, cwd: &Path) -> Result<()> {
-        match self {
-            Self::Full => Ok(()),
-            Self::Exec(root) => check_beneath(root, cwd),
-            Self::Cp(_) => Err(KohError::refused("key scope allows only cp")),
-        }
-    }
-
-    /// Interactive sessions and arbitrary jobs require Full scope.
-    pub fn check_full(&self) -> Result<()> {
-        match self {
-            Self::Full => Ok(()),
-            _ => Err(KohError::refused("key scope does not allow this operation")),
-        }
-    }
-}
-
-/// Whether `target` says, by its text, that it is beneath the scope's directory `root`: it
-/// starts with that directory's path (as the `clients` file has it, or resolved) and goes on
-/// with plain names, none of them `..` and none with a NUL in it. Nothing of `target` is
-/// resolved: a symlink beneath `root` leads where it leads.
-fn check_beneath(root: &Path, target: &Path) -> Result<()> {
-    let root = expand_home(root)?;
-    let base = root
-        .canonicalize()
-        .map_err(|e| KohError::refused(format!("scope root {}: {e}", root.display())))?;
-    let beneath = |dir: &Path| {
-        target.strip_prefix(dir).is_ok_and(|rest| {
-            rest.components().all(
-                |c| matches!(c, Component::Normal(name) if !name.as_encoded_bytes().contains(&0)),
-            )
-        })
-    };
-    if beneath(&root) || beneath(&base) {
-        Ok(())
-    } else {
-        Err(KohError::refused(format!(
-            "path {} is outside allowed scope {}",
-            target.display(),
-            base.display()
-        )))
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct ServerEntry {
     pub name: String,
@@ -116,7 +54,6 @@ pub struct ServerEntry {
 pub struct ClientEntry {
     pub name: String,
     pub id: EndpointId,
-    pub scope: Scope,
 }
 
 /// Default config directory (`$KOH_CONFIG_DIR`, else `$XDG_CONFIG_HOME/koh`, else `$HOME/.config/koh`).
@@ -374,21 +311,13 @@ pub fn load_clients(
             on_skipped(i + 1, line);
             continue;
         };
-        let scope = match rest.trim_start() {
-            "" => Scope::Full,
-            field => match field.split_once('=') {
-                Some(("cp", dir)) if !dir.is_empty() => Scope::Cp(PathBuf::from(dir)),
-                Some(("exec", dir)) if !dir.is_empty() => Scope::Exec(PathBuf::from(dir)),
-                _ => {
-                    on_skipped(i + 1, line);
-                    continue;
-                }
-            },
-        };
+        if !rest.trim_start().is_empty() {
+            on_skipped(i + 1, line);
+            continue;
+        }
         out.push(ClientEntry {
             name: name.to_string(),
             id,
-            scope,
         });
     }
     Ok(out)
@@ -402,11 +331,6 @@ pub fn save_clients(key_file: Option<&Path>, entries: &[ClientEntry]) -> Result<
         text.push_str(&e.name);
         text.push(' ');
         text.push_str(&e.id.to_string());
-        match &e.scope {
-            Scope::Full => {}
-            Scope::Cp(dir) => text.push_str(&format!(" cp={}", dir.display())),
-            Scope::Exec(dir) => text.push_str(&format!(" exec={}", dir.display())),
-        }
         text.push('\n');
     }
     atomic_write(&dir.join(Role::Server.list_file()), text.as_bytes())

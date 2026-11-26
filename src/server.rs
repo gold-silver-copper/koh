@@ -1,4 +1,4 @@
-//! `koh serve`: QUIC listener, TLS-bound client auth, scoped authorization,
+//! `koh serve`: QUIC listener, TLS-bound client auth,
 //! raw exec, headless jobs, and sessions, which are fux panes (`session`).
 
 use std::fs;
@@ -20,8 +20,7 @@ use tokio::time::{Instant, timeout_at};
 
 use crate::jobs::JobManager;
 use crate::keys::{
-    ClientEntry, Role, Scope, expand_home, hold_for_serving, home_dir, load_clients,
-    load_or_create_key,
+    Role, expand_home, hold_for_serving, home_dir, load_clients, load_or_create_key,
 };
 use crate::net::{bind_server, close_with, verify_client};
 use crate::proto::{
@@ -108,13 +107,13 @@ struct ServerState {
 }
 
 impl ServerState {
-    fn authorize(&self, id: EndpointId) -> Result<Scope> {
+    fn authorize(&self, id: EndpointId) -> Result<()> {
         if self.extra_allow.contains(&id) {
-            return Ok(Scope::Full);
+            return Ok(());
         }
-        let clients: Vec<ClientEntry> = load_clients(self.key_file.as_deref(), |_, _| {})?;
-        if let Some(entry) = clients.into_iter().find(|c| c.id == id) {
-            return Ok(entry.scope);
+        let clients = load_clients(self.key_file.as_deref(), |_, _| {})?;
+        if clients.iter().any(|c| c.id == id) {
+            return Ok(());
         }
         Err(KohError::refused("client key is not in clients list"))
     }
@@ -314,15 +313,12 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
                     return;
                 }
             };
-            let scope = match st.authorize(client_id) {
-                Ok(scope) => scope,
-                Err(err) => {
-                    let _ = send_msg(&mut send, &Reply::from_err(&err), MAX_CTRL).await;
-                    let _ = send.finish();
-                    close_with(&conn_clone, CloseCode::Refused);
-                    return;
-                }
-            };
+            if let Err(err) = st.authorize(client_id) {
+                let _ = send_msg(&mut send, &Reply::from_err(&err), MAX_CTRL).await;
+                let _ = send.finish();
+                close_with(&conn_clone, CloseCode::Refused);
+                return;
+            }
             proven.store(true, Ordering::Relaxed);
             let req: Request = match recv_msg(&mut recv, MAX_CTRL).await {
                 Ok(r) => r,
@@ -331,7 +327,7 @@ async fn handle_connection(conn: Connection, state: Arc<ServerState>, prove_by: 
                     return;
                 }
             };
-            if let Err(err) = dispatch(req, scope, &st, &mut send, recv).await {
+            if let Err(err) = dispatch(req, &st, &mut send, recv).await {
                 let _ = send_msg(&mut send, &Reply::from_err(&err), MAX_CTRL).await;
             }
             let _ = send.finish();
@@ -351,7 +347,6 @@ fn resolve_cwd(cwd: Option<&str>) -> Result<PathBuf> {
 
 async fn dispatch(
     req: Request,
-    scope: Scope,
     state: &ServerState,
     send: &mut SendStream,
     recv: RecvStream,
@@ -359,7 +354,6 @@ async fn dispatch(
     match req {
         Request::Exec { argv, cwd, shell } => {
             let dir = resolve_cwd(cwd.as_deref())?;
-            scope.check_exec(&dir)?;
             handle_exec(&argv, &dir, shell, send, recv).await
         }
         Request::Run {
@@ -369,7 +363,6 @@ async fn dispatch(
             shell,
         } => {
             let dir = resolve_cwd(cwd.as_deref())?;
-            scope.check_exec(&dir)?;
             // (A start is file work and a process made: not on a thread that serves requests.)
             let jobs = state.jobs.clone();
             let start = move || JobManager::start(&jobs, name, &argv, &dir, shell);
@@ -379,7 +372,6 @@ async fn dispatch(
             send_msg(send, &info, MAX_CTRL).await
         }
         Request::Jobs { name } => {
-            scope.check_full()?;
             let list = {
                 let guard = state
                     .jobs
@@ -396,7 +388,6 @@ async fn dispatch(
             all,
             follow,
         } => {
-            scope.check_full()?;
             let handle = {
                 let guard = state
                     .jobs
@@ -469,7 +460,6 @@ async fn dispatch(
             Ok(())
         }
         Request::Kill { name, signal } => {
-            scope.check_full()?;
             let info = JobManager::kill(&state.jobs, &name, signal).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_msg(send, &info, MAX_CTRL).await
@@ -479,7 +469,6 @@ async fn dispatch(
             tail,
             timeout_secs,
         } => {
-            scope.check_full()?;
             let handle = {
                 let guard = state
                     .jobs
@@ -498,19 +487,16 @@ async fn dispatch(
             send_msg(send, &res, MAX_FRAME).await
         }
         Request::Attach(asked) => {
-            scope.check_full()?;
             let dir = resolve_cwd(asked.cwd.as_deref())?;
             state.sessions.attach(asked, &dir, send, recv).await
         }
-        // The three that read a session's folder: a full key's, as an attach is.
+        // The three that read a session's folder.
         Request::Sessions => {
-            scope.check_full()?;
             let list = encode(&state.sessions.list().await?, usize::MAX)?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_pieces(send, &list).await
         }
         Request::Output { session, last } => {
-            scope.check_full()?;
             let text = state.sessions.output(&session, last).await?;
             send_msg(send, &Reply::Ok, MAX_CTRL).await?;
             send_pieces(send, &text).await
@@ -518,10 +504,7 @@ async fn dispatch(
         Request::WaitSession {
             session,
             timeout_secs,
-        } => {
-            scope.check_full()?;
-            state.sessions.wait(&session, timeout_secs, send).await
-        }
+        } => state.sessions.wait(&session, timeout_secs, send).await,
     }
 }
 

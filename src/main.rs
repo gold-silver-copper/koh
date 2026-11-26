@@ -65,11 +65,11 @@ fn main() -> ExitCode {
             return ExitCode::from(err.code.0);
         }
     };
-    let serving = args.first().map(String::as_str) == Some("serve");
+    let streams_stdin = matches!(args.first().map(String::as_str), Some("exec" | "rsh"));
     let done = rt.block_on(run(args));
-    if !serving {
-        // Every client command has finished its I/O, terminal reset, and connection close before
-        // `run` returns; a blocked read of stdin (or a stuck terminal writer) does not hold exit.
+    if streams_stdin {
+        // Output has been flushed and the connection closed before `run` returns;
+        // a blocked read of stdin does not hold `exec` or `rsh` after the remote command ends.
         rt.shutdown_background();
     }
     match done {

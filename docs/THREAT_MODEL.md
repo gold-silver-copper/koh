@@ -41,12 +41,14 @@ a QUIC handshake: the transport does not know the allowlist.
   out for as long as they keep at it. Each stream may also hold unread data up to the
   transport's window (about 1.25 MB) until its connection is closed.
 
-## 2. A client with an allowed key and no scope
+## 2. A client with an allowed key
 
 It is the server's user: it runs any command (`koh exec`, `koh rsh`, `koh run`), and attaches to
 any session, lists them, reads their text and
 waits for their commands (`koh sessions`, `koh output`, `koh wait --session`, which read a
-session's folder as a script of that user would: `src/pane.rs`). There is nothing to escalate to. Its
+session's folder as a script of that user would: `src/pane.rs`). There is no narrower key, and
+there is nothing to escalate to; to separate trust, run `koh serve` under another user account
+or on another machine. Its
 sessions are `fux` panes of the server's user, in a `fux` session of koh's own beneath the
 server's state (`src/session.rs`): it starts them, types into them, resizes them and hangs
 them up (a pane's `ctl`), and says what its terminal is like, which the server writes into
@@ -69,7 +71,7 @@ have it show another pane, another workspace, or run a script.
   and the two files are written once the attach will be shown a session, not before (one
   that is refused for its run, its name or the server's cap changes nothing; one whose
   program then cannot be started has written them).
-  The two files are the server's and not one session's: a client with an unscoped key
+  The two files are the server's and not one session's: a client with an allowed key
   chooses what the programs of every session there are told of their terminal's colours and
   keyboard, until the next attach says otherwise. For each attach
   the server runs one viewer on one pty, and ends it with the attach; a client's newer
@@ -91,42 +93,19 @@ have it show another pane, another workspace, or run a script.
   times a second, and between two looks sees that its client's stream has ended: it looks no
   more. A look that has begun is finished; so is a read for `koh output` or `koh sessions`,
   whose client is not looked for until the answer is sent.)
+- **Allowlist (`clients`).** Every line must be `NAME ID` (plus blank lines and `#` comments).
+  Any line with an extra field (including an older `cp=…` or `exec=…` line) is skipped and gives
+  that key nothing (exit 4): `koh clients` names each skipped line on stderr with its line number,
+  and the next `koh clients add`, `rm`, or `rename` writes the file without it. The file is read
+  anew for each request, so removing a key takes effect on its next request; what it already
+  started goes on.
 - **No deadline once a key is proved.** The 10 s are for the proof alone: after it, the request
   itself may come as slowly as its sender likes, and a connection that has proved a key may
-  stay, asking nothing, for as long as it is kept alive. So a client with any allowed key, a
-  scoped one too, can hold places idle, up to all of them; a key taken out of `clients` keeps
-  the connections it has until they ask for something again.
+  stay, asking nothing, for as long as it is kept alive. So a client with any allowed key can
+  hold places idle, up to all of them; a key taken out of `clients` keeps the connections it has
+  until they ask for something again.
 
-## 3. A client with a scoped key
-
-`koh clients add NAME ID --cp DIR` or `--exec DIR` (`src/keys.rs`, `Scope`).
-
-- **`--cp DIR`** is kept in `clients` until scoped keys are removed; with file copy removed from
-  the protocol, every request under it is refused (exit 4).
-- A `DIR` written in `clients` as its resolved path refuses a path that reaches it by another
-  name (`/var/home/u` for `/home/u`, `/private/tmp` for `/tmp`): only `DIR` is resolved. That
-  refuses more, never less.
-- **`--exec DIR`** runs commands and starts jobs whose starting directory is beneath `DIR` by
-  the text of the path: it must begin with `DIR` (as `clients` has it or as `DIR` resolves) and
-  go on with plain names (no `..`, no NUL). The path itself is not resolved (`src/keys.rs`,
-  `check_beneath`), so a symlink beneath `DIR` leads where it leads. **It is not a sandbox:** the
-  command is any command,
-  run as the server's user, and reaches whatever that user can. Every other request is refused:
-  a session (the scope is looked at before the name, the run or anything else of an
-  attach, and before anything is made) and everything about jobs but starting one (their
-  list, their logs, a wait for one, killing one). Treat it as a full key
-  that cannot open a terminal.
-- A scope is read with each request, so narrowing or removing a key takes effect on its next
-  request; what it already started goes on.
-- In `clients`, only an absent scope grants unrestricted access, and `DIR` after `cp=` or
-  `exec=` is read verbatim to the end of the line (spaces preserved, no trailing trim, no
-  inline `#` comments). A line with an unrecognized scope or no `DIR` (`cp=`, `exec=`) is
-  skipped and gives that client nothing; `koh clients` names each skipped line on stderr with
-  its line number, and the next `koh clients add`, `rm`, or `rename` writes the file without
-  it. `koh clients add` refuses a `DIR` that is empty, is not UTF-8, or contains `\n` or `\r`
-  (exit 2).
-
-## 4. A server a client dials
+## 3. A server a client dials
 
 A wrong endpoint id, or a host someone else now controls.
 

@@ -72,10 +72,15 @@ fn read_wait(
     }
 }
 
-/// Writes all of `bytes` to an unbuffered fd, waiting on `POLLOUT` if non-blocking.
-fn write_wait(mut w: &File, mut bytes: &[u8]) {
-    while !bytes.is_empty() {
-        match w.write(bytes) {
+/// Writes all of `bytes` to `w` and flushes, waiting on `POLLOUT` if non-blocking.
+fn write_wait(mut w: impl std::io::Write + std::os::fd::AsFd, mut bytes: &[u8]) {
+    loop {
+        let res = if bytes.is_empty() {
+            w.flush().map(|()| 0)
+        } else {
+            w.write(bytes)
+        };
+        match res {
             Ok(0) => break,
             Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -243,13 +248,6 @@ impl Client {
             let _ = send.finish();
         });
 
-        let raw_fd = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().ok().map(File::from);
-        let out_fd = (!capture_json)
-            .then(|| raw_fd(std::io::stdout().as_fd()))
-            .flatten();
-        let err_fd = (!capture_json)
-            .then(|| raw_fd(std::io::stderr().as_fd()))
-            .flatten();
         let mut cap_out = Vec::new();
         let mut cap_err = Vec::new();
         let mut exit_code = 0i32;
@@ -258,15 +256,15 @@ impl Client {
                 ExecServerMsg::Stdout(bytes) => {
                     if capture_json {
                         cap_out.extend_from_slice(&bytes);
-                    } else if let Some(ref f) = out_fd {
-                        write_wait(f, &bytes);
+                    } else {
+                        write_wait(std::io::stdout().lock(), &bytes);
                     }
                 }
                 ExecServerMsg::Stderr(bytes) => {
                     if capture_json {
                         cap_err.extend_from_slice(&bytes);
-                    } else if let Some(ref f) = err_fd {
-                        write_wait(f, &bytes);
+                    } else {
+                        write_wait(std::io::stderr().lock(), &bytes);
                     }
                 }
                 ExecServerMsg::Exit(code) => {

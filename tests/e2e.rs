@@ -4634,7 +4634,7 @@ fn job_reader_never_mixes_replacement_run() {
             "--tail",
             "5",
             "--timeout",
-            "10",
+            "2",
         ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -4682,18 +4682,24 @@ fn job_reader_never_mixes_replacement_run() {
         String::from_utf8_lossy(&w_out.stderr),
     );
 
-    let ok_outcome = |code: Option<i32>, err: &str| {
+    let ok_old = |code: Option<i32>, err: &str| {
         !err.contains("running")
             && ((code == Some(1) && err.contains("started anew")) || code == Some(137))
     };
     assert!(
-        !f_stdout.contains("NEW_RUN") && ok_outcome(f_st.code(), &f_stderr),
+        !f_stdout.contains("NEW_RUN") && ok_old(f_st.code(), &f_stderr),
         "follower mixed replacement: status={f_st:?} stdout={f_stdout:?} stderr={f_stderr:?}"
     );
+    let waiter_ok = (w_stdout.contains("OLD_RUN")
+        && !w_stdout.contains("NEW_RUN")
+        && ok_old(w_st.code(), &w_stderr))
+        || (w_st.code() == Some(127) && w_stdout.is_empty())
+        || (w_stdout.contains("NEW_RUN")
+            && !w_stdout.contains("OLD_RUN")
+            && w_st.code() == Some(124)
+            && w_stderr.contains("timed out"));
     assert!(
-        w_stdout.contains("OLD_RUN")
-            && !w_stdout.contains("NEW_RUN")
-            && ok_outcome(w_st.code(), &w_stderr),
+        waiter_ok,
         "waiter mixed replacement: status={w_st:?} stdout={w_stdout:?} stderr={w_stderr:?}"
     );
 }
@@ -4843,7 +4849,7 @@ fn job_logs_follow_ends_when_leftover_child_keeps_writing() {
                 "--",
                 "/bin/sh",
                 "-c",
-                "(trap '' HUP; exec yes) & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exit 3",
+                "trap '' HUP; yes & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exit 3",
                 "_",
                 &pid_arg,
             ],

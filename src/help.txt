@@ -13,9 +13,14 @@ Keys & peers:
             (needs kill(1) on its PATH: jobs are ended and commands hung up with it;
              and id(1) where XDG_RUNTIME_DIR is not set: its state is kept under `id -u`)
 
-Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop):
+Raw commands (no PTY; separate stdout/stderr; stdin EOF; hangup on drop while stdin is open):
   koh exec SERVER [--sync DIR] [-C DIR] [--json] -- PROG ARG...
   koh exec SERVER [--sync DIR] [-C DIR] [--json] --sh 'SHELL LINE'
+  koh rsh HOST WORD...                           ssh-shaped exec (words joined with spaces for sh -c)
+            rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
+            GIT_SSH_COMMAND='koh rsh' git clone box:repo.git
+            tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
+            (only --key-file, --direct, --relay-url, -- before HOST; ssh flags like -l/-p/-o exit 2)
 
 Headless persistent jobs (raw append-only logs; outlive koh and network drops):
   koh run SERVER [--name NAME] [--sync DIR] [-C DIR] [--json] -- PROG ARG...
@@ -56,9 +61,9 @@ Sessions (each a fux pane on the server, in koh's own fux session, kept by `koh 
             (--last and wait go by a shell's marks of its prompts, OSC 133: `koh help-agents`
             has the lines for bash, and nearly the same three as a script over the files.)
 
-Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json
+Global options: --key-file PATH, --direct IP:PORT, --relay-url URL, --json (not rsh)
 Exit codes: 0 ok, 1 failed, 2 usage, 3 unreachable, 4 refused/out-of-scope, 75 busy,
             124 timeout, 126 cannot start, 127 not found, 255 koh internal error.
-            (`exec`, `wait`, `logs -f` and `connect` exit with the remote
+            (`exec`, `rsh`, `wait`, `logs -f` and `connect` exit with the remote
             command's exit status.)
             `koh serve` exits 75 when another `koh serve` already holds its key.

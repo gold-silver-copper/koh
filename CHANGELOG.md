@@ -15,6 +15,19 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+### Added
+
+- **`koh rsh HOST WORD…` lets `rsync` and `git` run directly over koh.** Commands such as
+  `rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/`,
+  `rsync -a -e 'koh rsh' box:dst/ dst/`, and `GIT_SSH_COMMAND='koh rsh' git push`/`git clone`
+  now work without a wrapper script. `koh rsh` takes a saved server name or endpoint id as `HOST`,
+  joins `WORD…` with spaces, and runs them with `/bin/sh -c` over the existing `exec` request
+  (`koh/20`), preserving stdout, stderr, and the remote exit status; non-terminal stdin is
+  forwarded, and terminal stdin is sent as EOF. Only `--key-file`, `--direct`, and `--relay-url`
+  (and `--`) are accepted before `HOST`; ssh flags that koh cannot honour (`-l`, `-p`, `-o`, etc.)
+  are refused with exit 2. A command exceeding the 1 MiB control frame bound exits 2 for both
+  `exec` and `rsh`. Only clients need this.
+
 ### Security
 
 - **A `clients` line with an unreadable scope no longer grants full access, and a scope `DIR`
@@ -35,6 +48,14 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ### Fixed
 
+- **`koh exec` and `koh rsh` now exit as soon as the remote command ends, even if local stdin
+  stays open.** Previously, `(sleep 8) | koh exec box -- echo hi` printed `hi` and waited 8 seconds
+  until stdin closed, and `rsync` over koh hung at the end of a transfer because `rsync` keeps its
+  pipe to the remote shell open until the remote shell exits (dropping the tokio runtime waited on
+  a blocked read of stdin). `koh exec` and `koh rsh` now shut down the runtime in the background
+  after their output has been flushed and the connection closed, and wait on readiness (`poll`) if
+  a caller such as macOS `openrsync` passes non-blocking stdin/stdout/stderr descriptors instead of
+  treating `EAGAIN` as EOF or dropping streamed (non-`--json`) output. Only clients need this.
 - **Several `koh` processes of one client no longer knock each other's links down.** The 0.18.0
   rewrite bound each client endpoint with `client.key` again (a regression of 0.16.0's #68), so
   parallel processes from one machine shared one iroh endpoint id: of two `koh connect` started

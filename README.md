@@ -9,7 +9,18 @@ Rewritten from scratch on `fux` 0.43 and `fuxix` 0.12 (about 6,200 lines of `src
   compatible with existing `~/.config/koh/{client.key,server.key,servers,clients}` files, QR codes
   on `koh serve` / `koh id --qr`, and `--cp`/`--exec` path-scoped keys.
 - **Layer 2 — Raw Streams & Delta Sync (no PTY):**
-  - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF, SIGHUP on disconnect.
+  - `koh exec`: raw separate stdout/stderr, binary-clean, stdin EOF (SIGHUP on disconnect while
+    stdin is still open; a command whose stdin has ended runs on).
+  - `koh rsh HOST WORD…`: ssh's argument shape over `exec` (`WORD…` joined with spaces and run via
+    `/bin/sh -c` on the server; same streams and remote exit status), so `rsync -e 'koh rsh'` and
+    `GIT_SSH_COMMAND='koh rsh'` work with no wrapper. Accepts only `--key-file`, `--direct`,
+    `--relay-url`, and `--` before `HOST`; ssh options such as `-l`, `-p`, and `-o` exit 2. An
+    address with a user (`git@box:repo.git`) is not understood; use the server's saved name as the
+    host (`box:repo.git`). If your git configuration sets `ssh.variant = ssh`, pass
+    `git -c ssh.variant=simple` so git does not add `-o`. A remote path containing non-UTF-8 bytes
+    needs rsync's `-s` (push and pull; koh requires UTF-8 command-line arguments). If you interrupt
+    an rsync transfer, wait about 20 s before running again: the remote rsync may live until the
+    idle timeout and with `--partial` can rename its piece over a file a later run completed.
   - `koh run` / `jobs` / `logs` / `wait` / `kill`: detached headless jobs backed by raw append-only
     log files (no 80-column wrapping, no screen truncation). The server ends them with `kill(1)`,
     which must be on its `PATH`; so must `id(1)` where `XDG_RUNTIME_DIR` is not set.
@@ -231,6 +242,12 @@ koh serve
 koh servers add box <server-id>
 koh exec box -- uname -a
 koh exec box --sync proj -- cargo test
+rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/
+rsync -a -e 'koh rsh' box:dst/ dst/
+koh rsh box git init -q --bare repo.git
+GIT_SSH_COMMAND='koh rsh' git push box:repo.git HEAD:refs/heads/main
+GIT_SSH_COMMAND='koh rsh' git clone -b main box:repo.git
+tar -C src -cf - . | koh rsh box 'mkdir -p dst && tar -C dst -xf -'
 koh run box --name build -- make -j4 && koh wait box build
 koh cp -r --exclude target ./src box:proj/
 koh connect box

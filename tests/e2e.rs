@@ -4567,3 +4567,363 @@ async fn server_refuses_bad_clients_line_and_enforces_spaced_scope_dir() {
     }
     srv.shutdown().await;
 }
+
+fn wait_child(child: &mut std::process::Child, secs: u64, what: &str) -> std::process::ExitStatus {
+    let until = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            return st;
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} timed out after {secs}s");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn box_sh(host: &Host, script: &str) {
+    let addr = host.addr();
+    let add = ["servers", "add", "box", &host.id, "--direct", &addr];
+    assert!(host.koh(&add).status().unwrap().success());
+    let bin = Path::new(env!("CARGO_BIN_EXE_koh")).parent().unwrap();
+    let mut paths = vec![bin.to_path_buf()];
+    if let Some(old) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&old));
+    }
+    let mut child = Command::new("/bin/sh")
+        .args(["-ec", script])
+        .current_dir(&host.tmp.0)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+        .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+        .env("XDG_CONFIG_HOME", host.tmp.0.join("xdg_cfg"))
+        .env("HOME", host.tmp.0.join("home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out_r = child.stdout.take().unwrap();
+    let mut err_r = child.stderr.take().unwrap();
+    let out_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_r.read_to_end(&mut b);
+        b
+    });
+    let err_t = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_r.read_to_end(&mut b);
+        b
+    });
+    let status = wait_child(&mut child, 30, "box_sh");
+    let (stdout, stderr) = (out_t.join().unwrap(), err_t.join().unwrap());
+    assert!(
+        status.success(),
+        "status={status:?}\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr),
+    );
+}
+
+#[test]
+fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
+    let host = Host::start("exec-open-stdin", &[]);
+    let addr = host.addr();
+    let run_open = |args: &[&str]| {
+        let mut child = host
+            .koh(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let _hold = child.stdin.take().unwrap();
+        let mut out = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            buf
+        });
+        let st = wait_child(&mut child, 5, "koh with open stdin");
+        (st.code(), reader.join().unwrap())
+    };
+    let (rc, out) = run_open(&[
+        "exec",
+        &host.id,
+        "--direct",
+        &addr,
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'hi\\n'; exit 7",
+    ]);
+    assert_eq!((rc, out.as_slice()), (Some(7), b"hi\n".as_slice()));
+    let awk = "BEGIN { for (i = 0; i < 4096; i++) printf \"0123456789abcdef0123456789abcdef\\n\" }";
+    let (rc, out) = run_open(&["exec", &host.id, "--direct", &addr, "--", "awk", awk]);
+    assert_eq!(rc, Some(0));
+    assert_eq!(out, b"0123456789abcdef0123456789abcdef\n".repeat(4096));
+    let (rc, out) = run_open(&[
+        "rsh",
+        "--direct",
+        &addr,
+        &host.id,
+        "printf 'rsh-hi\\n'; exit 11",
+    ]);
+    assert_eq!((rc, out.as_slice()), (Some(11), b"rsh-hi\n".as_slice()));
+
+    // At the lowest open-fd limit where `koh exec` can bind, both stdout and stderr arrive
+    // without needing spare descriptors to duplicate them.
+    box_sh(
+        &host,
+        "found=0
+         for n in 10 11 12 13 14 15 16 18 20 24 32; do
+           set +e
+           (ulimit -n \"$n\" 2>/dev/null && exec koh exec box -- /bin/sh -c 'printf O; printf E >&2') >o 2>e
+           rc=$?
+           set -e
+           if [ \"$rc\" = 0 ]; then
+             found=1
+             [ \"$(cat o)\" = O ]
+             [ \"$(cat e)\" = E ]
+             break
+           fi
+         done
+         [ \"$found\" = 1 ]",
+    );
+}
+
+#[test]
+fn exec_and_rsh_handle_nonblocking_socketpair() {
+    use std::net::Shutdown;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    let host = Host::start("nonblock-sock", &[]);
+    let addr = host.addr();
+
+    // Non-blocking stdin: send second line only after first has been echoed; wait for child first.
+    let (mut peer, sock) = UnixStream::pair().unwrap();
+    sock.set_nonblocking(true).unwrap();
+    let mut peer_r = peer.try_clone().unwrap();
+    let mut child = host
+        .koh(&[
+            "exec",
+            &host.id,
+            "--direct",
+            &addr,
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat; exit 37",
+        ])
+        .stdin(OwnedFd::from(sock.try_clone().unwrap()))
+        .stdout(OwnedFd::from(sock))
+        .spawn()
+        .unwrap();
+    let (echoed_tx, echoed_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let mut notified = false;
+        while let Ok(n @ 1..) = peer_r.read(&mut buf) {
+            got.extend_from_slice(&buf[..n]);
+            if !notified && got.starts_with(b"hello\n") {
+                notified = true;
+                let _ = echoed_tx.send(());
+            }
+        }
+        got
+    });
+    peer.write_all(b"hello\n").unwrap();
+    echoed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first line was not echoed");
+    peer.write_all(b"world\n").unwrap();
+    peer.shutdown(Shutdown::Write).unwrap();
+    assert_eq!(
+        wait_child(&mut child, 10, "nonblock stdin").code(),
+        Some(37)
+    );
+    assert_eq!(reader.join().unwrap(), b"hello\nworld\n");
+
+    // Non-blocking stdout and stderr: 1.5 MiB (exceeds default Unix socket buffers) with a
+    // delayed small-buffer reader arrives whole on each stream.
+    let expected: Vec<u8> = (0..15000)
+        .flat_map(|i| format!("{i:099}\n").into_bytes())
+        .collect();
+    for (to_stderr, code) in [(false, 19), (true, 17)] {
+        let (mut peer, sock) = UnixStream::pair().unwrap();
+        sock.set_nonblocking(true).unwrap();
+        let redir = if to_stderr { " >&2" } else { "" };
+        let cmd = format!(
+            "awk 'BEGIN {{ for (i = 0; i < 15000; i++) printf \"%099d\\n\", i }}'{redir}; exit {code}"
+        );
+        let mut child_cmd = host.koh(&["rsh", "--direct", &addr, &host.id, &cmd]);
+        if to_stderr {
+            child_cmd.stderr(OwnedFd::from(sock));
+        } else {
+            child_cmd
+                .stdin(OwnedFd::from(sock.try_clone().unwrap()))
+                .stdout(OwnedFd::from(sock));
+        }
+        let mut child = child_cmd.spawn().unwrap();
+        drop(child_cmd);
+        peer.shutdown(Shutdown::Write).unwrap();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            let mut out = Vec::new();
+            let mut buf = [0u8; 256];
+            while let Ok(n @ 1..) = peer.read(&mut buf) {
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        });
+        let st = wait_child(&mut child, 15, "nonblock output");
+        let out = reader.join().unwrap();
+        assert_eq!(st.code(), Some(code));
+        assert_eq!(out.len(), expected.len());
+        assert_eq!(out, expected);
+    }
+}
+
+#[test]
+fn rsh_options_rsync_and_git() {
+    let host = Host::start("rsh-e2e", &[]);
+    let direct_cmd = format!(
+        "koh rsh --direct {} {} printf ok >o
+         [ \"$(cat o)\" = ok ]
+         koh servers add -box {} --direct {}
+         koh rsh -- -box printf ok >o
+         [ \"$(cat o)\" = ok ]",
+        host.addr(),
+        host.id,
+        host.id,
+        host.addr(),
+    );
+    box_sh(
+        &host,
+        &format!(
+            "set +e; koh rsh box 'printf out; printf err >&2; exit 9' >o 2>e; rc=$?; set -e
+             [ \"$rc\" = 9 ]
+             [ \"$(cat o)\" = out ]
+             [ \"$(cat e)\" = err ]
+             printf 'in\\n' | koh rsh box cat >o
+             [ \"$(cat o)\" = in ]
+             koh rsh -- box printf %s --json >o
+             [ \"$(cat o)\" = --json ]
+             {direct_cmd}
+             for f in -G -o -l -p --json; do
+               set +e; koh rsh \"$f\" box --json >o 2>e; rc=$?; set -e
+               [ \"$rc\" = 2 ]
+               [ ! -s o ]
+               grep -Fq -- \"$f\" e
+               grep -Fq 'rsh does not support' e
+             done
+             set +e; koh rsh nosuchhostxyz printf %s --json >o 2>e; rc=$?; set -e
+             [ \"$rc\" = 2 ]
+             [ ! -s o ]
+             [ -s e ]
+             set +e; koh rsh box >o 2>e; rc=$?; set -e
+             [ \"$rc\" = 2 ]
+             [ ! -s o ]
+             grep -Fq usage e"
+        ),
+    );
+
+    // Commands over MAX_CTRL (1 MiB) exit 2 (usage) for both rsh and exec, where OS allows spawn.
+    let big_word = "x".repeat(130);
+    for head in [&["rsh", "box"][..], &["exec", "box", "--"][..]] {
+        let mut over = host.koh(head);
+        for _ in 0..9000 {
+            over.arg(&big_word);
+        }
+        if let Ok(out) = over
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+        {
+            assert_eq!(out.status.code(), Some(2));
+            assert!(out.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
+        }
+    }
+
+    let (src, dst) = (host.tmp.0.join("src"), host.tmp.0.join("home/dst"));
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::create_dir_all(src.join("target")).unwrap();
+    fs::create_dir_all(dst.join("target")).unwrap();
+    let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs::write(src.join("big.bin"), &big).unwrap();
+    fs::write(src.join("sub/with space.txt"), b"spaced\n").unwrap();
+    std::os::unix::fs::symlink("sub/with space.txt", src.join("link_s")).unwrap();
+    fs::write(src.join("target/ignored.txt"), b"skip").unwrap();
+    fs::write(dst.join("stray.txt"), b"bye").unwrap();
+    fs::write(dst.join("target/keep.txt"), b"stay").unwrap();
+
+    box_sh(
+        &host,
+        "tar -C src -cf - . | koh rsh box 'mkdir -p tardst && tar -C tardst -xf -'",
+    );
+    let tar_f = host.tmp.0.join("home/tardst/sub/with space.txt");
+    assert_eq!(fs::read(tar_f).unwrap(), b"spaced\n");
+
+    if Command::new("rsync").arg("--version").output().is_err() {
+        eprintln!("skipping rsync in rsh_options_rsync_and_git: rsync not installed");
+    } else {
+        let sync = "rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/";
+        box_sh(&host, sync);
+        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), big);
+        assert_eq!(
+            fs::read(dst.join("sub/with space.txt")).unwrap(),
+            b"spaced\n"
+        );
+        let link = fs::read_link(dst.join("link_s")).unwrap();
+        assert_eq!(link, Path::new("sub/with space.txt"));
+        assert!(!dst.join("stray.txt").exists() && !dst.join("target/ignored.txt").exists());
+        assert_eq!(fs::read(dst.join("target/keep.txt")).unwrap(), b"stay");
+
+        let inos = || {
+            (
+                fs::metadata(dst.join("big.bin")).unwrap().ino(),
+                fs::metadata(dst.join("sub/with space.txt")).unwrap().ino(),
+            )
+        };
+        let before = inos();
+        box_sh(&host, sync);
+        assert_eq!(inos(), before, "second rsync rewrote unchanged files");
+
+        box_sh(&host, "rsync -a -e 'koh rsh' box:dst/ pulled/");
+        assert_eq!(fs::read(host.tmp.0.join("pulled/big.bin")).unwrap(), big);
+        let p_sp = host.tmp.0.join("pulled/sub/with space.txt");
+        assert_eq!(fs::read(p_sp).unwrap(), b"spaced\n");
+        let p_lk = fs::read_link(host.tmp.0.join("pulled/link_s")).unwrap();
+        assert_eq!(p_lk, Path::new("sub/with space.txt"));
+    }
+
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipping git in rsh_options_rsync_and_git: git not installed");
+    } else {
+        box_sh(
+            &host,
+            "koh rsh box git init -q --bare demo.git
+             mkdir work
+             cd work
+             git init -q
+             printf 'from-git\\n' > hello.txt
+             git add hello.txt
+             git commit -qm init
+             GIT_SSH_COMMAND='koh rsh' git push box:demo.git HEAD:refs/heads/main
+             cd ..
+             GIT_SSH_COMMAND='koh rsh' git clone -b main box:demo.git cloned",
+        );
+        let cloned = host.tmp.0.join("cloned/hello.txt");
+        assert_eq!(fs::read(cloned).unwrap(), b"from-git\n");
+    }
+}

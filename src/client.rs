@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, RelayUrl, SecretKey};
-use tokio::io::AsyncReadExt as _;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 use tokio::time::Instant as Timer;
@@ -55,6 +54,34 @@ pub struct Client {
     /// Where the server is, for a connection made anew on the same endpoint.
     addr: EndpointAddr,
     conn: Connection,
+}
+
+/// Retries `op` on `Interrupted`/`WouldBlock`, waiting on `event` when the fd is non-blocking.
+fn io_wait<W: std::os::fd::AsFd, T>(
+    w: &mut W,
+    event: i16,
+    mut op: impl FnMut(&mut W) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    loop {
+        match op(w) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                fuxix::wait([(Some(w.as_fd()), event)], -1)?;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Writes all of `bytes` to `w` and flushes, waiting on `POLLOUT` if non-blocking.
+fn write_wait(mut w: impl std::io::Write + std::os::fd::AsFd, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match io_wait(&mut w, fuxix::POLLOUT, |w| w.write(bytes)) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => bytes = bytes.get(n..).unwrap_or_default(),
+        }
+    }
+    let _ = io_wait(&mut w, fuxix::POLLOUT, std::io::Write::flush);
 }
 
 /// A session's text as it was sent, in pieces: what of it is no UTF-8 is shown as U+FFFD.
@@ -179,12 +206,18 @@ impl Client {
                 }
                 let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
             } else if !std::io::stdin().is_terminal() {
-                let mut stdin = tokio::io::stdin();
                 let mut buf = vec![0u8; 32 << 10];
                 loop {
-                    match stdin.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
+                    let read = tokio::task::spawn_blocking(move || {
+                        let mut stdin = std::io::stdin().lock();
+                        let n = io_wait(&mut stdin, fuxix::POLLIN, |s| s.read(&mut buf));
+                        (n, buf)
+                    })
+                    .await;
+                    match read {
+                        Ok((Ok(0), _)) | Ok((Err(_), _)) | Err(_) => break,
+                        Ok((Ok(n), b)) => {
+                            buf = b;
                             if let Some(slice) = buf.get(..n)
                                 && send_msg(
                                     &mut send,
@@ -197,7 +230,6 @@ impl Client {
                                 return;
                             }
                         }
-                        Err(_) => break,
                     }
                 }
                 let _ = send_msg(&mut send, &ExecClientMsg::Eof, MAX_CTRL).await;
@@ -216,16 +248,14 @@ impl Client {
                     if capture_json {
                         cap_out.extend_from_slice(&bytes);
                     } else {
-                        let _ = std::io::stdout().write_all(&bytes);
-                        let _ = std::io::stdout().flush();
+                        write_wait(std::io::stdout().lock(), &bytes);
                     }
                 }
                 ExecServerMsg::Stderr(bytes) => {
                     if capture_json {
                         cap_err.extend_from_slice(&bytes);
                     } else {
-                        let _ = std::io::stderr().write_all(&bytes);
-                        let _ = std::io::stderr().flush();
+                        write_wait(std::io::stderr().lock(), &bytes);
                     }
                 }
                 ExecServerMsg::Exit(code) => {

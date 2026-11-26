@@ -12,7 +12,7 @@ use koh::keys::{
     parse_endpoint_id, parse_relay_url, render_qr, reset_key, save_clients, save_servers,
     validate_peer_name,
 };
-use koh::proto::SessionInfo;
+use koh::proto::{MAX_CTRL, Request, SessionInfo, encode};
 use koh::server::{ServeOptions, cap, run_serve};
 use koh::{Exit, KohError, Result};
 
@@ -43,7 +43,8 @@ fn main() -> ExitCode {
         Some("hold") => return fux::command(words),
         _ => {}
     }
-    let json = std::env::args_os().skip(1).any(|a| a == "--json");
+    let json = words.peek().is_none_or(|w| w != "rsh")
+        && std::env::args_os().skip(1).any(|a| a == "--json");
     let Ok(args) = words
         .map(std::ffi::OsString::into_string)
         .collect::<std::result::Result<Vec<String>, _>>()
@@ -63,7 +64,14 @@ fn main() -> ExitCode {
             return ExitCode::from(err.code.0);
         }
     };
-    match rt.block_on(run(args)) {
+    let streams_stdin = matches!(args.first().map(String::as_str), Some("exec" | "rsh"));
+    let done = rt.block_on(run(args));
+    if streams_stdin {
+        // Output has been flushed and the connection closed before `run` returns;
+        // a blocked read of stdin does not hold `exec` or `rsh` after the remote command ends.
+        rt.shutdown_background();
+    }
+    match done {
         Ok(code) => ExitCode::from(code.0),
         Err(err) => {
             report_err(&err, json);
@@ -110,6 +118,7 @@ async fn run(args: Vec<String>) -> Result<Exit> {
         "clients" => cmd_clients(rest),
         "serve" => cmd_serve(rest).await,
         "exec" => cmd_exec(rest).await,
+        "rsh" => cmd_rsh(rest).await,
         "run" => cmd_run(rest).await,
         "jobs" => cmd_jobs(rest).await,
         "logs" => cmd_logs(rest).await,
@@ -432,12 +441,7 @@ fn parse_common_dial(args: &[String], i: &mut usize, opts: &mut DialOptions) -> 
 }
 
 async fn cmd_exec(args: &[String]) -> Result<Exit> {
-    let mut opts = DialOptions {
-        key_file: None,
-        direct: None,
-        relay: None,
-        json: false,
-    };
+    let mut opts = DialOptions::default();
     let (mut server, mut cwd, mut sync_dir, mut sh_line) = (
         None::<String>,
         None::<String>,
@@ -480,7 +484,29 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
         }
     };
 
-    let client = Client::connect(&server, &opts, false).await?;
+    run_exec(&server, &opts, argv, cwd, shell, sync_dir, excludes).await
+}
+
+async fn run_exec(
+    server: &str,
+    opts: &DialOptions,
+    argv: Vec<String>,
+    mut cwd: Option<String>,
+    shell: bool,
+    sync_dir: Option<PathBuf>,
+    excludes: Vec<String>,
+) -> Result<Exit> {
+    let req = Request::Exec {
+        argv: argv.clone(),
+        cwd: cwd.clone(),
+        shell,
+    };
+    if encode(&req, MAX_CTRL).is_err() {
+        return Err(KohError::usage(format!(
+            "command exceeds maximum size ({MAX_CTRL} bytes)"
+        )));
+    }
+    let client = Client::connect(server, opts, false).await?;
     let done = async {
         if let Some(dir) = sync_dir {
             let (remote_dir, _) =
@@ -504,6 +530,36 @@ async fn cmd_exec(args: &[String]) -> Result<Exit> {
         );
     }
     Ok(Exit(u8::try_from(code).unwrap_or(1)))
+}
+
+async fn cmd_rsh(args: &[String]) -> Result<Exit> {
+    const USAGE: &str =
+        "usage: koh rsh [--key-file PATH] [--direct IP:PORT] [--relay-url URL] HOST WORD...";
+    let mut opts = DialOptions::default();
+    let mut i = 0;
+    while let Some(a) = args.get(i).map(String::as_str) {
+        if a == "--" || !a.starts_with('-') {
+            break;
+        }
+        if a != "--json" && parse_common_dial(args, &mut i, &mut opts)? {
+            i += 1;
+            continue;
+        }
+        return Err(KohError::usage(format!(
+            "rsh does not support option {a:?} (only --key-file, --direct, --relay-url before HOST)"
+        )));
+    }
+    if args.get(i).map(String::as_str) == Some("--") {
+        i += 1;
+    }
+    let Some(host) = args.get(i) else {
+        return Err(KohError::usage(USAGE));
+    };
+    let words = args.get(i + 1..).unwrap_or_default();
+    if words.is_empty() {
+        return Err(KohError::usage(USAGE));
+    }
+    run_exec(host, &opts, vec![words.join(" ")], None, true, None, vec![]).await
 }
 
 async fn cmd_run(args: &[String]) -> Result<Exit> {

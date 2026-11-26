@@ -4521,7 +4521,7 @@ fn job_survives_serve_kill_and_restart() {
 }
 
 #[test]
-fn whole_fifty_mb_job_log_streams_exact_bytes() {
+fn a_fifty_mb_job_log_streams_exact_bytes() {
     let host = Host::start("job-50mb", &[]);
     let addr = host.addr();
     let bytes: usize = 50 * 1024 * 1024;

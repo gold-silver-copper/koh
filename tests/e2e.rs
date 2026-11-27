@@ -2610,15 +2610,6 @@ fn wait_session_returns_the_commands_code_or_124() {
         line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
         "{printed:?}"
     );
-    // A pane with no `marks.dropped` is kept by a holder of before there was one, whose marks
-    // have no numbers: a wait for it is refused, with what to do.
-    fs::remove_file(pane.join("marks.dropped")).unwrap();
-    let (code, _, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
-    assert_eq!(code, Some(1), "{said}");
-    assert!(
-        said.contains("marks.dropped") && said.contains("End that session"),
-        "{said}"
-    );
 }
 
 #[test]

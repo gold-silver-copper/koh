@@ -69,9 +69,8 @@ type Place = (u64, usize);
 /// listed, whatever moves it. (The two files are of one round only where `together` says so.)
 #[derive(Debug, Default, PartialEq)]
 pub struct Marks {
-    /// How many marks are gone from the file's front. None in a pane an older holder keeps:
-    /// its marks have no numbers.
-    dropped: Option<u64>,
+    /// How many marks are gone from the file's front.
+    dropped: u64,
     /// The last mark is an `output`: a command runs.
     pub busy: bool,
     /// The command that was asked for.
@@ -89,6 +88,7 @@ impl Marks {
     /// for the last command that has ended.
     pub fn read(dir: &Path, after: Option<u64>) -> Self {
         let dropped = line(dir, "marks.dropped").and_then(|dropped| dropped.parse().ok());
+        let dropped = dropped.unwrap_or(0);
         let (mut marks, mut open, mut printed) = (Self::default(), None, None);
         marks.dropped = dropped;
         let text = read(dir, "marks").unwrap_or_default();
@@ -103,7 +103,7 @@ impl Marks {
             match kind {
                 "output" => open = Some(place),
                 "end" => {
-                    let number = dropped.unwrap_or(0).saturating_add(n);
+                    let number = dropped.saturating_add(n);
                     let code = words.next().and_then(|code| code.parse().ok());
                     printed = open.take().map(|from| (from, place)).or(printed);
                     marks.ended = Some((number, code, printed));
@@ -122,10 +122,9 @@ impl Marks {
     /// `end`, or with none in the file, of the last mark that was dropped. An `end` that
     /// comes has a higher number. (Not the file's last mark: a prompt drawn again in its
     /// place takes back the `prompt` and `command` that end the file, and what is marked
-    /// next has their numbers.) None where the marks have no numbers.
-    pub fn asked(&self) -> Option<u64> {
-        let dropped = self.dropped?;
-        Some(self.ended.map_or(dropped, |(number, ..)| number))
+    /// next has their numbers.)
+    pub fn asked(&self) -> u64 {
+        self.ended.map_or(self.dropped, |(number, ..)| number)
     }
 }
 
@@ -213,7 +212,7 @@ pub fn last(dir: &Path) -> Option<Vec<u8>> {
 /// Read under one `together`, all of it is of one round.
 pub fn ended_since(asked: u64, dir: &Path) -> Option<(Option<u8>, Option<Vec<u8>>, u64)> {
     let now = Marks::read(dir, Some(asked));
-    let unread = now.dropped?.saturating_sub(asked);
+    let unread = now.dropped.saturating_sub(asked);
     let (_, code, from_to) = now.ended?;
     Some((code, from_to.map(|from_to| printed(from_to, dir)), unread))
 }
@@ -355,21 +354,15 @@ mod tests {
         // last `end`; with none in the file, from the last mark that was dropped.
         let idle = "3 0 output\n4 0 end 0\n4 0 prompt\n4 2 command\n";
         let last = read("40\n", idle, None);
-        assert_eq!((last.busy, last.asked()), (false, Some(42)));
+        assert_eq!((last.busy, last.asked()), (false, 42));
         assert_eq!(last.ended, Some((42, Some(0), Some(((3, 0), (4, 0))))));
         let runs = idle.to_string() + "5 0 output\n";
         let running = read("40\n", &runs, None);
-        assert_eq!((running.busy, running.asked()), (true, Some(42)));
+        assert_eq!((running.busy, running.asked()), (true, 42));
         assert_eq!(read("40\n", &runs, Some(42)).ended, None);
-        assert_eq!(
-            read("7\n", "9 0 prompt\n9 2 command\n", None).asked(),
-            Some(7)
-        );
+        assert_eq!(read("7\n", "9 0 prompt\n9 2 command\n", None).asked(), 7);
         // A line that is no mark is a line all the same: the marks after it keep their numbers.
-        assert_eq!(
-            read("40\n", &("?\n".to_string() + idle), None).asked(),
-            Some(43)
-        );
+        assert_eq!(read("40\n", &("?\n".to_string() + idle), None).asked(), 43);
         // The prompt drawn again in its place took back the file's last two marks, and an `end`
         // came with the number one of them had: it is above the last `end`, and new.
         let again = "3 0 output\n4 0 end 0\n4 0 prompt\n4 0 end 130\n";
@@ -382,14 +375,6 @@ mod tests {
         assert_eq!(first, Some((46, Some(7), Some(((5, 0), (6, 0))))));
         let last = read("44\n", two, None).ended;
         assert_eq!(last, Some((50, Some(9), Some(((7, 0), (8, 0))))));
-        // An older holder's pane has no `marks.dropped`: its marks have no numbers to count from.
-        fs::remove_file(dir.join("marks.dropped")).unwrap();
-        let old = Marks::read(&dir, None);
-        assert_eq!(
-            (old.asked(), old.ended.map(|(_, code, _)| code)),
-            (None, Some(Some(9)))
-        );
-        assert_eq!(ended_since(42, &dir), None);
         let _ = fs::remove_dir_all(dir);
     }
 }

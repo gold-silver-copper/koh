@@ -274,17 +274,14 @@ impl Sessions {
     ) -> Result<()> {
         let (dir, run) = self.named(name)?;
         let read = dir.clone();
-        // No number to count from: an older holder's pane, or one whose two files were not
-        // read as of one round. No wait is taken for either.
+        // No number to count from where its two files were not read as of one round.
         let numbered = move || pane::together(&read, lives, || Marks::read(&read, None).asked());
         let (asked, whole) = pooled(numbered).await?;
-        let Some(asked) = asked.filter(|_| whole) else {
-            let older = "is kept by a holder of before fux 0.43.2, which does not number its marks (it has no `marks.dropped`): a wait cannot tell its commands' ends. End that session and start it anew";
-            let moving =
+        if !whole {
+            let why =
                 "is written without a pause: its marks were not read as of one moment. Ask again";
-            let why = if whole { older } else { moving };
             return Err(KohError::failed(format!("the session {name} {why}")));
-        };
+        }
         send_msg(send, &Reply::Ok, MAX_CTRL).await?;
         // (More seconds than the clock has are no limit, as for a job: `after`.)
         let until = seconds.map(|s| after(Timer::now(), Duration::from_secs(s)));
@@ -749,7 +746,7 @@ mod tests {
         pane(&dir, 7);
         let holder = lock(&dir);
         fs::write(dir.join("marks.dropped"), "0\n").unwrap();
-        let asked = Marks::read(&dir, None).asked().unwrap();
+        let asked = Marks::read(&dir, None).asked();
         assert_eq!((asked, looked(&dir, 7, asked)), (0, None));
         // Between two looks it ends, and another run has its name, whose shell has marked a
         // command's end with 7: that is not what was waited for. The session has ended.

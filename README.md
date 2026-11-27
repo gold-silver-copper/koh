@@ -240,10 +240,6 @@ koh adds nothing to stop these. What happens instead is said.
   thousand: some 250 commands inside a tenth of a second, a script's doing). The first
   command that ended is then no longer listed: what it gives is the oldest that is, its code
   and its output, and it says so on the line it prints on stderr.
-- End the sessions that a koh built on a `fux` before 0.43.2 started, if you `koh wait` on
-  them: such a session's holder does not number its marks (its folder has no
-  `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh
-  sessions`, `koh output` and `koh connect` go on with it as it is.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default
   session.

@@ -7,7 +7,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 use iroh::endpoint::{RecvStream, SendStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -103,29 +103,29 @@ impl Door {
 }
 
 #[test]
-fn exec_keeps_binary_stdout_and_stderr_apart_and_ends_with_the_commands_code() {
+fn exec_keeps_binary_stdout_and_stderr_apart_and_a_line_with_a_leading_dash_is_a_command() {
     let host = Host::start("exec", &[]);
+    let (id, addr) = (host.id.as_str(), host.addr());
     let script = "printf 'out\\000line\\n'; printf 'errline\\n' >&2; exit 42";
-    let args = [
-        &host.id,
-        "--direct",
-        &host.addr(),
-        "-C",
-        "/tmp",
-        "--sh",
-        script,
-    ];
-    let out = host
-        .koh(&["exec"])
-        .args(args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .unwrap();
+    let args = ["exec", id, "--direct", &addr, "-C", "/tmp", "--sh", script];
+    let out = run_bounded(&mut host.koh(&args), 20, "exec");
+    let printed = (b"out\0line\n".to_vec(), b"errline\n".to_vec());
     assert_eq!(
-        (out.status.code(), out.stdout, out.stderr),
-        (Some(42), b"out\0line\n".to_vec(), b"errline\n".to_vec())
+        (out.status.code(), (out.stdout, out.stderr)),
+        (Some(42), printed)
     );
+    // `exec --sh` and `rsh` run a line that begins with `-` as `/bin/sh -c -- LINE`.
+    let line = "-nosuchcmd 2>/dev/null; echo dash-ok";
+    let exec = ["exec", id, "--direct", &addr, "--sh", line];
+    let rsh = ["rsh", "--direct", &addr, id, line];
+    for args in [&exec[..], &rsh[..]] {
+        let out = run_bounded(&mut host.koh(args), 20, args[0]);
+        assert_eq!(
+            (out.status.code(), out.stdout),
+            (Some(0), b"dash-ok\n".to_vec()),
+            "{args:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -188,7 +188,7 @@ async fn headless_jobs_raw_logs_wait_timeout_names_and_order() {
 /// `koh connect` as a person runs it, in a terminal of the test's own (a pty): what it drew there
 /// and how it ended. It is killed when the test lets go of it, however the test ends.
 struct InTerminal {
-    koh: std::process::Child,
+    koh: Child,
     tty: fs::File,
     drawn: Vec<u8>,
     /// Whether it says what it is when it is asked, as every terminal does (once: koh asks once).
@@ -309,36 +309,39 @@ impl InTerminal {
 }
 
 #[test]
-fn cli_keys_and_peer_lists() {
+fn cli_keys_peer_lists_and_usage_errors() {
     let tmp = TempDir::new("cli");
-    let koh = |args: &[&str]| {
-        let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
-        let out = koh
-            .env("KOH_CONFIG_DIR", &tmp.0)
-            .args(args)
-            .output()
-            .unwrap();
-        (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
-    };
-    let (code, id) = koh(&["id"]);
-    assert_eq!((code, id.trim().len()), (Some(0), 64));
-    let added = koh(&[
-        "servers",
-        "add",
-        "box",
-        id.trim(),
-        "--direct",
-        "127.0.0.1:4433",
-    ]);
-    assert_eq!(added.0, Some(0));
+    let (code, id, _) = koh(&tmp.0, &["id"]);
+    assert_eq!((code, id.len()), (Some(0), 64));
+    let add = ["servers", "add", "box", &id, "--direct", "127.0.0.1:4433"];
+    assert_eq!(koh(&tmp.0, &add).0, Some(0));
     // A word more than `rm NAME` is a usage error, and nothing is removed.
-    assert_eq!(koh(&["servers", "rm", "box", "extra"]).0, Some(2));
-    assert!(koh(&["servers"]).1.contains("box "));
-    assert_eq!(koh(&["servers", "rm", "box"]).0, Some(0));
-    assert!(!koh(&["servers"]).1.contains("box "));
+    assert_eq!(koh(&tmp.0, &["servers", "rm", "box", "extra"]).0, Some(2));
+    assert!(koh(&tmp.0, &["servers"]).1.contains("box "));
+    assert_eq!(koh(&tmp.0, &["servers", "rm", "box"]).0, Some(0));
+    assert!(!koh(&tmp.0, &["servers"]).1.contains("box "));
+    // So is a wait for a job and a session at once (what is a job's alone is not said of a
+    // session), a cap of `koh serve` out of its range, and an argument that is no UTF-8.
+    for more in [&["build"][..], &["--tail", "5"]] {
+        let args = [&["wait", "nowhere", "--session", "s"], more].concat();
+        assert_eq!(koh(&tmp.0, &args).0, Some(2), "{more:?}");
+    }
+    let caps = [
+        ("--max-connections", "18446744073709551615"),
+        ("--max-sessions", "many"),
+    ];
+    for (flag, value) in caps {
+        let (code, _, said) = koh(&tmp.0, &["serve", "--no-relay", flag, value]);
+        assert!(
+            code == Some(2) && said.contains(flag) && said.contains("1 to 65535"),
+            "{said}"
+        );
+    }
+    use std::os::unix::ffi::OsStrExt as _;
+    let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .output();
+    assert_eq!(not_utf8.unwrap().status.code(), Some(2));
 }
 
 #[tokio::test]
@@ -407,23 +410,32 @@ fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
 #[tokio::test]
 async fn connections_are_capped_before_auth_and_a_place_comes_back_when_one_ends() {
     let more = ServeOptions {
-        max_connections: 2,
+        max_connections: 1,
         proof_timeout: Duration::from_secs(60),
         ..ServeOptions::default()
     };
     let door = Door::open("max-conn", more).await;
     let stranger = new_key(&door.tmp, "stranger.key");
-    // Two peers the server does not know, which prove nothing, hold both places.
+    // A peer the server does not know, which proves nothing, holds the one place. A second is
+    // let connect to be told so, and has not asked yet: it holds the one place there is for
+    // that. A third is refused before it has connected at all, and that is the server being
+    // busy as much as the second's answer is: exit 75, not 3.
     let first = door.dial(&stranger, false).await.unwrap();
-    let second = door.dial(&stranger, false).await.unwrap();
-    let third = door.dial(&door.friend, false).await.unwrap();
-    let busy = third.jobs(None).await.unwrap_err();
-    assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
-    third.close().await;
-    // One of them goes: its place is the next client's.
+    let second = door.dial(&door.friend, false).await.unwrap();
+    let third = door
+        .dial(&door.friend, false)
+        .await
+        .err()
+        .expect("a refusal");
+    assert!(
+        third.code == Exit::BUSY && third.message.contains("server busy"),
+        "{third:?}"
+    );
+    assert_eq!(second.jobs(None).await.unwrap_err().code, Exit::BUSY);
+    second.close().await;
+    // The first goes: its place is the next client's.
     first.close().await;
     door.served().await;
-    second.close().await;
     door.shut().await;
 }
 
@@ -443,8 +455,7 @@ async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
     let closed = closed.expect("the silent connection was closed");
     let refused = koh::proto::CloseCode::Refused as u64;
     assert!(
-        matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close)
-            if close.error_code.into_inner() == refused),
+        matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == refused),
         "{closed:?}"
     );
     // One that proved its key in time stays past its own deadline. (The wait is the test.)
@@ -509,9 +520,8 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
 #[tokio::test]
 async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
     let tmp = TempDir::new("cap-range");
-    for (max_connections, max_sessions, flag) in
-        [(0, 64, "--max-connections"), (64, 65_536, "--max-sessions")]
-    {
+    let caps = [(0, 64, "--max-connections"), (64, 65_536, "--max-sessions")];
+    for (max_connections, max_sessions, flag) in caps {
         let more = ServeOptions {
             key_file: Some(tmp.0.join("srv_cfg/server.key")),
             max_connections,
@@ -521,24 +531,13 @@ async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
             ..ServeOptions::default()
         };
         let err = start_server(more).await.err().expect("a refusal");
-        assert_eq!(err.code, Exit::USAGE, "{err:?}");
-        assert!(err.message.contains(flag), "{err:?}");
+        assert!(
+            err.code == Exit::USAGE && err.message.contains(flag),
+            "{err:?}"
+        );
     }
     // (Nothing was started for them: not even the key.)
     assert!(!tmp.0.join("srv_cfg").exists());
-    for (flag, value) in [
-        ("--max-connections", "18446744073709551615"),
-        ("--max-sessions", "many"),
-    ] {
-        let out = Command::new(env!("CARGO_BIN_EXE_koh"))
-            .env("KOH_CONFIG_DIR", tmp.0.join("cli"))
-            .args(["serve", "--no-relay", flag, value])
-            .output()
-            .unwrap();
-        let said = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{flag} {value}: {said}");
-        assert!(said.contains(flag) && said.contains("1 to 65535"), "{said}");
-    }
 }
 
 #[tokio::test]
@@ -586,33 +585,6 @@ async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() 
     door.shut().await;
 }
 
-#[tokio::test]
-async fn a_client_refused_at_the_door_is_told_the_server_is_busy_too() {
-    let more = ServeOptions {
-        max_connections: 1,
-        ..ServeOptions::default()
-    };
-    let door = Door::open("refused-busy", more).await;
-    // One client has the place. A second is let connect to be told so, and has not asked yet: it
-    // holds the one place there is for that. A third is refused before it has connected at all,
-    // and that is the server being busy as much as the second's answer is: exit 75, not 3.
-    let first = door.dial(&door.friend, false).await.unwrap();
-    first.jobs(None).await.unwrap();
-    let second = door.dial(&door.friend, false).await.unwrap();
-    let third = door
-        .dial(&door.friend, false)
-        .await
-        .err()
-        .expect("a refusal");
-    assert_eq!(third.code, Exit::BUSY, "{third:?}");
-    assert!(third.message.contains("server busy"), "{third:?}");
-    let told = second.jobs(None).await.unwrap_err();
-    assert_eq!(told.code, Exit::BUSY, "{told:?}");
-    second.close().await;
-    first.close().await;
-    door.shut().await;
-}
-
 /// The names in `dir`, in order.
 fn names_in(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
@@ -626,7 +598,7 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
 /// `koh serve` as a process of its own, killed when this is dropped; the lines it says on its
 /// standard error, read as it says them.
 struct Served {
-    server: std::process::Child,
+    server: Child,
     said: std::sync::mpsc::Receiver<String>,
 }
 
@@ -641,9 +613,9 @@ impl Served {
     fn spawn(serve: &mut Command) -> Self {
         use std::io::BufRead as _;
         let mut server = serve
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let (tell, said) = std::sync::mpsc::channel();
@@ -705,12 +677,14 @@ fn a_key_that_is_a_symlink_is_read_as_the_file_it_leads_to() {
     assert_eq!(read.public(), made.public());
 }
 
-/// `koh` run with `args` and a runtime directory: how it ended, and what it said on its
-/// standard output and its standard error.
-fn koh(runtime: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+/// `koh` run with `args`, its configuration and runtime directory `dir`: how it ended, and what
+/// it said on its standard output and its standard error.
+fn koh(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
     let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
-    koh.env("XDG_RUNTIME_DIR", runtime).args(args);
-    let said = koh.stdin(std::process::Stdio::null()).output().unwrap();
+    koh.env("XDG_RUNTIME_DIR", dir)
+        .env("KOH_CONFIG_DIR", dir)
+        .args(args);
+    let said = koh.stdin(Stdio::null()).output().unwrap();
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim_end().to_string();
     (said.status.code(), text(&said.stdout), text(&said.stderr))
 }
@@ -917,8 +891,8 @@ impl Host {
             .env("KOH_CONFIG_DIR", self.tmp.0.join("cli_cfg"))
             .env("XDG_RUNTIME_DIR", self.tmp.0.join("crun"))
             .env("HOME", self.tmp.0.join("home"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null());
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
         koh
     }
 
@@ -1768,9 +1742,7 @@ impl Host {
     /// what it printed and what it said.
     fn asked(&self, command: &str, args: &[&str]) -> (Option<i32>, String, String) {
         let mut koh = self.koh(&[command, &self.id, "--direct", &self.addr()]);
-        koh.args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        koh.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         let said = koh.output().unwrap();
         let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
         (said.status.code(), text(&said.stdout), text(&said.stderr))
@@ -1781,8 +1753,8 @@ impl Host {
         let mut koh = self.koh(&["wait", &self.id, "--direct", &self.addr()]);
         koh.args(["--session", "s"])
             .args(more)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         Waits(koh.spawn().unwrap())
     }
 
@@ -1797,7 +1769,7 @@ impl Host {
 }
 
 /// A `koh wait` that runs. It is killed if the test lets go of it before it has ended.
-struct Waits(std::process::Child);
+struct Waits(Child);
 
 impl Drop for Waits {
     fn drop(&mut self) {
@@ -1941,14 +1913,14 @@ fn output_last_is_the_last_commands_output_across_history() {
     assert_eq!((code, shown.as_str()), (Some(127), ""), "{said}");
 }
 
-#[test]
-fn wait_session_returns_the_commands_code_or_124() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_session_returns_the_commands_code_or_124_or_the_sessions_end() {
     let host = Host::start("wait", &[]);
     let pane = host.session("s", &marking_shell(&host), "$");
     // No command ends: when the time given is over it is 124, with the screen as it is.
     let began = Instant::now();
-    let (code, waited, _) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
-    assert_eq!((code, waited), (Some(124), screen(&pane)));
+    let (code, shown, _) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
+    assert_eq!((code, shown), (Some(124), screen(&pane)));
     assert!(began.elapsed() >= Duration::from_secs(1));
     // A wait returns when one more command has ended than when it was asked, with that
     // command's code and what it printed. (When the server takes the request the test cannot
@@ -1961,19 +1933,11 @@ fn wait_session_returns_the_commands_code_or_124() {
     });
     let (code, printed, said) = wait.said();
     assert_eq!((code, printed.as_str()), (Some(42), "waited\n"), "{said}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wait_session_ends_when_the_session_does() {
-    let host = Host::start("wait-end", &[]);
-    let program = sh("echo ready; read line; echo bye-$line; exit 3");
-    let pane = host.session("s", &program, "ready");
-    // A wait the server has taken, of a program that marks nothing: the program ends, and the
-    // wait ends with its status and its last screen. Asked of a session that has ended, it
-    // says the same at once.
+    // A wait the server has taken: the program ends, and the wait ends with its status and its
+    // last screen. Asked of a session that has ended, it says the same at once.
     let client = host.client().await;
     let wait = waits(&client, "s").await;
-    fs::write(pane.join("in"), "now\n").unwrap();
+    fs::write(pane.join("in"), "exec sh -c 'echo bye-''now; exit 3'\n").unwrap();
     let (code, shown) = waited(wait).await;
     assert!(code == 3 && shown.contains("bye-now"), "{code} {shown:?}");
     let (code, again, said) = host.asked("wait", &["--session", "s"]);
@@ -2005,8 +1969,7 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     let recipe = |args: &[&str]| {
         let mut sh = Command::new("sh");
         sh.arg(&script).args(args).env("TMPDIR", &scratch);
-        sh.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        sh.stdout(Stdio::piped()).stderr(Stdio::piped());
         sh
     };
     let run = |args: &[&str]| {
@@ -2241,99 +2204,32 @@ async fn a_wait_gives_the_first_end_since_it_was_asked_and_marks_that_only_moved
         times(247, "ran fill 1")
     );
     let [a, b, c, d] = MOVES;
+    let begun = r"printf '\r\n'; m C; printf '\033[1T'";
+    let entered = r"printf '\r\n'; m 'D;1'; prompt; ran second 22";
+    let short = r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt";
+    #[rustfmt::skip]
     let cases: [Case; 9] = [
         // The four ways a screen moves its marks, few marks and all on the screen; then full.
-        (
-            &["ran one 7", a, b, c, d, "ran two 9"],
-            1,
-            false,
-            4,
-            false,
-            (9, Some("two\n")),
-        ),
-        (
-            &[&fill, a, b, c, d, cleared],
-            1,
-            true,
-            4,
-            false,
-            (4, Some("four\n")),
-        ),
+        (&["ran one 7", a, b, c, d, "ran two 9"], 1, false, 4, false, (9, Some("two\n"))),
+        (&[&fill, a, b, c, d, cleared], 1, true, 4, false, (4, Some("four\n"))),
         // Two commands end before the wait looks again: one typed while the other ran.
-        (
-            &["ran one 7", "ran two 0; ran three 5"],
-            1,
-            false,
-            0,
-            true,
-            (0, Some("two\n")),
-        ),
+        (&["ran one 7", "ran two 0; ran three 5"], 1, false, 0, true, (0, Some("two\n"))),
         // A shell that clears at every command: every mark of a full file but the last few is
         // at one place. A command's end there, and one asked for afresh after more.
-        (
-            &[&clears, "ran four 4", &more],
-            1,
-            true,
-            0,
-            false,
-            (4, Some("four\n")),
-        ),
-        (
-            &[&clears, "ran four 4", &more, "ran fresh 3"],
-            3,
-            true,
-            0,
-            false,
-            (3, Some("fresh\n")),
-        ),
+        (&[&clears, "ran four 4", &more], 1, true, 0, false, (4, Some("four\n"))),
+        (&[&clears, "ran four 4", &more, "ran fresh 3"], 3, true, 0, false, (3, Some("fresh\n"))),
         // A full file whose first mark is on the screen: a command scrolls it down, and ends
         // with 5 only later.
-        (
-            &[
-                &all_on_screen,
-                quiet,
-                r"printf '\r\n'; m C; printf '\033[1T'",
-                "m 'D;5'; prompt",
-            ],
-            2,
-            true,
-            1,
-            false,
-            (5, None),
-        ),
+        (&[&all_on_screen, quiet, begun, "m 'D;5'; prompt"], 2, true, 1, false, (5, None)),
         // A full file on three rows, a shell that clears at each prompt: a line inserted.
-        (
-            &[&at_prompts, a, "ran after 3"],
-            1,
-            true,
-            1,
-            false,
-            (3, Some("after\n")),
-        ),
+        (&[&at_prompts, a, "ran after 3"], 1, true, 1, false, (3, Some("after\n"))),
         // A full file whose oldest marks are alike; an empty line entered, whose `end` has the
         // code of the command before, then one that ends with 22: the first is the first.
-        (
-            &[&alike, r"printf '\r\n'; m 'D;1'; prompt; ran second 22"],
-            1,
-            true,
-            0,
-            false,
-            (1, Some("fill\n")),
-        ),
+        (&[&alike, entered], 1, true, 0, false, (1, Some("fill\n"))),
         // A command ends with 77, a prompt with no `end` (Ctrl-C), a clear and the prompt anew,
         // which takes two marks back. (What it printed went with the clear, unless the wait
         // looked before that.)
-        (
-            &[
-                &fill,
-                r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt",
-            ],
-            1,
-            true,
-            0,
-            false,
-            (77, None),
-        ),
+        (&[&fill, short], 1, true, 0, false, (77, None)),
     ];
     for (n, (steps, asked, full, nothing, between, (code, printed))) in
         cases.into_iter().enumerate()
@@ -2401,16 +2297,6 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
     door.shut().await;
 }
 
-#[test]
-fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
-    let tmp = TempDir::new("wait-usage");
-    // A wait is for a job or for a session; what is a job's alone is not said of a session.
-    for more in [&["build"][..], &["--tail", "5"]] {
-        let args = [&["wait", "nowhere", "--session", "s"], more].concat();
-        assert_eq!(koh(&tmp.0, &args).0, Some(2), "{more:?}");
-    }
-}
-
 // The sequences of the second round of reviews, each against fux's holder: what a full `marks`
 // could not say, and its count of the marks it dropped does.
 
@@ -2465,7 +2351,6 @@ async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
 
 #[test]
 fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
-    use std::os::unix::ffi::OsStrExt as _;
     let tmp = TempDir::new("clients-parse");
     let (key, file) = (tmp.0.join("server.key"), tmp.0.join("clients"));
     let k = iroh::SecretKey::from_bytes(&[1; 32]).public();
@@ -2526,12 +2411,6 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
     assert_eq!(cli(&["rename", "alice", "bob"]).0, Some(0));
     assert_eq!(cli(&["rm", "other"]).0, Some(0));
     assert_eq!(fs::read_to_string(&file).unwrap(), format!("bob {k}\n"));
-    // An argument that is no UTF-8 is a usage error.
-    let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
-        .arg("servers")
-        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
-        .output();
-    assert_eq!(not_utf8.unwrap().status.code(), Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2584,7 +2463,7 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     srv.shutdown().await;
 }
 
-fn wait_child(child: &mut std::process::Child, secs: u64, what: &str) -> std::process::ExitStatus {
+fn wait_child(child: &mut Child, secs: u64, what: &str) -> std::process::ExitStatus {
     let until = Instant::now() + Duration::from_secs(secs);
     loop {
         if let Some(st) = child.try_wait().unwrap() {
@@ -2813,7 +2692,7 @@ fn rsh_options_rsync_and_git() {
     for head in [&["rsh", "box"][..], &["exec", "box", "--"][..]] {
         let mut over = host.koh(head);
         over.args(std::iter::repeat_n(&big_word, 9000));
-        match over.stderr(std::process::Stdio::piped()).output() {
+        match over.stderr(Stdio::piped()).output() {
             Ok(out) => assert_eq!(out.status.code(), Some(2)),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ArgumentListTooLong),
         }
@@ -2919,7 +2798,7 @@ fn pid_running(pid: &str) -> bool {
 
 fn read_exact_bounded<const N: usize, R: std::io::Read + Send + 'static>(
     mut r: R,
-    child: &mut std::process::Child,
+    child: &mut Child,
     secs: u64,
     what: &str,
 ) -> ([u8; N], R) {
@@ -2946,27 +2825,20 @@ fn read_exact_bounded<const N: usize, R: std::io::Read + Send + 'static>(
 
 fn run_bounded(cmd: &mut Command, secs: u64, what: &str) -> std::process::Output {
     let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let mut out_r = child.stdout.take().unwrap();
-    let mut err_r = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out_r.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err_r.read_to_end(&mut b);
-        b
-    });
+    let (out, err) = (
+        drain(child.stdout.take().unwrap()),
+        drain(child.stderr.take().unwrap()),
+    );
     let status = wait_child(&mut child, secs, what);
+    let (stdout, stderr) = (out.join().unwrap(), err.join().unwrap());
     std::process::Output {
         status,
-        stdout: out_t.join().unwrap(),
-        stderr: err_t.join().unwrap(),
+        stdout,
+        stderr,
     }
 }
 
@@ -3032,7 +2904,7 @@ impl RawExecPeer {
             .args(["--", "true"])
             .env("KOH_CONFIG_DIR", self.tmp.0.join("cli_cfg"))
             .env("XDG_RUNTIME_DIR", self.tmp.0.join("crun"))
-            .stdin(std::process::Stdio::null());
+            .stdin(Stdio::null());
         cmd
     }
 
@@ -3050,18 +2922,14 @@ impl Host {
         let mut koh = self.koh(&[
             "exec", id, "--direct", &addr, "--", "/bin/sh", "-c", script, "_",
         ]);
-        koh.args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        koh.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         koh
     }
 
     /// One of the client's commands about this host, started, its output piped.
-    fn spawned(&self, command: &str, args: &[&str]) -> std::process::Child {
+    fn spawned(&self, command: &str, args: &[&str]) -> Child {
         let mut koh = self.koh(&[command, &self.id, "--direct", &self.addr()]);
-        koh.args(args)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        koh.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
         koh.spawn().unwrap()
     }
 }
@@ -3087,7 +2955,7 @@ fn exec_b_simultaneous_four_mib_each_way_no_deadlock() {
     // stdin while it reads stdout.
     let files = [out_file.to_str().unwrap(), in_file.to_str().unwrap()];
     let mut koh = host.exec("cat \"$1\"; cat > \"$2\"", &files);
-    let mut child = koh.stdin(std::process::Stdio::piped()).spawn().unwrap();
+    let mut child = koh.stdin(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || stdin.write_all(&sent_in).map(|()| sent_in));
     let got_out = drain(child.stdout.take().unwrap());
@@ -3143,7 +3011,7 @@ async fn exec_d_link_lost_after_start_exits_255_not_3() {
     assert_eq!(unreached.await.unwrap().status.code(), Some(3));
     // A link lost after the answer and some output is 255, not 3, and that output is kept.
     let mut koh = peer.koh(&peer.id, &[]);
-    let mut child = koh.stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut child = koh.stdout(Stdio::piped()).spawn().unwrap();
     let ended = tokio::task::spawn_blocking(move || {
         let out = child.stdout.take().unwrap();
         let (started, _out) = read_exact_bounded::<8, _>(out, &mut child, 20, "exec-d started");
@@ -3167,30 +3035,13 @@ fn exec_e_stdout_write_error_exits_1_not_0() {
     sh.args(["-c", script, "_", koh, &host.id, &host.addr(), file])
         .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
         .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
-        .stdin(std::process::Stdio::null());
+        .stdin(Stdio::null());
     let out = run_bounded(&mut sh, 20, "koh exec with EFBIG stdout");
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.code() == Some(1) && said.contains("write:"),
         "{said}"
     );
-}
-
-#[test]
-fn exec_f_sh_and_rsh_handle_leading_dash_command() {
-    let host = Host::start("exec-f", &[]);
-    let (id, addr) = (host.id.as_str(), host.addr());
-    let line = "-nosuchcmd 2>/dev/null; echo dash-ok";
-    let exec = ["exec", id, "--direct", &addr, "--sh", line];
-    let rsh = ["rsh", "--direct", &addr, id, line];
-    for args in [&exec[..], &rsh[..]] {
-        let out = run_bounded(&mut host.koh(args), 20, args[0]);
-        assert_eq!(
-            (out.status.code(), out.stdout),
-            (Some(0), b"dash-ok\n".to_vec()),
-            "{args:?}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -3320,7 +3171,7 @@ fn exec_stdin_closed_early_does_not_hang_sender() {
     // The remote closes stdin at once while the client still sends 64 MiB: the command's end
     // and output are koh's all the same.
     let mut koh = host.exec("exec 0<&-; sleep 1; echo done", &[]);
-    let mut child = koh.stdin(std::process::Stdio::piped()).spawn().unwrap();
+    let mut child = koh.stdin(Stdio::piped()).spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
         let block = vec![0u8; 64 << 10];

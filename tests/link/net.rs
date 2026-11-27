@@ -50,6 +50,7 @@ pub struct Counts {
     pub bytes: u64,
 }
 
+#[derive(Debug)]
 pub struct Packet {
     from: CustomAddr,
     pub data: Arc<[u8]>,
@@ -80,6 +81,12 @@ struct State {
 pub struct FaultNet {
     state: Arc<Mutex<State>>,
     wake: Arc<Notify>,
+}
+
+impl std::fmt::Debug for FaultNet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FaultNet")
+    }
 }
 
 impl FaultNet {
@@ -261,16 +268,11 @@ fn endpoint_id(addr: &CustomAddr) -> io::Result<EndpointId> {
 }
 
 /// One endpoint's place on the link, until iroh binds it.
+#[derive(Debug)]
 struct LinkTransport {
     net: FaultNet,
     id: EndpointId,
     packets: Mutex<Option<mpsc::Receiver<Packet>>>,
-}
-
-impl std::fmt::Debug for LinkTransport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LinkTransport({})", self.id.fmt_short())
-    }
 }
 
 impl CustomTransport for LinkTransport {
@@ -287,17 +289,12 @@ impl CustomTransport for LinkTransport {
     }
 }
 
+#[derive(Debug)]
 struct LinkEndpoint {
     net: FaultNet,
     id: EndpointId,
     local: n0_watcher::Watchable<Vec<CustomAddr>>,
     packets: mpsc::Receiver<Packet>,
-}
-
-impl std::fmt::Debug for LinkEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LinkEndpoint({})", self.id.fmt_short())
-    }
 }
 
 impl CustomEndpoint for LinkEndpoint {
@@ -345,15 +342,10 @@ impl CustomEndpoint for LinkEndpoint {
     }
 }
 
+#[derive(Debug)]
 struct LinkSender {
     net: FaultNet,
     id: EndpointId,
-}
-
-impl std::fmt::Debug for LinkSender {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LinkSender({})", self.id.fmt_short())
-    }
 }
 
 impl CustomSender for LinkSender {

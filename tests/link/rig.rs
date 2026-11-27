@@ -249,7 +249,10 @@ impl Rig {
     /// Connects and waits until the client's terminal has received its first screen bytes.
     pub async fn connect(&self, name: &str, who: &str) -> Connected {
         let conn = self.connect_on(self.dialled(who).await, Some(name), false);
-        conn.has_output(Duration::from_secs(20));
+        until("the client received output", secs(20), || {
+            !conn.raw().is_empty() || conn.task.is_finished()
+        });
+        assert!(!conn.task.is_finished(), "koh connect ended unexpectedly");
         conn
     }
 }
@@ -259,7 +262,7 @@ impl Rig {
 pub struct Connected {
     /// Local fux pane rendering everything `koh connect` wrote to its terminal.
     pub term: PathBuf,
-    master: File,
+    pub master: File,
     raw_out: Arc<Mutex<Vec<u8>>>,
     /// The client's endpoint: what the link counts towards it is what the server sent.
     pub id: EndpointId,
@@ -275,21 +278,9 @@ impl Drop for Connected {
 }
 
 impl Connected {
-    pub fn has_output(&self, long: Duration) {
-        until("the client received output", long, || {
-            !self.raw_out.lock().unwrap().is_empty() || self.task.is_finished()
-        });
-        assert!(!self.task.is_finished(), "koh connect ended unexpectedly");
-    }
-
     /// Types bytes into the client's terminal (blocking until all bytes are written to PTY).
     pub fn types(&self, bytes: &[u8]) {
         write_all_pty(&self.master, bytes);
-    }
-
-    /// Clones the master fd so a background thread can type while the test runs.
-    pub fn master_clone(&self) -> File {
-        self.master.try_clone().unwrap()
     }
 
     /// Resizes the client's PTY and its local terminal emulator.
@@ -357,6 +348,10 @@ pub fn reads_into(out: &Path) -> [&str; 4] {
     ["sh", "-c", script, out.to_str().unwrap()]
 }
 
+pub fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
 /// Waits, `long` at most, until `done` says so.
 pub fn until(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + long;
@@ -364,12 +359,6 @@ pub fn until(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "not in {long:?}: {what}");
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-/// What a pane's `state` says became of its program.
-pub fn state(dir: &Path) -> String {
-    let state = fs::read_to_string(dir.join("state")).unwrap_or_default();
-    state.trim().to_string()
 }
 
 /// The screen a pane's folder shows.
@@ -386,18 +375,10 @@ pub fn screen_agrees(pane: &Path, client: &Connected) {
         let rows = screen.lines().map(|row| row.trim_end().to_string());
         rows.collect()
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let (want, got) = (screen(pane), client.screen());
-        if !want.is_empty() && rows(want.clone()) == rows(got.clone()) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "client screen != pane screen:\n--- pane ---\n{want}\n--- client ---\n{got}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until("the client's screen is the pane's", secs(20), || {
+        let want = screen(pane);
+        !want.is_empty() && rows(want) == rows(client.screen())
+    });
 }
 
 /// The numbered line `n` of sixteen bytes, as a test types them.

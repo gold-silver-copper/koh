@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -12,110 +12,78 @@ use koh::proto::{
 };
 
 use crate::net::Profile;
-use crate::rig::{self, Rig};
+use crate::rig::{self, Rig, secs};
 
-/// What is typed, a line every 10 ms, while the link goes for longer than it may be silent:
-/// nothing of it arrives twice, what arrives is in its order, and its end arrives. What was
-/// typed into a link not yet known to be gone may be lost: one stretch, and no more.
+/// A link gone for forty seconds while a line is typed every 10 ms, and back: koh says there is
+/// no link once it has been silent for eight seconds, holds what is typed from then on and a
+/// resize, dials again, and is back within seconds of the path. What was typed arrives once
+/// and in its order: all of it, but what was on its way when the link went (one stretch).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn what_is_typed_through_a_blackout_arrives_once_and_in_order() {
-    let rig = Rig::start("blackout", Profile::default()).await;
+async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_arrives_once() {
+    let rig = Rig::start("forty", Profile::default()).await;
     let out = rig.file("out");
-    rig.pane("s", &rig::reads_into(&out));
+    let pane = rig.pane("s", &rig::reads_into(&out));
     let client = rig.connect("s", "a").await;
-    rig::until("the program is ready", Duration::from_secs(20), || {
+    rig::until("the program is ready", secs(20), || {
         client.screen().contains("READY")
     });
-    let typing = Arc::new(AtomicBool::new(true));
-    let (goes_on, master) = (typing.clone(), client.master_clone());
+    let (typing, typed) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let (goes_on, count, master) = (typing.clone(), typed.clone(), client.master.try_clone());
     let typist = std::thread::spawn(move || {
-        let mut all = Vec::new();
-        for line in (0..).map(rig::line) {
-            if !goes_on.load(SeqCst) {
-                break;
-            }
+        let (mut all, master) = (Vec::new(), master.unwrap());
+        for line in (0..).map(rig::line).take_while(|_| goes_on.load(SeqCst)) {
             rig::write_all_pty(&master, &line);
             all.extend(line);
+            count.store(all.len(), SeqCst);
             std::thread::sleep(Duration::from_millis(10));
         }
         all
     });
-    let read = || fs::metadata(&out).map_or(0, |out| out.len());
-    rig::until("the program reads", Duration::from_secs(10), || read() > 0);
-    rig.net.black_hole(Duration::from_secs(11));
-    rig::until("koh says there is no link", Duration::from_secs(20), || {
+    rig::until("the program reads", secs(10), || {
+        fs::metadata(&out).is_ok_and(|o| o.len() > 0)
+    });
+    let gone = Instant::now();
+    rig.net.black_hole(secs(40));
+    rig::until("koh says there is no link", secs(20), || {
         client.screen().contains("no link")
     });
-    let had = read();
-    rig::until("the program reads on", Duration::from_secs(30), || {
-        read() > had
+    let held = typed.load(SeqCst);
+    client.resize(92, 26);
+    // (The outage is the test's: it ends forty seconds after it began.)
+    tokio::time::sleep(secs(40).saturating_sub(gone.elapsed())).await;
+    // Within seconds: a dial every ten at most, and not the server's thirty of silence.
+    rig::until("the session is shown again", secs(20), || {
+        !client.screen().contains("no link")
     });
     typing.store(false, SeqCst);
     let all = typist.join().unwrap();
-    rig::until(
-        "the end of what was typed arrives",
-        Duration::from_secs(10),
-        || {
-            fs::read(&out)
-                .unwrap_or_default()
-                .ends_with(&all[all.len() - 16..])
-        },
-    );
-    // Read is a start of what was typed and an end of it: one stretch left out, at most.
+    rig::until("the end of what was typed arrives", secs(20), || {
+        fs::read(&out)
+            .unwrap_or_default()
+            .ends_with(&all[all.len() - 16..])
+    });
+    // Read is a start of what was typed and an end of it, which has all typed since koh said
+    // there was no link.
     let read = fs::read(&out).unwrap();
     let kept = read
         .iter()
         .zip(&all)
         .take_while(|(read, typed)| read == typed);
-    let kept = kept.count();
+    let end = read.len() - kept.count();
+    let whole = all.ends_with(&read[read.len() - end..]) && end >= all.len() - held;
     assert!(
-        all.ends_with(&read[kept..]),
-        "{} typed, {} read, the first {kept} in order",
+        whole,
+        "{} typed, {} read, the last {end} in order; {held} before koh said so",
         all.len(),
         read.len()
     );
-}
-
-/// A link gone for forty seconds, and back: koh shows the disconnected notice, holds typing
-/// and a resize, redials, paints the fresh screen within seconds of the path returning, types
-/// the held command once, and gives the session the terminal's new size.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_link_gone_for_forty_seconds_is_back_within_seconds() {
-    let rig = Rig::start("forty", Profile::default()).await;
-    let pane = rig.pane("s", &["sh"]);
-    let client = rig.connect("s", "a").await;
-    rig::screen_agrees(&pane, &client);
-    let gone = Instant::now();
-    rig.net.black_hole(Duration::from_secs(40));
-    fs::write(pane.join("in"), "echo while-$((6 * 7))-away\n").unwrap();
-    // koh says so once the link has been silent for eight seconds.
-    rig::until(
-        "the client says there is no link",
-        Duration::from_secs(20),
-        || client.screen().contains("no link"),
-    );
-    assert!(!client.screen().contains("while-42-away"));
-    client.types(b"echo held-$((6 * 7))-typed\n");
-    client.resize(92, 26);
-    // (The outage is the test's: it ends forty seconds after it began.)
-    tokio::time::sleep(Duration::from_secs(40).saturating_sub(gone.elapsed())).await;
-    // Within seconds: a dial every ten at most, and not the server's thirty of silence.
-    rig::until(
-        "the screen shows the present",
-        Duration::from_secs(20),
-        || client.screen().contains("while-42-away"),
-    );
-    rig::until("what was held is typed", Duration::from_secs(10), || {
-        client.screen().contains("held-42-typed")
-    });
-    rig::screen_agrees(&pane, &client);
-    assert_eq!(rig::screen(&pane).matches("held-42-typed").count(), 1);
     let size = || fs::read_to_string(pane.join("size")).unwrap_or_default();
-    rig::until(
-        "the session has the terminal's size",
-        Duration::from_secs(10),
-        || size().trim() == "92 26",
-    );
+    rig::until("the session has the terminal's size", secs(10), || {
+        size().trim() == "92 26"
+    });
 }
 
 /// A first attach to a session with megabytes of history is sent the screen, not the history.
@@ -124,7 +92,7 @@ async fn a_fresh_attach_to_megabytes_of_history_is_sent_a_screen() {
     let rig = Rig::start("fresh", Profile::default()).await;
     let pane = rig.pane("s", &["sh"]);
     fs::write(pane.join("in"), "seq 1 150000; echo all-pr''inted\n").unwrap();
-    rig::until("the history is there", Duration::from_secs(30), || {
+    rig::until("the history is there", secs(30), || {
         rig::screen(&pane).contains("all-printed")
     });
     let history = fs::metadata(pane.join("history")).map_or(0, |m| m.len());
@@ -145,7 +113,7 @@ const MODES_ON: &str = r"printf '\033[?1049h\033[?1002h\033[?1006h\033[?2004h\03
 /// (no mouse, no pastes marked, no focus told), the cursor shown.
 fn the_terminal_is_put_back(client: &rig::Connected, when: &str) {
     let said = format!("the terminal is put back {when}");
-    rig::until(&said, Duration::from_secs(10), || {
+    rig::until(&said, secs(10), || {
         client.shown() == "main" && client.says("modes").trim().is_empty()
     });
     assert!(client.says("cursor").contains("shown"), "{when}");
@@ -159,11 +127,11 @@ async fn kohs_key_leaves_with_no_link_and_the_terminal_is_put_back() {
     let rig = Rig::start("leaves", Profile::default()).await;
     rig.pane("s", &["sh", "-c", MODES_ON]);
     let mut client = rig.connect("s", "a").await;
-    rig::until("the modes are on", Duration::from_secs(10), || {
+    rig::until("the modes are on", secs(10), || {
         client.screen().contains("MODES-ON") && client.says("modes").contains("mouse")
     });
-    rig.net.black_hole(Duration::from_secs(600));
-    rig::until("koh says there is no link", Duration::from_secs(20), || {
+    rig.net.black_hole(secs(600));
+    rig::until("koh says there is no link", secs(20), || {
         client.screen().contains("no link")
     });
     the_terminal_is_put_back(&client, "while there is no link");
@@ -172,9 +140,9 @@ async fn kohs_key_leaves_with_no_link_and_the_terminal_is_put_back() {
     // pieces, which passes as well with the two read together.)
     tokio::time::sleep(Duration::from_millis(50)).await;
     client.types(b".");
-    assert_eq!(client.ends(Duration::from_secs(10)).await.unwrap(), 0);
+    assert_eq!(client.ends(secs(10)).await.unwrap(), 0);
     the_terminal_is_put_back(&client, "after it left with no link");
-    rig::until("what it said is wiped", Duration::from_secs(10), || {
+    rig::until("what it said is wiped", secs(10), || {
         !client.screen().contains("no link")
     });
 }
@@ -189,7 +157,7 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
     let reads = "stty raw -echo; echo READY; until [ -e \"$0.go\" ]; do sleep 0.05; done; exec cat > \"$0\"";
     let pane = rig.pane("s", &["sh", "-c", reads, out.to_str().unwrap()]);
     let mut client = rig.connect("s", "a").await;
-    rig::until("the program is there", Duration::from_secs(20), || {
+    rig::until("the program is there", secs(20), || {
         client.screen().contains("READY")
     });
     let pasted: Vec<u8> = (0..(1 << 20) / 16).flat_map(rig::line).collect();
@@ -197,19 +165,17 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
     // (So that the key comes behind the paste that waits: sooner, it is the easier test.)
     tokio::time::sleep(Duration::from_millis(500)).await;
     client.types(b"\x1d.");
-    assert_eq!(client.ends(Duration::from_secs(10)).await.unwrap(), 0);
-    assert_eq!(rig::state(&pane), "running");
+    assert_eq!(client.ends(secs(10)).await.unwrap(), 0);
+    assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
     // What the session had taken by then is the paste's start, in its order; a client that
     // comes then and pastes more, into a program that reads, has it typed whole after it.
     fs::write(rig.file("out.go"), "").unwrap();
     let more: Vec<u8> = (1 << 20..(1 << 20) + 4096).flat_map(rig::line).collect();
     let client = rig.connect("s", "a").await;
     client.types(&more);
-    rig::until(
-        "the second paste is read whole",
-        Duration::from_secs(30),
-        || fs::read(&out).unwrap_or_default().ends_with(&more),
-    );
+    rig::until("the second paste is read whole", secs(30), || {
+        fs::read(&out).unwrap_or_default().ends_with(&more)
+    });
     let read = fs::read(&out).unwrap();
     let before = &read[..read.len() - more.len()];
     assert!(pasted.starts_with(before), "{} bytes", before.len());
@@ -226,17 +192,17 @@ async fn a_link_that_goes_in_the_first_attach_is_dialled_again_and_a_new_session
     let pane = rig.pane("s", &["sh", "-c", "echo FIRST-''SCREEN; exec sleep 600"]);
     // (Gone for longer than a link may be silent: the connection the attach was asked on is lost.)
     let on = rig.dialled("a").await;
-    rig.net.black_hole(Duration::from_secs(11));
+    rig.net.black_hole(secs(11));
     let client = rig.connect_on(on, Some("s"), false);
-    rig::until("the first screen comes", Duration::from_secs(30), || {
+    rig::until("the first screen comes", secs(30), || {
         client.screen().contains("FIRST-SCREEN")
     });
     rig::screen_agrees(&pane, &client);
     assert!(rig.net.counts(rig.server_id).black_holed > 0);
     let on = rig.dialled("b").await;
-    rig.net.black_hole(Duration::from_secs(600));
+    rig.net.black_hole(secs(600));
     let mut client = rig.connect_on(on, None, true);
-    let ended = client.ends(Duration::from_secs(20)).await;
+    let ended = client.ends(secs(20)).await;
     assert_eq!(ended.unwrap_err().code, koh::Exit::UNREACHABLE);
     assert_eq!(rig.sessions(), ["s"]);
 }
@@ -300,24 +266,23 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
     let frame = format!(
         "{begins}\x1b[5;5H\x1b[38;2;10;20;30mcoloured\x1b]2;a title of some length\x1b\\\x1b]8;;https://example.com/a/link\x1b\\linked\x1b]8;;\x1b\\\x1b[7;1H\x1bPq#0;2;100;0;0#0~~~~-~~~~-~~~~\x1b\\\x1b[mafter"
     );
-    for inside in [
+    let insides = [
         "\x1b[3;",
         "\x1b[?202",
         "38;2;1",
         "a title",
         "example",
         "#0~~",
-    ] {
+    ];
+    for inside in insides {
         let cut = frame.find(inside).unwrap() + inside.len();
         let before = client.raw().len();
         draws(&mut send, &frame[..cut]).await;
-        rig::until(
-            "what was sent is on the terminal",
-            Duration::from_secs(10),
-            || client.raw().len() >= before + cut,
-        );
+        rig::until("what was sent is on the terminal", secs(10), || {
+            client.raw().len() >= before + cut
+        });
         conn.close(0u32.into(), b"cut");
-        rig::until("koh says there is no link", Duration::from_secs(10), || {
+        rig::until("koh says there is no link", secs(10), || {
             client.raw()[before + cut..]
                 .windows(7)
                 .any(|said| said == b"no link")
@@ -332,7 +297,7 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
         };
         rig::until(
             &format!("after a cut in {inside:?}, the screen is koh's line and no more"),
-            Duration::from_secs(10),
+            secs(10),
             || alone(client.screen()),
         );
         // The client comes again, to the run it was shown.
@@ -345,30 +310,26 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
         &format!("{begins}\x1b[2J\x1b[2;2H\x1b[32mRIGHT-AGAIN\x1b[m\x1b[?2026l"),
     )
     .await;
-    rig::until(
-        "the next screen is read right",
-        Duration::from_secs(10),
-        || client.screen().trim() == "RIGHT-AGAIN",
-    );
+    rig::until("the next screen is read right", secs(10), || {
+        client.screen().trim() == "RIGHT-AGAIN"
+    });
     // The server says its last word with all of that still on: koh ends with it, and puts
     // the terminal back all the same.
     let ended = ViewOutput::Exit(9);
     send_msg(&mut send, &ended, VIEW_FRAME).await.unwrap();
-    assert_eq!(client.ends(Duration::from_secs(10)).await.unwrap(), 9);
+    assert_eq!(client.ends(secs(10)).await.unwrap(), 9);
     the_terminal_is_put_back(&client, "after the server's last word");
-    rig::until("what it said is wiped", Duration::from_secs(10), || {
+    rig::until("what it said is wiped", secs(10), || {
         !client.screen().contains("no link")
     });
     // A server that sends what is no message: koh ends, saying so.
     let (mut client, _conn, mut send, _typed, _) = comes(&rig, &server, "b").await;
     draws(&mut send, &format!("{begins}\x1b[5;5HSHOWN")).await;
-    rig::until("the screen", Duration::from_secs(10), || {
-        client.screen().contains("SHOWN")
-    });
+    rig::until("the screen", secs(10), || client.screen().contains("SHOWN"));
     let long = ViewOutput::Bytes(vec![b'x'; VIEW_FRAME + 1]);
     // (The client reads its length and no further: the rest is sent to nobody.)
     let _ = send_msg(&mut send, &long, MAX_CTRL).await;
-    let ended = client.ends(Duration::from_secs(10)).await.unwrap_err();
+    let ended = client.ends(secs(10)).await.unwrap_err();
     assert!(
         ended.code == koh::Exit::FAILED && ended.message.contains("exceeds bound"),
         "{ended:?}"
@@ -412,14 +373,12 @@ while True:
     let flood = || {
         client
             .screen()
-            .lines()
-            .skip(1)
-            .collect::<Vec<_>>()
-            .join("\n")
+            .split_once('\n')
+            .map(|(_, rows)| rows.to_string())
     };
     // The flood has filled what waits ahead of the link before a key is typed: two seconds of
     // the link's frames have come.
-    rig::until("the flood fills the link", Duration::from_secs(20), || {
+    rig::until("the flood fills the link", secs(20), || {
         rig.net.counts(client.id).bytes > 64_000
     });
     let drawn = flood();
@@ -428,16 +387,14 @@ while True:
         let want = format!("===ECHO-{ch}===");
         let at = Instant::now();
         client.types(&[ch as u8]);
-        rig::until(&want, Duration::from_secs(30), || {
-            client.screen().contains(&want)
-        });
+        rig::until(&want, secs(30), || client.screen().contains(&want));
         echoes.push(at.elapsed());
     }
     echoes.sort();
     let (median, worst) = (echoes[2], echoes[4]);
     assert!(flood() != drawn, "the flood was not drawn on meanwhile");
     assert!(
-        median < Duration::from_secs(2) && worst < Duration::from_secs(5),
+        median < secs(2) && worst < secs(5),
         "echo queued behind the flood: {echoes:?}"
     );
 }

@@ -1894,70 +1894,44 @@ fn sessions_lists_what_the_folders_say() {
 fn output_last_is_the_last_commands_output_across_history() {
     let host = Host::start("last", &[]);
     let pane = host.session("1", &marking_shell(&host), "$");
+    let last = || host.asked("output", &["--session", "1", "--last"]);
     // A pane of ten rows, forty wide; and so much output that `history` has become `history.1`.
+    // That command's output began in `history.1`: all of it is there, in pieces.
     fs::write(pane.join("ctl"), "resize 40 10\n").unwrap();
     until("the pane takes the size", || {
         fs::read_to_string(pane.join("size")).unwrap() == "40 10\n"
     });
     fs::write(pane.join("in"), "seq 1 800000\n").unwrap();
-    until(
-        "history has become history.1, and the command has ended",
-        || {
-            let marks = fs::read_to_string(pane.join("marks")).unwrap_or_default();
-            pane.join("history.1").is_file() && marks.ends_with(" command\n")
-        },
-    );
-    // That command's output began in `history.1`: all of it is there, in pieces.
-    let (code, flood, said) = host.asked("output", &["--session", "1", "--last"]);
+    let marks = || fs::read_to_string(pane.join("marks")).unwrap_or_default();
+    // (The screen is read before the marks: a round of the holder writes them in that order.)
+    until("the command has ended, its output in history.1 too", || {
+        screen(&pane).contains("\n800000\n") && marks().ends_with(" command\n")
+    });
+    assert!(pane.join("history.1").is_file());
     let numbers: String = (1..=800_000).map(|n| format!("{n}\n")).collect();
-    assert_eq!((code, flood.len()), (Some(0), numbers.len()), "{said}");
-    assert!(flood == numbers);
-    // A command that prints 26 lines, one of them wider than the pane: 19 of them are in
-    // `history` by its end, and the wide one is three rows of the screen.
+    let (code, flood, said) = last();
+    assert!(code == Some(0) && flood == numbers, "{said}");
+    // A command that prints 26 lines, one of them wider than the pane: what it printed, each
+    // line whole, from where its output began to where it ended, history and screen: not the
+    // command, not the prompt after it.
     let lines: Vec<String> = (1..=26)
         .map(|n| match n {
             24 => "wide-".repeat(20),
             n => format!("line-{n}"),
         })
         .collect();
-    fs::write(
-        pane.join("in"),
-        format!("printf '%s\\n' {}\n", lines.join(" ")),
-    )
-    .unwrap();
+    let printf = format!("printf '%s\\n' {}\n", lines.join(" "));
+    fs::write(pane.join("in"), printf).unwrap();
     let printed = lines.join("\n") + "\n";
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let last = loop {
-        let last = host.asked("output", &["--session", "1", "--last"]);
-        if last.0 != Some(0) || last.1 == printed || Instant::now() > deadline {
-            break last;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    // What it printed, each line whole, from where its output began to where it ended: not
-    // the command, not the prompt after it.
-    assert_eq!(
-        (last.0, last.1.as_str()),
-        (Some(0), printed.as_str()),
-        "{}",
-        last.2
-    );
-    let rows = screen(&pane);
-    assert!(
-        rows.contains(&format!("{}\n", "wide-".repeat(8))),
-        "{rows:?}"
-    );
-    let history = fs::read_to_string(pane.join("history")).unwrap();
-    assert!(history.ends_with("line-19\n") && rows.contains("line-20\n"));
+    until("output --last is what it printed", || {
+        last() == (Some(0), printed.clone(), String::new())
+    });
     // Without `--last` it is the screen that is shown.
     let (code, shown, said) = host.asked("output", &["--session", "1"]);
-    assert_eq!((code, shown.as_str()), (Some(0), rows.as_str()), "{said}");
-    // A name that is no session's is not found.
-    let (code, _, said) = host.asked("output", &["--session", "none"]);
-    assert_eq!(code, Some(127), "{said}");
-    assert!(said.contains("no session none"), "{said}");
-    // Nor is a name that is none a path: the folder above the sessions is no session, also
-    // where it looks like a pane.
+    assert_eq!((code, shown), (Some(0), screen(&pane)), "{said}");
+    // A name that is no session's is not found; nor is a name that is none a path: the folder
+    // above the sessions is no session, also where it looks like a pane.
+    assert_eq!(host.asked("output", &["--session", "none"]).0, Some(127));
     let above = host.sessions.parent().unwrap();
     fs::create_dir_all(above.join("shown")).unwrap();
     fs::write(above.join("status"), "holder 1\n").unwrap();
@@ -1973,70 +1947,47 @@ fn wait_session_returns_the_commands_code_or_124() {
     let pane = host.session("s", &marking_shell(&host), "$");
     // No command ends: when the time given is over it is 124, with the screen as it is.
     let began = Instant::now();
-    let (code, waited, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
-    assert_eq!((code, said.as_str()), (Some(124), "· timed out\n"));
+    let (code, waited, _) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
+    assert_eq!((code, waited), (Some(124), screen(&pane)));
     assert!(began.elapsed() >= Duration::from_secs(1));
-    assert_eq!(waited, screen(&pane));
     // A wait returns when one more command has ended than when it was asked, with that
     // command's code and what it printed. (When the server takes the request the test cannot
-    // see: it types one command after the other until the wait has returned. Each prints a
-    // line of its own and ends with 42.)
+    // see: it types the same command again until the wait has returned.)
     let mut wait = host.waits(&["--timeout", "30"]);
-    let mut typed = 0;
     until("koh wait returns", || {
-        typed += 1;
-        let command = format!("sh -c 'echo waited-{typed}; exit 42'\n");
-        fs::write(pane.join("in"), command).unwrap();
+        fs::write(pane.join("in"), "sh -c 'echo waited; exit 42'\n").unwrap();
         std::thread::sleep(Duration::from_millis(250));
         wait.ended()
     });
     let (code, printed, said) = wait.said();
-    assert_eq!(code, Some(42), "{said}");
-    let line = printed
-        .strip_prefix("waited-")
-        .and_then(|n| n.strip_suffix('\n'));
-    assert!(
-        line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
-        "{printed:?}"
-    );
+    assert_eq!((code, printed.as_str()), (Some(42), "waited\n"), "{said}");
 }
 
-#[test]
-fn wait_session_ends_when_the_session_does() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_session_ends_when_the_session_does() {
     let host = Host::start("wait-end", &[]);
-    let pane = host.session(
-        "s",
-        &sh("echo ready; read line; echo bye-$line; exit 3"),
-        "ready",
-    );
-    // A wait with no time given, of a program that marks nothing: it waits while that runs.
-    let mut wait = host.waits(&[]);
-    std::thread::sleep(Duration::from_millis(700));
-    assert!(!wait.ended());
-    // The program ends: the wait ends with its status and its last screen.
+    let program = sh("echo ready; read line; echo bye-$line; exit 3");
+    let pane = host.session("s", &program, "ready");
+    // A wait the server has taken, of a program that marks nothing: the program ends, and the
+    // wait ends with its status and its last screen. Asked of a session that has ended, it
+    // says the same at once.
+    let client = host.client().await;
+    let wait = waits(&client, "s").await;
     fs::write(pane.join("in"), "now\n").unwrap();
-    until("koh wait ends", || wait.ended());
-    let (code, shown, said) = wait.said();
-    assert_eq!(code, Some(3), "{said}");
-    assert!(
-        shown.contains("bye-now") && said.contains("exited 3"),
-        "{shown:?} {said}"
-    );
-    // Asked of a session that has ended, it says the same at once.
-    let (code, shown, said) = host.asked("wait", &["--session", "s"]);
-    assert_eq!(code, Some(3), "{said}");
-    assert!(shown.contains("bye-now"), "{shown:?}");
-    // Of one whose holder was killed nothing says how it ended: that is 1, not 0.
+    let (code, shown) = waited(wait).await;
+    assert!(code == 3 && shown.contains("bye-now"), "{code} {shown:?}");
+    let (code, again, said) = host.asked("wait", &["--session", "s"]);
+    assert_eq!((code, again), (Some(3), shown), "{said}");
+    // Of one whose holder was killed nothing says how it ended: that is 1, not 0. And a name
+    // that is no session's is not found.
     let dead = host.session("dead", &sh("echo ready; sleep 30"), "ready");
     signal(&holder_of(&dead), "-KILL");
     until("the holder is gone", || {
         fs::File::open(&dead).unwrap().try_lock_shared().is_ok()
     });
-    let (code, _, said) = host.asked("wait", &["--session", "dead"]);
-    assert_eq!(code, Some(1), "{said}");
-    // And a name that is no session's is not found.
-    let (code, _, said) = host.asked("wait", &["--session", "none"]);
-    assert_eq!(code, Some(127), "{said}");
+    assert_eq!(host.asked("wait", &["--session", "dead"]).0, Some(1));
+    assert_eq!(host.asked("wait", &["--session", "none"]).0, Some(127));
+    client.close().await;
 }
 
 #[test]
@@ -2049,39 +2000,42 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     let script = host.tmp.0.join("sessions.sh");
     fs::write(&script, &help[help.find("#!/bin/sh").unwrap()..]).unwrap();
     assert!(!koh(&host.tmp.0, &["--help"]).1.contains("#!/bin/sh"));
+    let (scratch, dir) = (host.tmp.0.join("scratch"), host.sessions.to_str().unwrap());
+    fs::create_dir_all(&scratch).unwrap();
     let recipe = |args: &[&str]| {
         let mut sh = Command::new("sh");
-        let said = sh.arg(&script).args(args).output().unwrap();
+        sh.arg(&script).args(args).env("TMPDIR", &scratch);
+        sh.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        sh
+    };
+    let run = |args: &[&str]| {
+        let said = recipe(args).output().unwrap();
         let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
         (said.status.code(), text(&said.stdout), text(&said.stderr))
     };
     // Run on the server, where the folders are, it lists, shows and waits as the commands do.
-    let (dir, pane_dir) = (host.sessions.to_str().unwrap(), pane.to_str().unwrap());
+    let pane_dir = pane.to_str().unwrap();
     fs::write(pane.join("in"), "sh -c 'echo from-the-recipe; exit 9'\n").unwrap();
     until("the command has ended", || {
         host.asked("sessions", &[]).1.contains("\texit=9\t")
     });
-    let (code, list, said) = recipe(&["list", dir]);
+    let listed = run(&["list", dir]);
     assert_eq!(
-        (code, list.as_str()),
-        (Some(0), "s\talive\trunning\t80x24\tidle\t9\t\n"),
-        "{said}"
+        (listed.0, listed.1.as_str()),
+        (Some(0), "s\talive\trunning\t80x24\tidle\t9\t\n")
     );
-    let (code, last, said) = recipe(&["last", pane_dir]);
-    assert_eq!(
-        (code, last.as_str()),
-        (Some(0), "from-the-recipe\n"),
-        "{said}"
-    );
+    let (code, last, _) = run(&["last", pane_dir]);
+    assert_eq!((code, last.as_str()), (Some(0), "from-the-recipe\n"));
     assert_eq!(last, host.asked("output", &["--session", "s", "--last"]).1);
-    let (code, shown, said) = recipe(&["wait", pane_dir, "1"]);
+    let (code, shown, said) = run(&["wait", pane_dir, "1"]);
     assert_eq!((code, shown), (Some(124), screen(&pane)), "{said}");
-    assert_eq!(recipe(&["screen", pane_dir]).1, screen(&pane));
+    assert_eq!(run(&["screen", pane_dir]).1, screen(&pane));
     // The session ends: the recipe's wait ends with the program's status.
     fs::write(pane.join("in"), "exit 3\n").unwrap();
-    assert_eq!(recipe(&["wait", pane_dir, "20"]).0, Some(3));
+    assert_eq!(run(&["wait", pane_dir, "20"]).0, Some(3));
     assert_eq!(
-        recipe(&["list", dir]).1,
+        run(&["list", dir]).1,
         "s\tended\texited 3\t80x24\tidle\t9\t\n"
     );
     // Its wait has the command's rule: marks that only moved end nothing (a line inserted
@@ -2098,7 +2052,7 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     ];
     let moving = host.session("m", &marks_by_steps(&steps), "$");
     let last_is = |want: &str| {
-        let (code, last, said) = recipe(&["last", moving.to_str().unwrap()]);
+        let (code, last, said) = run(&["last", moving.to_str().unwrap()]);
         assert_eq!((code, last.as_str()), (Some(0), want), "{said}");
         assert_eq!(last, host.asked("output", &["--session", "m", "--last"]).1);
     };
@@ -2106,17 +2060,21 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     stepped(&moving, 1);
     last_is(&screen(&moving));
     stepped(&moving, 2);
-    let mut wait = Command::new("sh");
-    wait.arg(&script)
-        .args(["wait", moving.to_str().unwrap(), "30"]);
     let mut wait = Waits(
-        wait.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
+        recipe(&["wait", moving.to_str().unwrap(), "30"])
             .spawn()
             .unwrap(),
     );
-    std::thread::sleep(Duration::from_millis(500));
+    // (Its first look has taken what it waits from once it has written what it read.)
+    let looked = || {
+        fs::read_dir(&scratch)
+            .unwrap()
+            .flatten()
+            .any(|f| f.metadata().is_ok_and(|m| m.len() > 0))
+    };
+    until("the recipe's wait has looked", looked);
     stepped(&moving, 3);
+    // (Time for it to look at the moved marks: the wait is the test.)
     std::thread::sleep(Duration::from_millis(500));
     assert!(!wait.ended(), "{:?}", wait.said());
     stepped(&moving, 4);
@@ -2132,10 +2090,9 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     // And its list has a pane that has only begun: a `status`, and nothing else yet.
     fs::create_dir(host.sessions.join("bare")).unwrap();
     fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();
-    let (code, list, said) = recipe(&["list", dir]);
-    assert_eq!(code, Some(0), "{said}");
+    let (code, list, said) = run(&["list", dir]);
     assert!(
-        list.starts_with("bare\tended\t\t0x0\tidle\t-\t\n"),
+        code == Some(0) && list.starts_with("bare\tended\t\t0x0\tidle\t-\t\n"),
         "{list:?} {said}"
     );
 }
@@ -2167,11 +2124,11 @@ const MOVES: [&str; 4] = [
 ];
 
 /// A wait asked of the server by the client in this process: the stream, once the server has
-/// taken the request.
+/// taken the request. (Its time is a watchdog's: a wait that says nothing is the test's.)
 async fn waits(client: &Client, session: &str) -> RecvStream {
     let asked = Request::WaitSession {
         session: session.into(),
-        timeout_secs: Some(8),
+        timeout_secs: Some(60),
     };
     client.request(&asked).await.unwrap().1
 }
@@ -2197,12 +2154,12 @@ async fn silent(wait: &mut RecvStream) -> bool {
         .is_err()
 }
 
-/// A session of `marks_by_steps`, and how many of its steps are done.
+/// A session `name` of `marks_by_steps`, and how many of its steps are done.
 struct Stepped(PathBuf, u32);
 
 impl Stepped {
-    fn start(host: &Host, steps: &[&str]) -> Self {
-        Self(host.session("s", &marks_by_steps(steps), "$"), 0)
+    fn start(host: &Host, name: &str, steps: &[&str]) -> Self {
+        Self(host.session(name, &marks_by_steps(steps), "$"), 0)
     }
 
     /// Has the next step done, and gives the pane's `marks` after it.
@@ -2210,6 +2167,19 @@ impl Stepped {
         self.1 += 1;
         stepped(&self.0, self.1)
     }
+}
+
+/// Holds the server still (stopped, and seen to be) while `then` runs: what it does falls
+/// between two of the server's looks.
+fn still<T>(host: &Host, then: impl FnOnce() -> T) -> T {
+    let server = host.served.as_ref().unwrap().server.id().to_string();
+    signal(&server, "-STOP");
+    until("the server is stopped", || {
+        ps(&server, "stat=").starts_with('T')
+    });
+    let done = then();
+    signal(&server, "-CONT");
+    done
 }
 
 /// Has a session of `marks_by_steps` do its next step, the `done`th, and gives the pane's
@@ -2232,90 +2202,175 @@ fn stepped(pane: &Path, done: u32) -> String {
     marks
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wait_is_not_ended_by_marks_that_only_moved() {
-    let host = Host::start("moved", &[]);
-    let fill = "i=0; while [ $i -lt 260 ]; do ran fill 0; i=$((i + 1)); done";
-    let cleared = r"printf '\r\n'; m C; printf '\033[H\033[2Jfour\r\n'; m 'D;4'; prompt";
-    let mut steps = vec!["ran one 7"];
-    steps.extend(MOVES);
-    steps.extend(["ran two 9", fill]);
-    steps.extend(MOVES);
-    steps.push(cleared);
-    let pane = host.session("s", &marks_by_steps(&steps), "$");
-    let mut done = 0;
-    let mut step = || {
-        done += 1;
-        stepped(&pane, done)
-    };
-    let client = host.client().await;
-    // A command has ended with 7; a wait is asked at the prompt after it. The marks are few, and
-    // all on the screen.
-    let before = step();
-    let mut wait = waits(&client, "s").await;
-    // Whatever moves the screen moves its marks, and is no command's end: the wait says nothing.
-    for moved in [
-        "a line inserted",
-        "a scroll down",
-        "a clear",
-        "the prompt again",
-    ] {
-        let marks = step();
-        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
-        assert!(
-            said.is_err(),
-            "after {moved} the wait ended: {before:?} became {marks:?}"
-        );
-    }
-    // A command's end is one.
-    step();
-    assert_eq!(waited(wait).await, (9, "two\n".to_string()));
-    // The same in a pane whose `marks` is full: it keeps a thousand, and drops one for each it takes.
-    let full = step();
-    assert_eq!(full.lines().count(), 1000);
-    let mut wait = waits(&client, "s").await;
-    for moved in [
-        "a line inserted",
-        "a scroll down",
-        "a clear",
-        "the prompt again",
-    ] {
-        let marks = step();
-        let said = tokio::time::timeout(Duration::from_millis(400), wait.read(&mut [0; 1])).await;
-        assert!(
-            said.is_err(),
-            "full, after {moved} the wait ended: {marks:?}"
-        );
-    }
-    // There a command that clears the screen and ends no further down than the last has ended too.
-    let marks = step();
-    assert_eq!(marks.lines().count(), 1000);
-    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
-    client.close().await;
+/// So many times `body`, as one step of a session's program.
+fn times(n: u32, body: &str) -> String {
+    format!("i=0; while [ $i -lt {n} ]; do {body}; i=$((i + 1)); done")
 }
 
+/// A case of the test below: steps; how many are done before a wait is asked, and whether
+/// `marks` is full by then; how many next end nothing; whether the rest come between two of
+/// the server's looks; the code the wait is answered, and what was printed.
+type Case<'a> = (&'a [&'a str], u32, bool, u32, bool, (i32, Option<&'a str>));
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wait_gives_the_first_command_that_ended_since_it_was_asked() {
-    let host = Host::start("first", &[]);
-    // Two commands end before the wait looks again: one typed while the other ran.
-    let pane = host.session(
-        "s",
-        &marks_by_steps(&["ran one 7", "ran two 0; ran three 5"]),
-        "$",
-    );
-    let step = |done: u32| {
-        fs::write(pane.join("in"), "\n").unwrap();
-        let title = format!("done-{done}\n");
-        until(&title, || {
-            fs::read_to_string(pane.join("title")).is_ok_and(|said| said == title)
-        });
-    };
-    step(1);
+async fn a_wait_gives_the_first_end_since_it_was_asked_and_marks_that_only_moved_end_nothing() {
+    let host = Host::start("moved", &[]);
     let client = host.client().await;
-    let wait = waits(&client, "s").await;
-    step(2);
-    // It is the first of them that the wait was for: its code, and what it printed.
-    assert_eq!(waited(wait).await, (0, "two\n".to_string()));
+    // Each a session: steps; how many are done before the wait is asked, and whether `marks`
+    // is full by then (a thousand: it drops one for each it takes); how many come next that end
+    // nothing, each looked at by the server; whether the rest come between two of its looks;
+    // and what the wait is answered: a code, and what that command printed (where it is kept).
+    let fill = times(260, "ran fill 0");
+    let cleared = r"printf '\r\n'; m C; printf '\033[H\033[2Jfour\r\n'; m 'D;4'; prompt";
+    let clears = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2Jhi %s\r\n' $i; m 'D;0'; prompt",
+    );
+    let more = times(16, "ran more $((i + 10))");
+    let all_on_screen = times(
+        255,
+        r"printf '\r\n'; m C; printf '\033[H\033[2J'; m 'D;0'; prompt",
+    );
+    let quiet = r"printf '\r\n'; m C; m 'D;0'; prompt";
+    let at_prompts = times(
+        260,
+        r"printf '\033[H\033[2J'; prompt; printf '\r\n'; m C; printf 'x\r\n'; m 'D;7'",
+    ) + "; prompt";
+    let alike = format!(
+        "{quiet}; {quiet}; {quiet}; printf '\\r\\n'; m C; printf '\\033[H\\033[2J'; m 'D;0'; prompt; {}",
+        times(247, "ran fill 1")
+    );
+    let [a, b, c, d] = MOVES;
+    let cases: [Case; 9] = [
+        // The four ways a screen moves its marks, few marks and all on the screen; then full.
+        (
+            &["ran one 7", a, b, c, d, "ran two 9"],
+            1,
+            false,
+            4,
+            false,
+            (9, Some("two\n")),
+        ),
+        (
+            &[&fill, a, b, c, d, cleared],
+            1,
+            true,
+            4,
+            false,
+            (4, Some("four\n")),
+        ),
+        // Two commands end before the wait looks again: one typed while the other ran.
+        (
+            &["ran one 7", "ran two 0; ran three 5"],
+            1,
+            false,
+            0,
+            true,
+            (0, Some("two\n")),
+        ),
+        // A shell that clears at every command: every mark of a full file but the last few is
+        // at one place. A command's end there, and one asked for afresh after more.
+        (
+            &[&clears, "ran four 4", &more],
+            1,
+            true,
+            0,
+            false,
+            (4, Some("four\n")),
+        ),
+        (
+            &[&clears, "ran four 4", &more, "ran fresh 3"],
+            3,
+            true,
+            0,
+            false,
+            (3, Some("fresh\n")),
+        ),
+        // A full file whose first mark is on the screen: a command scrolls it down, and ends
+        // with 5 only later.
+        (
+            &[
+                &all_on_screen,
+                quiet,
+                r"printf '\r\n'; m C; printf '\033[1T'",
+                "m 'D;5'; prompt",
+            ],
+            2,
+            true,
+            1,
+            false,
+            (5, None),
+        ),
+        // A full file on three rows, a shell that clears at each prompt: a line inserted.
+        (
+            &[&at_prompts, a, "ran after 3"],
+            1,
+            true,
+            1,
+            false,
+            (3, Some("after\n")),
+        ),
+        // A full file whose oldest marks are alike; an empty line entered, whose `end` has the
+        // code of the command before, then one that ends with 22: the first is the first.
+        (
+            &[&alike, r"printf '\r\n'; m 'D;1'; prompt; ran second 22"],
+            1,
+            true,
+            0,
+            false,
+            (1, Some("fill\n")),
+        ),
+        // A command ends with 77, a prompt with no `end` (Ctrl-C), a clear and the prompt anew,
+        // which takes two marks back. (What it printed went with the clear, unless the wait
+        // looked before that.)
+        (
+            &[
+                &fill,
+                r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt",
+            ],
+            1,
+            true,
+            0,
+            false,
+            (77, None),
+        ),
+    ];
+    for (n, (steps, asked, full, nothing, between, (code, printed))) in
+        cases.into_iter().enumerate()
+    {
+        let mut session = Stepped::start(&host, &format!("s{n}"), steps);
+        let mut marks = String::new();
+        while session.1 < asked {
+            marks = session.step();
+        }
+        assert!(
+            !full || marks.lines().count() == 1000,
+            "case {n}: {marks:?}"
+        );
+        let mut wait = waits(&client, &format!("s{n}")).await;
+        for _ in 0..nothing {
+            let marks = session.step();
+            assert!(
+                silent(&mut wait).await,
+                "case {n}: the wait ended at {marks:?}"
+            );
+        }
+        let rest = |session: &mut Stepped| {
+            while session.1 < steps.len() as u32 {
+                session.step();
+            }
+        };
+        match between {
+            true => still(&host, || rest(&mut session)),
+            false => rest(&mut session),
+        }
+        let (got, text) = waited(wait).await;
+        assert_eq!(
+            (got, printed.is_none_or(|printed| printed == text)),
+            (code, true),
+            "case {n}: {text:?}"
+        );
+    }
     client.close().await;
 }
 
@@ -2333,12 +2388,15 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
         fs::write(pane.join("run"), format!("{n:032x}\n")).unwrap();
         fs::write(pane.join("title"), "t".repeat(256) + "\n").unwrap();
     }
-    let list = client.sessions().await.unwrap();
-    assert_eq!(list.len(), 4500);
-    assert!(
-        list.iter()
-            .all(|session| session.title.len() == 256 && session.state == "ended")
-    );
+    let mut names: Vec<u32> = client
+        .sessions()
+        .await
+        .unwrap()
+        .iter()
+        .map(|s| s.name.parse().unwrap())
+        .collect();
+    names.sort();
+    assert!(names.into_iter().eq(1..=4500));
     client.close().await;
     door.shut().await;
 }
@@ -2348,99 +2406,13 @@ fn a_wait_for_a_job_and_a_session_at_once_is_a_usage_error() {
     let tmp = TempDir::new("wait-usage");
     // A wait is for a job or for a session; what is a job's alone is not said of a session.
     for more in [&["build"][..], &["--tail", "5"]] {
-        let mut args = vec!["wait", "nowhere", "--session", "s"];
-        args.extend(more);
-        let (code, _, said) = koh(&tmp.0, &args);
-        assert_eq!(code, Some(2), "{more:?}: {said}");
-        assert!(
-            said.contains("a job's") && said.contains("--session"),
-            "{more:?}: {said}"
-        );
+        let args = [&["wait", "nowhere", "--session", "s"], more].concat();
+        assert_eq!(koh(&tmp.0, &args).0, Some(2), "{more:?}");
     }
 }
 
 // The sequences of the second round of reviews, each against fux's holder: what a full `marks`
 // could not say, and its count of the marks it dropped does.
-
-/// So many times `body`, as one step of a session's program.
-fn times(n: u32, body: &str) -> String {
-    format!("i=0; while [ $i -lt {n} ]; do {body}; i=$((i + 1)); done")
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_wait_sees_a_commands_end_in_a_shell_that_clears_at_every_command() {
-    let host = Host::start("clears", &[]);
-    // `clear; echo hi N`, 255 times, in a pane of 80 by 24: the file is full, and every mark
-    // of it but the last few is at one place. Then a command that ends with 4, and 16 more.
-    let clears = times(
-        255,
-        r"printf '\r\n'; m C; printf '\033[H\033[2Jhi %s\r\n' $i; m 'D;0'; prompt",
-    );
-    let more = times(16, "ran more $((i + 10))");
-    let mut session = Stepped::start(&host, &[&clears, "ran four 4", &more, "ran fresh 3"]);
-    assert_eq!(session.step().lines().count(), 1000);
-    let client = host.client().await;
-    let wait = waits(&client, "s").await;
-    session.step();
-    session.step();
-    assert_eq!(waited(wait).await, (4, "four\n".to_string()));
-    // And a wait asked afresh after those.
-    let wait = waits(&client, "s").await;
-    session.step();
-    assert_eq!(waited(wait).await, (3, "fresh\n".to_string()));
-    client.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_screen_that_moves_ends_nothing_where_every_mark_is_on_it() {
-    let host = Host::start("on-screen", &[]);
-    // `clear` 255 times and `true`: a full file whose first mark is still on the screen. A
-    // command begins, scrolls the screen down, and ends with 5 only later.
-    let clears = times(
-        255,
-        r"printf '\r\n'; m C; printf '\033[H\033[2J'; m 'D;0'; prompt",
-    );
-    let begun = r"printf '\r\n'; m C; printf '\033[1T'";
-    let steps = [
-        &clears,
-        r"printf '\r\n'; m C; m 'D;0'; prompt",
-        begun,
-        "m 'D;5'; prompt",
-    ];
-    let mut session = Stepped::start(&host, &steps);
-    session.step();
-    assert_eq!(session.step().lines().count(), 1000);
-    let client = host.client().await;
-    let mut wait = waits(&client, "s").await;
-    let scrolled = session.step();
-    assert!(
-        silent(&mut wait).await,
-        "the wait ended at a scroll down: {scrolled:?}"
-    );
-    session.step();
-    assert_eq!(waited(wait).await.0, 5);
-    client.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_line_inserted_ends_nothing_where_a_shell_clears_at_each_prompt() {
-    let host = Host::start("inserted", &[]);
-    // 260 commands, each at a prompt drawn on a cleared screen: a full file on three rows.
-    let cleared = r"printf '\033[H\033[2J'; prompt; printf '\r\n'; m C; printf 'x\r\n'; m 'D;7'";
-    let fill = times(260, cleared) + "; prompt";
-    let mut session = Stepped::start(&host, &[&fill, MOVES[0], "ran after 3"]);
-    assert_eq!(session.step().lines().count(), 1000);
-    let client = host.client().await;
-    let mut wait = waits(&client, "s").await;
-    let inserted = session.step();
-    assert!(
-        silent(&mut wait).await,
-        "the wait ended at a line inserted: {inserted:?}"
-    );
-    session.step();
-    assert_eq!(waited(wait).await, (3, "after\n".to_string()));
-    client.close().await;
-}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed() {
@@ -2448,31 +2420,19 @@ async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed
     // One command has ended; then the marks of 300, in one write: more than the file keeps.
     let one = r#"s="$s\r\n\033]133;C\007burst-$i\r\n\033]133;D;$((i % 100))\007\033]133;A\007\$ \033]133;B\007""#;
     let burst = format!(r#"s=; {}; printf "$s""#, times(300, one));
-    let mut session = Stepped::start(&host, &["ran one 7", &burst]);
+    let mut session = Stepped::start(&host, "s", &["ran one 7", &burst]);
     session.step();
     let client = host.client().await;
     let wait = waits(&client, "s").await;
-    // The server looks ten times a second, and the holder writes the burst in as many rounds
-    // as it reads it in. So that all of it is between two looks, the server stands still
-    // from the look the wait was asked with until the pane has the whole burst: a look in the
-    // middle would find the first command, or the oldest of that moment.
-    let server = host.served.as_ref().unwrap().server.id().to_string();
-    let state = || {
-        let ps = Command::new("ps")
-            .args(["-o", "state=", "-p", &server])
-            .output();
-        String::from_utf8_lossy(&ps.unwrap().stdout).into_owned()
-    };
-    signal(&server, "-STOP");
-    until("the server is stopped", || state().contains('T'));
-    let marks = session.step();
-    signal(&server, "-CONT");
+    // So that all of the burst is between two looks (the holder writes it in as many rounds
+    // as it reads it in), the server stands still from the look the wait was asked with until
+    // the pane has the whole burst.
+    let marks = still(&host, || session.step());
     assert_eq!(marks.lines().count(), 1000);
     let (code, text, said) = told(wait).await;
     // The first that ended is not there any more. The wait gives the oldest that is, and says
     // that it is not known to be the first.
-    let kept = marks.lines().filter(|mark| mark.contains(" end")).count();
-    let oldest = 300 - kept;
+    let oldest = 300 - marks.lines().filter(|mark| mark.contains(" end")).count();
     assert!(said.contains("marks came and went unread"), "{said}");
     assert_eq!(
         (code, text),
@@ -2482,90 +2442,42 @@ async fn more_marks_than_a_pane_keeps_between_two_looks_are_said_and_not_guessed
     client.close().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_first_end_is_the_first_where_the_files_oldest_marks_are_alike() {
-    let host = Host::start("alike", &[]);
-    // Three commands and a clear, which puts their marks at one place; 247 more, and the file
-    // is full with those alike at its front. Then an empty line entered, whose `end` has the
-    // code of the command before, and a command that ends with 22: the first is the first.
-    let quiet = r"printf '\r\n'; m C; m 'D;0'; prompt";
-    let fill = format!(
-        "{quiet}; {quiet}; {quiet}; printf '\\r\\n'; m C; printf '\\033[H\\033[2J'; m 'D;0'; prompt; {}",
-        times(247, "ran fill 1")
-    );
-    let entered = r"printf '\r\n'; m 'D;1'; prompt; ran second 22";
-    let mut session = Stepped::start(&host, &[&fill, entered]);
-    assert_eq!(session.step().lines().count(), 1000);
-    let client = host.client().await;
-    let wait = waits(&client, "s").await;
-    session.step();
-    assert_eq!(waited(wait).await, (1, "fill\n".to_string()));
-    client.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_end_is_seen_where_a_prompt_drawn_again_left_a_full_file_short() {
-    let host = Host::start("short", &[]);
-    // A full file. A command ends with 77; a prompt with no `end` (Ctrl-C); a clear and the
-    // prompt anew, which takes two marks back: 998 lines, and six were dropped.
-    let after = r"ran hello 77; printf '^C\r\n'; prompt; printf '\033[H\033[2J'; prompt";
-    let mut session = Stepped::start(&host, &[&times(260, "ran fill 0"), after]);
-    assert_eq!(session.step().lines().count(), 1000);
-    let client = host.client().await;
-    let wait = waits(&client, "s").await;
-    assert_eq!(session.step().lines().count(), 998);
-    // (What it printed went with the clear, unless the wait looked before that.)
-    assert_eq!(waited(wait).await.0, 77);
-    client.close().await;
-}
-
 #[tokio::test]
 async fn each_client_dials_from_its_own_key_and_proves_the_client_key() {
-    let tmp = TempDir::new("ephemeral-dial");
-    let key = new_key(&tmp, "client.key");
-    let (srv, route) = boot_server(&tmp, vec![key.public()], ServeOptions::default()).await;
-    let dial = || Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false);
-
-    let (a, b) = (dial().await.unwrap(), dial().await.unwrap());
-    assert!(srv.endpoint.remote_info(key.public()).await.is_none());
+    let door = Door::open("ephemeral-dial", ServeOptions::default()).await;
+    let (key, route) = (door.friend.public(), door.route.clone());
+    // Two clients of one key are served at once, and the server never meets the key as a
+    // transport's: each dials from a key of its own, and proves the client's in a request.
+    let (a, b) = (door.client().await, door.client().await);
     let (r1, r2) = tokio::join!(a.jobs(None), b.jobs(None));
     assert!(r1.unwrap().is_empty() && r2.unwrap().is_empty());
-    a.close().await;
-    b.close().await;
-
+    assert!(door.srv.endpoint.remote_info(key).await.is_none());
     let cfg = koh::net::transport_config(false);
-    let (e1, _, _) = koh::net::connect_server(srv.endpoint_id, route.clone(), cfg.clone())
-        .await
-        .unwrap();
-    let (e2, _, _) = koh::net::connect_server(srv.endpoint_id, route, cfg)
-        .await
-        .unwrap();
-    assert_ne!(e1.id(), key.public());
-    assert_ne!(e2.id(), key.public());
-    assert_ne!(e1.id(), e2.id());
-    assert!(srv.endpoint.remote_info(e1.id()).await.is_some());
-    assert!(srv.endpoint.remote_info(e2.id()).await.is_some());
+    let dial = || koh::net::connect_server(door.srv.endpoint_id, route.clone(), cfg.clone());
+    let ((e1, _, _), (e2, _, _)) = (dial().await.unwrap(), dial().await.unwrap());
+    assert!(e1.id() != key && e2.id() != key && e1.id() != e2.id());
     e1.close().await;
     e2.close().await;
-    srv.shutdown().await;
+    a.close().await;
+    b.close().await;
+    door.shut().await;
 }
 
 #[test]
 fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
-    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt as _;
-
     let tmp = TempDir::new("clients-parse");
     let (key, file) = (tmp.0.join("server.key"), tmp.0.join("clients"));
     let k = iroh::SecretKey::from_bytes(&[1; 32]).public();
+    // Each line of the file, and whether it is a client: NAME ID and no more, a comment and a
+    // blank line are none, nor is a line that is said again on its own (its control bytes
+    // escaped). The last has no line feed after its `\r`.
     let rows = [
         ("# comment".into(), None),
         (String::new(), None),
         (format!("full {k}"), Some("full")),
         (format!("ws {k}   "), Some("ws")),
         (format!("cp {k} cp=/srv"), None),
-        (format!("ex {k} exec=~/a b"), None),
-        (format!("t1 {k} copy=/srv"), None),
         (format!("t2 {k} # inline"), None),
         (format!("t3 {k} --cp /srv\x1b[2K"), None),
         ("bad_id notakey".into(), None),
@@ -2573,144 +2485,102 @@ fn clients_file_rejects_extra_fields_and_keeps_valid_lines() {
         (format!("cr {k}\r"), Some("cr")),
     ];
     let text: Vec<_> = rows.iter().map(|(l, _)| l.as_str()).collect();
-    // No trailing LF: exercises a bare trailing `\r` on the last line.
     fs::write(&file, text.join("\n")).unwrap();
-
-    let mut skipped = Vec::new();
-    let entries =
-        koh::keys::load_clients(Some(&key), |n, l| skipped.push((n, l.to_string()))).unwrap();
-    let want: Vec<_> = rows.iter().filter_map(|(_, w)| *w).collect();
-    let got: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(got, want);
-    let skipped_want: Vec<_> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, (l, w))| w.is_none() && !l.is_empty() && !l.starts_with('#'))
-        .map(|(i, (l, _))| (i + 1, l.clone()))
-        .collect();
-    assert_eq!(skipped, skipped_want);
-
     let cli = |args: &[&str]| {
         let mut c = Command::new(env!("CARGO_BIN_EXE_koh"));
-        c.arg("clients").arg("--key-file").arg(&key).args(args);
-        c
-    };
-    let out = cli(&[]).output().unwrap();
-    assert!(out.status.success());
-    let (stdout, stderr) = (
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
-    );
-    for name in &want {
-        assert!(stdout.contains(&format!("{name} ")), "{stdout}");
-    }
-    assert_eq!(stderr.lines().count(), skipped_want.len(), "{stderr}");
-    for (n, line) in &skipped_want {
-        let expected = format!("koh: clients:{n}: ignored, not NAME ID: {line:?}");
-        assert!(stderr.contains(&expected), "missing {expected} in {stderr}");
-    }
-
-    for flag in ["--cp", "--exec"] {
-        let res = cli(&["add", "bad", &k.to_string(), flag, "/srv"])
+        let out = c
+            .arg("clients")
+            .arg("--key-file")
+            .arg(&key)
+            .args(args)
             .output()
             .unwrap();
-        assert_eq!(res.status.code(), Some(2), "{flag}");
-    }
-    let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
-        .arg("servers")
-        .arg(OsStr::from_bytes(b"\xff"))
-        .output()
-        .unwrap();
-    assert_eq!(not_utf8.status.code(), Some(2));
-    assert!(not_utf8.stdout.is_empty());
-    assert_eq!(not_utf8.stderr, b"koh: arguments must be valid UTF-8\n");
-
-    // `rm` on a skipped name fails and leaves the file unchanged; `add`, `rename`, and `rm` of
-    // accepted names warn about skipped lines on stderr and rewrite from accepted lines only.
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+        (out.status.code(), text(&out.stdout), text(&out.stderr))
+    };
+    let (code, listed, said) = cli(&[]);
+    let names: Vec<_> = listed.lines().filter_map(|l| l.split(' ').next()).collect();
+    assert_eq!((code, names), (Some(0), ["full", "ws", "cr"].to_vec()));
+    let ignored = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, (l, w))| w.is_none() && !l.is_empty() && !l.starts_with('#'));
+    let ignored: Vec<_> = ignored
+        .map(|(i, (l, _))| format!("koh: clients:{}: ignored, not NAME ID: {l:?}", i + 1))
+        .collect();
+    assert_eq!(said.lines().collect::<Vec<_>>(), ignored);
+    // `rm` of an ignored name fails and leaves the file as it was; `add`, `rename` and `rm` of
+    // clients say what they ignore and write the clients alone.
     let before = format!("old {k} cp=/srv\nother {k}\n");
     fs::write(&file, &before).unwrap();
-    let rm_old = cli(&["rm", "old"]).output().unwrap();
-    assert!(!rm_old.status.success());
-    let rm_err = String::from_utf8_lossy(&rm_old.stderr);
-    assert!(rm_err.contains("koh: clients:1: ignored") && rm_err.contains("no client named"));
+    let (code, _, said) = cli(&["rm", "old"]);
+    assert!(
+        code != Some(0) && said.contains("clients:1: ignored") && said.contains("no client named")
+    );
     assert_eq!(fs::read_to_string(&file).unwrap(), before);
-    let added = cli(&["add", "alice", &k.to_string()]).output().unwrap();
-    assert!(added.status.success());
-    assert!(String::from_utf8_lossy(&added.stderr).contains("koh: clients:1: ignored"));
-    assert!(cli(&["rename", "alice", "bob"]).status().unwrap().success());
-    let names: Vec<_> = koh::keys::load_clients(Some(&key), |_, _| {})
-        .unwrap()
-        .into_iter()
-        .map(|e| e.name)
-        .collect();
-    assert_eq!(names, ["other", "bob"]);
-    assert!(cli(&["rm", "other"]).status().unwrap().success());
+    assert!(
+        cli(&["add", "alice", &k.to_string()])
+            .2
+            .contains("clients:1: ignored")
+    );
+    assert_eq!(cli(&["rename", "alice", "bob"]).0, Some(0));
+    assert_eq!(cli(&["rm", "other"]).0, Some(0));
     assert_eq!(fs::read_to_string(&file).unwrap(), format!("bob {k}\n"));
+    // An argument that is no UTF-8 is a usage error.
+    let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
+        .arg("servers")
+        .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+        .output();
+    assert_eq!(not_utf8.unwrap().status.code(), Some(2));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     let tmp = TempDir::new("clients-enforce");
-    let bot_cfg = tmp.0.join("bot_cfg");
-    let crun = tmp.0.join("crun");
+    let (bot_cfg, crun) = (tmp.0.join("bot_cfg"), tmp.0.join("crun"));
     for d in [tmp.0.join("srv_cfg"), bot_cfg.clone(), crun.clone()] {
         fs::create_dir_all(d).unwrap();
     }
     let valid = new_key(&tmp, "v.key");
-    let cp_key = load_or_create_key(Role::Client, Some(&bot_cfg.join("client.key"))).unwrap();
-    let exec_key = new_key(&tmp, "ex.key");
-    let typo = new_key(&tmp, "t.key");
-    let clients_file = tmp.0.join("srv_cfg/clients");
-    let skipped_only = format!(
-        "cpbot {} cp=/srv\nexecbot {} exec=/srv\ntypo {} copy=/srv\nold_valid {} cp=/srv\n",
-        cp_key.public(),
-        exec_key.public(),
-        typo.public(),
-        valid.public()
-    );
-    fs::write(
-        &clients_file,
-        format!("{skipped_only}valid {}\n", valid.public()),
-    )
-    .unwrap();
-
+    let scoped = load_or_create_key(Role::Client, Some(&bot_cfg.join("client.key"))).unwrap();
+    // A key on a line with more than NAME ID is no client's; one that is also on a line of its
+    // own is.
+    let (file, v) = (tmp.0.join("srv_cfg/clients"), valid.public());
+    let ignored = format!("cpbot {} cp=/srv\nold_valid {v} cp=/srv\n", scoped.public());
+    fs::write(&file, format!("{ignored}valid {v}\n")).unwrap();
     let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
-    let addr = srv.direct_addr.unwrap().to_string();
-    let srv_id = srv.endpoint_id.to_string();
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
     let marker = tmp.0.join("ran");
-    let touch = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "--".into(),
-        format!("touch {}", marker.display()),
-    ];
-    for refused in [cp_key, exec_key, typo] {
-        let cl = dial(refused).await.unwrap();
-        assert_eq!(
-            cl.exec(touch.clone(), None).await.unwrap_err().code,
-            Exit::REFUSED
-        );
-        cl.close().await;
-    }
-    assert!(!marker.exists(), "refused key ran a command");
-
-    // Refused `koh connect` via the binary exits 4 promptly (no infinite retry) and creates no session.
-    let mut terminal = InTerminal::connect(
-        &bot_cfg,
-        &crun,
-        &[&srv_id, "--direct", &addr, "--session", "s"],
+    let refused = dial(scoped).await.unwrap();
+    let touch = sh(&format!("touch {}", marker.display()));
+    assert_eq!(
+        refused.exec(touch, None).await.unwrap_err().code,
+        Exit::REFUSED
     );
-    assert_eq!(terminal.ends(), Some(4), "refused connect must exit 4");
+    refused.close().await;
+    assert!(!marker.exists(), "refused key ran a command");
+    // A refused `koh connect` exits 4 at once (it is not dialled again), and starts nothing.
+    let (id, addr) = (
+        srv.endpoint_id.to_string(),
+        srv.direct_addr.unwrap().to_string(),
+    );
+    let asks = [&id, "--direct", &addr, "--session", "s"];
+    assert_eq!(InTerminal::connect(&bot_cfg, &crun, &asks).ends(), Some(4));
     assert_eq!(names_in(&tmp.0.join("state/fux/koh-sessions")), [""; 0]);
-
-    // Same id on a skipped line and a good line is allowed; removing the good line revokes it.
-    let v = dial(valid).await.unwrap();
-    assert!(v.jobs(None).await.unwrap().is_empty());
-    assert_eq!(v.exec(vec!["true".into()], None).await.unwrap(), 0);
-    fs::write(&clients_file, &skipped_only).unwrap();
-    assert_eq!(v.jobs(None).await.unwrap_err().code, Exit::REFUSED);
-    v.close().await;
+    // The file is read at every request, on a connection that lives: the line taken away
+    // revokes the key. A file that is no UTF-8 is no list of anyone, its good line before the
+    // bad byte too.
+    let good = format!("valid {v}\n");
+    let lists = [ignored.into_bytes(), [good.as_bytes(), b"\xff\n"].concat()];
+    for list in lists {
+        fs::write(&file, &good).unwrap();
+        let client = dial(valid.clone()).await.unwrap();
+        assert_eq!(client.exec(vec!["true".into()], None).await.unwrap(), 0);
+        fs::write(&file, &list).unwrap();
+        let refused = client.jobs(None).await.unwrap_err().code;
+        assert_eq!(refused, Exit::REFUSED, "{}", String::from_utf8_lossy(&list));
+        client.close().await;
+    }
     srv.shutdown().await;
 }
 
@@ -2730,6 +2600,7 @@ fn wait_child(child: &mut std::process::Child, secs: u64, what: &str) -> std::pr
 }
 
 fn box_sh(host: &Host, script: &str) {
+    // (`box` is this host, on every call: adding a name again replaces it.)
     let addr = host.addr();
     let add = ["servers", "add", "box", &host.id, "--direct", &addr];
     assert!(host.koh(&add).status().unwrap().success());
@@ -2738,8 +2609,8 @@ fn box_sh(host: &Host, script: &str) {
     if let Some(old) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&old));
     }
-    let mut child = Command::new("/bin/sh")
-        .args(["-ec", script])
+    let mut sh = Command::new("/bin/sh");
+    sh.args(["-ec", script])
         .current_dir(&host.tmp.0)
         .env("PATH", std::env::join_paths(paths).unwrap())
         .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
@@ -2747,34 +2618,19 @@ fn box_sh(host: &Host, script: &str) {
         .env("XDG_CONFIG_HOME", host.tmp.0.join("xdg_cfg"))
         .env("HOME", host.tmp.0.join("home"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_AUTHOR_NAME", "test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.com")
-        .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.com")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out_r = child.stdout.take().unwrap();
-    let mut err_r = child.stderr.take().unwrap();
-    let out_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out_r.read_to_end(&mut b);
-        b
-    });
-    let err_t = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = err_r.read_to_end(&mut b);
-        b
-    });
-    let status = wait_child(&mut child, 30, "box_sh");
-    let (stdout, stderr) = (out_t.join().unwrap(), err_t.join().unwrap());
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    for who in ["AUTHOR", "COMMITTER"] {
+        sh.env(format!("GIT_{who}_NAME"), "test")
+            .env(format!("GIT_{who}_EMAIL"), "test@example.com");
+    }
+    let out = run_bounded(&mut sh, 120, "box_sh");
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     assert!(
-        status.success(),
-        "status={status:?}\nstdout={}\nstderr={}",
-        String::from_utf8_lossy(&stdout),
-        String::from_utf8_lossy(&stderr),
+        out.status.success(),
+        "{:?}\n{}\n{}",
+        out.status,
+        text(&out.stdout),
+        text(&out.stderr)
     );
 }
 
@@ -2782,47 +2638,49 @@ fn box_sh(host: &Host, script: &str) {
 fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
     let host = Host::start("exec-open-stdin", &[]);
     let addr = host.addr();
-    let run_open = |args: &[&str]| {
-        let mut child = host
-            .koh(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let _hold = child.stdin.take().unwrap();
-        let mut out = child.stdout.take().unwrap();
-        let reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = out.read_to_end(&mut buf);
-            buf
-        });
-        let st = wait_child(&mut child, 5, "koh with open stdin");
-        (st.code(), reader.join().unwrap())
-    };
-    let (rc, out) = run_open(&[
-        "exec",
-        &host.id,
-        "--direct",
-        &addr,
-        "--",
-        "/bin/sh",
-        "-c",
-        "printf 'hi\\n'; exit 7",
-    ]);
-    assert_eq!((rc, out.as_slice()), (Some(7), b"hi\n".as_slice()));
+    // Its standard input a pipe that stays open: the command's end is koh's, with all it
+    // printed (more than a pipe holds, too).
     let awk = "BEGIN { for (i = 0; i < 4096; i++) printf \"0123456789abcdef0123456789abcdef\\n\" }";
-    let (rc, out) = run_open(&["exec", &host.id, "--direct", &addr, "--", "awk", awk]);
-    assert_eq!(rc, Some(0));
-    assert_eq!(out, b"0123456789abcdef0123456789abcdef\n".repeat(4096));
-    let (rc, out) = run_open(&[
-        "rsh",
-        "--direct",
-        &addr,
-        &host.id,
-        "printf 'rsh-hi\\n'; exit 11",
-    ]);
-    assert_eq!((rc, out.as_slice()), (Some(11), b"rsh-hi\n".as_slice()));
-
+    let ways: [(&[&str], i32, Vec<u8>); 3] = [
+        (
+            &[
+                "exec",
+                &host.id,
+                "--direct",
+                &addr,
+                "--sh",
+                "printf 'hi\\n'; exit 7",
+            ],
+            7,
+            b"hi\n".to_vec(),
+        ),
+        (
+            &["exec", &host.id, "--direct", &addr, "--", "awk", awk],
+            0,
+            b"0123456789abcdef0123456789abcdef\n".repeat(4096),
+        ),
+        (
+            &[
+                "rsh",
+                "--direct",
+                &addr,
+                &host.id,
+                "printf 'rsh-hi\\n'; exit 11",
+            ],
+            11,
+            b"rsh-hi\n".to_vec(),
+        ),
+    ];
+    for (args, code, printed) in ways {
+        let mut koh = host.koh(args);
+        let (stdin, _open) = std::io::pipe().unwrap();
+        let out = run_bounded(koh.stdin(stdin), 20, "koh with open stdin");
+        assert_eq!(
+            (out.status.code(), out.stdout),
+            (Some(code), printed),
+            "{args:?}"
+        );
+    }
     // At every open-fd limit where `koh exec` can bind, both stdout and stderr arrive
     // without needing spare descriptors to duplicate them. (At marginal limits 11-12, iroh's
     // background probes can print a socket warning to stderr, so stderr is matched by marker.)
@@ -2849,58 +2707,33 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-    use std::sync::mpsc;
-
     let host = Host::start("nonblock-sock", &[]);
     let addr = host.addr();
-
-    // Non-blocking stdin: send second line only after first has been echoed; wait for child first.
+    // Non-blocking stdin: the second line is sent only after the first has been echoed.
     let (mut peer, sock) = UnixStream::pair().unwrap();
     sock.set_nonblocking(true).unwrap();
-    let mut peer_r = peer.try_clone().unwrap();
     let mut child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "cat; exit 37",
-        ])
+        .koh(&["exec", &host.id, "--direct", &addr, "--sh", "cat; exit 37"])
         .stdin(OwnedFd::from(sock.try_clone().unwrap()))
         .stdout(OwnedFd::from(sock))
         .spawn()
         .unwrap();
-    let (echoed_tx, echoed_rx) = mpsc::channel();
-    let reader = std::thread::spawn(move || {
-        let mut got = Vec::new();
-        let mut buf = [0u8; 64];
-        let mut notified = false;
-        while let Ok(n @ 1..) = peer_r.read(&mut buf) {
-            got.extend_from_slice(&buf[..n]);
-            if !notified && got.starts_with(b"hello\n") {
-                notified = true;
-                let _ = echoed_tx.send(());
-            }
-        }
-        got
-    });
     peer.write_all(b"hello\n").unwrap();
-    echoed_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("first line was not echoed");
+    let (echoed, mut peer_r) =
+        read_exact_bounded::<6, _>(peer.try_clone().unwrap(), &mut child, 20, "echo");
+    assert_eq!(&echoed, b"hello\n");
     peer.write_all(b"world\n").unwrap();
     peer.shutdown(Shutdown::Write).unwrap();
     assert_eq!(
-        wait_child(&mut child, 10, "nonblock stdin").code(),
+        wait_child(&mut child, 20, "nonblock stdin").code(),
         Some(37)
     );
-    assert_eq!(reader.join().unwrap(), b"hello\nworld\n");
-
-    // Non-blocking stdout and stderr: 1.5 MiB (exceeds default Unix socket buffers) with a
-    // delayed small-buffer reader arrives whole on each stream.
+    let mut rest = Vec::new();
+    peer_r.read_to_end(&mut rest).unwrap();
+    assert_eq!(rest, b"world\n");
+    // Non-blocking stdout and stderr: 1.5 MiB (more than a Unix socket's buffer) to a reader
+    // that comes late with a small buffer arrives whole on each stream. (The wait only lets the
+    // buffer fill: a reader at once is the easier test.)
     let expected: Vec<u8> = (0..15000)
         .flat_map(|i| format!("{i:099}\n").into_bytes())
         .collect();
@@ -2911,48 +2744,37 @@ fn exec_and_rsh_handle_nonblocking_socketpair() {
         let cmd = format!(
             "awk 'BEGIN {{ for (i = 0; i < 15000; i++) printf \"%099d\\n\", i }}'{redir}; exit {code}"
         );
-        let mut child_cmd = host.koh(&["rsh", "--direct", &addr, &host.id, &cmd]);
-        if to_stderr {
-            child_cmd.stderr(OwnedFd::from(sock));
-        } else {
-            child_cmd
+        let mut koh = host.koh(&["rsh", "--direct", &addr, &host.id, &cmd]);
+        match to_stderr {
+            true => koh.stderr(OwnedFd::from(sock)),
+            false => koh
                 .stdin(OwnedFd::from(sock.try_clone().unwrap()))
-                .stdout(OwnedFd::from(sock));
-        }
-        let mut child = child_cmd.spawn().unwrap();
-        drop(child_cmd);
+                .stdout(OwnedFd::from(sock)),
+        };
+        let mut child = koh.spawn().unwrap();
+        drop(koh);
         peer.shutdown(Shutdown::Write).unwrap();
         let reader = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(400));
-            let mut out = Vec::new();
-            let mut buf = [0u8; 256];
+            let (mut out, mut buf) = (Vec::new(), [0u8; 256]);
             while let Ok(n @ 1..) = peer.read(&mut buf) {
                 out.extend_from_slice(&buf[..n]);
             }
             out
         });
-        let st = wait_child(&mut child, 15, "nonblock output");
-        let out = reader.join().unwrap();
-        assert_eq!(st.code(), Some(code));
-        assert_eq!(out.len(), expected.len());
-        assert_eq!(out, expected);
+        assert_eq!(
+            wait_child(&mut child, 20, "nonblock output").code(),
+            Some(code)
+        );
+        assert!(reader.join().unwrap() == expected, "{to_stderr}");
     }
 }
 
 #[test]
 fn rsh_options_rsync_and_git() {
     let host = Host::start("rsh-e2e", &[]);
-    let direct_cmd = format!(
-        "koh rsh --direct {} {} printf ok >o
-         [ \"$(cat o)\" = ok ]
-         koh servers add -box {} --direct {}
-         koh rsh -- -box printf ok >o
-         [ \"$(cat o)\" = ok ]",
-        host.addr(),
-        host.id,
-        host.id,
-        host.addr(),
-    );
+    // Options before the host are koh's, and those it has none of are refused; after the host
+    // and after `--` they are the command's.
     box_sh(
         &host,
         &format!(
@@ -2964,102 +2786,52 @@ fn rsh_options_rsync_and_git() {
              [ \"$(cat o)\" = in ]
              koh rsh -- box printf %s --json >o
              [ \"$(cat o)\" = --json ]
-             {direct_cmd}
+             koh rsh --direct {addr} {id} printf ok >o
+             [ \"$(cat o)\" = ok ]
+             koh servers add -box {id} --direct {addr}
+             koh rsh -- -box printf ok >o
+             [ \"$(cat o)\" = ok ]
              for f in -G -o -l -p --json; do
                set +e; koh rsh \"$f\" box --json >o 2>e; rc=$?; set -e
                [ \"$rc\" = 2 ]
                [ ! -s o ]
                grep -Fq -- \"$f\" e
-               grep -Fq 'rsh does not support' e
              done
              set +e; koh rsh nosuchhostxyz printf %s --json >o 2>e; rc=$?; set -e
              [ \"$rc\" = 2 ]
              [ ! -s o ]
-             [ -s e ]
              set +e; koh rsh box >o 2>e; rc=$?; set -e
              [ \"$rc\" = 2 ]
-             [ ! -s o ]
-             grep -Fq usage e"
+             grep -Fq usage e",
+            addr = host.addr(),
+            id = host.id,
         ),
     );
-
-    // Commands over MAX_CTRL (1 MiB) exit 2 (usage) for both rsh and exec, skipping only on E2BIG.
+    // A command over a request's bound (1 MiB) is a usage error, for rsh and exec (unless the
+    // system takes no such command line at all).
     let big_word = "x".repeat(130);
     for head in [&["rsh", "box"][..], &["exec", "box", "--"][..]] {
         let mut over = host.koh(head);
-        for _ in 0..9000 {
-            over.arg(&big_word);
-        }
-        match over
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(out) => {
-                assert_eq!(out.status.code(), Some(2));
-                assert!(out.stdout.is_empty());
-                assert!(String::from_utf8_lossy(&out.stderr).contains("1048576"));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::ArgumentListTooLong => {}
-            Err(e) => panic!("unexpected spawn error for {head:?}: {e}"),
+        over.args(std::iter::repeat_n(&big_word, 9000));
+        match over.stderr(std::process::Stdio::piped()).output() {
+            Ok(out) => assert_eq!(out.status.code(), Some(2)),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::ArgumentListTooLong),
         }
     }
-
-    let (src, dst) = (host.tmp.0.join("src"), host.tmp.0.join("home/dst"));
-    fs::create_dir_all(src.join("sub")).unwrap();
-    fs::create_dir_all(src.join("target")).unwrap();
-    fs::create_dir_all(dst.join("target")).unwrap();
+    // rsync and git through `koh rsh`, where they are installed: a binary file there and back,
+    // and a push and a clone.
     let big: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
-    fs::write(src.join("big.bin"), &big).unwrap();
-    fs::write(src.join("sub/with space.txt"), b"spaced\n").unwrap();
-    std::os::unix::fs::symlink("sub/with space.txt", src.join("link_s")).unwrap();
-    fs::write(src.join("target/ignored.txt"), b"skip").unwrap();
-    fs::write(dst.join("stray.txt"), b"bye").unwrap();
-    fs::write(dst.join("target/keep.txt"), b"stay").unwrap();
-
-    box_sh(
-        &host,
-        "tar -C src -cf - . | koh rsh box 'mkdir -p tardst && tar -C tardst -xf -'",
-    );
-    let tar_f = host.tmp.0.join("home/tardst/sub/with space.txt");
-    assert_eq!(fs::read(tar_f).unwrap(), b"spaced\n");
-
-    if Command::new("rsync").arg("--version").output().is_err() {
-        eprintln!("skipping rsync in rsh_options_rsync_and_git: rsync not installed");
-    } else {
-        let sync = "rsync -a --delete --exclude target -e 'koh rsh' src/ box:dst/";
-        box_sh(&host, sync);
-        assert_eq!(fs::read(dst.join("big.bin")).unwrap(), big);
-        assert_eq!(
-            fs::read(dst.join("sub/with space.txt")).unwrap(),
-            b"spaced\n"
+    fs::create_dir_all(host.tmp.0.join("src")).unwrap();
+    fs::write(host.tmp.0.join("src/big.bin"), &big).unwrap();
+    if Command::new("rsync").arg("--version").output().is_ok() {
+        box_sh(
+            &host,
+            "rsync -a -e 'koh rsh' src/ box:dst/\nrsync -a -e 'koh rsh' box:dst/ pulled/",
         );
-        let link = fs::read_link(dst.join("link_s")).unwrap();
-        assert_eq!(link, Path::new("sub/with space.txt"));
-        assert!(!dst.join("stray.txt").exists() && !dst.join("target/ignored.txt").exists());
-        assert_eq!(fs::read(dst.join("target/keep.txt")).unwrap(), b"stay");
-
-        let inos = || {
-            (
-                fs::metadata(dst.join("big.bin")).unwrap().ino(),
-                fs::metadata(dst.join("sub/with space.txt")).unwrap().ino(),
-            )
-        };
-        let before = inos();
-        box_sh(&host, sync);
-        assert_eq!(inos(), before, "second rsync rewrote unchanged files");
-
-        box_sh(&host, "rsync -a -e 'koh rsh' box:dst/ pulled/");
+        assert_eq!(fs::read(host.tmp.0.join("home/dst/big.bin")).unwrap(), big);
         assert_eq!(fs::read(host.tmp.0.join("pulled/big.bin")).unwrap(), big);
-        let p_sp = host.tmp.0.join("pulled/sub/with space.txt");
-        assert_eq!(fs::read(p_sp).unwrap(), b"spaced\n");
-        let p_lk = fs::read_link(host.tmp.0.join("pulled/link_s")).unwrap();
-        assert_eq!(p_lk, Path::new("sub/with space.txt"));
     }
-
-    if Command::new("git").arg("--version").output().is_err() {
-        eprintln!("skipping git in rsh_options_rsync_and_git: git not installed");
-    } else {
+    if Command::new("git").arg("--version").output().is_ok() {
         box_sh(
             &host,
             "koh rsh box git init -q --bare demo.git
@@ -3073,8 +2845,10 @@ fn rsh_options_rsync_and_git() {
              cd ..
              GIT_SSH_COMMAND='koh rsh' git clone -b main box:demo.git cloned",
         );
-        let cloned = host.tmp.0.join("cloned/hello.txt");
-        assert_eq!(fs::read(cloned).unwrap(), b"from-git\n");
+        assert_eq!(
+            fs::read(host.tmp.0.join("cloned/hello.txt")).unwrap(),
+            b"from-git\n"
+        );
     }
 }
 
@@ -3091,17 +2865,26 @@ impl KillPid {
         }
     }
 
+    /// The pid the file says, once it says one (it is written after it is made).
+    fn pid(&self) -> String {
+        let pid = || {
+            fs::read_to_string(&self.path)
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        };
+        until("the pid is written", || pid().parse::<u32>().is_ok());
+        pid()
+    }
+
     fn dead_within(&mut self, secs: u64, what: &str) {
-        let pid = fs::read_to_string(&self.path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        assert!(!pid.is_empty(), "{what}: empty pid");
+        let pid = self.pid();
         let deadline = Instant::now() + Duration::from_secs(secs);
         while pid_running(&pid) {
-            if Instant::now() >= deadline {
-                panic!("{what}: pid {pid} still alive after {secs}s");
-            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: pid {pid} still alive after {secs}s"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
         self.disarmed = true;

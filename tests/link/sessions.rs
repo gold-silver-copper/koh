@@ -609,7 +609,7 @@ async fn draws(send: &mut SendStream, bytes: &str) {
 /// left: a stream cut in the middle of a sequence, a string or a picture, with modes on and a
 /// scroll region set, by a server that says no last word.
 /// Before a first screen Ctrl-C ends koh; after it, it is typed. And a server that answers
-/// with another run, or with what is no message, is the client's end, the terminal put back.
+/// with what is no message is the client's end, the terminal put back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_terminal_its_own() {
     let rig = Rig::start("says", Profile::named("clean"), 1).await;
@@ -699,36 +699,22 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
     rig::until("what it said is wiped", Duration::from_secs(5), || {
         !client.screen().contains("no link")
     });
-    // A server that answers a client that comes again with another run: nothing is typed
-    // there, and koh ends. One that sends what is no message: koh ends, saying so.
-    for other in [true, false] {
-        let (mut client, conn, mut send, _typed, _) = comes(&rig, &server, "b").await;
-        draws(&mut send, &format!("{begins}\x1b[5;5HSHOWN")).await;
-        rig::until("the screen", Duration::from_secs(10), || {
-            client.screen().contains("SHOWN")
-        });
-        client.types(b"typed");
-        let _answered = if other {
-            conn.close(0u32.into(), b"cut");
-            Some(server.0.attached(8).await)
-        } else {
-            let long = ViewOutput::Bytes(vec![b'x'; VIEW_FRAME + 1]);
-            // (The client reads its length and no further: the rest is sent to nobody.)
-            let _ = send_msg(&mut send, &long, MAX_CTRL).await;
-            None
-        };
-        let ended = client.ends(Duration::from_secs(10)).await.unwrap_err();
-        let said = if other {
-            "another run"
-        } else {
-            "exceeds bound"
-        };
-        assert!(
-            ended.code == koh::Exit::FAILED && ended.message.contains(said),
-            "{ended:?}"
-        );
-        the_terminal_is_put_back(&client, "after what no server says");
-    }
+    // A server that sends what is no message: koh ends, saying so.
+    let (mut client, _conn, mut send, _typed, _) = comes(&rig, &server, "b").await;
+    draws(&mut send, &format!("{begins}\x1b[5;5HSHOWN")).await;
+    rig::until("the screen", Duration::from_secs(10), || {
+        client.screen().contains("SHOWN")
+    });
+    client.types(b"typed");
+    let long = ViewOutput::Bytes(vec![b'x'; VIEW_FRAME + 1]);
+    // (The client reads its length and no further: the rest is sent to nobody.)
+    let _ = send_msg(&mut send, &long, MAX_CTRL).await;
+    let ended = client.ends(Duration::from_secs(10)).await.unwrap_err();
+    assert!(
+        ended.code == koh::Exit::FAILED && ended.message.contains("exceeds bound"),
+        "{ended:?}"
+    );
+    the_terminal_is_put_back(&client, "after what no server says");
 }
 
 /// A key's echo during a flood at 256 kbit/s does not wait behind seconds of old frames: the

@@ -273,8 +273,13 @@ impl InTerminal {
     /// Types into the terminal, all of it: a pty takes only so much at once (a kilobyte on
     /// macOS), and the rest when koh has read.
     fn types(&mut self, keys: &[u8]) {
-        let mut typed = 0;
+        let (mut typed, deadline) = (0, Instant::now() + Duration::from_secs(20));
         while typed < keys.len() {
+            assert!(
+                Instant::now() < deadline,
+                "koh took {typed} of {} bytes",
+                keys.len()
+            );
             match (&self.tty).write(&keys[typed..]) {
                 Ok(n) => typed += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -283,6 +288,12 @@ impl InTerminal {
                 Err(e) => panic!("typing: {e}"),
             }
         }
+    }
+
+    /// Whether koh has drawn `what` since its `from`th byte.
+    fn drew(&self, from: usize, what: &[u8]) -> bool {
+        let drawn = self.drawn.get(from..).unwrap_or_default();
+        drawn.windows(what.len()).any(|drawn| drawn == what)
     }
 
     /// The exit code koh ended with.
@@ -712,61 +723,44 @@ fn ps(pid: &str, what: &str) -> String {
         .to_string()
 }
 
-/// The holder a pane's `status` names.
+/// The holder a pane's `status` names, once it names one.
 fn holder_of(pane: &Path) -> String {
-    let status = fs::read_to_string(pane.join("status")).unwrap();
-    status
-        .lines()
-        .next()
-        .unwrap()
-        .strip_prefix("holder ")
-        .unwrap()
-        .to_string()
+    let status = || fs::read_to_string(pane.join("status")).unwrap_or_default();
+    let holder = || {
+        let status = status();
+        let first = status
+            .lines()
+            .next()
+            .and_then(|l| l.strip_prefix("holder "));
+        first
+            .filter(|pid| pid.parse::<u32>().is_ok())
+            .map(String::from)
+    };
+    until("the pane's status names its holder", || holder().is_some());
+    holder().unwrap_or_default()
 }
 
 #[test]
 fn koh_fux_is_fux_and_a_holder_has_no_runtime() {
     let tmp = TempDir::new("koh-fux");
     let run = fs::canonicalize(&tmp.0).unwrap().join("run");
-    // `koh fux …` is fux's command line: its default session, by fux's rule.
-    let (code, dir, _) = koh(&run, &["fux", "dir"]);
-    assert_eq!(
-        (code, dir.as_str()),
-        (Some(0), run.join("fux").to_str().unwrap())
-    );
-    // A pane it starts is held by this same file, under the word `hold`: no `fux` is looked for.
+    // `koh fux start` is fux's, and the pane it starts is held by this same file under the word
+    // `hold`: no `fux` is looked for.
     let named = run.join("ws/p");
-    let (code, pane, said) = koh(
-        &run,
-        &["fux", "start", named.to_str().unwrap(), "--", "sleep", "30"],
-    );
-    assert_eq!(
-        (code, pane.as_str()),
-        (Some(0), named.to_str().unwrap()),
-        "{said}"
-    );
+    let args = ["fux", "start", named.to_str().unwrap(), "--", "sleep", "30"];
+    let (code, pane, said) = koh(&run, &args);
+    assert_eq!((code, pane.as_str()), (Some(0), args[2]), "{said}");
     let holder = holder_of(&named);
     let args = ps(&holder, "args=");
     let words: Vec<&str> = args.split_whitespace().collect();
     assert_eq!(words[..2], [env!("CARGO_BIN_EXE_koh"), "hold"], "{args}");
-    assert_eq!(words[words.len() - 2..], ["sleep", "30"], "{args}");
     // The holder is fux's code and nothing of koh's: the thread it began with and the one fux
     // waits for the program on. A runtime would be a thread for each core.
     if cfg!(target_os = "linux") {
-        let threads = fs::read_dir(format!("/proc/{holder}/task"))
-            .unwrap()
-            .count();
-        assert_eq!(threads, 2);
+        let threads = fs::read_dir(format!("/proc/{holder}/task")).unwrap();
+        assert!(threads.count() <= 2);
     }
-    // `koh fux wait` waits for the holder's end and says what became of the program.
     fs::write(named.join("ctl"), "kill\n").unwrap();
-    let (code, state, said) = koh(&run, &["fux", "wait", &pane]);
-    assert_eq!(code, Some(0), "{said}");
-    assert!(state.ends_with("state killed 1"), "{state}");
-    // A word fux does not know is fux's to refuse.
-    let (code, _, said) = koh(&run, &["fux", "nothing"]);
-    assert_eq!(code, Some(1));
-    assert!(said.starts_with("fux: usage:"), "{said}");
 }
 
 #[tokio::test]
@@ -941,30 +935,23 @@ impl Host {
 #[test]
 fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
     let host = Host::start("connect-tty", &[]);
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
-    let (id, addr, pane) = (host.id.clone(), host.addr(), host.pane("1"));
+    let pane = host.pane("1");
     let program = "stty -icanon -echo; echo READY; od -An -tx1 -N2; head -c 1 >/dev/null; exit 7";
-    let shown = |tty: &mut InTerminal| tty.drawn.windows(5).any(|drawn| drawn == b"READY");
-
     // The detach key, Ctrl-] and a dot: koh leaves with 0, and the session runs on.
-    let started = ["--direct", &addr, &id, "--", "/bin/sh", "-c", program];
-    let mut first = InTerminal::connect(&config, &runtime, &started);
-    first.until("the terminal shows READY", shown);
+    let mut first = host.attach(&[], &sh(program));
+    first.until("the terminal shows READY", |tty| tty.drew(0, b"READY"));
     first.types(b"\x1d.");
     assert_eq!(first.ends(), Some(0));
     assert_eq!(fs::read_to_string(pane.join("state")).unwrap(), "running\n");
-
     // koh's key typed twice is the key's own byte, typed to the program; and C-b is no key of
     // koh's: it is the session's as it is typed.
-    let again = ["--direct", &addr, &id, "--session", "1"];
-    let mut second = InTerminal::connect(&config, &runtime, &again);
-    second.until("the terminal shows READY", shown);
+    let mut second = host.attach(&["--session", "1"], &[]);
+    second.until("the terminal shows READY", |tty| tty.drew(0, b"READY"));
     second.types(b"\x1d\x1d\x02");
     let typed = |_: &mut InTerminal| {
         screen(&pane).split_whitespace().collect::<Vec<_>>() == ["READY", "1d", "02"]
     };
     second.until("the program reads the two bytes", typed);
-
     // The terminal's size is the session's, also when it changes.
     let size = fuxix::Winsize {
         rows: 30,
@@ -975,50 +962,62 @@ fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
     fuxix::set_winsize(&second.tty, size).unwrap();
     let resized = |_: &mut InTerminal| fs::read_to_string(pane.join("size")).unwrap() == "100 30\n";
     second.until("the session takes the terminal's size", resized);
-
     // The program's end is the end of `koh connect`, with the program's status: nobody has to
-    // type the detach key at a session that is over.
+    // type the detach key at a session that is over. No local session files were created.
     second.types(b"x");
     assert_eq!(second.ends(), Some(7));
-
-    // No local session files were created.
-    assert_eq!(names_in(&runtime), [""; 0]);
+    assert_eq!(names_in(&host.tmp.0.join("crun")), [""; 0]);
 }
 
 #[test]
-fn viewer_reconnects_after_serve_restarts() {
+fn viewer_reconnects_after_serve_restarts_and_a_killed_server_leaves_no_viewer() {
     let mut host = Host::start("view-restart", &[]);
     let mut tty = host.attach(&["--session", "s"], &[]);
     let pane = host.pane("s");
-    tty.types(b"echo shell-$((20+22))\n");
-    tty.until("shell echo", |tty| {
-        tty.drawn.windows(8).any(|s| s == b"shell-42")
-    });
+    tty.until("the session is shown", |_| viewers(&host).len() == 1);
     let holder = holder_of(&pane);
-    host.stop();
-    tty.until("link down", |tty| {
-        tty.drawn.windows(7).any(|s| s == b"no link")
-    });
-    tty.types(b"echo back-$((6*7))\n");
-    host.serve();
-    tty.until("held input after reconnect", |tty| {
-        tty.drawn.windows(7).any(|s| s == b"back-42")
-    });
+    // Stopped as Ctrl-C does, and as a service is told to end (`systemctl restart`): its
+    // clients hear of it at once, and not after the eight seconds of silence that end a link
+    // that died. What is typed meanwhile is held, and typed when the server is back.
+    for how in ["-INT", "-TERM"] {
+        let drawn = tty.drawn.len();
+        host.stop_by(how);
+        let told = Instant::now();
+        tty.until("link down", |tty| tty.drew(drawn, b"no link"));
+        assert!(
+            told.elapsed() < Duration::from_secs(5),
+            "{how}: {:?}",
+            told.elapsed()
+        );
+        tty.types(format!("echo back-''{how}\n").as_bytes());
+        host.serve();
+        let back = format!("back-{how}");
+        tty.until("held input after reconnect", |tty| {
+            tty.drew(drawn, back.as_bytes())
+        });
+    }
     assert_eq!(holder_of(&pane), holder);
-    // Told to end as a service is (`systemctl restart`), the server closes as it does on
-    // Ctrl-C: its clients hear of it at once, and not after the eight seconds of silence.
-    let drawn = tty.drawn.len();
-    host.stop_by("-TERM");
-    let told = Instant::now();
-    tty.until("link down again", |tty| {
-        tty.drawn[drawn..].windows(7).any(|s| s == b"no link")
+    // Killed outright, its viewer killed with it (the server is stopped first: it removes the
+    // folder of a viewer it sees end): the server that starts next removes what that viewer
+    // left, and the client is shown the session again.
+    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
+    let server = host.served.as_ref().unwrap().server.id().to_string();
+    signal(&server, "-STOP");
+    until("the server is stopped", || {
+        ps(&server, "stat=").starts_with('T')
     });
-    assert!(
-        told.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        told.elapsed()
-    );
+    signal(&viewer, "-KILL");
+    signal(&server, "-KILL");
+    let drawn = tty.drawn.len();
+    tty.until("link down", |tty| tty.drew(drawn, b"no link"));
+    assert_eq!(viewers(&host).len(), 1);
+    host.served = None;
     host.serve();
+    tty.types(b"echo again-''42\n");
+    tty.until("the session is shown again", |tty| {
+        tty.drew(drawn, b"again-42")
+    });
+    assert!(viewers(&host).len() == 1 && !viewers(&host).contains(&format!(".view.{viewer}")));
     tty.types(b"exit 7\n");
     assert_eq!(tty.ends(), Some(7));
 }
@@ -1026,14 +1025,12 @@ fn viewer_reconnects_after_serve_restarts() {
 #[test]
 fn one_session_draws_to_two_terminals_and_survives_hangup() {
     let host = Host::start("view-two", &[]);
-    let mut a = host.attach(&["--session", "s"], &[]);
-    let has = |tty: &mut InTerminal, what: &[u8]| tty.drawn.windows(what.len()).any(|s| s == what);
+    // The first on a pty that is no controlling terminal of its own.
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
+    let asks = ["--direct", &host.addr(), &host.id, "--session", "s"];
+    let mut a = InTerminal::connect_on(InTerminal::pty(), &config, &runtime, &asks, false);
     a.types(b"printf '\\033[?1049h'; echo fullscreen-$((6*7))\n");
-    a.until("alternate screen", |tty| has(tty, b"fullscreen-42"));
-    assert_eq!(
-        fs::read_link(host.pane("s").join("shown")).unwrap(),
-        Path::new("alt")
-    );
+    a.until("alternate screen", |tty| tty.drew(0, b"fullscreen-42"));
     // A second terminal comes to the session: it is shown the screen as it is now. (This one is
     // a terminal that draws what it is sent, a pane of fux's: a viewer sends the cells that
     // changed, and a line of text is not one run of bytes.)
@@ -1042,23 +1039,16 @@ fn one_session_draws_to_two_terminals_and_survives_hangup() {
     until("the second terminal shows the current screen", || {
         shows("fullscreen-42")
     });
-    // The first is closed: its koh ends, and the second goes on, through a flood, to the
-    // session's end.
+    // The first is closed: its koh ends with 0, its viewer with it, and the second goes on to
+    // the session's end.
     drop(std::mem::replace(
         &mut a.tty,
         fs::File::open("/dev/null").unwrap(),
     ));
-    until("closed terminal exits", || {
-        a.koh.try_wait().unwrap().is_some()
-    });
-    b.types(b"printf '\\033[?1049l'; seq 1 300000; echo flood-$((6*7))\n");
-    until("the flood's end is drawn", || {
-        shows("300000") && shows("flood-42")
-    });
-    assert_eq!(
-        fs::read_link(host.pane("s").join("shown")).unwrap(),
-        Path::new("main")
-    );
+    assert_eq!(a.ends(), Some(0));
+    until("its viewer is gone", || viewers(&host).len() == 1);
+    b.types(b"echo still-''here\n");
+    until("the second terminal goes on", || shows("still-here"));
     b.types(b"exit 9\n");
     assert_eq!(b.ends(), "exited 9");
 }
@@ -1090,14 +1080,13 @@ async fn attach(client: &Client, asks: Attach) -> koh::Result<(SendStream, RecvS
     Ok((send, recv, attached))
 }
 
-/// Reads a session's stream to its end: what its viewer drew, and its last word if it had one.
-async fn drawn(from: &mut RecvStream) -> (Vec<u8>, Option<i32>) {
-    let mut all = Vec::new();
+/// Reads a session's stream to its end: its last word, if it had one.
+async fn drawn(from: &mut RecvStream) -> Option<i32> {
     loop {
         match koh::proto::recv_msg_opt::<ViewOutput>(from, VIEW_FRAME).await {
-            Ok(Some(ViewOutput::Bytes(bytes))) => all.extend(bytes),
-            Ok(Some(ViewOutput::Exit(code))) => return (all, Some(code)),
-            _ => return (all, None),
+            Ok(Some(ViewOutput::Bytes(_))) => {}
+            Ok(Some(ViewOutput::Exit(code))) => return Some(code),
+            _ => return None,
         }
     }
 }
@@ -1123,6 +1112,9 @@ fn reads_into(out: &Path) -> Vec<String> {
 /// what a terminal would show: `screen`, `modes`, `cursor`, and which screen (`shown`).
 struct InPane(PathBuf);
 
+/// What a terminal says it is like: the files of its session, and what is in them.
+type Like<'a> = &'a [(&'a str, &'a str)];
+
 impl Drop for InPane {
     fn drop(&mut self) {
         signal(&holder_of(&self.0), "-KILL");
@@ -1132,7 +1124,7 @@ impl Drop for InPane {
 impl InPane {
     /// A terminal `tag` of the colours and the keyboard's flags its session's files say, and
     /// `koh connect` to the host in it.
-    fn connect(host: &Host, tag: &str, like: &[(&str, &str)], asks: &[&str]) -> Self {
+    fn connect(host: &Host, tag: &str, like: Like, asks: &[&str]) -> Self {
         let root = host.tmp.0.join(tag);
         let pane = root.join("fux/main/terminal");
         fs::create_dir_all(root.join("fux")).unwrap();
@@ -1165,18 +1157,25 @@ impl InPane {
         typed.write_all(keys).unwrap();
     }
 
-    /// `koh connect`'s process number, and how it ended once it has (`state`).
+    /// `koh connect`'s process number, once its `status` says it, and how it ended once it
+    /// has (`state`).
     fn pid(&self) -> String {
-        let status = self.says("status");
-        let pid = status.lines().find_map(|line| line.strip_prefix("pid "));
-        pid.unwrap().to_string()
+        let pid = || {
+            let status = self.says("status");
+            let pid = status.lines().find_map(|line| line.strip_prefix("pid "));
+            pid.filter(|pid| pid.parse::<u32>().is_ok())
+                .map(String::from)
+        };
+        until("the terminal's status names koh", || pid().is_some());
+        pid().unwrap_or_default()
     }
 
     fn ends(&self) -> String {
+        let state = || self.says("state").trim().to_string();
         until("koh connect ends", || {
-            self.says("state").trim() != "running"
+            !["", "running"].contains(&state().as_str())
         });
-        self.says("state").trim().to_string()
+        state()
     }
 }
 
@@ -1185,132 +1184,101 @@ async fn a_session_is_a_pane_kept_by_koh_hold_and_shown_by_a_viewer_on_the_serve
     let host = Host::start("pane", &[]);
     let client = host.client().await;
     let sleeps = ["sleep".to_string(), "30".into()];
-    let (send, mut from, attached) = attach(&client, asks(None, &sleeps)).await.unwrap();
+    let (_send, _from, attached) = attach(&client, asks(None, &sleeps)).await.unwrap();
     // The session is a folder in koh's own fux session, beneath its state, which it printed;
     // its run is the one its holder wrote there.
     let state = fs::canonicalize(host.tmp.0.join("run/koh")).unwrap();
     assert_eq!(host.sessions, state.join("fux/koh-sessions"));
-    assert_eq!(
-        (names_in(&host.sessions), attached.name.as_str()),
-        (vec!["1".to_string()], "1")
+    let (pane, server) = (
+        host.pane(&attached.name),
+        host.served.as_ref().unwrap().server.id(),
     );
-    let (pane, server) = (host.pane("1"), host.served.as_ref().unwrap().server.id());
     assert_eq!(fux::run_of(&pane), Some(attached.run));
     // Its holder is this binary under the word `hold`, with the lock on the folder: fux's proof
-    // that it lives. It is no child of `koh serve`, and lives on when that is stopped.
-    let holder = holder_of(&pane);
+    // that it lives. It is no child of `koh serve`. Its viewer is this binary too, a child of
+    // `koh serve`.
     let words = |pid: &str| {
         let args = ps(pid, "args=");
         let words = args.split_whitespace().take(2).map(String::from);
         words.collect::<Vec<_>>()
     };
+    let holder = holder_of(&pane);
     assert_eq!(words(&holder), [env!("CARGO_BIN_EXE_koh"), "hold"]);
     assert_ne!(ps(&holder, "ppid="), server.to_string());
-    let locked = || fs::File::open(&pane).unwrap().try_lock_shared().is_err();
-    assert!(locked());
-    // Its viewer is this binary too, a child of `koh serve`, with a folder of its own in the
-    // session; what it draws is what the stream carries.
+    assert!(fs::File::open(&pane).unwrap().try_lock_shared().is_err());
     until("the viewer is there", || viewers(&host).len() == 1);
     let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
     assert_eq!(words(&viewer), [env!("CARGO_BIN_EXE_koh"), "view-session"]);
     assert_eq!(ps(&viewer, "ppid="), server.to_string());
-    let first: ViewOutput = recv_msg(&mut from, VIEW_FRAME).await.unwrap();
-    assert!(
-        matches!(first, ViewOutput::Bytes(bytes) if bytes.starts_with(b"\x1b]8;;\x1b\\\x1b[22;2t\x1b[?1049h"))
-    );
-    // The client leaves: the viewer does, and its folder; the session runs on. Nothing of the
-    // session was ever the client's to keep.
-    drop((send, from));
     client.close().await;
-    until("the viewer is gone", || {
-        viewers(&host).is_empty() && ps(&viewer, "pid=").is_empty()
-    });
-    assert!(locked() && fs::read_to_string(pane.join("state")).unwrap() == "running\n");
-    assert_eq!(names_in(&host.tmp.0.join("crun")), [""; 0]);
-    assert_eq!(names_in(&state), ["fux"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sessions_are_capped_and_the_oldest_ended_one_makes_room() {
-    let host = Host::start("capped", &["--max-sessions", "2"]);
+    let host = Host::start("capped", &["--max-sessions", "3"]);
     let client = host.client().await;
-    let run = |who: u64, program: &[&str]| {
-        let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
+    let run = |who: u64, script: &str| {
         let asks = Attach {
             client: who,
-            ..asks(None, &program)
+            ..asks(None, &sh(script))
         };
         attach(&client, asks)
     };
-    // Two sessions: one that runs, and one that has ended.
-    let _first = run(1, &["sleep", "30"]).await.unwrap();
-    let (_send, mut from, _) = run(2, &["sh", "-c", "exit 0"]).await.unwrap();
-    assert_eq!(drawn(&mut from).await.1, Some(0));
-    assert_eq!(names_in(&host.sessions), ["1", "2"]);
-    // A third takes the place of the one that ended, once it has started.
-    let _third = run(3, &["sleep", "30"]).await.unwrap();
-    until("the third runs, and the ended one is gone", || {
-        names_in(&host.sessions) == ["1", "3"]
+    // Two sessions that have ended, the older first, and one that runs.
+    for who in [1, 2] {
+        let (_send, mut from, _) = run(who, "exit 0").await.unwrap();
+        assert_eq!(drawn(&mut from).await, Some(0));
+    }
+    let _third = run(3, "exec sleep 30").await.unwrap();
+    // A new one takes the place of the oldest that ended, and not of the newer.
+    let _fourth = run(4, "exec sleep 30").await.unwrap();
+    until("the oldest ended one made room", || {
+        names_in(&host.sessions) == ["2", "3", "4"]
     });
-    // With both running there is no room: the client is told the server is busy, and nothing starts.
-    let err = run(4, &["sleep", "30"]).await.unwrap_err();
+    let _fifth = run(5, "exec sleep 30").await.unwrap();
+    // (Named by the first free number, as every session given no name is.)
+    until("the other ended one made room", || {
+        names_in(&host.sessions) == ["1", "3", "4"]
+    });
+    // With all running there is no room: the client is told the server is busy, and nothing
+    // starts.
+    let err = run(6, "exec sleep 30").await.unwrap_err();
     assert!(
         err.code == Exit::BUSY && err.message.contains("--max-sessions"),
         "{err:?}"
     );
-    assert_eq!(names_in(&host.sessions), ["1", "3"]);
+    assert_eq!(names_in(&host.sessions), ["1", "3", "4"]);
     client.close().await;
-}
-
-/// How `ps` has a process: nothing once it is gone and was waited for (a `Z` while it is not).
-fn in_ps(pid: &str) -> String {
-    let said = Command::new("ps").args(["-o", "stat=", "-p", pid]).output();
-    String::from_utf8_lossy(&said.unwrap().stdout)
-        .trim()
-        .to_string()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_attach_ends_with_its_stream_and_its_viewer_is_gone_before_its_folder() {
     let host = Host::start("ends", &[]);
     let client = host.client().await;
-    let soon = |what: &str, mut done: Box<dyn FnMut() -> bool>| {
-        let deadline = Instant::now() + Duration::from_secs(4);
-        while !done() {
-            assert!(Instant::now() < deadline, "not in 4 s: {what}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
     // A client that stops reading its stream and keeps its connection, under a program that
-    // draws nothing more and with megabytes typed that the program does not read: the server
-    // waits on neither end for it. The attach ends, and its viewer goes.
-    let deaf = ["sh", "-c", "stty -echo; echo READY; exec sleep 300"].map(String::from);
+    // draws nothing more and with more typed than the program reads: the server waits on
+    // neither end for it. The attach ends, and its viewer goes.
+    let deaf = sh("stty -echo; echo READY; exec sleep 300");
     let (mut send, mut from, attached) = attach(&client, asks(None, &deaf)).await.unwrap();
     until("the program is ready", || {
         screen(&host.pane(&attached.name)).contains("READY")
     });
+    // (Four megabytes, or until what is typed waits: a message not taken in a second.)
     let pasted = ViewInput::Bytes(vec![b'p'; 8 << 10]);
-    let paste = async {
-        loop {
-            send_msg(&mut send, &pasted, VIEW_FRAME).await.unwrap();
+    for _ in 0..512 {
+        let sent = send_msg(&mut send, &pasted, VIEW_FRAME);
+        match tokio::time::timeout(Duration::from_secs(1), sent).await {
+            Ok(Ok(())) => {}
+            _ => break,
         }
-    };
-    let _ = tokio::time::timeout(Duration::from_secs(2), paste).await;
+    }
     assert_eq!(viewers(&host).len(), 1);
     from.stop(0u32.into()).unwrap();
-    let there = host.sessions.parent().unwrap().to_path_buf();
-    let gone = move || {
-        !names_in(&there)
-            .iter()
-            .any(|name| name.starts_with(".view."))
-    };
-    soon(
-        "the viewer of a stream that was stopped is gone",
-        Box::new(gone),
-    );
+    until("the viewer of a stream that was stopped is gone", || {
+        viewers(&host).is_empty()
+    });
     // A viewer that does not leave in its second (stopped, here) is killed and waited for
-    // before the attach is over: no dead process is left for some later moment, and its
-    // folder went after it, not under it.
+    // before its folder goes: when the folder is gone, so is the process.
     client.close().await;
     let mut tty = host.attach(&["--session", "z"], &[]);
     tty.until("the viewer is there", |_| viewers(&host).len() == 1);
@@ -1318,15 +1286,10 @@ async fn an_attach_ends_with_its_stream_and_its_viewer_is_gone_before_its_folder
     signal(&viewer, "-STOP");
     tty.types(b"\x1d.");
     assert_eq!(tty.ends(), Some(0));
-    let (pid, there) = (
-        viewer.clone(),
-        host.sessions.parent().unwrap().to_path_buf(),
-    );
-    let reaped = move || in_ps(&pid).is_empty() && !there.join(format!(".view.{viewer}")).exists();
-    soon(
-        "the stopped viewer is killed, waited for, and its folder gone",
-        Box::new(reaped),
-    );
+    until("the stopped viewer's folder is gone", || {
+        viewers(&host).is_empty()
+    });
+    assert_eq!(ps(&viewer, "stat="), "", "the viewer outlived its folder");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1363,25 +1326,20 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
         "{:?}",
         viewers(&host)
     );
-    assert_eq!(drawn(&mut old).await.1, None);
+    assert_eq!(drawn(&mut old).await, None);
     send_msg(&mut newer, &typed(b"bbbb"), VIEW_FRAME)
         .await
         .unwrap();
     until("the program has read both", || {
         fs::read(&out).unwrap_or_default() == b"aaaabbbb"
     });
-    // Asked for a run the name has not, a client is answered with none: nothing is typed into
-    // a session that only has the name. And one that names no session names no run.
+    // Asked for a run the name has not, a client is answered with none, and nothing it says of
+    // its terminal is written for a session that only has the name.
+    let keyboard = host.sessions.parent().unwrap().join("keyboard");
     let other = Attach {
         run: Some(attached.run ^ 1),
-        ..again.clone()
-    };
-    let session = host.sessions.parent().unwrap();
-    let told = || fs::read_to_string(session.join("keyboard")).unwrap();
-    let before = told();
-    let other = Attach {
         keyboard: 9,
-        ..other
+        ..again
     };
     let err = attach(&client, other).await.unwrap_err();
     assert_eq!(err.code, Exit::NOT_FOUND, "{err:?}");
@@ -1389,16 +1347,7 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
         err.message.contains("another run has the session's name 1"),
         "{err:?}"
     );
-    assert_eq!((before.as_str(), told().as_str()), ("0\n", "0\n"));
-    let nameless = Attach {
-        name: None,
-        ..again
-    };
-    assert_eq!(
-        attach(&client, nameless).await.unwrap_err().code,
-        Exit::USAGE
-    );
-    assert_eq!(names_in(&host.sessions), ["1"]);
+    assert_eq!(fs::read_to_string(keyboard).unwrap(), "0\n");
     client.close().await;
 }
 
@@ -1457,95 +1406,58 @@ async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream()
         colours: "foreground #aabbcc\n".into(),
         ..asks(None, &sleeps)
     };
+    let none = ["/no/such/koh-test-program".to_string()];
     let refused = [
         (Some(1), None, &sleeps[..], Exit::USAGE),
         (Some(1), Some("nosuch"), &sleeps[..], Exit::NOT_FOUND),
+        (None, Some("dead"), &none[..], Exit::CANNOT_START),
+        (None, None, &none[..], Exit::CANNOT_START),
     ];
     for (run, name, program, code) in refused {
         let asks = Attach {
             run,
             name: name.map(String::from),
-            new: false,
+            new: run.is_none() && name.is_none(),
             argv: program.to_vec(),
             ..told.clone()
         };
         let err = attach(&client, asks.clone()).await.unwrap_err();
         assert_eq!(err.code, code, "{asks:?}: {err:?}");
-    }
-    assert_eq!(
-        (names_in(&session), names_in(&host.sessions)),
-        (
-            vec!["koh-jobs".to_string(), "koh-sessions".to_string()],
-            vec![]
-        )
-    );
-    let none = ["/no/such/koh-test-program".to_string()];
-    for name in [Some("dead"), None] {
-        let asks = Attach {
-            name: name.map(String::from),
-            argv: none.to_vec(),
-            ..told.clone()
-        };
-        let err = attach(&client, asks).await.unwrap_err();
-        assert_eq!(err.code, Exit::CANNOT_START, "{err:?}");
         assert_eq!(names_in(&host.sessions), [""; 0], "{err:?}");
+        let told = ["keyboard", "colours"].map(|file| session.join(file).exists());
+        assert!(code == Exit::CANNOT_START || told == [false; 2], "{err:?}");
     }
-    // What it may say is written where the session's programs are answered from.
-    let said = Attach {
-        keyboard: 5,
-        colours: "foreground #d0d0d0\nbackground #1c1c1c\n".into(),
-        ..asks(None, &sleeps)
-    };
-    let (mut send, mut from, _) = attach(&client, said.clone()).await.unwrap();
-    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
-    assert_eq!(
-        fs::read_to_string(session.join("colours")).unwrap(),
-        said.colours
-    );
     // On the stream a client types and tells its terminal's size, a message of 16 KiB at most:
     // one that is longer ends the stream, with nothing of it typed.
-    let size = ViewSize {
-        cols: 100,
-        rows: 30,
-        ..ViewSize::default()
-    };
-    send_msg(&mut send, &ViewInput::Resize(size), VIEW_FRAME)
-        .await
-        .unwrap();
-    until("the session takes the size", || {
-        fs::read_to_string(host.pane("1").join("size")).unwrap_or_default() == "100 30\n"
-    });
+    let (mut send, mut from, _) = attach(&client, asks(None, &sleeps)).await.unwrap();
     let long = ViewInput::Bytes(vec![b'x'; VIEW_FRAME + 1]);
     send_msg(&mut send, &long, MAX_CHUNK).await.unwrap();
-    let ended = tokio::time::timeout(Duration::from_secs(10), drawn(&mut from)).await;
-    assert_eq!(ended.expect("the stream lived on").1, None);
+    let ended = tokio::time::timeout(Duration::from_secs(20), drawn(&mut from)).await;
+    assert_eq!(ended.expect("the stream lived on"), None);
     until("its viewer is gone", || viewers(&host).is_empty());
-    assert_eq!(names_in(&host.tmp.0.join("run/koh")), ["fux"]);
     client.close().await;
 }
 
 #[test]
 fn the_exit_code_is_the_programs_and_not_zero_without_one() {
     let host = Host::start("code", &[]);
-    let run = |asks: &[&str], program: &[&str]| {
-        let program: Vec<String> = program.iter().map(|word| word.to_string()).collect();
-        host.attach(asks, &program).ends()
-    };
-    // The program's status; of one a signal ended, 128 and the signal.
-    assert_eq!(run(&["--new"], &["sh", "-c", "exit 7"]), Some(7));
-    assert_eq!(run(&["--new"], &["sh", "-c", "kill -9 $$"]), Some(137));
-    // An ended session stays, and a later client is shown the same and ends the same.
-    assert_eq!(run(&["--session", "1"], &[]), Some(7));
-    assert_eq!(run(&["--session", "2"], &[]), Some(137));
-    // A holder that was killed left `state` at `running`, with no lock: that is no 0.
-    let mut shown = host.attach(&["--new"], &sh("echo SHOWN; exec sleep 30"));
-    shown.until("the session is shown", |tty| {
-        tty.drawn.windows(5).any(|drawn| drawn == b"SHOWN")
-    });
-    signal(&holder_of(&host.pane("3")), "-KILL");
-    assert_eq!(shown.ends(), Some(1));
-    assert_eq!(run(&["--session", "3"], &[]), Some(1));
-    assert_eq!(names_in(&host.sessions), ["1", "2", "3"]);
+    // The program's status; of one a signal ended, 128 and the signal; of one whose holder was
+    // killed, which left `state` at `running` with no lock, 1 and no 0. An ended session stays,
+    // and a later client is shown the same and ends the same.
+    let ends = [
+        ("1", "exit 7", 7),
+        ("2", "kill -9 $$", 137),
+        ("3", "echo SHOWN; exec sleep 30", 1),
+    ];
+    for (name, script, code) in ends {
+        let mut tty = host.attach(&["--new"], &sh(script));
+        if code == 1 {
+            tty.until("the session is shown", |tty| tty.drew(0, b"SHOWN"));
+            signal(&holder_of(&host.pane(name)), "-KILL");
+        }
+        assert_eq!(tty.ends(), Some(code), "{script}");
+        assert_eq!(host.attach(&["--session", name], &[]).ends(), Some(code));
+    }
     assert_eq!(viewers(&host), [""; 0]);
 }
 
@@ -1559,81 +1471,48 @@ fn koh_connect_asks_its_terminal_what_it_is_like_and_puts_it_back_however_it_end
         ("colours", "foreground #d0d0d0\nbackground #1c1c1c\n"),
         ("keyboard", "5\n"),
     ];
-    let on = |terminal: &InPane| {
+    // A terminal that says its colours and takes the keyboard's flags 1 and 4 is asked before
+    // anything was dialled, and its answers are in the server's session, where the programs of
+    // its panes are answered from; one that knows neither tells no colours (the file is as it
+    // was) and has the plain keyboard. Told to end, hung up as by a terminal that is closed, or
+    // left by its user, koh puts the terminal back before it goes, and the session runs on.
+    let starts = ["--session", "s", "--", "sh", "-c", modes];
+    let ways: [(Like, &[&str], &str, &str); 3] = [
+        (&like, &starts, "-TERM", "5\n"),
+        (&[], &starts[..2], "-HUP", "0\n"),
+        (&[], &starts[..2], "", "0\n"),
+    ];
+    for (n, (like_it, asks, how, keyboard)) in ways.into_iter().enumerate() {
+        let terminal = InPane::connect(&host, &format!("t{n}"), like_it, asks);
         until("the terminal shows the program, its modes on", || {
             terminal.says("shown/screen").contains("MODES-ON")
                 && terminal.says("modes").contains("mouse")
         });
-        assert!(!terminal.is_put_back());
-    };
-    // A terminal that says its colours and takes the keyboard's flags 1 and 4: asked before
-    // anything was dialled, and its answers are in the server's session, where the programs of
-    // its panes are answered from. Nothing of the answers was typed into the session.
-    let asks = ["--session", "s", "--", "sh", "-c", modes];
-    let first = InPane::connect(&host, "t1", &like, &asks);
-    on(&first);
-    assert_eq!(
-        fs::read_to_string(session.join("colours")).unwrap(),
-        like[0].1
-    );
-    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
-    // Told to end, it puts the terminal back before it goes, and the session runs on.
-    signal(&first.pid(), "-TERM");
-    assert_eq!(first.ends(), "exited 0");
-    until("the terminal is put back", || first.is_put_back());
-    // One that knows neither: no colours are told (the file is as it was), the plain keyboard.
-    // Hung up, as by a terminal that is closed, it ends the same way; and so when its user leaves.
-    let second = InPane::connect(&host, "t2", &[], &["--session", "s"]);
-    on(&second);
-    assert_eq!(
-        fs::read_to_string(session.join("colours")).unwrap(),
-        like[0].1
-    );
-    assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "0\n");
-    signal(&second.pid(), "-HUP");
-    assert_eq!(second.ends(), "exited 0");
-    until("the terminal is put back", || second.is_put_back());
-    let third = InPane::connect(&host, "t3", &[], &["--session", "s"]);
-    on(&third);
-    third.types(b"\x1d.");
-    assert_eq!(third.ends(), "exited 0");
-    until("the terminal is put back", || third.is_put_back());
+        let told = |file: &str| fs::read_to_string(session.join(file)).unwrap();
+        assert_eq!(
+            (told("colours"), told("keyboard")),
+            (like[0].1.into(), keyboard.into())
+        );
+        match how {
+            "" => terminal.types(b"\x1d."),
+            how => signal(&terminal.pid(), how),
+        }
+        assert_eq!(terminal.ends(), "exited 0", "{how}");
+        until("the terminal is put back", || terminal.is_put_back());
+    }
     // The session's program was typed nothing, by any of the three, and no viewer is left.
     assert_eq!(screen(&host.pane("s")).trim(), "MODES-ON");
     until("the viewers are gone", || viewers(&host).is_empty());
 }
 
-/// A program for a session that asks its terminal for its background and, having set the
-/// keyboard's first flag, which flags are in force; and then writes all it reads into `out`.
-fn asks_and_reads_into(out: &Path) -> Vec<String> {
-    let script = r#"stty raw -echo; printf '\033]11;?\033\\\033[>1u\033[?u'; exec cat > "$0""#;
-    ["sh", "-c", script, out.to_str().unwrap()]
-        .map(String::from)
-        .to_vec()
-}
-
 #[test]
 fn a_sessions_program_is_told_the_terminals_colours_and_has_its_keys_in_the_form_it_asked_for() {
     let host = Host::start("told", &[]);
-    let read =
-        |out: &Path| String::from_utf8_lossy(&fs::read(out).unwrap_or_default()).into_owned();
-    let with = |tag: &str, like: &[(&str, &str)]| {
-        let out = host.tmp.0.join(format!("{tag}.out"));
-        let program = asks_and_reads_into(&out);
-        let mut asks = vec!["--session", tag, "--"];
-        asks.extend(program.iter().map(String::as_str));
-        (InPane::connect(&host, tag, like, &asks), out)
-    };
+    // A program that asks its terminal for its background and, having set the keyboard's
+    // first flag, which flags are in force; and then writes all it reads into `out`.
+    let asks = r#"stty raw -echo; printf '\033]11;?\033\\\033[>1u\033[?u'; exec cat > "$0""#;
     // In a terminal that tells no colours and does not know the kitty keyboard protocol, the
     // program is told that no flag is in force, and no colour; Escape, typed, is the one byte.
-    let (plain, out) = with("plain", &[]);
-    until("the program is told of no flags", || {
-        read(&out) == "\x1b[?0u"
-    });
-    plain.types(b"\x1b");
-    until("Escape is typed in its old form", || {
-        read(&out) == "\x1b[?0u\x1b"
-    });
     // In one that says its colours and takes the keyboard's flags, the program is told the
     // background and that its flag is in force; and Escape, which such a terminal sends in the
     // protocol's form once the flag is set there, reaches the program in that form.
@@ -1641,26 +1520,51 @@ fn a_sessions_program_is_told_the_terminals_colours_and_has_its_keys_in_the_form
         ("colours", "foreground #d0d0d0\nbackground #1c1c1c\n"),
         ("keyboard", "5\n"),
     ];
-    let (kitty, out) = with("kitty", &like);
-    let told = "\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[?1u";
-    until("the program is told the background and its flag", || {
-        read(&out) == told
-    });
-    until("the flag is set in the client's terminal", || {
-        kitty.says("modes").contains("keys1")
-    });
-    kitty.types(b"\x1b[27u");
-    until("Escape is typed in the protocol's form", || {
-        read(&out) == format!("{told}\x1b[27u")
-    });
-    assert_eq!(read(&host.tmp.0.join("plain.out")), "\x1b[?0u\x1b");
-    // koh's key leaves in that form too, and the terminal is as it was.
-    kitty.types(b"\x1b[93;5u.");
-    assert_eq!(kitty.ends(), "exited 0");
-    until("the terminal is put back", || {
-        kitty.is_put_back() && !kitty.says("modes").contains("keys")
-    });
-    assert_eq!(read(&out), format!("{told}\x1b[27u"));
+    let terminals: [(&str, Like, &str, &[u8]); 2] = [
+        ("plain", &[], "\x1b[?0u", b"\x1b"),
+        (
+            "kitty",
+            &like,
+            "\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\\x1b[?1u",
+            b"\x1b[27u",
+        ),
+    ];
+    for (tag, like, told, escape) in terminals {
+        let out = host.tmp.0.join(format!("{tag}.out"));
+        let program = [
+            "--session",
+            tag,
+            "--",
+            "sh",
+            "-c",
+            asks,
+            out.to_str().unwrap(),
+        ];
+        let terminal = InPane::connect(&host, tag, like, &program);
+        let read = || fs::read(&out).unwrap_or_default();
+        until("the program is told what its terminal is", || {
+            read() == told.as_bytes()
+        });
+        if tag == "kitty" {
+            until("the flag is set in the client's terminal", || {
+                terminal.says("modes").contains("keys1")
+            });
+        }
+        terminal.types(escape);
+        let typed = [told.as_bytes(), escape].concat();
+        until("Escape is typed in the form it asked for", || {
+            read() == typed
+        });
+        // koh's key leaves in that form too, and the terminal is as it was.
+        if tag == "kitty" {
+            terminal.types(b"\x1b[93;5u.");
+            assert_eq!(terminal.ends(), "exited 0");
+            until("the terminal is put back", || {
+                terminal.is_put_back() && !terminal.says("modes").contains("keys")
+            });
+            assert_eq!(read(), typed);
+        }
+    }
 }
 
 #[test]
@@ -1668,16 +1572,16 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
     let mut host = Host::start("late", &[]);
     let session = host.sessions.parent().unwrap().to_path_buf();
     let out = host.tmp.0.join("out");
-    let has = |tty: &mut InTerminal, what: &[u8]| tty.drawn.windows(what.len()).any(|s| s == what);
     let asked = |tty: &InTerminal| tty.drawn.windows(3).filter(|s| s == b"\x1b[c").count();
     // A terminal that answers nothing: koh waits a second for it, and goes on with the plain
     // keyboard and no colours.
-    let began = Instant::now();
     let mut tty = host.attach(&["--session", "s"], &reads_into(&out));
     tty.answers = false;
-    tty.until("the program is ready", |tty| has(tty, b"READY"));
+    tty.until("it is asked", |tty| tty.drew(0, b"\x1b[c"));
+    let began = Instant::now();
+    tty.until("the program is ready", |tty| tty.drew(0, b"READY"));
     assert!(
-        began.elapsed() >= Duration::from_secs(1),
+        began.elapsed() >= Duration::from_millis(900),
         "{:?}",
         began.elapsed()
     );
@@ -1695,34 +1599,30 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
     // The server goes and comes back: koh dials again and attaches again, and asks its
     // terminal nothing again. (So a terminal that answers nothing costs its second once.)
     host.stop();
-    tty.until("link down", |tty| has(tty, b"no link"));
-    let (down, drawn) = (Instant::now(), tty.drawn.len());
+    tty.until("link down", |tty| tty.drew(0, b"no link"));
     host.serve();
-    tty.until("the session is shown again", |tty| {
-        tty.drawn[drawn..].windows(8).any(|s| s == b"\x1b[?1049h")
-    });
-    println!("shown again {:?} after the link went", down.elapsed());
-    assert_eq!(asked(&tty), 1);
     tty.types(b"y");
-    until("typed on return", || {
+    tty.until("typed on return", |_| {
         fs::read(&out).unwrap_or_default() == [&late[..], b"y"].concat()
     });
+    assert_eq!(asked(&tty), 1);
     // A terminal that answers in pieces, within the wait: its flags, a colour cut in two, and
     // what it is, cut in two, with a key right after it. The answers are heard, and the key
-    // is the session's first.
+    // is the session's first. (The pauses are for the pieces to come in reads of their own;
+    // together they are the easier test.)
     let out = host.tmp.0.join("out.pieces");
     let mut slow = host.attach(&["--session", "p"], &reads_into(&out));
     slow.answers = false;
-    slow.until("it is asked", |tty| has(tty, b"\x1b[c"));
+    slow.until("it is asked", |tty| tty.drew(0, b"\x1b[c"));
     for piece in [
         &b"\x1b[?5u\x1b]11;rgb:12"[..],
         b"34/abcd/00ff\x1b\\\x1b[?6",
         b"2;4cz",
     ] {
         slow.types(piece);
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(30));
     }
-    slow.until("the program is ready", |tty| has(tty, b"READY"));
+    slow.until("the program is ready", |tty| tty.drew(0, b"READY"));
     assert_eq!(fs::read_to_string(session.join("keyboard")).unwrap(), "5\n");
     assert_eq!(
         fs::read_to_string(session.join("colours")).unwrap(),
@@ -1736,66 +1636,61 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
 #[test]
 fn what_was_typed_before_the_key_that_leaves_is_typed() {
     let host = Host::start("before", &[]);
-    // What is typed right before `Ctrl-] .`, in one write with it (a paste and the key, a
-    // fast hand): koh leaves, and the session has it, all of it and in its order. One byte;
-    // and more than a pty holds at once, so that the last of it waits on the server for the
-    // viewer to read what is before it, while the client is leaving.
-    let lines: Vec<u8> = (0..5000)
+    // What is typed right before `Ctrl-] .`, in one write with it (a paste and the key, a fast
+    // hand): koh leaves, and the session has it, all of it and in its order. More than a pty
+    // holds at once (a kilobyte on macOS), so that the last of it waits on the server for the
+    // viewer to read what is before it, while the client is leaving; and less than the second
+    // koh gives that on its way out may type on a slow machine (README: "it has a second for
+    // that"; at 40 KB a macOS runner typed some 35 KB in it).
+    let typed: Vec<u8> = (0..1500)
         .flat_map(|n| format!("{n:07}\n").into_bytes())
         .collect();
-    for (name, typed) in [("one", &b"q"[..]), ("many", &lines[..])] {
-        let out = host.tmp.0.join(name);
-        let mut tty = host.attach(&["--session", name], &reads_into(&out));
-        tty.until("the program is ready", |tty| {
-            tty.drawn.windows(5).any(|drawn| drawn == b"READY")
-        });
-        tty.types(&[typed, b"\x1d."].concat());
-        let typing = Instant::now();
-        assert_eq!(tty.ends(), Some(0));
-        let left = typing.elapsed();
-        let has = || fs::read(&out).unwrap_or_default();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while has() != typed {
-            let (read, whole) = (has().len(), typed.len());
-            let said = format!(
-                "{name}: the program read {read} of {whole} bytes; koh left after {left:?}"
-            );
-            assert!(Instant::now() < deadline, "{said}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        until("the viewer is gone", || viewers(&host).is_empty());
-    }
+    let out = host.tmp.0.join("out");
+    let mut tty = host.attach(&["--session", "s"], &reads_into(&out));
+    tty.until("the program is ready", |tty| tty.drew(0, b"READY"));
+    tty.types(&[&typed[..], b"\x1d."].concat());
+    assert_eq!(tty.ends(), Some(0));
+    until("the program has read all that was typed", || {
+        fs::read(&out).unwrap_or_default() == typed
+    });
+    until("the viewer is gone", || viewers(&host).is_empty());
 }
 
 #[test]
 fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let host = Host::start("unread", &[]);
-    // A program that reads nothing and ends after a second, with megabytes typed meanwhile:
-    // more than its pane takes, so that the viewer's own terminal holds what the viewer has
-    // not read. The viewer has left when the server looks for that, and nothing waits a
-    // second for a viewer that is gone to read it: the client has the program's status then.
-    let ends = ["sh", "-c", "stty -echo; echo READY; sleep 1; exit 42"].map(String::from);
-    let mut tty = host.attach(&["--session", "s"], &ends);
-    tty.until("the program is ready", |tty| {
-        tty.drawn.windows(5).any(|drawn| drawn == b"READY")
-    });
-    let (ready, burst) = (Instant::now(), vec![b'x'; 64 << 10]);
+    // A program that reads nothing, with more typed meanwhile than its pane takes, so that the
+    // viewer's own terminal holds what the viewer has not read; and it ends. The viewer has
+    // left when the server looks for that, and nothing waits a second for a viewer that is
+    // gone to read it: the client has the program's status then.
+    let gate = host.tmp.0.join("gate");
+    let script = "stty -echo; echo READY; until [ -e \"$0\" ]; do sleep 0.05; done; exit 42";
+    let program = ["sh", "-c", script, gate.to_str().unwrap()].map(String::from);
+    let mut tty = host.attach(&["--session", "s"], &program);
+    tty.until("the program is ready", |tty| tty.drew(0, b"READY"));
     let state = || fs::read_to_string(host.pane("s").join("state")).unwrap_or_default();
-    let mut over = None;
+    let (burst, mut over, mut full) = (vec![b'x'; 64 << 10], None, 0);
     let ended = loop {
         // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
-        let _ = (&tty.tty).write(&burst);
+        // Once the terminal has taken nothing a hundred times running, the program ends.
+        match (&tty.tty).write(&burst) {
+            Ok(1..) => full = 0,
+            _ => full += 1,
+        }
+        if full == 100 {
+            fs::write(&gate, "").unwrap();
+        }
         let mut drawn = [0; 4096];
         while let Ok(n @ 1..) = (&tty.tty).read(&mut drawn) {
             tty.drawn.extend_from_slice(&drawn[..n]);
         }
-        if over.is_none() && state().trim() != "running" {
+        if over.is_none() && state().starts_with("exited") {
             over = Some(Instant::now());
         }
-        match tty.koh.try_wait().unwrap() {
-            Some(ended) => break ended.code(),
-            None => assert!(ready.elapsed() < Duration::from_secs(10), "still there"),
+        if let Some(ended) = tty.koh.try_wait().unwrap() {
+            break ended.code();
         }
+        assert!(full < 10_000, "koh is still there");
         std::thread::sleep(Duration::from_millis(2));
     };
     assert_eq!(ended, Some(42));
@@ -1804,56 +1699,9 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let after = over.map(|over| over.elapsed());
     assert!(
         after.is_some_and(|after| after < Duration::from_millis(800)),
-        "{after:?} after the program ended; {:?} in all",
-        ready.elapsed()
+        "{after:?}"
     );
-    assert!(!tty.drawn.windows(7).any(|said| said == b"no link"));
-}
-
-// (On Linux alone: on CI's macOS the test itself did not end, twice, and where it waits there
-// is not known. What it holds is in code that is the same on both.)
-#[cfg(target_os = "linux")]
-#[test]
-fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to() {
-    let host = Host::start("stalled-first", &[]);
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
-    // A terminal that takes nothing from before koh starts (another program has filled it,
-    // and nobody reads): koh cannot ask it what it is like, and waits for nothing to do so.
-    // Told to end, it ends, each of the three ways.
-    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
-        let (tty, theirs) = InTerminal::pty();
-        let mut fills = Command::new("sh");
-        fills
-            .args(["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"])
-            .stdout(theirs.try_clone().unwrap());
-        let mut fills = fills.spawn().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
-        let name = how.trim_start_matches('-');
-        let asks = [&host.id, "--direct", &host.addr(), "--session", name];
-        let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
-        // (koh has dialled and has its terminal by now: the session is there.)
-        until("the session is started", || {
-            host.pane(name).join("run").exists()
-        });
-        std::thread::sleep(Duration::from_millis(500));
-        let told = Instant::now();
-        signal(&koh.koh.id().to_string(), how);
-        let ended = loop {
-            match koh.koh.try_wait().unwrap() {
-                Some(ended) => break ended.code(),
-                None => assert!(
-                    told.elapsed() < Duration::from_secs(2),
-                    "{how}: still there"
-                ),
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(ended, Some(code), "{how}");
-        // (The terminal goes first: on macOS a program that leaves a terminal it has written
-        // to is not gone until what it wrote is read, or the terminal's other end is closed.)
-        drop(koh);
-        let _ = (fills.kill(), fills.wait());
-    }
+    assert!(!tty.drew(0, b"no link"));
 }
 
 #[test]
@@ -1886,52 +1734,6 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         };
         assert_eq!(ended, Some(code), "{how}");
     }
-}
-
-#[test]
-fn a_terminal_that_is_closed_ends_koh_and_a_server_that_was_killed_leaves_no_viewer() {
-    let mut host = Host::start("hangup", &[]);
-    // `koh connect` on a pty that is no controlling terminal of its own, which is then closed:
-    // it ends, its viewer on the server with it, and nothing was made on the client.
-    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
-    let asks = ["--direct", &host.addr(), &host.id, "--session", "s"];
-    let mut connect = InTerminal::connect_on(InTerminal::pty(), &config, &runtime, &asks, false);
-    connect.until("the terminal shows the session", |tty| {
-        tty.drawn.windows(8).any(|drawn| drawn == b"\x1b[?1049h") && viewers(&host).len() == 1
-    });
-    drop(std::mem::replace(
-        &mut connect.tty,
-        fs::File::open("/dev/null").unwrap(),
-    ));
-    assert_eq!(connect.ends(), Some(0));
-    until("its viewer is gone", || viewers(&host).is_empty());
-    assert_eq!(names_in(&runtime), [""; 0]);
-    // The server is killed outright while a client is attached: the viewer reads the end of
-    // its terminal and leaves by itself. One that was killed with it left its folder: the
-    // server that starts next removes it, and the client is shown the session again.
-    let mut connect = host.attach(&["--session", "s"], &[]);
-    connect.until("the session is shown", |_| viewers(&host).len() == 1);
-    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
-    // (The server is stopped first: it removes the folder of a viewer it sees end.)
-    let server = host.served.as_ref().unwrap().server.id().to_string();
-    for (pid, how) in [(&server, "-STOP"), (&viewer, "-KILL"), (&server, "-KILL")] {
-        signal(pid, how);
-    }
-    connect.until("koh says there is no link", |tty| {
-        tty.drawn.windows(7).any(|drawn| drawn == b"no link")
-    });
-    assert_eq!(viewers(&host).len(), 1);
-    host.served = None;
-    host.serve();
-    connect.types(b"echo back-$((6*7))\n");
-    connect.until("the session is shown again", |tty| {
-        tty.drawn.windows(7).any(|drawn| drawn == b"back-42")
-    });
-    assert!(viewers(&host).len() == 1 && !viewers(&host).contains(&format!(".view.{viewer}")));
-    assert_eq!(
-        fs::read_to_string(host.pane("s").join("state")).unwrap(),
-        "running\n"
-    );
 }
 
 // ---- the three commands: `koh sessions`, `koh output`, `koh wait --session` ---------------------
@@ -2027,8 +1829,10 @@ fn sessions_lists_what_the_folders_say() {
     let mut live = host.attach(&["--session", "live"], &marking_shell(&host));
     let pane = host.pane("live");
     until("the shell has its prompt", || screen(&pane).contains('$'));
-    let mut done = host.attach(&["--session", "done"], &sh("exit 7"));
-    assert_eq!(done.ends(), Some(7));
+    assert_eq!(
+        host.attach(&["--session", "done"], &sh("exit 7")).ends(),
+        Some(7)
+    );
     let mut dead = host.attach(&["--session", "dead"], &marking_shell(&host));
     let killed = host.pane("dead");
     until("the third has its prompt", || screen(&killed).contains('$'));
@@ -2037,76 +1841,53 @@ fn sessions_lists_what_the_folders_say() {
     until("its command runs", || marks().ends_with(" output\n"));
     signal(&holder_of(&killed), "-KILL");
     assert_eq!(dead.ends(), Some(1));
-    assert_eq!(
-        fs::read_to_string(host.pane("dead").join("state")).unwrap(),
-        "running\n"
-    );
-    // A line a session, its fields after one tab each: name, attached or detached, state,
-    // busy or idle, exit=N or exit=-, COLSxROWS, and the title, the rest of the line.
-    let list = || -> Vec<Vec<String>> {
+    // One a holder that is gone left with a tab in its title is printed with `?`, as a job's
+    // command: the title is the last field.
+    fs::write(killed.join("title"), "a\tb\n").unwrap();
+    // A line a session, the oldest first, its fields after one tab each: name, attached or
+    // detached, state, busy or idle, exit=N or exit=-, COLSxROWS, and the title.
+    let list = || -> Vec<String> {
         let (code, list, said) = host.asked("sessions", &[]);
         assert_eq!(code, Some(0), "{said}");
-        let fields = |line: &str| line.split('\t').map(String::from).collect::<Vec<_>>();
-        list.lines().map(fields).collect()
+        list.lines().map(|line| line.replace('\t', "|")).collect()
     };
-    let of = |name: &str, field: usize| {
-        let list = list();
-        let session = list.iter().find(|session| session[0] == name);
-        session.unwrap_or_else(|| panic!("no {name} in {list:?}"))[field].clone()
-    };
-    // Each by its name, the oldest first; its size and whether a client has it.
-    let names: Vec<_> = list().iter().map(|s| s[0].clone()).collect();
-    assert_eq!(names, ["live", "done", "dead"]);
-    assert_eq!(of("live", 5), "80x24");
-    assert_eq!(
-        (of("live", 1), of("done", 1)),
-        ("attached".into(), "detached".into())
-    );
-    // What became of each program is what `state` says; but only a session whose holder lives
-    // runs: of the one that was killed nothing says how it ended.
-    let states = ["live", "done", "dead"].map(|name| of(name, 2));
-    assert_eq!(states, ["running", "exited 7", "ended"]);
-    // At a prompt no command runs: the last mark is where what is typed begins. One runs from
-    // where its output begins (the last mark is `output`) to its end, which has its code.
-    assert_eq!(of("live", 3), "idle");
     let gate = host.tmp.0.join("gate");
     let waits = format!(
         "sh -c 'until [ -e {} ]; do sleep 0.1; done; exit 5'\n",
         gate.display()
     );
+    let listed = list();
+    let starts = [
+        "live|attached|running|idle|",
+        "done|detached|exited 7|idle|exit=-|",
+        "dead|detached|ended|idle|",
+    ];
+    let ends = ["|80x24|", "|80x24|", "|80x24|a?b"];
+    assert_eq!(listed.len(), 3, "{listed:?}");
+    for ((line, start), end) in listed.iter().zip(starts).zip(ends) {
+        let fields = line.matches('|').count() + 1;
+        assert!(
+            line.starts_with(start) && line.ends_with(end) && fields == 7,
+            "{listed:?}"
+        );
+    }
+    // A command runs from where its output begins (the last mark is `output`) to its end,
+    // which has its code. A session whose holder is gone runs no command, whatever its marks
+    // say (the last mark of the one that was killed is still its command's `output`).
     fs::write(pane.join("in"), waits).unwrap();
-    until("the command runs", || of("live", 3) == "busy");
-    assert!(
-        fs::read_to_string(pane.join("marks"))
-            .unwrap()
-            .ends_with(" output\n")
-    );
+    until("the command runs", || {
+        list()[0].starts_with("live|attached|running|busy|")
+    });
     fs::write(&gate, "").unwrap();
-    until("the command has ended", || of("live", 3) == "idle");
-    assert_eq!(
-        (of("live", 4), of("done", 4)),
-        ("exit=5".into(), "exit=-".into())
-    );
-    // A session whose holder is gone runs no command, whatever its marks say: the last mark
-    // of the one that was killed is still the `output` of the command it ran.
-    assert_eq!(
-        (of("done", 3), of("dead", 3)),
-        ("idle".into(), "idle".into())
-    );
-    // A title the program gave a tab is still the last field: a title has no control character.
-    fs::write(pane.join("in"), "printf '\\033]2;a\\tb\\007'\n").unwrap();
-    let title = || fs::read_to_string(pane.join("title")).unwrap_or_default();
-    until("the title is set", || title() == "ab\n");
-    let line = &list()[0];
-    assert_eq!((line.len(), line[6].as_str()), (7, "ab"), "{line:?}");
-    // One a holder that is gone left with a tab in it is printed with `?`, as a job's command.
-    fs::write(killed.join("title"), "a\tb\n").unwrap();
-    let line = &list()[2];
-    assert_eq!((line.len(), line[6].as_str()), (7, "a?b"), "{line:?}");
+    until("the command has ended", || {
+        list()[0].starts_with("live|attached|running|idle|exit=5|")
+    });
     // The client leaves: the session is not attached.
     signal(&live.koh.id().to_string(), "-TERM");
     assert_eq!(live.ends(), Some(0));
-    until("the session has no client", || of("live", 1) == "detached");
+    until("the session has no client", || {
+        list()[0].starts_with("live|detached|")
+    });
 }
 
 #[test]

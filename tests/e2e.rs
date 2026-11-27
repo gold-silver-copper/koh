@@ -1798,6 +1798,26 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connect_with_no_name_is_to_the_newest_session_that_lives() {
+    let host = Host::start("newest", &[]);
+    let client = host.client().await;
+    // `live` runs on; `gone`, started after it, has ended.
+    let sleeps = ["sleep".to_string(), "100".into()];
+    attach(&client, asks(Some("live"), &sleeps)).await.unwrap();
+    attach(&client, asks(Some("gone"), &sh("exit 0")))
+        .await
+        .unwrap();
+    let state = || fs::read_to_string(host.pane("gone").join("state")).unwrap_or_default();
+    until("gone has ended", || state() == "exited 0\n");
+    let nameless = Attach {
+        new: false,
+        ..asks(None, &[])
+    };
+    assert_eq!(attach(&client, nameless).await.unwrap().2.name, "live");
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream() {
     let host = Host::start("says", &[]);
     let client = host.client().await;

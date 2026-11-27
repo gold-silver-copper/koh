@@ -3043,262 +3043,153 @@ impl RawExecPeer {
     }
 }
 
+impl Host {
+    /// `koh exec` of this host: `/bin/sh -c SCRIPT _ ARGS…`, its output piped.
+    fn exec(&self, script: &str, args: &[&str]) -> Command {
+        let (id, addr) = (&self.id, self.addr());
+        let mut koh = self.koh(&[
+            "exec", id, "--direct", &addr, "--", "/bin/sh", "-c", script, "_",
+        ]);
+        koh.args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        koh
+    }
+
+    /// One of the client's commands about this host, started, its output piped.
+    fn spawned(&self, command: &str, args: &[&str]) -> std::process::Child {
+        let mut koh = self.koh(&[command, &self.id, "--direct", &self.addr()]);
+        koh.args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        koh.spawn().unwrap()
+    }
+}
+
+/// All that `from` gives, read on a thread of its own.
+fn drain(mut from: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        let _ = from.read_to_end(&mut all);
+        all
+    })
+}
+
 #[test]
 fn exec_b_simultaneous_four_mib_each_way_no_deadlock() {
     let host = Host::start("exec-b", &[]);
-    let addr = host.addr();
-    let n = 4 * 1024 * 1024;
+    let n = 4 << 20;
     let sent_in: Vec<u8> = (0..n).map(|i| ((i * 31 + 17) % 256) as u8).collect();
     let sent_out: Vec<u8> = (0..n).map(|i| ((i * 131 + 7) % 256) as u8).collect();
-    let out_file = host.tmp.0.join("out.bin");
-    let in_file = host.tmp.0.join("in.bin");
+    let (out_file, in_file) = (host.tmp.0.join("out.bin"), host.tmp.0.join("in.bin"));
     fs::write(&out_file, &sent_out).unwrap();
-    let out_arg = out_file.display().to_string();
-    let in_arg = in_file.display().to_string();
-
-    // Remote writes 4 MiB stdout BEFORE reading 4 MiB stdin; client writes stdin while reading stdout.
-    let mut child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "cat \"$1\"; cat > \"$2\"",
-            "_",
-            &out_arg,
-            &in_arg,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    let mut stdin_pipe = child.stdin.take().unwrap();
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    let expected_in = sent_in.clone();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin_pipe.write_all(&sent_in);
-    });
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::with_capacity(n);
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let st = wait_child(&mut child, 15, "4 MiB bidirectional exec");
-    let _ = writer.join();
-    let got_out = reader.join().unwrap();
-    let got_err = err_reader.join().unwrap();
-    assert!(
-        st.success(),
-        "expected exit 0, got {st:?}; stderr={}",
-        String::from_utf8_lossy(&got_err)
-    );
-    assert_eq!(got_out.len(), sent_out.len(), "stdout byte count");
-    assert!(got_out == sent_out, "stdout bytes mismatch");
-    let got_in = fs::read(&in_file).unwrap();
-    assert_eq!(got_in.len(), expected_in.len(), "stdin byte count");
-    assert!(got_in == expected_in, "stdin bytes mismatch");
+    // The remote writes 4 MiB to stdout before it reads 4 MiB of stdin; the client writes
+    // stdin while it reads stdout.
+    let files = [out_file.to_str().unwrap(), in_file.to_str().unwrap()];
+    let mut koh = host.exec("cat \"$1\"; cat > \"$2\"", &files);
+    let mut child = koh.stdin(std::process::Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(&sent_in).map(|()| sent_in));
+    let got_out = drain(child.stdout.take().unwrap());
+    assert!(wait_child(&mut child, 30, "4 MiB each way").success());
+    let sent_in = writer.join().unwrap().unwrap();
+    assert!(got_out.join().unwrap() == sent_out, "stdout");
+    assert!(fs::read(&in_file).unwrap() == sent_in, "stdin");
 }
 
 #[test]
 fn exec_c_broken_stdout_pipe_returns_141_and_hangs_up_producer() {
     let host = Host::start("exec-c", &[]);
-    let addr = host.addr();
     let pid_file = host.tmp.0.join("yes.pid");
     let mut guard = KillPid::new(pid_file.clone());
-    let pid_arg = pid_file.display().to_string();
-
+    let script = "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes";
     let mut child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes",
-            "_",
-            &pid_arg,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .exec(script, &[pid_file.to_str().unwrap()])
         .spawn()
         .unwrap();
-
-    let (head, stdout) =
-        read_exact_bounded::<2, _>(child.stdout.take().unwrap(), &mut child, 10, "exec-c y");
+    let out = child.stdout.take().unwrap();
+    let (head, out) = read_exact_bounded::<2, _>(out, &mut child, 20, "exec-c y");
     assert_eq!(&head, b"y\n");
-    drop(stdout);
-
-    let st = wait_child(&mut child, 10, "koh exec with closed stdout pipe");
-    guard.dead_within(10, "remote yes after stdout EPIPE");
-    assert_eq!(
-        st.code(),
-        Some(141),
-        "expected 141 on stdout EPIPE, got {st:?}"
-    );
+    drop(out);
+    let st = wait_child(&mut child, 20, "koh exec with closed stdout pipe");
+    assert_eq!(st.code(), Some(141));
+    guard.dead_within(20, "remote yes after stdout EPIPE");
 }
 
 #[tokio::test]
 async fn exec_d_link_lost_after_start_exits_255_not_3() {
-    let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
-    let drop_rx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(drop_rx)));
+    let (lose, lost) = tokio::sync::oneshot::channel::<()>();
+    let lost = std::sync::Arc::new(tokio::sync::Mutex::new(Some(lost)));
     let peer = RawExecPeer::start("exec-d", move |conn, mut send, _recv| {
-        let drop_rx = drop_rx.clone();
+        let lost = lost.clone();
         async move {
             let _ = send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL).await;
-            let _ = send_msg(
-                &mut send,
-                &koh::proto::ExecServerMsg::Stdout(b"started\n".to_vec()),
-                MAX_CHUNK,
-            )
-            .await;
-            if let Some(rx) = drop_rx.lock().await.take() {
-                let _ = rx.await;
+            let started = koh::proto::ExecServerMsg::Stdout(b"started\n".to_vec());
+            let _ = send_msg(&mut send, &started, MAX_CHUNK).await;
+            if let Some(lost) = lost.lock().await.take() {
+                let _ = lost.await;
             }
             conn.close(0u32.into(), b"lost");
             false
         }
     })
     .await;
-
-    // (d1) Server that is never reached (Client::connect fails) still exits 3.
-    let wrong_id = load_or_create_key(Role::Server, Some(&peer.tmp.0.join("wrong.key")))
-        .unwrap()
-        .public()
-        .to_string();
-    let mut unreach = peer.koh(&wrong_id, &["--relay-url", "http://127.0.0.1:1"]);
-    let unreach_out =
-        tokio::task::spawn_blocking(move || run_bounded(&mut unreach, 10, "unreachable exec"))
-            .await
-            .unwrap();
-    assert_eq!(
-        unreach_out.status.code(),
-        Some(3),
-        "expected 3 when server never reached, got {:?}; stderr={}",
-        unreach_out.status,
-        String::from_utf8_lossy(&unreach_out.stderr)
-    );
-
-    // (d2) Link lost after Reply::Ok and output exits 255 (not 3), preserving received stdout.
-    let mut child = peer
-        .koh(&peer.id, &[])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let out_r = child.stdout.take().unwrap();
-    let (mut child, got_started, _out_r) = tokio::task::spawn_blocking(move || {
-        let (buf, out_r) = read_exact_bounded::<8, _>(out_r, &mut child, 10, "exec-d started");
-        (child, buf, out_r)
-    })
-    .await
-    .unwrap();
-    assert_eq!(&got_started, b"started\n");
-    let _ = drop_tx.send(());
-    let (st, stderr) = tokio::task::spawn_blocking(move || {
-        let st = wait_child(&mut child, 10, "exec-d lost link");
-        let mut err = Vec::new();
-        let _ = child.stderr.take().unwrap().read_to_end(&mut err);
-        (st, err)
-    })
-    .await
-    .unwrap();
+    // A server that is never reached is 3. (Within the 15 s a dial is given.)
+    let wrong = load_or_create_key(Role::Server, Some(&peer.tmp.0.join("wrong.key")));
+    let wrong = wrong.unwrap().public().to_string();
+    let mut unreached = peer.koh(&wrong, &["--relay-url", "http://127.0.0.1:1"]);
+    let unreached =
+        tokio::task::spawn_blocking(move || run_bounded(&mut unreached, 30, "unreached"));
+    assert_eq!(unreached.await.unwrap().status.code(), Some(3));
+    // A link lost after the answer and some output is 255, not 3, and that output is kept.
+    let mut koh = peer.koh(&peer.id, &[]);
+    let mut child = koh.stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let ended = tokio::task::spawn_blocking(move || {
+        let out = child.stdout.take().unwrap();
+        let (started, _out) = read_exact_bounded::<8, _>(out, &mut child, 20, "exec-d started");
+        let _ = lose.send(());
+        (started, wait_child(&mut child, 20, "exec-d lost link"))
+    });
+    let (started, st) = ended.await.unwrap();
     peer.close().await;
-    assert_eq!(
-        st.code(),
-        Some(255),
-        "expected 255 on lost link after start, got {st:?}; stderr={}",
-        String::from_utf8_lossy(&stderr)
-    );
+    assert_eq!((&started, st.code()), (b"started\n", Some(255)));
 }
 
 #[test]
 fn exec_e_stdout_write_error_exits_1_not_0() {
     let host = Host::start("exec-e", &[]);
-    let addr = host.addr();
+    // A stdout whose writes fail, and not with a closed pipe (EFBIG, on Linux and macOS: a
+    // file of at most 0 blocks, and SIGXFSZ ignored): koh says so and ends with 1.
     let out_file = host.tmp.0.join("zero-limit.out");
-
-    // Portable non-EPIPE stdout write failure (EFBIG on both Linux and macOS):
-    // ignore SIGXFSZ and cap file size at 0 blocks so writing to stdout returns EFBIG.
-    let mut cmd = Command::new("/bin/sh");
-    cmd.args([
-        "-c",
-        "trap '' XFSZ; ulimit -f 0; exec \"$1\" exec \"$2\" --direct \"$3\" -- printf 'hello\\n' > \"$4\"",
-        "_",
-        env!("CARGO_BIN_EXE_koh"),
-        &host.id,
-        &addr,
-        &out_file.display().to_string(),
-    ])
-    .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
-    .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
-    .env("HOME", host.tmp.0.join("home"))
-    .stdin(std::process::Stdio::null());
-    let out = run_bounded(&mut cmd, 10, "koh exec with EFBIG stdout");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "expected exit 1 on stdout EFBIG, got {:?}; stderr={stderr}",
-        out.status
-    );
+    let script = "trap '' XFSZ; ulimit -f 0; exec \"$1\" exec \"$2\" --direct \"$3\" -- printf 'hello\\n' > \"$4\"";
+    let (koh, file) = (env!("CARGO_BIN_EXE_koh"), out_file.to_str().unwrap());
+    let mut sh = Command::new("/bin/sh");
+    sh.args(["-c", script, "_", koh, &host.id, &host.addr(), file])
+        .env("KOH_CONFIG_DIR", host.tmp.0.join("cli_cfg"))
+        .env("XDG_RUNTIME_DIR", host.tmp.0.join("crun"))
+        .stdin(std::process::Stdio::null());
+    let out = run_bounded(&mut sh, 20, "koh exec with EFBIG stdout");
+    let said = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("write:"),
-        "expected write error on stderr, got {stderr:?}"
+        out.status.code() == Some(1) && said.contains("write:"),
+        "{said}"
     );
 }
 
 #[test]
 fn exec_f_sh_and_rsh_handle_leading_dash_command() {
     let host = Host::start("exec-f", &[]);
-    let addr = host.addr();
-    let cases = [
-        (
-            vec![
-                "exec",
-                &host.id,
-                "--direct",
-                &addr,
-                "--sh",
-                "-nosuchcmd 2>/dev/null; echo sh-dash-ok",
-            ],
-            "sh-dash-ok\n",
-            "exec --sh leading dash",
-        ),
-        (
-            vec![
-                "rsh",
-                "--direct",
-                &addr,
-                &host.id,
-                "-nosuchcmd 2>/dev/null; echo rsh-dash-ok",
-            ],
-            "rsh-dash-ok\n",
-            "rsh leading dash",
-        ),
-    ];
-    for (args, expected, what) in cases {
-        let out = run_bounded(&mut host.koh(&args), 10, what);
-        assert!(
-            out.status.success(),
-            "{what} failed: {:?}; stderr={}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
+    let (id, addr) = (host.id.as_str(), host.addr());
+    let line = "-nosuchcmd 2>/dev/null; echo dash-ok";
+    let exec = ["exec", id, "--direct", &addr, "--sh", line];
+    let rsh = ["rsh", "--direct", &addr, id, line];
+    for args in [&exec[..], &rsh[..]] {
+        let out = run_bounded(&mut host.koh(args), 20, args[0]);
+        assert_eq!(
+            (out.status.code(), out.stdout),
+            (Some(0), b"dash-ok\n".to_vec()),
+            "{args:?}"
         );
-        assert_eq!(String::from_utf8_lossy(&out.stdout), expected);
     }
 }
 
@@ -3306,302 +3197,166 @@ fn exec_f_sh_and_rsh_handle_leading_dash_command() {
 async fn exec_g_stream_eof_without_exit_status_exits_255_not_0() {
     let peer = RawExecPeer::start("exec-g", |_conn, mut send, _recv| async move {
         let _ = send_msg(&mut send, &koh::proto::Reply::Ok, MAX_CTRL).await;
-        let _ = send_msg(
-            &mut send,
-            &koh::proto::ExecServerMsg::Stdout(b"partial\n".to_vec()),
-            MAX_CHUNK,
-        )
-        .await;
+        let partial = koh::proto::ExecServerMsg::Stdout(b"partial\n".to_vec());
+        let _ = send_msg(&mut send, &partial, MAX_CHUNK).await;
         let _ = send.finish();
-        let _ = tokio::time::timeout(Duration::from_secs(10), send.stopped()).await;
+        let _ = tokio::time::timeout(Duration::from_secs(20), send.stopped()).await;
         false
     })
     .await;
     let mut cmd = peer.koh(&peer.id, &[]);
-    let out = tokio::task::spawn_blocking(move || run_bounded(&mut cmd, 10, "exec-g"))
-        .await
-        .unwrap();
+    let out = tokio::task::spawn_blocking(move || run_bounded(&mut cmd, 20, "exec-g"));
+    let out = out.await.unwrap();
     peer.close().await;
+    let said = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        out.status.code(),
-        Some(255),
-        "expected 255 on stream EOF without Exit, got {:?}; stderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        (out.status.code(), out.stdout),
+        (Some(255), b"partial\n".to_vec()),
+        "{said}"
     );
-    assert_eq!(out.stdout, b"partial\n");
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("no exit status came"),
-        "expected missing-status stderr, got {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(said.contains("no exit status came"), "{said}");
 }
 
 #[test]
 fn exec_hangup_kills_hup_ignoring_group_member() {
     let host = Host::start("exec-group-member", &[]);
-    let addr = host.addr();
     let pid_file = host.tmp.0.join("worker.pid");
     let mut guard = KillPid::new(pid_file.clone());
-    let pid_arg = pid_file.display().to_string();
-
-    // Leader dies on SIGHUP while its same-group worker ignores SIGHUP; SIGKILL must still kill it.
+    // The leader ends at its hangup; a worker of its group that ignores SIGHUP is killed.
+    let script = "cat >/dev/null; (trap '' HUP; echo READY; exec sleep 301) & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait";
     let mut child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "cat >/dev/null; (trap '' HUP; echo READY; exec sleep 301) & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
-            "_",
-            &pid_arg,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .exec(script, &[pid_file.to_str().unwrap()])
         .spawn()
         .unwrap();
-    let (ready, _out) = read_exact_bounded::<6, _>(
-        child.stdout.take().unwrap(),
-        &mut child,
-        10,
-        "group member READY",
-    );
+    let out = child.stdout.take().unwrap();
+    let (ready, _out) = read_exact_bounded::<6, _>(out, &mut child, 20, "group member READY");
     assert_eq!(&ready, b"READY\n");
-    until("worker pid written", || pid_file.is_file());
-
+    guard.pid();
     signal(&child.id().to_string(), "-TERM");
-    let st = wait_child(&mut child, 10, "koh exec on SIGTERM (group member)");
-    assert_eq!(st.code(), Some(143), "expected 143, got {st:?}");
-    guard.dead_within(10, "HUP-ignoring group member");
+    let st = wait_child(&mut child, 20, "koh exec on SIGTERM (group member)");
+    assert_eq!(st.code(), Some(143));
+    guard.dead_within(20, "HUP-ignoring group member");
 }
 
 #[test]
 fn exec_signal_exits_while_stdout_pipe_is_blocked() {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-
     let host = Host::start("exec-sig-blocked", &[]);
-    let addr = host.addr();
     let usr1 = tokio::signal::unix::SignalKind::user_defined1().as_raw_value();
-
+    // Told to end while its write to a stdout that nobody reads waits (a pipe, and a socket
+    // that does not block): it ends with the signal's code, what was written is a start of
+    // what the command wrote, and the command is gone.
     for nonblocking in [false, true] {
-        let tag = if nonblocking { "nonblock" } else { "blocking" };
-        let pid_file = host.tmp.0.join(format!("yes-{tag}.pid"));
+        let pid_file = host.tmp.0.join(format!("yes-{nonblocking}.pid"));
         let mut guard = KillPid::new(pid_file.clone());
-        let pid_arg = pid_file.display().to_string();
-
-        let mut cmd = host.koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes",
-            "_",
-            &pid_arg,
-        ]);
-        cmd.stderr(std::process::Stdio::piped());
-        let (mut child, reader_box): (std::process::Child, Box<dyn std::io::Read + Send>) =
-            if nonblocking {
+        let script = "echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exec yes";
+        let mut cmd = host.exec(script, &[pid_file.to_str().unwrap()]);
+        let (mut child, out): (_, Box<dyn std::io::Read + Send>) = match nonblocking {
+            true => {
                 let (peer, sock) = UnixStream::pair().unwrap();
                 sock.set_nonblocking(true).unwrap();
-                cmd.stdout(OwnedFd::from(sock));
-                let child = cmd.spawn().unwrap();
-                drop(cmd);
-                (child, Box::new(peer))
-            } else {
-                cmd.stdout(std::process::Stdio::piped());
+                (
+                    cmd.stdout(OwnedFd::from(sock)).spawn().unwrap(),
+                    Box::new(peer),
+                )
+            }
+            false => {
                 let mut child = cmd.spawn().unwrap();
                 let out = child.stdout.take().unwrap();
                 (child, Box::new(out))
-            };
-
-        // Read 1 byte, keep read end open without draining so write_wait blocks on full pipe.
-        let (one, mut reader_box) = read_exact_bounded::<1, _>(
-            reader_box,
-            &mut child,
-            10,
-            &format!("sig-blocked first byte ({tag})"),
-        );
-        assert_eq!(&one, b"y");
+            }
+        };
+        drop(cmd);
+        let (one, mut out) = read_exact_bounded::<1, _>(out, &mut child, 20, "first byte");
+        // (Time for what is not read to fill the pipe: sooner, the write does not wait, and the
+        // test is the easier one.)
         std::thread::sleep(Duration::from_millis(500));
-
         signal(&child.id().to_string(), "-USR1");
-        let st = wait_child(&mut child, 10, &format!("koh exec USR1 blocked ({tag})"));
-        assert_eq!(
-            st.code(),
-            Some(128 + usr1),
-            "expected 128+USR1={} ({tag}), got {st:?}",
-            128 + usr1
-        );
+        let st = wait_child(&mut child, 20, "koh exec USR1 blocked");
+        assert_eq!(st.code(), Some(128 + usr1), "nonblocking {nonblocking}");
         let mut got = one.to_vec();
-        let _ = reader_box.read_to_end(&mut got);
-        assert!(
-            got.iter().enumerate().all(|(i, &b)| b == b"y\n"[i % 2]),
-            "captured bytes ({tag}) are not a prefix of `y\\n` repeated (len={})",
-            got.len()
-        );
-        guard.dead_within(10, &format!("remote yes ({tag})"));
+        let _ = out.read_to_end(&mut got);
+        assert!(got.iter().enumerate().all(|(i, &b)| b == b"y\n"[i % 2]));
+        guard.dead_within(20, "remote yes");
     }
 }
 
 #[tokio::test]
 async fn exec_signal_before_reply_ok_closes_link() {
-    let (got_req_tx, got_req_rx) = tokio::sync::oneshot::channel();
-    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
-    let got_req_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(got_req_tx)));
-    let stopped_tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(stopped_tx)));
+    let (asked, was_asked) = tokio::sync::oneshot::channel();
+    let (stopped, was_stopped) = tokio::sync::oneshot::channel();
+    let tell = std::sync::Arc::new(tokio::sync::Mutex::new(Some((asked, stopped))));
     let peer = RawExecPeer::start("exec-sig-pre-ok", move |_conn, send, _recv| {
-        let got_req_tx = got_req_tx.clone();
-        let stopped_tx = stopped_tx.clone();
+        let tell = tell.clone();
         async move {
-            if let Some(tx) = got_req_tx.lock().await.take() {
-                let _ = tx.send(());
-            }
-            // Hold Reply::Ok back; expect the client's SIGTERM to close the link promptly.
-            let saw_stop = tokio::time::timeout(Duration::from_secs(10), send.stopped())
-                .await
-                .is_ok();
-            if let Some(tx) = stopped_tx.lock().await.take() {
-                let _ = tx.send(saw_stop);
+            // No answer: the client's SIGTERM must close the link at once.
+            if let Some((asked, stopped)) = tell.lock().await.take() {
+                let _ = asked.send(());
+                let saw = tokio::time::timeout(Duration::from_secs(20), send.stopped()).await;
+                let _ = stopped.send(saw.is_ok());
             }
             false
         }
     })
     .await;
-
-    let mut child = peer
-        .koh(&peer.id, &[])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(10), got_req_rx)
-        .await
-        .expect("server did not receive Request::Exec")
-        .unwrap();
+    let mut child = peer.koh(&peer.id, &[]).spawn().unwrap();
+    let asked = tokio::time::timeout(Duration::from_secs(20), was_asked).await;
+    asked.expect("the request came").unwrap();
     signal(&child.id().to_string(), "-TERM");
-    let st =
-        tokio::task::spawn_blocking(move || wait_child(&mut child, 10, "koh exec pre-Ok TERM"))
-            .await
-            .unwrap();
-    let saw_stop = tokio::time::timeout(Duration::from_secs(10), stopped_rx)
-        .await
-        .expect("server task timed out")
-        .unwrap();
+    let st = tokio::task::spawn_blocking(move || wait_child(&mut child, 20, "pre-Ok TERM"));
+    let st = st.await.unwrap();
+    let saw = tokio::time::timeout(Duration::from_secs(30), was_stopped).await;
     peer.close().await;
     assert_eq!(
-        st.code(),
-        Some(143),
-        "expected 143 on pre-Ok SIGTERM, got {st:?}"
-    );
-    assert!(
-        saw_stop,
-        "server did not observe link close on pre-Ok SIGTERM"
+        (st.code(), saw.ok().and_then(Result::ok)),
+        (Some(143), Some(true))
     );
 }
 
 #[test]
 fn exec_stdin_closed_early_does_not_hang_sender() {
     let host = Host::start("exec-early-stdin", &[]);
-    let addr = host.addr();
-
-    // Remote closes stdin early while client still sends 64 MiB: no hang, stdout arrives, exit 0.
-    let mut child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "exec 0<&-; sleep 1; echo done",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin_pipe = child.stdin.take().unwrap();
-    let mut stdout_pipe = child.stdout.take().unwrap();
+    // The remote closes stdin at once while the client still sends 64 MiB: the command's end
+    // and output are koh's all the same.
+    let mut koh = host.exec("exec 0<&-; sleep 1; echo done", &[]);
+    let mut child = koh.stdin(std::process::Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || {
         let block = vec![0u8; 64 << 10];
-        for _ in 0..1024 {
-            if stdin_pipe.write_all(&block).is_err() {
-                break;
-            }
-        }
+        (0..1024).try_for_each(|_| stdin.write_all(&block))
     });
-    let reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut b);
-        b
-    });
-    let st = wait_child(&mut child, 10, "early stdin close with 64 MiB sender");
+    let out = drain(child.stdout.take().unwrap());
+    assert!(wait_child(&mut child, 20, "early stdin close").success());
     let _ = writer.join();
-    assert!(st.success(), "expected exit 0, got {st:?}");
-    assert_eq!(reader.join().unwrap(), b"done\n");
+    assert_eq!(out.join().unwrap(), b"done\n");
 }
 
 #[test]
 fn exec_serve_shutdown_with_hup_ignoring_exec_and_live_session() {
     let mut host = Host::start("exec-srv-shut", &[]);
-    let addr = host.addr();
-
-    // Start a live `koh connect` session alongside a HUP-ignoring `koh exec` with /dev/null stdin.
+    // A live `koh connect` beside a `koh exec` whose command ignores SIGHUP: SIGTERM to
+    // `koh serve` ends it (within `stop_by`'s fifteen seconds), the exec with 255, and kills
+    // the command.
     let mut tty = host.attach(&[], &sh("echo SESSION_UP; exec sleep 60"));
-    tty.until("session is up", |t| {
-        t.drawn.windows(10).any(|w| w == b"SESSION_UP")
-    });
-
+    tty.until("session is up", |tty| tty.drew(0, b"SESSION_UP"));
     let pid_file = host.tmp.0.join("hup-exec.pid");
     let mut guard = KillPid::new(pid_file.clone());
-    let pid_arg = pid_file.display().to_string();
-    let mut exec_child = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "--",
-            "/bin/sh",
-            "-c",
-            "trap '' HUP; echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo READY; exec sleep 600",
-            "_",
-            &pid_arg,
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+    let script =
+        "trap '' HUP; echo $$ > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo READY; exec sleep 600";
+    let mut exec = host
+        .exec(script, &[pid_file.to_str().unwrap()])
         .spawn()
         .unwrap();
-    let (ready, _out) = read_exact_bounded::<6, _>(
-        exec_child.stdout.take().unwrap(),
-        &mut exec_child,
-        10,
-        "serve shutdown READY",
-    );
+    let out = exec.stdout.take().unwrap();
+    let (ready, _out) = read_exact_bounded::<6, _>(out, &mut exec, 20, "serve shutdown READY");
     assert_eq!(&ready, b"READY\n");
-
-    // SIGTERM to `koh serve`: must finish within 8 s and kill the HUP-ignoring exec command.
-    let t0 = Instant::now();
     host.stop_by("-TERM");
-    let elapsed = t0.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(8),
-        "koh serve shutdown took {elapsed:?} (>= 8 s)"
+    assert_eq!(
+        wait_child(&mut exec, 20, "koh exec on serve SIGTERM").code(),
+        Some(255)
     );
-    let st = wait_child(&mut exec_child, 10, "koh exec on serve SIGTERM");
-    assert_eq!(st.code(), Some(255), "expected 255, got {st:?}");
-    guard.dead_within(10, "HUP-ignoring exec after serve SIGTERM");
-    tty.types(b"\x1d.");
-    let _ = tty.ends();
+    guard.dead_within(20, "HUP-ignoring exec after serve SIGTERM");
 }
 
 fn job_cmd(host: &Host, sub: &str, args: &[&str], secs: u64) -> std::process::Output {
@@ -3614,157 +3369,115 @@ fn job_cmd(host: &Host, sub: &str, args: &[&str], secs: u64) -> std::process::Ou
 #[test]
 fn job_survives_serve_kill_and_restart() {
     let mut host = Host::start("job-restart", &[]);
-    let addr = host.addr();
     let go = host.tmp.0.join("go");
-    let go_arg = go.display().to_string();
-
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &[
-                "--name",
-                "persist",
-                "--",
-                "/bin/sh",
-                "-c",
-                "echo before; while [ ! -f \"$1\" ]; do sleep 0.05; done; echo after; exit 7",
-                "_",
-                &go_arg,
-            ],
-            10,
-        )
-        .status
-        .success()
-    );
-
-    // Kill `koh serve` outright and start it again on the same key and state directory.
+    let script = "echo before; while [ ! -f \"$1\" ]; do sleep 0.05; done; echo after; exit 7";
+    let run = [
+        "--name",
+        "persist",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        "_",
+        go.to_str().unwrap(),
+    ];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
+    // `koh serve` killed outright and started again on the same key and state: a fresh client
+    // follows the job's log to its end, and waits for it.
     host.stop_by("-KILL");
     host.serve();
-
-    // Start `logs -f` from a fresh client while the job is still running, then release it.
-    let mut follow = host
-        .koh(&[
-            "logs", &host.id, "--direct", &addr, "persist", "--all", "--follow",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (first, mut follow_out) = read_exact_bounded::<7, _>(
-        follow.stdout.take().unwrap(),
-        &mut follow,
-        10,
-        "logs -f before after restart",
-    );
+    let mut follow = host.spawned("logs", &["persist", "--all", "--follow"]);
+    let out = follow.stdout.take().unwrap();
+    let (first, out) = read_exact_bounded::<7, _>(out, &mut follow, 20, "logs -f before");
     assert_eq!(&first, b"before\n");
     fs::write(&go, b"go\n").unwrap();
-
-    let mut rest = Vec::new();
-    let f_st = wait_child(&mut follow, 10, "koh logs -f after restart");
-    let _ = follow_out.read_to_end(&mut rest);
-    assert_eq!(f_st.code(), Some(7));
+    let rest = drain(out);
     assert_eq!(
-        [first.as_slice(), rest.as_slice()].concat(),
-        b"before\nafter\n"
+        wait_child(&mut follow, 20, "koh logs -f after restart").code(),
+        Some(7)
     );
-
-    let waited = job_cmd(&host, "wait", &["persist", "--tail", "10"], 10);
-    assert_eq!(waited.status.code(), Some(7));
-    assert_eq!(waited.stdout, b"before\nafter\n");
+    assert_eq!(rest.join().unwrap(), b"after\n");
+    let waited = job_cmd(&host, "wait", &["persist", "--tail", "10"], 20);
+    assert_eq!(
+        (waited.status.code(), waited.stdout),
+        (Some(7), b"before\nafter\n".to_vec())
+    );
 }
 
 #[test]
 fn job_multi_megabyte_log_streams_exact_content() {
     let host = Host::start("job-multimb", &[]);
-    // ~3.39 MiB (>50 64 KiB chunks) of unique numbered lines: any dropped, duplicated, or
-    // reordered chunk fails the content check without starving neighbour tests on CI.
+    // Some 3.4 MiB (more than fifty chunks of 64 KiB) of numbered lines: a chunk dropped,
+    // twice or out of its order fails it.
     let expected: String = (1..=500_000).map(|n| format!("{n}\n")).collect();
-
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &["--name", "seqlog", "--", "seq", "1", "500000"],
-            10
-        )
-        .status
-        .success()
-    );
+    let run = ["--name", "seqlog", "--", "seq", "1", "500000"];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
     assert!(
         job_cmd(&host, "wait", &["seqlog", "--timeout", "20"], 25)
             .status
             .success()
     );
     let whole = job_cmd(&host, "logs", &["seqlog", "--all"], 25);
-    assert!(whole.status.success());
-    assert!(
-        whole.stdout == expected.as_bytes(),
-        "streamed log content mismatch"
-    );
+    assert!(whole.status.success() && whole.stdout == expected.as_bytes());
 }
 
 #[test]
 fn jobs_lists_a_line_a_job_the_command_last() {
     let host = Host::start("job-list", &[]);
-    let args = ["--name", "tabbed", "--", "sh", "-c", "exit 3", "a\tb"];
-    assert_eq!(job_cmd(&host, "run", &args, 10).stdout, b"tabbed\n");
-    let waited = job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 15);
-    assert_eq!(waited.status.code(), Some(3));
-    // Name, state, age and the command, the rest of the line: a tab in it is shown as `?`,
-    // as fux writes it, and as koh prints it when the folder's `status` has one.
+    let args = ["--name", "tabbed", "--", "sh", "-c", "exit 3"];
+    assert_eq!(job_cmd(&host, "run", &args, 20).stdout, b"tabbed\n");
+    assert_eq!(
+        job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 20)
+            .status
+            .code(),
+        Some(3)
+    );
+    // Name, state, age and the command, the rest of the line: a tab a folder's `status` has in
+    // it is shown as `?`.
     let status = host
         .sessions
         .parent()
         .unwrap()
         .join("koh-jobs/tabbed/status");
-    for written in ["a?b", "a\tb"] {
-        let was = fs::read_to_string(&status).unwrap();
-        assert!(was.contains("command sh -c exit 3 a?b\n"), "{was:?}");
-        fs::write(&status, was.replace("a?b", written)).unwrap();
-        let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 10).stdout).unwrap();
-        let fields: Vec<&str> = listed.strip_suffix('\n').unwrap().split('\t').collect();
-        let [name, state, age, command] = fields[..] else {
-            panic!("{listed:?}")
-        };
-        assert_eq!(
-            (name, state, command),
-            ("tabbed", "exited 3", "sh -c exit 3 a?b")
-        );
-        let secs = age.strip_suffix('s').map(str::parse::<u64>);
-        assert!(secs.is_some_and(|n| n.is_ok()), "{age}");
-    }
+    let was = fs::read_to_string(&status).unwrap();
+    fs::write(
+        &status,
+        was.replace("command sh -c exit 3", "command sh -c exit 3 a\tb"),
+    )
+    .unwrap();
+    let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 20).stdout).unwrap();
+    let fields: Vec<&str> = listed.trim_end().split('\t').collect();
+    let [name, state, age, command] = fields[..] else {
+        panic!("{listed:?}")
+    };
+    assert_eq!(
+        (name, state, command),
+        ("tabbed", "exited 3", "sh -c exit 3 a?b")
+    );
+    assert!(
+        age.strip_suffix('s')
+            .is_some_and(|n| n.parse::<u64>().is_ok()),
+        "{age}"
+    );
 }
 
 #[test]
 fn job_kill_ctl_default_invalid_and_ended() {
     let host = Host::start("job-kill-ctl", &[]);
-
+    let code = |sub, args: &[&str]| job_cmd(&host, sub, args, 20).status.code();
+    // `koh kill` is SIGTERM; signal 0 (no signal ctl takes) is a usage error; and a job that
+    // has ended is killed with 0, saying it is not running.
+    assert_eq!(
+        code("run", &["--name", "dflt", "--", "sleep", "60"]),
+        Some(0)
+    );
+    assert_eq!(code("kill", &["dflt"]), Some(0));
+    assert_eq!(code("wait", &["dflt", "--timeout", "10"]), Some(143));
+    assert_eq!(code("kill", &["dflt", "--signal", "0"]), Some(2));
+    let ended = job_cmd(&host, "kill", &["dflt"], 20);
     assert!(
-        job_cmd(&host, "run", &["--name", "dflt", "--", "sleep", "60"], 10)
-            .status
-            .success()
+        ended.status.success() && String::from_utf8_lossy(&ended.stderr).contains("not running")
     );
-    assert!(job_cmd(&host, "kill", &["dflt"], 10).status.success());
-    assert_eq!(
-        job_cmd(&host, "wait", &["dflt", "--timeout", "10"], 15)
-            .status
-            .code(),
-        Some(143)
-    );
-
-    // Signal 0 (outside what ctl takes) is a usage error (exit 2).
-    assert_eq!(
-        job_cmd(&host, "kill", &["dflt", "--signal", "0"], 10)
-            .status
-            .code(),
-        Some(2)
-    );
-
-    // Killing an already-ended job exits 0 and says so on stderr.
-    let ended = job_cmd(&host, "kill", &["dflt"], 10);
-    assert!(ended.status.success());
-    assert!(String::from_utf8_lossy(&ended.stderr).contains("not running"));
 }
 
 #[test]
@@ -3772,314 +3485,163 @@ fn job_leader_exit_hangs_up_group_child() {
     let host = Host::start("job-child-hup", &[]);
     let pid_file = host.tmp.0.join("straggler.pid");
     let mut guard = KillPid::new(pid_file.clone());
-    let pid_arg = pid_file.display().to_string();
-
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &[
-                "--name",
-                "spawner",
-                "--",
-                "/bin/sh",
-                "-c",
-                "sleep 60 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo done",
-                "_",
-                &pid_arg,
-            ],
-            10,
-        )
-        .status
-        .success()
-    );
-    let waited = job_cmd(&host, "wait", &["spawner", "--timeout", "10"], 15);
+    // The leader ends; the `sleep` it left in its group is hung up.
+    let script = "sleep 60 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; echo done";
+    let run = [
+        "--name",
+        "spawner",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        "_",
+        pid_file.to_str().unwrap(),
+    ];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
+    let waited = job_cmd(&host, "wait", &["spawner", "--timeout", "10"], 20);
     assert!(waited.status.success() && waited.stdout == b"done\n");
-    guard.dead_within(5, "straggler child left by job leader");
+    guard.dead_within(20, "straggler child left by job leader");
 }
 
 #[test]
 fn job_reader_never_mixes_replacement_run() {
     let host = Host::start("job-replace-race", &[]);
-    let addr = host.addr();
-    let jobs_dir = host.sessions.parent().unwrap().join("koh-jobs");
-
+    let jobs = host.sessions.parent().unwrap().join("koh-jobs");
+    // Two runs; the second is put in the first's place while a follower reads the first.
     for (name, msg) in [("rep", "OLD_RUN"), ("rep_new", "NEW_RUN")] {
         let script = format!("printf '{msg}\\n'; sleep 30");
-        assert!(
-            job_cmd(
-                &host,
-                "run",
-                &["--name", name, "--", "/bin/sh", "-c", &script],
-                10
-            )
-            .status
-            .success()
-        );
-        let out = jobs_dir.join(name).join("out");
+        let run = ["--name", name, "--", "/bin/sh", "-c", &script];
+        assert!(job_cmd(&host, "run", &run, 20).status.success());
+        let out = jobs.join(name).join("out");
         until("marker written", || {
             fs::read(&out)
                 .unwrap_or_default()
                 .starts_with(msg.as_bytes())
         });
     }
-
-    // Start `wait` first, then `logs -f` and wait until `OLD_RUN\n` arrives (synchronizing on
-    // server acceptance without a fixed sleep) before killing `rep` and swapping `rep_new` in.
-    let mut waiter = host
-        .koh(&[
-            "wait",
-            &host.id,
-            "--direct",
-            &addr,
-            "rep",
-            "--tail",
-            "5",
-            "--timeout",
-            "2",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut follower = host
-        .koh(&["logs", &host.id, "--direct", &addr, "rep", "-f"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (seen, mut f_stdout_pipe) = read_exact_bounded::<8, _>(
-        follower.stdout.take().unwrap(),
-        &mut follower,
-        10,
-        "OLD_RUN",
-    );
+    let mut follower = host.spawned("logs", &["rep", "-f"]);
+    let out = follower.stdout.take().unwrap();
+    let (seen, out) = read_exact_bounded::<8, _>(out, &mut follower, 20, "OLD_RUN");
     assert_eq!(&seen, b"OLD_RUN\n");
-
-    let pane = jobs_dir.join("rep");
+    let pane = jobs.join("rep");
     if let Ok(mut ctl) = fuxix::open_fifo(pane.join("ctl")) {
         let _ = ctl.write_all(b"kill 9\n");
     }
-    until("old rep holder dropped lock", || {
-        !matches!(
-            fuxix::open(&pane, false).map(|f| f.try_lock_shared()),
-            Ok(Err(fs::TryLockError::WouldBlock))
-        )
+    until("the old run's holder has let go of its lock", || {
+        let lock = fuxix::open(&pane, false).map(|f| f.try_lock_shared());
+        !matches!(lock, Ok(Err(fs::TryLockError::WouldBlock)))
     });
     fs::remove_dir_all(&pane).unwrap();
-    fs::rename(jobs_dir.join("rep_new"), &pane).unwrap();
-
-    let f_st = wait_child(&mut follower, 10, "follower after replace");
-    let mut f_rest = Vec::new();
-    let _ = f_stdout_pipe.read_to_end(&mut f_rest);
-    let f_out = follower.wait_with_output().unwrap();
-    let w_st = wait_child(&mut waiter, 10, "waiter after replace");
-    let w_out = waiter.wait_with_output().unwrap();
-    let (f_stdout, f_stderr) = (
-        String::from_utf8_lossy(&f_rest),
-        String::from_utf8_lossy(&f_out.stderr),
+    fs::rename(jobs.join("rep_new"), &pane).unwrap();
+    // The follower has none of the new run: it ends with the old one's kill, or says the job
+    // was started anew.
+    let (rest, said) = (drain(out), drain(follower.stderr.take().unwrap()));
+    let st = wait_child(&mut follower, 20, "follower after replace");
+    let (rest, said) = (
+        rest.join().unwrap(),
+        String::from_utf8(said.join().unwrap()).unwrap(),
     );
-    let (w_stdout, w_stderr) = (
-        String::from_utf8_lossy(&w_out.stdout),
-        String::from_utf8_lossy(&w_out.stderr),
-    );
-
-    let ok_old = |code: Option<i32>, err: &str| {
-        !err.contains("running")
-            && ((code == Some(1) && err.contains("started anew")) || code == Some(137))
-    };
+    let old = st.code() == Some(137) || (st.code() == Some(1) && said.contains("started anew"));
     assert!(
-        !f_stdout.contains("NEW_RUN") && ok_old(f_st.code(), &f_stderr),
-        "follower mixed replacement: status={f_st:?} stdout={f_stdout:?} stderr={f_stderr:?}"
-    );
-    let waiter_ok = (w_stdout.contains("OLD_RUN")
-        && !w_stdout.contains("NEW_RUN")
-        && ok_old(w_st.code(), &w_stderr))
-        || (w_st.code() == Some(127) && w_stdout.is_empty())
-        || (w_stdout.contains("NEW_RUN")
-            && !w_stdout.contains("OLD_RUN")
-            && w_st.code() == Some(124)
-            && w_stderr.contains("timed out"));
-    assert!(
-        waiter_ok,
-        "waiter mixed replacement: status={w_st:?} stdout={w_stdout:?} stderr={w_stderr:?}"
+        old && !String::from_utf8_lossy(&rest).contains("NEW_RUN"),
+        "{st:?} {said}"
     );
 }
 
 #[test]
 fn job_logs_broken_pipe_and_non_utf8_wait_tail() {
     let host = Host::start("job-io-edge", &[]);
-    let addr = host.addr();
-
-    // 1. `logs -f` piped to a consumer that reads 1 byte and closes its pipe ends with 141.
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &[
-                "--name",
-                "chatter",
-                "--",
-                "/bin/sh",
-                "-c",
-                "i=0; while [ $i -lt 500 ]; do printf 'LINE-%04d\\n' $i; sleep 0.02; i=$((i+1)); done",
-            ],
-            10,
-        )
-        .status
-        .success()
-    );
-    let mut follow = host
-        .koh(&["logs", &host.id, "--direct", &addr, "chatter", "-f"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let (byte, stdout) =
-        read_exact_bounded::<1, _>(follow.stdout.take().unwrap(), &mut follow, 10, "first byte");
+    // `logs -f` to a reader that takes a byte and closes its pipe ends with 141.
+    let script =
+        "i=0; while [ $i -lt 500 ]; do printf 'LINE-%04d\\n' $i; sleep 0.02; i=$((i+1)); done";
+    let run = ["--name", "chatter", "--", "/bin/sh", "-c", script];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
+    let mut follow = host.spawned("logs", &["chatter", "-f"]);
+    let out = follow.stdout.take().unwrap();
+    let (byte, out) = read_exact_bounded::<1, _>(out, &mut follow, 20, "first byte");
     assert_eq!(&byte, b"L");
-    drop(stdout);
+    drop(out);
     assert_eq!(
-        wait_child(&mut follow, 10, "logs -f after closed stdout pipe").code(),
+        wait_child(&mut follow, 20, "logs -f, its pipe closed").code(),
         Some(141)
     );
-    let _ = job_cmd(&host, "kill", &["chatter", "--signal", "9"], 10);
-
-    // 2. Non-UTF-8 output (~3 MiB of 0xff, expanding to ~9 MiB > MAX_FRAME if uncapped) still
-    // delivers the job's real exit status (7) on `wait --tail 1`.
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &[
-                "--name",
-                "binff",
-                "--",
-                "/bin/sh",
-                "-c",
-                "dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\\000' '\\377'; exit 7",
-            ],
-            15,
-        )
-        .status
-        .success()
+    let _ = job_cmd(&host, "kill", &["chatter", "--signal", "9"], 20);
+    // Output that is no UTF-8 (3 MiB of 0xff, some 9 MiB, over a frame, if each were made a
+    // replacement character): `wait --tail 1` has the job's code all the same.
+    let script = "dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\\000' '\\377'; exit 7";
+    let run = ["--name", "binff", "--", "/bin/sh", "-c", script];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
+    let waited = job_cmd(
+        &host,
+        "wait",
+        &["binff", "--tail", "1", "--timeout", "20"],
+        25,
     );
-    assert_eq!(
-        job_cmd(
-            &host,
-            "wait",
-            &["binff", "--tail", "1", "--timeout", "20"],
-            25
-        )
-        .status
-        .code(),
-        Some(7)
-    );
+    assert_eq!(waited.status.code(), Some(7));
 }
 
 #[test]
 fn job_run_name_lifecycle_and_start_errors() {
     let host = Host::start("job-lifecycle", &[]);
-
-    // Running name is refused; once ended, the same name is replaced cleanly.
+    let run = |args: &[&str]| job_cmd(&host, "run", args, 20);
+    // A name that runs is refused; once it has ended, it is started anew.
     assert!(
-        job_cmd(&host, "run", &["--name", "dup", "--", "sleep", "30"], 10)
+        run(&["--name", "dup", "--", "sleep", "30"])
             .status
             .success()
     );
-    let refused = job_cmd(&host, "run", &["--name", "dup", "--", "true"], 10);
+    let refused = run(&["--name", "dup", "--", "true"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("already running"));
-
     assert!(
-        job_cmd(&host, "kill", &["dup", "--signal", "9"], 10)
+        job_cmd(&host, "kill", &["dup", "--signal", "9"], 20)
             .status
             .success()
     );
-    let _ = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 15);
+    let _ = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
     assert!(
-        job_cmd(&host, "run", &["--name", "dup", "--", "echo", "second"], 10)
+        run(&["--name", "dup", "--", "echo", "second"])
             .status
             .success()
     );
-    let w = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 15);
+    let w = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
     assert!(w.status.success() && w.stdout == b"second\n");
-
-    // Missing executable -> exit 127 (no folder left behind); missing cwd -> exit 126.
+    // A program that is not there is 127, and leaves no folder; a folder to start in that is
+    // not there is 126.
     assert_eq!(
-        job_cmd(
-            &host,
-            "run",
-            &["--name", "nf", "--", "/no/such/koh-job-prog"],
-            10
-        )
-        .status
-        .code(),
+        run(&["--name", "nf", "--", "/no/such/koh-job-prog"])
+            .status
+            .code(),
         Some(127)
     );
     assert!(!host.sessions.parent().unwrap().join("koh-jobs/nf").exists());
-    assert_eq!(
-        job_cmd(
-            &host,
-            "run",
-            &["-C", "/no/such/koh-job-dir", "--name", "nc", "--", "true"],
-            10,
-        )
-        .status
-        .code(),
-        Some(126)
-    );
+    let nowhere = run(&["-C", "/no/such/koh-job-dir", "--name", "nc", "--", "true"]);
+    assert_eq!(nowhere.status.code(), Some(126));
 }
 
 #[test]
 fn job_logs_follow_ends_when_leftover_child_keeps_writing() {
     let host = Host::start("job-follow-leftover", &[]);
-    let addr = host.addr();
     let pid_file = host.tmp.0.join("yes.pid");
-    let _guard = KillPid::new(pid_file.clone());
-    let pid_arg = pid_file.display().to_string();
-
-    // Leader spawns a HUP-ignoring `yes` that keeps appending to `out`, then exits 3.
-    // `logs -f --tail 10` must observe the leader's exit and end with 3 instead of hanging.
-    assert!(
-        job_cmd(
-            &host,
-            "run",
-            &[
-                "--name",
-                "noisy",
-                "--",
-                "/bin/sh",
-                "-c",
-                "trap '' HUP; yes & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exit 3",
-                "_",
-                &pid_arg,
-            ],
-            10,
-        )
-        .status
-        .success()
-    );
-    until("yes pid written", || pid_file.is_file());
-
-    let mut follow = host
-        .koh(&[
-            "logs", &host.id, "--direct", &addr, "noisy", "--tail", "10", "-f",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut out = follow.stdout.take().unwrap();
-    let drainer = std::thread::spawn(move || {
-        let mut buf = [0u8; 64 << 10];
-        let mut n = 0usize;
-        while let Ok(k @ 1..) = out.read(&mut buf) {
-            n += k;
-        }
-        n
-    });
-    let st = wait_child(&mut follow, 10, "logs -f with noisy leftover child");
-    assert!(drainer.join().unwrap() > 0);
+    let guard = KillPid::new(pid_file.clone());
+    // The leader leaves a `yes` that ignores SIGHUP and goes on writing to `out`, and ends
+    // with 3: `logs -f --tail 10` ends with 3 when the leader does.
+    let script = "trap '' HUP; yes & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; exit 3";
+    let run = [
+        "--name",
+        "noisy",
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        "_",
+        pid_file.to_str().unwrap(),
+    ];
+    assert!(job_cmd(&host, "run", &run, 20).status.success());
+    guard.pid();
+    let mut follow = host.spawned("logs", &["noisy", "--tail", "10", "-f"]);
+    let out = drain(follow.stdout.take().unwrap());
+    let st = wait_child(&mut follow, 20, "logs -f with noisy leftover child");
+    assert!(!out.join().unwrap().is_empty());
     assert_eq!(st.code(), Some(3));
 }

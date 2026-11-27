@@ -2685,15 +2685,12 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
         "s\tended\texited 3\t80x24\tidle\t9\t\n"
     );
     // Its wait has the command's rule: marks that only moved end nothing (a line inserted
-    // above the prompt), and of two commands that ended the code is the first's.
-    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5"];
+    // above the prompt), and of two commands that ended the code and output are the first's.
+    let no_lf = r"printf '\r\n'; m C; printf no-lf; m 'D;6'; printf '\r\n'; prompt";
+    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5", no_lf];
     let moving = host.session("m", &marks_by_steps(&steps), "$");
-    let step = |done: u32| {
-        fs::write(moving.join("in"), "\n").unwrap();
-        let title = format!("done-{done}\n");
-        until(&title, || {
-            fs::read_to_string(moving.join("title")).is_ok_and(|said| said == title)
-        });
+    let step = |done| {
+        stepped(&moving, done);
     };
     step(1);
     let mut wait = Command::new("sh");
@@ -2711,7 +2708,13 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     assert!(!wait.ended(), "{:?}", wait.said());
     step(3);
     until("the recipe's wait ends", || wait.ended());
-    assert_eq!(wait.said().0, Some(9));
+    let (code, printed, said) = wait.said();
+    assert_eq!((code, printed.as_str()), (Some(9), "two\n"), "{said}");
+    // A command's output with no line break at its end is its last line all the same.
+    step(4);
+    let (code, last, said) = recipe(&["last", moving.to_str().unwrap()]);
+    assert_eq!((code, last.as_str()), (Some(0), "no-lf\n"), "{said}");
+    assert_eq!(last, host.asked("output", &["--session", "m", "--last"]).1);
     // And its list has a pane that has only begun: a `status`, and nothing else yet.
     fs::create_dir(host.sessions.join("bare")).unwrap();
     fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();

@@ -5,8 +5,7 @@ printed (`sessions dir:`: `$XDG_RUNTIME_DIR/koh/fux/koh-sessions`, or with no
 `XDG_RUNTIME_DIR` the temporary directory's `koh-UID/fux/koh-sessions`), and named
 as `koh sessions` names it. `koh sessions`, `koh output` and `koh wait --session` read
 those files there and no more; the script below is nearly the same as sh, for `koh exec`
-or for a script of your own on the server (where it is not the same, its comments say:
-`last` cuts whole lines, `wait` prints the last output):
+or for a script of your own on the server:
 
   koh help-agents | sed -n '/^#!/,$p' | koh rsh SERVER 'cat > sessions.sh'
   koh exec SERVER -- sh sessions.sh list DIR          DIR: the folder `koh serve` printed
@@ -55,16 +54,17 @@ text() {
   echo $((before - top + 1))
 }
 
-last() { # what the last command that has ended printed: the lines from its `output` mark to its `end` mark
+last() { # what the last command that has ended printed, or with N the first whose `end` is numbered above N: from its `output` mark to its `end` mark
   f=$(mktemp) m=$(mktemp) tries=0
   # Of one round of the holder's writing: `generation` the same even number before and after
   # (ten tries: a pane that never stops printing, or whose holder was killed as it wrote, is taken as it is).
-  while g=$(cat "$1/generation"); add=$(text "$1" "$f"); cat "$1/marks" > "$m"
+  while g=$(cat "$1/generation"); add=$(text "$1" "$f"); cat "$1/marks.dropped" "$1/marks" > "$m"
     { [ $((${g:-1} % 2)) -eq 1 ] || [ "$g" != "$(cat "$1/generation")" ]; } && [ $tries -lt 10 ]; do tries=$((tries + 1)); sleep 0.02; done
-  # (Whole lines: a last line with no line break is left out. `koh output --last` cuts at the
-  # marks' bytes, as fux's key `C-b C` does: its script, keys/C-b/S-c, is the longer form.)
-  awk -v add="$add" 'NR == FNR { if ($3 == "output") o = $1; if ($3 == "end" && o != "") { from = o; to = $1; o = "" }; next }
-    from != "" && FNR >= from + add && FNR < to + add' "$m" "$f"
+  # (Cut at the marks' bytes, as `koh output --last` and fux's key `C-b C` cut, with a line break after the last line.)
+  LC_ALL=C awk -v add="$add" -v n="${2:-}" 'NR == FNR { if (FNR == 1) d = $1; else if (!done) { if ($3 == "output") { o = $1; oa = $2 }
+      if ($3 == "end" && o != "") { from = o; fa = oa; to = $1; ta = $2; o = "" }; done = n != "" && $3 == "end" && d + FNR - 1 > n }; next }
+    from != "" && FNR >= from + add && FNR <= to + add { l = FNR == to + add ? substr($0, 1, ta) : $0
+      if (FNR == from + add) l = substr(l, fa + 1); if (FNR < to + add || l != "") print l }' "$m" "$f"
   rm -f "$f" "$m"
 }
 
@@ -87,10 +87,8 @@ await() { # until a command has ended since this was asked (its exit code is thi
     # The first `end` of a higher number is the command, and how many marks came and went unread.
     now=; [ -z "$asked" ] || now=$(ends "$1" | awk -v e="$asked" 'NR == 1 { gone = $1 > e ? $1 - e : 0; next } $1 > e { print $2, gone; exit }')
     [ -z "$now" ] || {
-      # (The code is that command's. If another has ended by now too, `last` prints that one's
-      # output: `koh wait --session` gives the first's, read with its code.)
       [ "${now#* }" = 0 ] || echo "the oldest end still kept, not known to be the first: ${now#* } marks came and went unread" >&2
-      last "$1"; exit "${now% *}"; }
+      last "$1" "$asked"; exit "${now% *}"; }
     alive "$1" || { cat "$1/shown/screen"; s=$(cat "$1/state")
       case $s in "exited "*) exit "${s#exited }" ;; "killed "*) exit $((128 + ${s#killed })) ;; *) exit 1 ;; esac; }
     [ -z "${2:-}" ] || [ $(($(date +%s) - began)) -lt "$2" ] || { cat "$1/shown/screen"; exit 124; }

@@ -2698,12 +2698,25 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     // Its wait has the command's rule: marks that only moved end nothing (a line inserted
     // above the prompt), and of two commands that ended the code and output are the first's.
     let no_lf = r"printf '\r\n'; m C; printf no-lf; m 'D;6'; printf '\r\n'; prompt";
-    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5", no_lf];
+    let blank = r"printf '\033[H\033[2J'; m C; printf '\r\n'; m 'D;0'";
+    let steps = [
+        "m 'D;4'",
+        "ran one 7",
+        MOVES[0],
+        "ran two 9; ran three 5",
+        no_lf,
+        blank,
+    ];
     let moving = host.session("m", &marks_by_steps(&steps), "$");
-    let step = |done| {
-        stepped(&moving, done);
+    let last_is = |want: &str| {
+        let (code, last, said) = recipe(&["last", moving.to_str().unwrap()]);
+        assert_eq!((code, last.as_str()), (Some(0), want), "{said}");
+        assert_eq!(last, host.asked("output", &["--session", "m", "--last"]).1);
     };
-    step(1);
+    // An end with no output marked before it, and none before that, is of the screen.
+    stepped(&moving, 1);
+    last_is(&screen(&moving));
+    stepped(&moving, 2);
     let mut wait = Command::new("sh");
     wait.arg(&script)
         .args(["wait", moving.to_str().unwrap(), "30"]);
@@ -2714,18 +2727,19 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
             .unwrap(),
     );
     std::thread::sleep(Duration::from_millis(500));
-    step(2);
+    stepped(&moving, 3);
     std::thread::sleep(Duration::from_millis(500));
     assert!(!wait.ended(), "{:?}", wait.said());
-    step(3);
+    stepped(&moving, 4);
     until("the recipe's wait ends", || wait.ended());
     let (code, printed, said) = wait.said();
     assert_eq!((code, printed.as_str()), (Some(9), "two\n"), "{said}");
-    // A command's output with no line break at its end is its last line all the same.
-    step(4);
-    let (code, last, said) = recipe(&["last", moving.to_str().unwrap()]);
-    assert_eq!((code, last.as_str()), (Some(0), "no-lf\n"), "{said}");
-    assert_eq!(last, host.asked("output", &["--session", "m", "--last"]).1);
+    // A command's output with no line break at its end is its last line all the same, and one
+    // empty line on an otherwise blank screen is that line.
+    stepped(&moving, 5);
+    last_is("no-lf\n");
+    stepped(&moving, 6);
+    last_is("\n");
     // And its list has a pane that has only begun: a `status`, and nothing else yet.
     fs::create_dir(host.sessions.join("bare")).unwrap();
     fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();

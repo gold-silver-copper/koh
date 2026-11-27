@@ -1801,19 +1801,22 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
 async fn a_connect_with_no_name_is_to_the_newest_session_that_lives() {
     let host = Host::start("newest", &[]);
     let client = host.client().await;
-    // `live` runs on; `gone`, started after it, has ended.
+    // `first` and `second` run on; `third`, started after them, has ended. (`status` times
+    // that are the same go by name, which is the order they were started in.)
     let sleeps = ["sleep".to_string(), "100".into()];
-    attach(&client, asks(Some("live"), &sleeps)).await.unwrap();
-    attach(&client, asks(Some("gone"), &sh("exit 0")))
+    for name in ["first", "second"] {
+        attach(&client, asks(Some(name), &sleeps)).await.unwrap();
+    }
+    attach(&client, asks(Some("third"), &sh("exit 0")))
         .await
         .unwrap();
-    let state = || fs::read_to_string(host.pane("gone").join("state")).unwrap_or_default();
-    until("gone has ended", || state() == "exited 0\n");
+    let third = || fs::File::open(host.pane("third")).unwrap();
+    until("third has ended", || third().try_lock_shared().is_ok());
     let nameless = Attach {
         new: false,
         ..asks(None, &[])
     };
-    assert_eq!(attach(&client, nameless).await.unwrap().2.name, "live");
+    assert_eq!(attach(&client, nameless).await.unwrap().2.name, "second");
     client.close().await;
 }
 

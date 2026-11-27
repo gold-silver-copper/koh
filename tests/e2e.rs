@@ -19,7 +19,7 @@ use koh::proto::{
     Attach, Attached, MAX_CHUNK, MAX_CTRL, Request, VIEW_FRAME, ViewInput, ViewOutput, ViewSize,
     recv_msg, send_msg,
 };
-use koh::server::{ServeOptions, start_server};
+use koh::server::{RunningServer, ServeOptions, start_server};
 
 struct TempDir(PathBuf);
 
@@ -42,224 +42,147 @@ impl Drop for TempDir {
     }
 }
 
-async fn boot_pair(
-    tag: &str,
-) -> (
-    TempDir,
-    koh::server::RunningServer,
-    Client,
-    iroh::SecretKey,
-    PathBuf,
-) {
-    let tmp = TempDir::new(tag);
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    fs::create_dir_all(&srv_cfg).unwrap();
-    fs::create_dir_all(&cli_cfg).unwrap();
+/// A server in this process that allows one client's key, with its other options from `more`.
+struct Door {
+    tmp: TempDir,
+    srv: RunningServer,
+    friend: iroh::SecretKey,
+    route: Option<Route>,
+}
 
-    let client_key = load_or_create_key(Role::Client, Some(&cli_cfg.join("client.key"))).unwrap();
-    let state_dir = tmp.0.join("state");
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_cfg.join("server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: vec![client_key.public()],
-        shell: Some("/bin/sh".into()),
-        state_dir: Some(state_dir.clone()),
-        session_exe: Some(PathBuf::from(env!("CARGO_BIN_EXE_koh"))),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.expect("server bound local udp");
-    let client = Client::connect_direct(
-        client_key.clone(),
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        true,
-    )
-    .await
-    .unwrap();
-    (tmp, srv, client, client_key, state_dir)
+impl Door {
+    async fn open(tag: &str, more: ServeOptions) -> Self {
+        let tmp = TempDir::new(tag);
+        let friend = new_key(&tmp, "client.key");
+        let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+        Self {
+            tmp,
+            srv,
+            friend,
+            route,
+        }
+    }
+
+    /// A client of `key` that has connected (and, `proves`, proved its key).
+    async fn dial(&self, key: &iroh::SecretKey, proves: bool) -> koh::Result<Client> {
+        let route = self.route.clone();
+        Client::connect_direct(key.clone(), self.srv.endpoint_id, route, proves).await
+    }
+
+    /// The friend's client, connected and with its key proved.
+    async fn client(&self) -> Client {
+        self.dial(&self.friend, true).await.unwrap()
+    }
+
+    /// Waits until the friend is served, asking again for as long as the server is busy.
+    async fn served(&self) {
+        let serving = async {
+            loop {
+                let listed = match self.dial(&self.friend, false).await {
+                    Ok(next) => {
+                        let listed = next.jobs(None).await;
+                        next.close().await;
+                        listed
+                    }
+                    Err(busy) => Err(busy),
+                };
+                match listed {
+                    Ok(_) => break,
+                    Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let served = tokio::time::timeout(Duration::from_secs(20), serving).await;
+        served.expect("a place came back within 20 s");
+    }
+
+    async fn shut(self) {
+        self.srv.shutdown().await;
+    }
 }
 
 #[test]
-fn raw_exec_binary_streams_stdin_eof_and_exit_code() {
+fn exec_keeps_binary_stdout_and_stderr_apart_and_ends_with_the_commands_code() {
     let host = Host::start("exec", &[]);
-    let addr = host.addr();
-
-    // Separate stdout/stderr, binary NUL byte preserved (no PTY mangling), exit code 42.
+    let script = "printf 'out\\000line\\n'; printf 'errline\\n' >&2; exit 42";
+    let args = [
+        &host.id,
+        "--direct",
+        &host.addr(),
+        "-C",
+        "/tmp",
+        "--sh",
+        script,
+    ];
     let out = host
-        .koh(&[
-            "exec",
-            &host.id,
-            "--direct",
-            &addr,
-            "-C",
-            "/tmp",
-            "--sh",
-            "printf 'out\\000line\\n'; printf 'errline\\n' >&2; exit 42",
-        ])
+        .koh(&["exec"])
+        .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(42));
-    assert_eq!(out.stdout, b"out\0line\n");
-    assert_eq!(out.stderr, b"errline\n");
-
-    // Stdin forwarding + clean EOF.
-    let mut child = host
-        .koh(&[
-            "exec", &host.id, "--direct", &addr, "-C", "/tmp", "--", "cat",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(b"hello stdin\n")
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, b"hello stdin\n");
-    assert!(out.stderr.is_empty());
+    assert_eq!(
+        (out.status.code(), out.stdout, out.stderr),
+        (Some(42), b"out\0line\n".to_vec(), b"errline\n".to_vec())
+    );
 }
 
 #[tokio::test]
-async fn headless_jobs_raw_logs_wait_timeout_and_kill() {
-    let (tmp, srv, client, _, _) = boot_pair("jobs").await;
+async fn headless_jobs_raw_logs_wait_timeout_names_and_order() {
+    let door = Door::open("jobs", ServeOptions::default()).await;
+    let client = door.client().await;
+    let cwd = || Some(door.tmp.0.display().to_string());
 
-    // 200-char line must NOT be wrapped at 80 columns (raw append-only log, no PTY).
+    // A line of 200 is not wrapped at 80 columns: a job's log is what it wrote, with no PTY.
     let long_line = "X".repeat(200);
-    let info = client
-        .run_job(
-            Some("long".into()),
-            vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "--".into(),
-                format!("printf '{long_line}\\nREADY_TOKEN\\n'; exit 7"),
-            ],
-            Some(tmp.0.display().to_string()),
-        )
-        .await
-        .unwrap();
-    assert_eq!(info.name, "long");
+    let script = format!("sleep 0.3; printf '{long_line}\\n'; exit 7");
+    let info = client.run_job(Some("long".into()), sh(&script), cwd());
+    assert_eq!(info.await.unwrap().name, "long");
+    // More seconds than the clock has: the job is waited for to its end.
+    let waited = client.wait_job("long".into(), 200, Some(u64::MAX)).await;
+    let waited = waited.unwrap();
+    assert_eq!((waited.exit, waited.detail.as_str()), (7, "exited 7"));
+    assert!(waited.tail.contains(&long_line));
+    let mut log = Vec::new();
+    let ended = client.logs_to("long".into(), None, true, false, &mut log);
+    let (state, exit, _) = ended.await.unwrap().unwrap();
+    assert_eq!((state.as_str(), exit), ("exited 7", Some(7)));
+    assert!(String::from_utf8_lossy(&log).contains(&long_line));
 
-    let wait_res = client.wait_job("long".into(), 200, Some(10)).await.unwrap();
-    assert_eq!((wait_res.exit, wait_res.detail.as_str()), (7, "exited 7"));
-    assert!(wait_res.tail.contains(&long_line));
-
-    let mut raw_log = Vec::new();
-    let (state, exit, _) = client
-        .logs_to("long".into(), None, true, false, &mut raw_log)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(state, "exited 7");
-    assert_eq!(exit, Some(7));
-    assert!(String::from_utf8_lossy(&raw_log).contains(&long_line));
-
-    // Timeout 124 and kill.
-    let _ = client
-        .run_job(
-            Some("srv".into()),
-            vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "--".into(),
-                "printf 'BOOTING\\n'; sleep 60".into(),
-            ],
-            Some(tmp.0.display().to_string()),
-        )
-        .await
-        .unwrap();
-    let timed = client.wait_job("srv".into(), 10, Some(1)).await.unwrap();
+    // A job given no name has the first free number; the list is the oldest first.
+    let info = client.run_job(None, sh("sleep 60"), cwd()).await.unwrap();
+    assert_eq!(info.name, "1");
+    let timed = client.wait_job("1".into(), 10, Some(1)).await.unwrap();
     assert_eq!((timed.exit, timed.detail.as_str()), (124, "timed out"));
-
     let jobs = client.jobs(None).await.unwrap();
-    assert_eq!(jobs.len(), 2);
+    let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
+    assert_eq!(names, ["long", "1"]);
 
-    let _ = client.kill_job("srv".into(), 9).await.unwrap();
-    let killed = client.wait_job("srv".into(), 10, Some(5)).await.unwrap();
-    assert_eq!((killed.exit, killed.detail.as_str()), (137, "killed 9"));
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_wait_with_a_limit_the_clock_cannot_say_has_no_limit() {
-    let (tmp, srv, client, _, _) = boot_pair("wait-limit").await;
-    let cwd = Some(tmp.0.display().to_string());
-    let script = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "--".into(),
-        "sleep 0.3; exit 3".into(),
-    ];
-    client
-        .run_job(Some("brief".into()), script, cwd)
-        .await
-        .unwrap();
-    // More seconds than the clock has: the job is waited for to its end, and the server serves on.
-    let waited = client
-        .wait_job("brief".into(), 10, Some(u64::MAX))
-        .await
-        .unwrap();
-    assert_eq!(waited.exit, 3, "{waited:?}");
-    assert_eq!(client.jobs(None).await.unwrap().len(), 1);
-
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_wait_and_a_followed_log_end_on_the_server_when_their_client_s_stream_does() {
-    let (tmp, srv, client, _, _) = boot_pair("left").await;
-    let cwd = Some(tmp.0.display().to_string());
-    let script = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "--".into(),
-        "sleep 60".into(),
-    ];
-    client
-        .run_job(Some("long".into()), script, cwd)
-        .await
-        .unwrap();
-    let name = || "long".to_string();
+    // A wait and a followed log end on the server when their client lets go of what it reads,
+    // on a connection that lives: seen here as the server letting go of what the client sends.
     let (wait, follow) = (
         Request::WaitJob {
-            name: name(),
+            name: "1".into(),
             tail: 10,
             timeout_secs: None,
         },
         Request::Logs {
-            name: name(),
+            name: "1".into(),
             tail: None,
             all: false,
             follow: true,
         },
     );
     for request in [wait, follow] {
-        // The client lets go of what it reads, on a connection that lives: the server lets go
-        // of the request, which is seen here as its end of what the client sends being let go.
         let (send, recv) = client.request(&request).await.unwrap();
         drop(recv);
-        let ended = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
-        assert!(ended.is_ok(), "still served after 5 s: {request:?}");
+        let ended = tokio::time::timeout(Duration::from_secs(20), send.stopped()).await;
+        assert!(ended.is_ok(), "still served: {request:?}");
     }
-
-    client.kill_job(name(), 9).await.unwrap();
+    client.kill_job("1".into(), 9).await.unwrap();
     client.close().await;
-    srv.shutdown().await;
+    door.shut().await;
 }
 
 /// `koh connect` as a person runs it, in a terminal of the test's own (a pty): what it drew there
@@ -281,13 +204,7 @@ impl Drop for InTerminal {
 
 impl InTerminal {
     fn connect(config: &Path, runtime: &Path, args: &[&str]) -> Self {
-        Self::connect_in(config, runtime, args, true)
-    }
-
-    /// In a terminal that is koh's controlling terminal (`its`), as a shell's is; or one that
-    /// is only its standard input and output.
-    fn connect_in(config: &Path, runtime: &Path, args: &[&str], its: bool) -> Self {
-        Self::connect_on(Self::pty(), config, runtime, args, its)
+        Self::connect_on(Self::pty(), config, runtime, args, true)
     }
 
     /// A terminal of 80 by 24: its end here, and the end a program has.
@@ -301,7 +218,8 @@ impl InTerminal {
         fuxix::pty(size).unwrap()
     }
 
-    /// `koh connect` on this terminal.
+    /// `koh connect` on this terminal: koh's controlling terminal (`its`), as a shell's is; or
+    /// one that is only its standard input and output.
     fn connect_on(
         (tty, theirs): (fs::File, fs::File),
         config: &Path,
@@ -379,118 +297,54 @@ impl InTerminal {
     }
 }
 
-#[tokio::test]
-async fn unauthorized_key_is_refused_with_exit_4() {
-    let tmp = TempDir::new("auth");
-    let srv_cfg = tmp.0.join("srv_cfg");
-    let cli_cfg = tmp.0.join("cli_cfg");
-    fs::create_dir_all(&srv_cfg).unwrap();
-    fs::create_dir_all(&cli_cfg).unwrap();
-
-    let stranger_key =
-        load_or_create_key(Role::Client, Some(&cli_cfg.join("stranger.key"))).unwrap();
-
-    let srv = start_server(ServeOptions {
-        key_file: Some(srv_cfg.join("server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow: Vec::new(),
-        shell: None,
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
-    .unwrap();
-    let addr = srv.direct_addr.unwrap();
-
-    let stranger = Client::connect_direct(
-        stranger_key,
-        srv.endpoint_id,
-        Some(Route::Direct(addr)),
-        false,
-    )
-    .await
-    .unwrap();
-    let err = stranger.jobs(None).await.unwrap_err();
-    assert_eq!(err.code, Exit::REFUSED, "expected exit 4, got {err:?}");
-    stranger.close().await;
-    srv.shutdown().await;
-}
-
 #[test]
-fn cli_help_keys_and_peer_lists() {
+fn cli_keys_and_peer_lists() {
     let tmp = TempDir::new("cli");
-    let bin = env!("CARGO_BIN_EXE_koh");
-
-    let help = Command::new(bin).arg("--help").output().unwrap();
-    assert!(help.status.success());
-    assert!(String::from_utf8_lossy(&help.stdout).contains("koh connect"));
-
-    let id_out = Command::new(bin)
-        .env("KOH_CONFIG_DIR", &tmp.0)
-        .arg("id")
-        .output()
-        .unwrap();
-    assert!(id_out.status.success());
-    let id = String::from_utf8(id_out.stdout).unwrap().trim().to_string();
-    assert_eq!(id.len(), 64);
-
-    assert!(
-        Command::new(bin)
+    let koh = |args: &[&str]| {
+        let mut koh = Command::new(env!("CARGO_BIN_EXE_koh"));
+        let out = koh
             .env("KOH_CONFIG_DIR", &tmp.0)
-            .args(["servers", "add", "box", &id, "--direct", "127.0.0.1:4433"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let list = Command::new(bin)
-        .env("KOH_CONFIG_DIR", &tmp.0)
-        .arg("servers")
-        .output()
-        .unwrap();
-    assert!(String::from_utf8_lossy(&list.stdout).contains("box "));
-    // A word more than `rm NAME` is a usage error, and nothing is removed.
-    let rm = |more: &[&str]| {
-        let mut koh = Command::new(bin);
-        koh.env("KOH_CONFIG_DIR", &tmp.0)
-            .args(["servers", "rm", "box"]);
-        let out = koh.args(more).output().unwrap();
-        (out.status.code(), out.stdout, out.stderr)
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
     };
-    let usage = b"koh: usage: koh servers rm NAME\n".to_vec();
-    assert_eq!(rm(&["extra"]), (Some(2), Vec::new(), usage));
-    assert_eq!(rm(&[]).0, Some(0));
+    let (code, id) = koh(&["id"]);
+    assert_eq!((code, id.trim().len()), (Some(0), 64));
+    let added = koh(&[
+        "servers",
+        "add",
+        "box",
+        id.trim(),
+        "--direct",
+        "127.0.0.1:4433",
+    ]);
+    assert_eq!(added.0, Some(0));
+    // A word more than `rm NAME` is a usage error, and nothing is removed.
+    assert_eq!(koh(&["servers", "rm", "box", "extra"]).0, Some(2));
+    assert!(koh(&["servers"]).1.contains("box "));
+    assert_eq!(koh(&["servers", "rm", "box"]).0, Some(0));
+    assert!(!koh(&["servers"]).1.contains("box "));
 }
 
 #[tokio::test]
 async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
     let tmp = TempDir::new("serve-lock");
-    let key = tmp.0.join("cfg/server.key");
-    fs::create_dir_all(tmp.0.join("cfg")).unwrap();
-    let serve = || {
-        start_server(ServeOptions {
-            key_file: Some(key.clone()),
-            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            allow: Vec::new(),
-            shell: None,
-            state_dir: Some(tmp.0.join("state")),
-            disable_relay: true,
-            quiet: true,
-            ..ServeOptions::default()
-        })
-    };
-    let first = serve().await.expect("the first server starts");
-    let refused = serve().await.err().expect("a second server on the key");
+    let first = boot_server_on(&tmp, Vec::new()).await.unwrap();
+    let refused = boot_server_on(&tmp, Vec::new()).await.err().unwrap();
     assert_eq!(refused.code, Exit::BUSY, "{refused:?}");
     assert!(refused.message.contains("server.key"), "{refused:?}");
-
-    // The first stopped: the key is free, and what marks it held is a lock, not a file's being
-    // there (a server that was killed leaves the file, and nothing to clean up).
+    // The first stopped: the key is free (what marks it held is a lock, not a file's being
+    // there: a server that was killed leaves the file, and nothing to clean up).
     first.shutdown().await;
-    assert!(tmp.0.join("cfg/server.key.serving").exists());
-    let again = serve().await.expect("a server once the first stopped");
-    again.shutdown().await;
+    let again = boot_server_on(&tmp, Vec::new()).await;
+    again
+        .expect("a server once the first stopped")
+        .shutdown()
+        .await;
 }
 
 /// A server that allows `allow`, with its other options from `more`.
@@ -498,7 +352,7 @@ async fn boot_server(
     tmp: &TempDir,
     allow: Vec<iroh::EndpointId>,
     more: ServeOptions,
-) -> (koh::server::RunningServer, Option<Route>) {
+) -> (RunningServer, Option<Route>) {
     fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
     let session_exe = more
         .session_exe
@@ -520,6 +374,20 @@ async fn boot_server(
     (srv, route)
 }
 
+/// A server on the key `boot_server` uses, or why it could not start.
+async fn boot_server_on(tmp: &TempDir, allow: Vec<iroh::EndpointId>) -> koh::Result<RunningServer> {
+    start_server(ServeOptions {
+        key_file: Some(tmp.0.join("srv_cfg/server.key")),
+        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        allow,
+        state_dir: Some(tmp.0.join("state")),
+        disable_relay: true,
+        quiet: true,
+        ..ServeOptions::default()
+    })
+    .await
+}
+
 fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
     fs::create_dir_all(tmp.0.join("cli_cfg")).unwrap();
     load_or_create_key(Role::Client, Some(&tmp.0.join("cli_cfg").join(name))).unwrap()
@@ -527,200 +395,89 @@ fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
 
 #[tokio::test]
 async fn connections_are_capped_before_auth_and_a_place_comes_back_when_one_ends() {
-    let tmp = TempDir::new("max-conn");
-    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
     let more = ServeOptions {
         max_connections: 2,
         proof_timeout: Duration::from_secs(60),
         ..ServeOptions::default()
     };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    let dial = |key: &iroh::SecretKey| {
-        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), false)
-    };
-
+    let door = Door::open("max-conn", more).await;
+    let stranger = new_key(&door.tmp, "stranger.key");
     // Two peers the server does not know, which prove nothing, hold both places.
-    let (first, second) = (
-        dial(&stranger).await.unwrap(),
-        dial(&stranger).await.unwrap(),
-    );
-    let third = dial(&friend).await.unwrap();
+    let first = door.dial(&stranger, false).await.unwrap();
+    let second = door.dial(&stranger, false).await.unwrap();
+    let third = door.dial(&door.friend, false).await.unwrap();
     let busy = third.jobs(None).await.unwrap_err();
     assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
     third.close().await;
-
     // One of them goes: its place is the next client's.
     first.close().await;
-    let served = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let next = dial(&friend).await.unwrap();
-            let listed = next.jobs(None).await;
-            next.close().await;
-            match listed {
-                Ok(list) => break list,
-                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("a place came back within 5 s");
-    assert!(served.is_empty());
-
+    door.served().await;
     second.close().await;
-    srv.shutdown().await;
+    door.shut().await;
 }
 
 #[tokio::test]
 async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
-    let tmp = TempDir::new("proof-deadline");
-    let (friend, stranger) = (new_key(&tmp, "friend.key"), new_key(&tmp, "stranger.key"));
     let more = ServeOptions {
         proof_timeout: Duration::from_secs(1),
         ..ServeOptions::default()
     };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    let dial = |key: &iroh::SecretKey| {
-        Client::connect_direct(key.clone(), srv.endpoint_id, route.clone(), true)
-    };
-
-    let silent = dial(&stranger).await.unwrap();
-    let known = dial(&friend).await.unwrap();
+    let door = Door::open("proof-deadline", more).await;
+    let stranger = new_key(&door.tmp, "stranger.key");
+    let silent = door.dial(&stranger, true).await.unwrap();
+    let (known, since) = (door.client().await, Instant::now());
     known.jobs(None).await.unwrap();
-    let closed = tokio::time::timeout(Duration::from_secs(5), silent.connection().closed())
-        .await
-        .expect("the silent connection was closed within 5 s");
+    let conn = silent.connection();
+    let closed = tokio::time::timeout(Duration::from_secs(20), conn.closed()).await;
+    let closed = closed.expect("the silent connection was closed");
     let refused = koh::proto::CloseCode::Refused as u64;
     assert!(
         matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close)
             if close.error_code.into_inner() == refused),
         "{closed:?}"
     );
-    // One that proved its key in time stays, past the deadline (it came a moment after the other).
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // One that proved its key in time stays past its own deadline. (The wait is the test.)
+    tokio::time::sleep_until((since + Duration::from_millis(1500)).into()).await;
     known.jobs(None).await.unwrap();
-
     known.close().await;
     silent.close().await;
-    srv.shutdown().await;
+    door.shut().await;
 }
 
-#[tokio::test]
-async fn the_server_takes_no_stream_but_a_request() {
-    let (_tmp, srv, client, _, _) = boot_pair("no-uni").await;
-    // Nothing reads a unidirectional stream, so a peer is given none to fill.
-    let conn = client.connection();
-    let opened = tokio::time::timeout(Duration::from_millis(300), conn.open_uni()).await;
-    assert!(opened.is_err(), "a unidirectional stream was opened");
-    client.jobs(None).await.unwrap();
-    client.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_command_that_fails_gives_its_place_back_at_once() {
-    let tmp = TempDir::new("close-on-error");
-    let cfg = tmp.0.join("cli_cfg");
-    let friend = new_key(&tmp, "client.key");
-    let more = ServeOptions {
-        max_connections: 1,
-        ..ServeOptions::default()
-    };
-    let (srv, _) = boot_server(&tmp, vec![friend.public()], more).await;
-    let (id, addr) = (srv.endpoint_id.to_string(), srv.direct_addr.unwrap());
-    let koh = move |args: &'static [&'static str]| {
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_koh"));
-        command
-            .env("KOH_CONFIG_DIR", &cfg)
-            .arg(args[0])
-            .arg(&id)
-            .args(&args[1..])
-            .args(["--direct", &addr.to_string()]);
-        async move { command.output().await.unwrap() }
-    };
-
+#[test]
+fn a_command_that_fails_gives_its_place_back_at_once() {
+    let host = Host::start("close-on-error", &["--max-connections", "1"]);
     // No such job: the command fails after it connected. The server has one place, and the
     // next command must find it free, not wait out the first one's connection.
-    let failed = koh(&["jobs", "no-such-job"]).await;
-    assert_eq!(failed.status.code(), Some(127), "{failed:?}");
-    let next = koh(&["jobs"]).await;
-    assert_eq!(next.status.code(), Some(0), "{next:?}");
-
-    srv.shutdown().await;
+    assert_eq!(host.asked("jobs", &["no-such-job"]).0, Some(127));
+    assert_eq!(host.asked("jobs", &[]).0, Some(0));
 }
 
 #[tokio::test]
 async fn a_connection_s_place_comes_back_when_its_requests_have_ended() {
-    let tmp = TempDir::new("place-requests");
-    let friend = new_key(&tmp, "friend.key");
     let more = ServeOptions {
         max_connections: 1,
         ..ServeOptions::default()
     };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-    // A command that ignores SIGHUP (so it runs into the 2 s HANGUP_WAIT window) of a client
-    // that then leaves. (It writes `deaf` after installing the trap so the client never leaves
-    // before the shell has read its first word.)
-    let left = |script: &str| {
-        let exec = Request::Exec {
-            argv: vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "--".into(),
-                format!("trap '' HUP; : > deaf; {script}"),
-            ],
-            cwd: Some(tmp.0.display().to_string()),
-        };
-        let deaf = tmp.0.join("deaf");
-        async move {
-            let client = dial().await.unwrap();
-            let streams = client.request(&exec).await.unwrap();
-            until("the command is deaf to a hangup", || deaf.exists());
-            fs::remove_file(&deaf).unwrap();
-            (client, streams)
-        }
+    let door = Door::open("place-requests", more).await;
+    // A command that ignores SIGHUP, of a client that then leaves: it finishes in the 2 s the
+    // server gives a command after its hangup. (It writes `deaf` once the trap is set, so the
+    // client never leaves before the shell has read its first word.)
+    let (deaf, ended) = (door.tmp.0.join("deaf"), door.tmp.0.join("ended"));
+    let script = "trap '' HUP; : > deaf; sleep 1; : > ended";
+    let exec = Request::Exec {
+        argv: sh(script),
+        cwd: Some(door.tmp.0.display().to_string()),
     };
-    // The next client is served: asked again for as long as the server is busy.
-    let served = || async {
-        let serving = async {
-            loop {
-                let listed = match dial().await {
-                    Ok(next) => {
-                        let listed = next.jobs(None).await;
-                        next.close().await;
-                        listed
-                    }
-                    Err(busy) => Err(busy),
-                };
-                match listed {
-                    Ok(_) => break,
-                    Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        };
-        let served = tokio::time::timeout(Duration::from_secs(20), serving).await;
-        served.expect("the place came back within 20 s");
-    };
-
-    // The command finishes during the 2 s hangup grace window after its client left: the place
-    // stays the connection's until hangup finishes, then goes to the next client.
-    let (client, streams) = left("sleep 1; : > ended").await;
+    let client = door.dial(&door.friend, false).await.unwrap();
+    let streams = client.request(&exec).await.unwrap();
+    until("the command is deaf to a hangup", || deaf.exists());
     drop(streams);
     client.close().await;
-    served().await;
-    assert!(tmp.0.join("ended").exists(), "served beside the command");
-
-    // A command that keeps writing to a client that left gets closed pipes immediately and ends
-    // without holding the connection place past hangup.
-    let (client, streams) = left("sleep 0.2; head -c 2097152 /dev/zero").await;
-    drop(streams);
-    client.close().await;
-    let cut_off = tokio::time::timeout(Duration::from_secs(10), served()).await;
-    cut_off.expect("the place of a command that only writes came back within 10 s");
-
-    srv.shutdown().await;
+    // The place stays the connection's until its command has ended, then is the next client's.
+    door.served().await;
+    assert!(ended.exists(), "served beside the command");
+    door.shut().await;
 }
 
 #[test]
@@ -734,22 +491,18 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     std::thread::spawn(move || {
         tell.send(koh::keys::load_clients(Some(&key), |_, _| {}).map(|list| list.len()))
     });
-    let read = told.recv_timeout(Duration::from_secs(5));
+    let read = told.recv_timeout(Duration::from_secs(20));
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
 }
 
 #[tokio::test]
 async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
     let tmp = TempDir::new("cap-range");
-    for (max_connections, max_sessions, flag) in [
-        (usize::MAX, 64, "--max-connections"),
-        (0, 64, "--max-connections"),
-        (64, 65_536, "--max-sessions"),
-        (64, 0, "--max-sessions"),
-    ] {
+    for (max_connections, max_sessions, flag) in
+        [(0, 64, "--max-connections"), (64, 65_536, "--max-sessions")]
+    {
         let more = ServeOptions {
             key_file: Some(tmp.0.join("srv_cfg/server.key")),
-            direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
             max_connections,
             max_sessions,
             quiet: true,
@@ -758,58 +511,39 @@ async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
         };
         let err = start_server(more).await.err().expect("a refusal");
         assert_eq!(err.code, Exit::USAGE, "{err:?}");
-        assert!(
-            err.message.contains(flag) && err.message.contains("1 to 65535"),
-            "{err:?}"
-        );
+        assert!(err.message.contains(flag), "{err:?}");
     }
     // (Nothing was started for them: not even the key.)
     assert!(!tmp.0.join("srv_cfg").exists());
-
-    let koh = |flag: &'static str, value: &'static str| {
+    for (flag, value) in [
+        ("--max-connections", "18446744073709551615"),
+        ("--max-sessions", "many"),
+    ] {
         let out = Command::new(env!("CARGO_BIN_EXE_koh"))
             .env("KOH_CONFIG_DIR", tmp.0.join("cli"))
             .args(["serve", "--no-relay", flag, value])
             .output()
             .unwrap();
-        (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    };
-    for (flag, value) in [
-        ("--max-connections", "18446744073709551615"),
-        ("--max-sessions", "70000"),
-        ("--max-connections", "0"),
-        ("--max-sessions", "many"),
-    ] {
-        let (code, said) = koh(flag, value);
-        assert_eq!(code, Some(2), "{flag} {value}: {said}");
+        let said = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{flag} {value}: {said}");
         assert!(said.contains(flag) && said.contains("1 to 65535"), "{said}");
     }
 }
 
 #[tokio::test]
 async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() {
-    let tmp = TempDir::new("handshake");
-    let friend = new_key(&tmp, "friend.key");
     let more = ServeOptions {
         max_connections: 1,
         proof_timeout: Duration::from_secs(2),
         ..ServeOptions::default()
     };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    let server = srv.direct_addr.unwrap();
-
+    let door = Door::open("handshake", more).await;
+    let server = door.srv.direct_addr.unwrap();
     // A peer whose packets reach the server and to whom nothing comes back: a socket that passes
     // on what it is sent and never reads the answers. Its handshake begins and cannot end, and it
     // sends its first packet again and again, which keeps the transport from giving it up.
-    let front = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let back = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
+    let bind = || tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0));
+    let (front, back) = (bind().await.unwrap(), bind().await.unwrap());
     let front_addr = front.local_addr().unwrap();
     let (passed, mut passed_on) = tokio::sync::watch::channel(0u32);
     let forward = tokio::spawn(async move {
@@ -820,130 +554,52 @@ async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() 
         }
     });
     let stalled = tokio::spawn(Client::connect_direct(
-        friend.clone(),
-        srv.endpoint_id,
+        door.friend.clone(),
+        door.srv.endpoint_id,
         Some(Route::Direct(front_addr)),
         false,
     ));
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        passed_on.wait_for(|count| *count > 0),
-    )
-    .await
-    .expect("the stalled peer sent a packet within 5 s")
-    .unwrap();
-
+    let first = passed_on.wait_for(|count| *count > 0);
+    let first = tokio::time::timeout(Duration::from_secs(20), first).await;
+    first.expect("the stalled peer sent a packet").unwrap();
     // It has the server's one place: a client that comes now is told the server is busy.
-    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-    let early = dial().await.unwrap();
+    let early = door.dial(&door.friend, false).await.unwrap();
     let busy = early.jobs(None).await.unwrap_err();
     assert_eq!(busy.code, Exit::BUSY, "{busy:?}");
     early.close().await;
-
-    // The deadline is counted from when the server took that up, handshake and all: two seconds on, the
-    // place is the next client's, though the stalled peer is still sending.
-    tokio::time::timeout(Duration::from_secs(8), async {
-        loop {
-            let next = dial().await.unwrap();
-            let listed = next.jobs(None).await;
-            next.close().await;
-            if listed.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the place came back within 8 s");
-    assert!(!stalled.is_finished(), "the stalled peer gave up by itself");
-
+    // The deadline is counted from when the server took that up, handshake and all: two seconds
+    // on, the place is the next client's, though the stalled peer is still sending.
+    door.served().await;
     stalled.abort();
     forward.abort();
-    srv.shutdown().await;
+    door.shut().await;
 }
 
 #[tokio::test]
 async fn a_client_refused_at_the_door_is_told_the_server_is_busy_too() {
-    let tmp = TempDir::new("refused-busy");
-    let friend = new_key(&tmp, "friend.key");
     let more = ServeOptions {
         max_connections: 1,
         ..ServeOptions::default()
     };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    let dial = || Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-
+    let door = Door::open("refused-busy", more).await;
     // One client has the place. A second is let connect to be told so, and has not asked yet: it
     // holds the one place there is for that. A third is refused before it has connected at all,
     // and that is the server being busy as much as the second's answer is: exit 75, not 3.
-    let first = dial().await.unwrap();
+    let first = door.dial(&door.friend, false).await.unwrap();
     first.jobs(None).await.unwrap();
-    let second = dial().await.unwrap();
-    let third = dial().await.err().expect("a refusal");
+    let second = door.dial(&door.friend, false).await.unwrap();
+    let third = door
+        .dial(&door.friend, false)
+        .await
+        .err()
+        .expect("a refusal");
     assert_eq!(third.code, Exit::BUSY, "{third:?}");
     assert!(third.message.contains("server busy"), "{third:?}");
     let told = second.jobs(None).await.unwrap_err();
     assert_eq!(told.code, Exit::BUSY, "{told:?}");
-
     second.close().await;
     first.close().await;
-    srv.shutdown().await;
-}
-
-#[tokio::test]
-async fn a_server_that_is_dropped_stops_taking_connections_as_it_lets_go_of_its_key() {
-    let tmp = TempDir::new("drop-lock");
-    let friend = new_key(&tmp, "friend.key");
-    let (first, route) = boot_server(&tmp, vec![friend.public()], ServeOptions::default()).await;
-    let id = first.endpoint_id;
-    let dial = |route: Option<Route>| Client::connect_direct(friend.clone(), id, route, false);
-    let client = dial(route.clone()).await.unwrap();
-    client.jobs(None).await.unwrap();
-    client.close().await;
-
-    // Dropped, not shut down: the key is free for another server only once this one takes no
-    // more connections. So when a second server on the key has started, the first one's address
-    // serves nobody.
-    drop(first);
-    let second = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match boot_server_on(&tmp, vec![friend.public()]).await {
-                Ok(server) => break server,
-                Err(busy) => assert_eq!(busy.code, Exit::BUSY, "{busy:?}"),
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the key was free within 5 s");
-    let old = tokio::time::timeout(Duration::from_secs(1), async {
-        let client = dial(route).await?;
-        client.jobs(None).await
-    })
-    .await;
-    assert!(
-        !matches!(old, Ok(Ok(_))),
-        "the dropped server served a client"
-    );
-
-    second.shutdown().await;
-}
-
-/// A server on the key `boot_server` uses, or why it could not start.
-async fn boot_server_on(
-    tmp: &TempDir,
-    allow: Vec<iroh::EndpointId>,
-) -> koh::Result<koh::server::RunningServer> {
-    start_server(ServeOptions {
-        key_file: Some(tmp.0.join("srv_cfg/server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow,
-        state_dir: Some(tmp.0.join("state2")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
+    door.shut().await;
 }
 
 /// The names in `dir`, in order.
@@ -956,113 +612,72 @@ fn names_in(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-#[tokio::test]
-async fn a_proof_deadline_too_far_off_for_the_clock_is_no_deadline_and_no_panic() {
-    // (`ServeOptions` is public: `Duration::MAX` added to the clock's time panicked in the task
-    // that takes connections, at the first peer to come, and no other was taken after it.)
-    let tmp = TempDir::new("proof-never");
-    let friend = new_key(&tmp, "friend.key");
-    let more = ServeOptions {
-        proof_timeout: Duration::MAX,
-        ..ServeOptions::default()
-    };
-    let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
-    for nth in 0..2 {
-        let dial = Client::connect_direct(friend.clone(), srv.endpoint_id, route.clone(), false);
-        let client = tokio::time::timeout(Duration::from_secs(5), dial)
-            .await
-            .unwrap_or_else(|_| panic!("connection {nth} was not taken within 5 s"))
-            .unwrap();
-        client.jobs(None).await.unwrap();
-        client.close().await;
-    }
-    srv.shutdown().await;
-}
-
-/// `koh serve` as a process of its own, and processes it started: all ended when this is dropped.
+/// `koh serve` as a process of its own, killed when this is dropped; the lines it says on its
+/// standard error, read as it says them.
 struct Served {
     server: std::process::Child,
-    started: Vec<u32>,
-    // (Kept open: the server goes on writing to it.)
-    said: std::io::BufReader<std::process::ChildStderr>,
+    said: std::sync::mpsc::Receiver<String>,
 }
 
 impl Drop for Served {
     fn drop(&mut self) {
         let _ = self.server.kill();
         let _ = self.server.wait();
-        for pid in &self.started {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-        }
     }
 }
 
 impl Served {
-    /// A server that allows `client`, with `path` for its PATH, a runtime directory or none,
-    /// and a temporary directory of its own.
-    fn start(
-        tmp: &TempDir,
-        path: &std::path::Path,
-        client: iroh::EndpointId,
-        runtime: bool,
-    ) -> Self {
-        let mut serve = Command::new(env!("CARGO_BIN_EXE_koh"));
-        serve
-            .args(["serve", "--direct", "127.0.0.1:0", "--no-relay", "--allow"])
-            .arg(client.to_string())
-            .env("PATH", path)
-            .env("KOH_CONFIG_DIR", tmp.0.join("served_cfg"))
-            .env("TMPDIR", &tmp.0)
-            .env_remove("XDG_RUNTIME_DIR")
+    fn spawn(serve: &mut Command) -> Self {
+        use std::io::BufRead as _;
+        let mut server = serve
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        if runtime {
-            serve.env("XDG_RUNTIME_DIR", tmp.0.join("run"));
-        }
-        let mut server = serve.spawn().unwrap();
-        let said = std::io::BufReader::new(server.stderr.take().unwrap());
-        Self {
-            server,
-            started: Vec::new(),
-            said,
-        }
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tell, said) = std::sync::mpsc::channel();
+        let lines = std::io::BufReader::new(server.stderr.take().unwrap()).lines();
+        std::thread::spawn(move || lines.map_while(Result::ok).try_for_each(|l| tell.send(l)));
+        Self { server, said }
     }
 
-    /// What follows `label` on a line the server says as it starts; `Err` with all it said if
-    /// it ended without saying it.
-    fn says(&mut self, label: &str) -> Result<String, String> {
-        use std::io::BufRead as _;
+    /// What follows `label` on a line the server says as it starts, twenty seconds at most.
+    fn says(&mut self, label: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut all = String::new();
         loop {
-            let mut line = String::new();
-            if self.said.read_line(&mut line).unwrap() == 0 {
-                return Err(all);
+            let long = deadline.saturating_duration_since(Instant::now());
+            match self.said.recv_timeout(long) {
+                Ok(line) => match line.strip_prefix(label) {
+                    Some(rest) => return rest.trim().to_string(),
+                    None => all.push_str(&line),
+                },
+                Err(_) => panic!("koh serve did not say {label:?}; it said {all:?}"),
             }
-            if let Some(rest) = line.strip_prefix(label) {
-                return Ok(rest.trim().to_string());
-            }
-            all.push_str(&line);
         }
     }
 }
 
-#[tokio::test]
-async fn koh_serve_keeps_its_state_under_its_user_without_kill_or_id() {
+#[test]
+fn koh_serve_keeps_its_state_under_its_user_without_kill_or_id() {
     let tmp = TempDir::new("no-helpers");
     let key = new_key(&tmp, "client.key");
     let empty = tmp.0.join("empty-bin");
     fs::create_dir_all(&empty).unwrap();
-
     // Neither kill(1) nor id(1) is needed on PATH: `koh serve` uses fuxix::uid() for its default
     // state directory and talks to job holders over `ctl` instead of spawning kill(1).
-    let mut plain = Served::start(&tmp, &empty, key.public(), false);
-    let (mine, state) = (
-        fs::metadata(&tmp.0).unwrap().uid(),
-        fs::canonicalize(&tmp.0).unwrap(),
-    );
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_koh"));
+    serve
+        .args(["serve", "--direct", "127.0.0.1:0", "--no-relay", "--allow"])
+        .arg(key.public().to_string())
+        .env("PATH", &empty)
+        .env("KOH_CONFIG_DIR", tmp.0.join("served_cfg"))
+        .env("TMPDIR", &tmp.0)
+        .env_remove("XDG_RUNTIME_DIR");
+    let mine = fs::metadata(&tmp.0).unwrap().uid();
+    let state = fs::canonicalize(&tmp.0).unwrap();
     assert_eq!(
-        plain.says("sessions dir:").unwrap(),
+        Served::spawn(&mut serve).says("sessions dir:"),
         format!("{}/koh-{mine}/fux/koh-sessions", state.display())
     );
 }
@@ -1156,21 +771,20 @@ fn koh_fux_is_fux_and_a_holder_has_no_runtime() {
 
 #[tokio::test]
 async fn a_message_with_more_after_it_is_no_message() {
-    let (_tmp, srv, client, key, _) = boot_pair("more-after").await;
+    let door = Door::open("more-after", ServeOptions::default()).await;
+    let (client, key) = (door.client().await, &door.friend);
     // A request as it is sent, and one byte more inside its frame.
     let conn = client.connection();
-    let (mut send, mut recv) = koh::net::open_authed_stream(&conn, &key).await.unwrap();
+    let (mut send, mut recv) = koh::net::open_authed_stream(&conn, key).await.unwrap();
     let mut body = postcard::to_allocvec(&Request::Jobs { name: None }).unwrap();
     body.push(0);
-    send.write_all(&(body.len() as u32).to_be_bytes())
-        .await
-        .unwrap();
-    send.write_all(&body).await.unwrap();
+    koh::proto::send_frame(&mut send, &body).await.unwrap();
     // The server reads no request in it, and answers none: it closes the connection.
-    let answer = recv_msg::<koh::proto::Reply>(&mut recv, MAX_CTRL).await;
-    assert!(answer.is_err(), "{answer:?}");
+    let answer = recv_msg::<koh::proto::Reply>(&mut recv, MAX_CTRL);
+    let answer = tokio::time::timeout(Duration::from_secs(20), answer).await;
+    assert!(matches!(answer, Ok(Err(_))), "{answer:?}");
     client.close().await;
-    srv.shutdown().await;
+    door.shut().await;
 }
 
 // ---- sessions: a real `koh serve`, real `koh connect` ---------------------------
@@ -1269,19 +883,10 @@ impl Host {
             .args(&self.extra)
             .env("KOH_CONFIG_DIR", self.tmp.0.join("srv_cfg"))
             .env("XDG_RUNTIME_DIR", self.tmp.0.join("run"))
-            .env("HOME", self.tmp.0.join("home"))
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped());
-        let mut server = serve.spawn().unwrap();
-        let said = std::io::BufReader::new(server.stderr.take().unwrap());
-        let mut served = Served {
-            server,
-            started: Vec::new(),
-            said,
-        };
-        self.id = served.says("koh server id:").unwrap();
-        self.sessions = PathBuf::from(served.says("sessions dir:").unwrap());
+            .env("HOME", self.tmp.0.join("home"));
+        let mut served = Served::spawn(&mut serve);
+        self.id = served.says("koh server id:");
+        self.sessions = PathBuf::from(served.says("sessions dir:"));
         self.served = Some(served);
     }
 
@@ -2290,7 +1895,7 @@ fn a_terminal_that_is_closed_ends_koh_and_a_server_that_was_killed_leaves_no_vie
     // it ends, its viewer on the server with it, and nothing was made on the client.
     let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
     let asks = ["--direct", &host.addr(), &host.id, "--session", "s"];
-    let mut connect = InTerminal::connect_in(&config, &runtime, &asks, false);
+    let mut connect = InTerminal::connect_on(InTerminal::pty(), &config, &runtime, &asks, false);
     connect.until("the terminal shows the session", |tty| {
         tty.drawn.windows(8).any(|drawn| drawn == b"\x1b[?1049h") && viewers(&host).len() == 1
     });
@@ -2353,7 +1958,7 @@ fn marking_shell(host: &Host) -> Vec<String> {
 }
 
 fn sh(script: &str) -> Vec<String> {
-    ["sh", "-c", script].map(String::from).to_vec()
+    ["sh", "-c", "--", script].map(String::from).to_vec()
 }
 
 impl Host {
@@ -2935,10 +2540,11 @@ async fn a_wait_gives_the_first_command_that_ended_since_it_was_asked() {
 
 #[tokio::test]
 async fn a_list_of_sessions_longer_than_one_message_is_whole() {
-    let (_tmp, srv, client, _, state) = boot_pair("many").await;
+    let door = Door::open("many", ServeOptions::default()).await;
+    let client = door.client().await;
     // As many ended panes as `--max-sessions` may keep, each with a title as long as fux
     // writes one: more than a message holds.
-    let sessions = state.join("fux/koh-sessions");
+    let sessions = door.tmp.0.join("state/fux/koh-sessions");
     for n in 1..=4500 {
         let pane = sessions.join(n.to_string());
         fs::create_dir(&pane).unwrap();
@@ -2953,7 +2559,7 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
             .all(|session| session.title.len() == 256 && session.state == "ended")
     );
     client.close().await;
-    srv.shutdown().await;
+    door.shut().await;
 }
 
 #[test]

@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.45 and `fuxix` 0.13 (about 4,750 non-test Rust lines in `src/*.rs`, 5,300 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's
@@ -115,8 +115,8 @@ Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust
     session's files. They read what a script there could. What is
     of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
     marks and the text) is read between two looks at the same even `generation`; what is of
-    one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
-    replaces a file whole. A session lives while its holder has the lock on its folder.
+    one file (`output`'s screen) is read as it is, since `fux` replaces a file whole. A
+    session lives while its holder has the lock on its folder.
     - `sessions` lists each pane with a valid name, a `run` and a `status`, the oldest first:
       its name, whether a client is attached, what `state` says became of its program
       (`running` only while the holder lives; `ended` where none does and nothing says how),
@@ -240,10 +240,6 @@ koh adds nothing to stop these. What happens instead is said.
   thousand: some 250 commands inside a tenth of a second, a script's doing). The first
   command that ended is then no longer listed: what it gives is the oldest that is, its code
   and its output, and it says so on the line it prints on stderr.
-- End the sessions that a koh built on a `fux` before 0.43.2 started, if you `koh wait` on
-  them: such a session's holder does not number its marks (its folder has no
-  `marks.dropped`), and a wait for it is refused with a line that says so (exit 1). `koh
-  sessions`, `koh output` and `koh connect` go on with it as it is.
 - In a session, `fux start x` (or `koh fux start x`) starts `main/x` of **your own** `fux`
   session, not a koh session: `fux` reads no variable, and a name is a name in the default
   session.

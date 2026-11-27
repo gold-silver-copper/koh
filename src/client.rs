@@ -25,7 +25,7 @@ use crate::net::{
 use crate::proto::{
     Attach, Attached, ExecServerMsg, JobInfo, LogMsg, MAX_CHUNK, MAX_CTRL, MAX_FRAME, Reply,
     Request, SessionInfo, VIEW_FRAME, ViewInput, ViewOutput, ViewSize, WaitResult, decode, encode,
-    recv_msg, recv_msg_opt, recv_pieces, send_frame, send_msg, session_name,
+    recv_msg, recv_msg_opt, recv_pieces, send_frame, send_msg,
 };
 use crate::{Exit, KohError, Result};
 
@@ -400,25 +400,11 @@ impl Client {
         })?;
         reply.into_result().map_err(|e| (true, e))?;
         // (An answer that is over its bound or is none is the last word; the transport's end
-        // is not. A name it is, and no path. And a client that comes again is given the run
-        // it named, or types nothing.)
+        // is not. The name and run go back with the next attach, where the server checks them.)
         let attached: Attached = recv_msg(&mut recv, MAX_CTRL)
             .await
             .map_err(|e| (e.code == Exit::FAILED, e))?;
-        let refused = |what: &str| {
-            (
-                true,
-                KohError::failed(format!("the server answered {what}")),
-            )
-        };
-        match (
-            session_name(&attached.name),
-            asks.run.is_none_or(|run| run == attached.run),
-        ) {
-            (true, true) => Ok((send, recv, attached)),
-            (true, false) => Err(refused("with another run than the one that was asked for")),
-            (false, _) => Err(refused("with a session's name that is none")),
-        }
+        Ok((send, recv, attached))
     }
 
     /// An attach after a link went: a new stream on the connection if it lives (iroh may have

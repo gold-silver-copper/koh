@@ -1798,6 +1798,29 @@ async fn a_new_attach_ends_the_clients_older_stream_first_and_is_to_the_run_it_n
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connect_with_no_name_is_to_the_newest_session_that_lives() {
+    let host = Host::start("newest", &[]);
+    let client = host.client().await;
+    // `first` and `second` run on; `third`, started after them, has ended. (`status` times
+    // that are the same go by name, which is the order they were started in.)
+    let sleeps = ["sleep".to_string(), "100".into()];
+    for name in ["first", "second"] {
+        attach(&client, asks(Some(name), &sleeps)).await.unwrap();
+    }
+    attach(&client, asks(Some("third"), &sh("exit 0")))
+        .await
+        .unwrap();
+    let third = || fs::File::open(host.pane("third")).unwrap();
+    until("third has ended", || third().try_lock_shared().is_ok());
+    let nameless = Attach {
+        new: false,
+        ..asks(None, &[])
+    };
+    assert_eq!(attach(&client, nameless).await.unwrap().2.name, "second");
+    client.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_client_that_says_what_no_client_says_is_refused_or_loses_its_stream() {
     let host = Host::start("says", &[]);
     let client = host.client().await;
@@ -2590,15 +2613,6 @@ fn wait_session_returns_the_commands_code_or_124() {
         line.is_some_and(|n| n.parse::<u32>().is_ok_and(|n| n <= typed)),
         "{printed:?}"
     );
-    // A pane with no `marks.dropped` is kept by a holder of before there was one, whose marks
-    // have no numbers: a wait for it is refused, with what to do.
-    fs::remove_file(pane.join("marks.dropped")).unwrap();
-    let (code, _, said) = host.asked("wait", &["--session", "s", "--timeout", "1"]);
-    assert_eq!(code, Some(1), "{said}");
-    assert!(
-        said.contains("marks.dropped") && said.contains("End that session"),
-        "{said}"
-    );
 }
 
 #[test]
@@ -2685,17 +2699,27 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
         "s\tended\texited 3\t80x24\tidle\t9\t\n"
     );
     // Its wait has the command's rule: marks that only moved end nothing (a line inserted
-    // above the prompt), and of two commands that ended the code is the first's.
-    let steps = ["ran one 7", MOVES[0], "ran two 9; ran three 5"];
+    // above the prompt), and of two commands that ended the code and output are the first's.
+    let no_lf = r"printf '\r\n'; m C; printf no-lf; m 'D;6'; printf '\r\n'; prompt";
+    let blank = r"printf '\033[H\033[2J'; m C; printf '\r\n'; m 'D;0'";
+    let steps = [
+        "m 'D;4'",
+        "ran one 7",
+        MOVES[0],
+        "ran two 9; ran three 5",
+        no_lf,
+        blank,
+    ];
     let moving = host.session("m", &marks_by_steps(&steps), "$");
-    let step = |done: u32| {
-        fs::write(moving.join("in"), "\n").unwrap();
-        let title = format!("done-{done}\n");
-        until(&title, || {
-            fs::read_to_string(moving.join("title")).is_ok_and(|said| said == title)
-        });
+    let last_is = |want: &str| {
+        let (code, last, said) = recipe(&["last", moving.to_str().unwrap()]);
+        assert_eq!((code, last.as_str()), (Some(0), want), "{said}");
+        assert_eq!(last, host.asked("output", &["--session", "m", "--last"]).1);
     };
-    step(1);
+    // An end with no output marked before it, and none before that, is of the screen.
+    stepped(&moving, 1);
+    last_is(&screen(&moving));
+    stepped(&moving, 2);
     let mut wait = Command::new("sh");
     wait.arg(&script)
         .args(["wait", moving.to_str().unwrap(), "30"]);
@@ -2706,12 +2730,19 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
             .unwrap(),
     );
     std::thread::sleep(Duration::from_millis(500));
-    step(2);
+    stepped(&moving, 3);
     std::thread::sleep(Duration::from_millis(500));
     assert!(!wait.ended(), "{:?}", wait.said());
-    step(3);
+    stepped(&moving, 4);
     until("the recipe's wait ends", || wait.ended());
-    assert_eq!(wait.said().0, Some(9));
+    let (code, printed, said) = wait.said();
+    assert_eq!((code, printed.as_str()), (Some(9), "two\n"), "{said}");
+    // A command's output with no line break at its end is its last line all the same, and one
+    // empty line on an otherwise blank screen is that line.
+    stepped(&moving, 5);
+    last_is("no-lf\n");
+    stepped(&moving, 6);
+    last_is("\n");
     // And its list has a pane that has only begun: a `status`, and nothing else yet.
     fs::create_dir(host.sessions.join("bare")).unwrap();
     fs::write(host.sessions.join("bare/status"), "holder 1\n").unwrap();

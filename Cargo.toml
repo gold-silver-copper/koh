@@ -8,7 +8,7 @@ authors = ["Stephen Korzen <stephen.korzen@gmail.com>"]
 repository = "https://github.com/gold-silver-copper/koh"
 description = "Ultra-minimal peer-to-peer remote shell, jobs, and fux sessions over iroh QUIC"
 readme = "README.md"
-keywords = ["mosh", "shell", "terminal", "iroh", "fux"]
+keywords = ["remote", "shell", "terminal", "iroh", "fux"]
 categories = ["command-line-utilities", "network-programming"]
 include = ["/src/**", "/README.md", "/COPYING", "/SECURITY.md", "/docs/THREAT_MODEL.md"]
 

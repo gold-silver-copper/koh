@@ -61,12 +61,12 @@ text() {
 # bytes as `koh output --last` and fux's key `C-b C` cut, with a line break after the last line, or with no pair the screen.
 look() {
   g=$(cat "$1/generation"); add=$(text "$1" "$f"); cat "$1/marks.dropped" "$1/marks" > "$m"; cat "$1/shown/screen" > "$c"
-  LC_ALL=C awk -v add="$add" -v n="${2:-}" -v c="$c" 'NR == FNR { if (FNR == 1) d = $1; else if (!done) { if ($3 == "output") { o = $1; oa = $2 }
+  LC_ALL=C C="$c" awk -v add="$add" -v n="${2:-}" 'BEGIN { c = ENVIRON["C"] } NR == FNR { if (FNR == 1) d = $1 + 0; else if (!done) { if ($3 == "output") { o = $1; oa = $2 }
       if ($3 == "end") { e = $4 + 0; if (o != "") { from = o; fa = oa; to = $1; ta = $2; o = "" } }; done = $3 == "end" && n != "" && d + FNR - 1 > n + 0 }; next }
     n != "" && !done { exit }; from != "" && FNR >= from + add && FNR <= to + add { l = FNR == to + add ? substr($0, 1, ta) : $0
       if (FNR == from + add) l = substr(l, fa + 1); if (FNR < to + add || l != "") print l > c }
-    END { if (from != "") printf "" > c; if (n == "" ? e != "" : done) print e, (d > n + 0 ? d - n : 0) }' "$m" "$f"
-  [ $((${g:-1} % 2)) -eq 0 ] && [ "$g" = "$(cat "$1/generation")" ]
+    END { if (from != "") printf "" > c; if (n == "" ? e != "" : done) print e, (d > n + 0 ? d - n : 0) }' "$m" "$f" &&
+    [ $((${g:-1} % 2)) -eq 0 ] && [ "$g" = "$(cat "$1/generation")" ]
 } 2> /dev/null
 # (Ten tries: a pane that never stops printing, or whose holder was killed as it wrote, is taken as it is.)
 last() { tries=0; until look "$1" > /dev/null || [ $tries -ge 10 ]; do tries=$((tries + 1)); sleep 0.02; done; cat "$c"; }
@@ -99,6 +99,6 @@ case ${1:-} in
   list) list "$2" ;;
   screen) cat "$2/shown/screen" ;;
   last) last "$2" ;;
-  wait) await "$2" "${3:-}" ;;
+  wait) cd "$2" && await . "${3:-}" ;;   # (in the folder: a name that is started anew is another session)
   *) echo "sessions.sh list DIR | screen PANE | last PANE | wait PANE [SECONDS]" >&2; exit 2 ;;
 esac

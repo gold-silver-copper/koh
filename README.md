@@ -115,8 +115,8 @@ Rewritten from scratch on `fux` 0.45 and `fuxix` 0.13 (about 4,750 non-test Rust
     session's files. They read what a script there could. What is
     of several files (a line of `sessions`; for `--last`, and for what a `wait` returns, the
     marks and the text) is read between two looks at the same even `generation`; what is of
-    one file (`output`'s screen, a wait's look at `marks`) is read as it is, since `fux`
-    replaces a file whole. A session lives while its holder has the lock on its folder.
+    one file (`output`'s screen) is read as it is, since `fux` replaces a file whole. A
+    session lives while its holder has the lock on its folder.
     - `sessions` lists each pane with a valid name, a `run` and a `status`, the oldest first:
       its name, whether a client is attached, what `state` says became of its program
       (`running` only while the holder lives; `ended` where none does and nothing says how),

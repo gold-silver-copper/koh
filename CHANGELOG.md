@@ -11,7 +11,7 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0, 0.18.1 and 0.19.0 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0, 0.18.1, 0.19.0 and 0.19.1 (0.12.1 is tag-only).
 
 ## [Unreleased]
 
@@ -22,12 +22,14 @@ The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0 and 0.19.1 wo
 ### Changed
 
 - koh carries `fux` 0.45.0. A job whose program is not found (127) is told from one that cannot
-  be started (126) by the status `fux start` exits with, not by the words of its error.
+  be started (126) by the status `fux start` exits with, not by the words of its error; and
+  `koh fux start` itself exits 127 or 126 there, where it exited 1.
 
 ### Removed
 
 - `koh wait --session`'s refusal of a session with no `marks.dropped`, and the script's line in
-  `koh help-agents` that did the same: no released koh started one. Its marks are counted from 0.
+  `koh help-agents` that did the same: no released koh started one. `koh wait --session` counts
+  its marks from 0.
 - The client's check that the server's answer to an attach is a session's name and the run it
   asked for: the server checks both on the next attach.
 - The crate's keyword `mosh`, for `remote`: koh predicts no keys and does not roam.
@@ -35,9 +37,10 @@ The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0 and 0.19.1 wo
 ### Fixed
 
 - The script in `koh help-agents`: `last` cuts at the marks' bytes, as `koh output --last` does,
-  so a command's last line with no line break is printed (it was left out); and `wait` prints
-  the output of the command whose exit code it gives (of two that had ended, it printed the
-  second's).
+  so a command's last line with no line break is printed (it was left out), and so are one empty
+  line on an otherwise blank screen and, where no output was marked, the screen; and
+  `wait` prints the output of the command whose exit code it gives, of one read (of two that had
+  ended, it printed the second's).
 
 ## [0.19.0] — 2026-11-26
 

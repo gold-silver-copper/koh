@@ -15,6 +15,30 @@ binary, its tests and the fuzz targets share code, and any release may change it
 
 ## [Unreleased]
 
+## [0.19.1] — 2026-11-27
+
+The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0 and 0.19.1 work together.
+
+### Changed
+
+- koh carries `fux` 0.45.0. A job whose program is not found (127) is told from one that cannot
+  be started (126) by the status `fux start` exits with, not by the words of its error.
+
+### Removed
+
+- `koh wait --session`'s refusal of a session with no `marks.dropped`, and the script's line in
+  `koh help-agents` that did the same: no released koh started one. Its marks are counted from 0.
+- The client's check that the server's answer to an attach is a session's name and the run it
+  asked for: the server checks both on the next attach.
+- The crate's keyword `mosh`, for `remote`: koh predicts no keys and does not roam.
+
+### Fixed
+
+- The script in `koh help-agents`: `last` cuts at the marks' bytes, as `koh output --last` does,
+  so a command's last line with no line break is printed (it was left out); and `wait` prints
+  the output of the command whose exit code it gives (of two that had ended, it printed the
+  second's).
+
 ## [0.19.0] — 2026-11-26
 
 koh 0.19.0 speaks `koh/21`, which 0.18 does not: upgrade clients and servers together. It needs no
@@ -882,7 +906,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/gold-silver-copper/koh/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/gold-silver-copper/koh/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/gold-silver-copper/koh/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/gold-silver-copper/koh/compare/v0.17.2...v0.18.0

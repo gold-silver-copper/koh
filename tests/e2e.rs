@@ -992,8 +992,13 @@ fn viewer_reconnects_after_serve_restarts_and_a_killed_server_leaves_no_viewer()
         tty.drew(drawn, b"again-42")
     });
     assert!(viewers(&host).len() == 1 && !viewers(&host).contains(&format!(".view.{viewer}")));
-    tty.types(b"exit 7\n");
-    assert_eq!(tty.ends(), Some(7));
+    // Killed outright, the server leaves a viewer that reads the end of its terminal and goes.
+    let viewer = viewers(&host)[0].trim_start_matches(".view.").to_string();
+    signal(
+        &host.served.as_ref().unwrap().server.id().to_string(),
+        "-KILL",
+    );
+    until("the viewer has gone by itself", || !pid_running(&viewer));
 }
 
 #[test]
@@ -1945,6 +1950,9 @@ async fn wait_session_returns_the_commands_code_or_124_or_the_sessions_end() {
     // Of one whose holder was killed nothing says how it ended: that is 1, not 0. And a name
     // that is no session's is not found.
     let dead = host.session("dead", &sh("echo ready; sleep 30"), "ready");
+    // (Of a session no command of which has ended, `output --last` is its screen.)
+    let last = host.asked("output", &["--session", "dead", "--last"]);
+    assert_eq!((last.0, last.1), (Some(0), screen(&dead)));
     signal(&holder_of(&dead), "-KILL");
     until("the holder is gone", || {
         fs::File::open(&dead).unwrap().try_lock_shared().is_ok()
@@ -2560,6 +2568,21 @@ fn exec_exits_when_remote_command_ends_even_with_open_stdin() {
             "{args:?}"
         );
     }
+    // A terminal's input is sent as its end: `cat` there ends at once.
+    let (_tty, terminal) = InTerminal::pty();
+    let mut koh = host.koh(&[
+        "exec",
+        &host.id,
+        "--direct",
+        &addr,
+        "--sh",
+        "cat; echo after",
+    ]);
+    let out = run_bounded(koh.stdin(terminal), 20, "exec on a terminal");
+    assert_eq!(
+        (out.status.code(), out.stdout),
+        (Some(0), b"after\n".to_vec())
+    );
     // At every open-fd limit where `koh exec` can bind, both stdout and stderr arrive
     // without needing spare descriptors to duplicate them. (At marginal limits 11-12, iroh's
     // background probes can print a socket warning to stderr, so stderr is matched by marker.)
@@ -3270,46 +3293,46 @@ fn job_multi_megabyte_log_streams_exact_content() {
     );
     let whole = job_cmd(&host, "logs", &["seqlog", "--all"], 25);
     assert!(whole.status.success() && whole.stdout == expected.as_bytes());
+    // A reader that takes a byte and closes its pipe ends `koh logs` with 141.
+    let mut logs = host.spawned("logs", &["seqlog", "--all"]);
+    let out = logs.stdout.take().unwrap();
+    drop(read_exact_bounded::<1, _>(
+        out,
+        &mut logs,
+        20,
+        "the log's first byte",
+    ));
+    assert_eq!(
+        wait_child(&mut logs, 20, "koh logs, its pipe closed").code(),
+        Some(141)
+    );
 }
 
 #[test]
 fn jobs_lists_a_line_a_job_the_command_last() {
     let host = Host::start("job-list", &[]);
-    let args = ["--name", "tabbed", "--", "sh", "-c", "exit 3"];
+    let args = ["--name", "tabbed", "--sh", "exit 3"];
     assert_eq!(job_cmd(&host, "run", &args, 20).stdout, b"tabbed\n");
-    assert_eq!(
-        job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 20)
-            .status
-            .code(),
-        Some(3)
-    );
-    // Name, state, age and the command, the rest of the line: a tab a folder's `status` has in
-    // it is shown as `?`.
+    let waited = job_cmd(&host, "wait", &["tabbed", "--timeout", "10"], 20);
+    assert_eq!(waited.status.code(), Some(3));
+    // Name, state, age and the command, the rest of the line: `--sh LINE` is `/bin/sh -c --
+    // LINE`, and a tab a folder's `status` has in it is shown as `?`.
     let status = host
         .sessions
         .parent()
         .unwrap()
         .join("koh-jobs/tabbed/status");
     let was = fs::read_to_string(&status).unwrap();
-    fs::write(
-        &status,
-        was.replace("command sh -c exit 3", "command sh -c exit 3 a\tb"),
-    )
-    .unwrap();
+    fs::write(&status, was.replace("exit 3\n", "exit 3 a\tb\n")).unwrap();
     let listed = String::from_utf8(job_cmd(&host, "jobs", &[], 20).stdout).unwrap();
     let fields: Vec<&str> = listed.trim_end().split('\t').collect();
     let [name, state, age, command] = fields[..] else {
         panic!("{listed:?}")
     };
-    assert_eq!(
-        (name, state, command),
-        ("tabbed", "exited 3", "sh -c exit 3 a?b")
-    );
-    assert!(
-        age.strip_suffix('s')
-            .is_some_and(|n| n.parse::<u64>().is_ok()),
-        "{age}"
-    );
+    let line = (name, state, command);
+    assert_eq!(line, ("tabbed", "exited 3", "/bin/sh -c -- exit 3 a?b"));
+    let secs = age.strip_suffix('s').map(str::parse::<u64>);
+    assert!(secs.is_some_and(|secs| secs.is_ok()), "{age}");
 }
 
 #[test]
@@ -3435,39 +3458,32 @@ fn job_logs_broken_pipe_and_non_utf8_wait_tail() {
 fn job_run_name_lifecycle_and_start_errors() {
     let host = Host::start("job-lifecycle", &[]);
     let run = |args: &[&str]| job_cmd(&host, "run", args, 20);
+    let code = |args: &[&str]| run(args).status.code();
+    // A name that is no session's name (fux's own among them) is a usage error.
+    for bad in ["-", "colours", "layout", ".hidden", "a/b", &"x".repeat(65)] {
+        assert_eq!(code(&["--name", bad, "--", "true"]), Some(2), "{bad}");
+    }
     // A name that runs is refused; once it has ended, it is started anew.
-    assert!(
-        run(&["--name", "dup", "--", "sleep", "30"])
-            .status
-            .success()
-    );
+    assert_eq!(code(&["--name", "dup", "--", "sleep", "30"]), Some(0));
     let refused = run(&["--name", "dup", "--", "true"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&refused.stderr).contains("already running"));
-    assert!(
-        job_cmd(&host, "kill", &["dup", "--signal", "9"], 20)
-            .status
-            .success()
-    );
+    let killed = job_cmd(&host, "kill", &["dup", "--signal", "9"], 20);
+    assert!(killed.status.success());
     let _ = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
-    assert!(
-        run(&["--name", "dup", "--", "echo", "second"])
-            .status
-            .success()
-    );
-    let w = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
-    assert!(w.status.success() && w.stdout == b"second\n");
-    // A program that is not there is 127, and leaves no folder; a folder to start in that is
-    // not there is 126.
+    assert_eq!(code(&["--name", "dup", "--", "echo", "second"]), Some(0));
+    let second = || job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
+    assert!(second().status.success() && second().stdout == b"second\n");
+    // A folder to start in that is not there is 126, and is refused before the ended run of
+    // that name is removed; a program that is not there is 127, and leaves no folder.
+    let nowhere = ["-C", "/no/such/koh-job-dir", "--name", "dup", "--", "true"];
+    assert_eq!(code(&nowhere), Some(126));
+    assert_eq!(second().stdout, b"second\n");
     assert_eq!(
-        run(&["--name", "nf", "--", "/no/such/koh-job-prog"])
-            .status
-            .code(),
+        code(&["--name", "nf", "--", "/no/such/koh-job-prog"]),
         Some(127)
     );
     assert!(!host.sessions.parent().unwrap().join("koh-jobs/nf").exists());
-    let nowhere = run(&["-C", "/no/such/koh-job-dir", "--name", "nc", "--", "true"]);
-    assert_eq!(nowhere.status.code(), Some(126));
 }
 
 #[test]

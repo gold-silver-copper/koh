@@ -87,10 +87,10 @@ impl Marks {
     /// Reads them for the first command whose `end` has a number above `after`; with none,
     /// for the last command that has ended.
     pub fn read(dir: &Path, after: Option<u64>) -> Self {
-        let dropped = line(dir, "marks.dropped").and_then(|dropped| dropped.parse().ok());
-        let dropped = dropped.unwrap_or(0);
         let (mut marks, mut open, mut printed) = (Self::default(), None, None);
-        marks.dropped = dropped;
+        marks.dropped = line(dir, "marks.dropped")
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
         let text = read(dir, "marks").unwrap_or_default();
         for (n, mark) in (1u64..).zip(String::from_utf8_lossy(&text).lines()) {
             let mut words = mark.split(' ');
@@ -103,7 +103,7 @@ impl Marks {
             match kind {
                 "output" => open = Some(place),
                 "end" => {
-                    let number = dropped.saturating_add(n);
+                    let number = marks.dropped.saturating_add(n);
                     let code = words.next().and_then(|code| code.parse().ok());
                     printed = open.take().map(|from| (from, place)).or(printed);
                     marks.ended = Some((number, code, printed));

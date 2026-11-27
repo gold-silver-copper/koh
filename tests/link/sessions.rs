@@ -565,16 +565,16 @@ impl Says {
         (Says(rig.net.endpoint(secret, true).await), id)
     }
 
-    /// The next connection, and its attach answered with the run `run` of a session `s`: the
+    /// The next connection, and its attach answered with the run 7 of a session `s`: the
     /// stream, and what the client asked.
-    async fn attached(&self, run: u128) -> (Connection, SendStream, RecvStream, Attach) {
+    async fn attached(&self) -> (Connection, SendStream, RecvStream, Attach) {
         let conn = self.0.accept().await.unwrap().await.unwrap();
-        let (send, recv, asked) = Says::again(&conn, run).await;
+        let (send, recv, asked) = Says::again(&conn).await;
         (conn, send, recv, asked)
     }
 
     /// The next attach on a connection there is.
-    async fn again(conn: &Connection, run: u128) -> (SendStream, RecvStream, Attach) {
+    async fn again(conn: &Connection) -> (SendStream, RecvStream, Attach) {
         let (mut send, mut recv) = conn.accept_bi().await.unwrap();
         koh::net::verify_client(conn, &mut recv).await.unwrap();
         let Request::Attach(asked) = recv_msg(&mut recv, MAX_CTRL).await.unwrap() else {
@@ -582,7 +582,7 @@ impl Says {
         };
         send_msg(&mut send, &Reply::Ok, MAX_CTRL).await.unwrap();
         let name = "s".to_string();
-        send_msg(&mut send, &Attached { name, run }, MAX_CTRL)
+        send_msg(&mut send, &Attached { name, run: 7 }, MAX_CTRL)
             .await
             .unwrap();
         (send, recv, asked)
@@ -596,7 +596,7 @@ async fn comes(
     who: &str,
 ) -> (rig::Connected, Connection, SendStream, RecvStream, Attach) {
     let connects = async { rig.connect_on(rig.dialled_to(who, *id).await, None, false) };
-    let (client, (conn, send, recv, asked)) = tokio::join!(connects, server.attached(7));
+    let (client, (conn, send, recv, asked)) = tokio::join!(connects, server.attached());
     (client, conn, send, recv, asked)
 }
 
@@ -676,7 +676,7 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
         rig::until(&said, Duration::from_secs(5), || alone(client.screen()));
         // The client comes again, to the run it was shown.
         let (again, asked);
-        (conn, again, typed, asked) = server.0.attached(7).await;
+        (conn, again, typed, asked) = server.0.attached().await;
         send = again;
         assert_eq!(asked.run, Some(7));
     }

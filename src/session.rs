@@ -671,7 +671,7 @@ pub(crate) async fn start(
         {
             let _ = fs::remove_dir_all(f);
         }
-        let code = if out && why.ends_with("(os error 2)") {
+        let code = if out && said.status.code() == Some(127) {
             Exit::NOT_FOUND
         } else {
             Exit::CANNOT_START

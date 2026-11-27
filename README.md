@@ -3,7 +3,7 @@
 Ultra-minimal peer-to-peer remote shell, headless jobs, and interactive
 [`fux`](https://github.com/gold-silver-copper/fux) sessions over [iroh](https://iroh.computer) QUIC.
 
-Rewritten from scratch on `fux` 0.44 and `fuxix` 0.13 (about 4,750 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
+Rewritten from scratch on `fux` 0.45 and `fuxix` 0.13 (about 4,750 non-test Rust lines in `src/*.rs`, 5,350 including unit tests, down from ~22,000):
 
 - **Layer 1 — Transport & Auth:** iroh QUIC (`koh/21`) with TLS-bound Ed25519 client proofs,
   using `~/.config/koh/{client.key,server.key,servers,clients}`. An allowed key is the server's

@@ -1730,9 +1730,6 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
         until("the session is started", || {
             host.pane(name).join("run").exists()
         });
-        // (As master: told sooner after the session starts, koh is still there seconds on, in
-        // about half the runs on Linux. That is koh's, not this test's.)
-        std::thread::sleep(Duration::from_millis(500));
         assert_eq!(koh.told(how), Some(code), "{how}");
         drop(koh); // (before the filler: see InTerminal's drop)
     }
@@ -1760,11 +1757,8 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         tty.until("the flood is drawn", |tty| {
             tty.drawn.windows(2).any(|drawn| drawn == b"es")
         });
-        // (Not read from here on: what koh writes fills the terminal, and waits.) The 2 s are
-        // koh's: told within about a second of its start, it is in some runs still there 20 s
-        // on; a second later, never seen to be.
+        // (Not read from here on: what koh writes fills the terminal, and waits.)
         InTerminal::takes_no_more(&slave);
-        std::thread::sleep(Duration::from_secs(2));
         assert_eq!(tty.told(how), Some(code), "{how}");
     }
 }

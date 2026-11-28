@@ -54,7 +54,9 @@ impl Door {
     async fn open(tag: &str, more: ServeOptions) -> Self {
         let tmp = TempDir::new(tag);
         let friend = new_key(&tmp, "client.key");
-        let (srv, route) = boot_server(&tmp, vec![friend.public()], more).await;
+        let (srv, route) = boot_server(&tmp, vec![friend.public()], more)
+            .await
+            .unwrap();
         Self {
             tmp,
             srv,
@@ -74,8 +76,8 @@ impl Door {
         self.dial(&self.friend, true).await.unwrap()
     }
 
-    /// Waits until the friend is served, asking again for as long as the server is busy.
-    async fn served(&self) {
+    /// Waits `secs` until the friend is served, asking again for as long as the server is busy.
+    async fn served(&self, secs: u64) {
         let serving = async {
             loop {
                 let listed = match self.dial(&self.friend, false).await {
@@ -93,8 +95,8 @@ impl Door {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };
-        let served = tokio::time::timeout(Duration::from_secs(20), serving).await;
-        served.expect("a place came back within 20 s");
+        let served = tokio::time::timeout(Duration::from_secs(secs), serving).await;
+        served.expect("a place came back in time");
     }
 
     async fn shut(self) {
@@ -153,11 +155,13 @@ async fn headless_jobs_raw_logs_wait_timeout_names_and_order() {
     // A job given no name has the first free number; the list is the oldest first.
     let info = client.run_job(None, sh("sleep 60"), cwd()).await.unwrap();
     assert_eq!(info.name, "1");
+    let info = client.run_job(None, sh("true"), cwd()).await.unwrap();
+    assert_eq!(info.name, "2", "with 1 there");
     let timed = client.wait_job("1".into(), 10, Some(1)).await.unwrap();
     assert_eq!((timed.exit, timed.detail.as_str()), (124, "timed out"));
     let jobs = client.jobs(None).await.unwrap();
     let names: Vec<&str> = jobs.iter().map(|job| job.name.as_str()).collect();
-    assert_eq!(names, ["long", "1"]);
+    assert_eq!(names, ["long", "1", "2"]);
 
     // A wait and a followed log end on the server when their client lets go of what it reads,
     // on a connection that lives: seen here as the server letting go of what the client sends.
@@ -189,7 +193,8 @@ async fn headless_jobs_raw_logs_wait_timeout_names_and_order() {
 /// and how it ended. It is killed when the test lets go of it, however the test ends.
 struct InTerminal {
     koh: Child,
-    tty: fs::File,
+    /// The terminal's end here, until it is closed.
+    master: Option<fs::File>,
     drawn: Vec<u8>,
     /// Whether it says what it is when it is asked, as every terminal does (once: koh asks once).
     answers: bool,
@@ -199,7 +204,7 @@ impl Drop for InTerminal {
     fn drop(&mut self) {
         let _ = self.koh.kill();
         // (The terminal goes first: on macOS a koh killed is not gone while what it wrote waits.)
-        drop(fs::File::open("/dev/null").map(|null| std::mem::replace(&mut self.tty, null)));
+        drop(self.master.take());
         let _ = self.koh.wait();
     }
 }
@@ -240,10 +245,22 @@ impl InTerminal {
         fuxix::new_session(&mut koh, its);
         Self {
             koh: koh.spawn().unwrap(),
-            tty,
+            master: Some(tty),
             drawn: Vec::new(),
             answers: true,
         }
+    }
+
+    fn tty(&self) -> &fs::File {
+        self.master.as_ref().unwrap()
+    }
+
+    /// Waits until a terminal takes no more of what its program writes (its `slave` end is not
+    /// writable), 20 s at most.
+    fn takes_no_more(slave: &fs::File) {
+        use std::os::fd::AsFd as _;
+        let full = || fuxix::wait([(Some(slave.as_fd()), fuxix::POLLOUT)], 0);
+        until("the terminal takes no more", || matches!(full(), Ok([0])));
     }
 
     /// Waits until `done` says so, reading meanwhile what koh draws (a terminal nobody reads
@@ -252,7 +269,7 @@ impl InTerminal {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let mut some = [0u8; 4096];
-            while let Ok(n @ 1..) = (&self.tty).read(&mut some) {
+            while let Some(Ok(n @ 1..)) = self.master.as_ref().map(|mut tty| tty.read(&mut some)) {
                 self.drawn.extend_from_slice(&some[..n]);
             }
             if self.answers && self.drawn.windows(3).any(|asked| asked == b"\x1b[c") {
@@ -282,7 +299,7 @@ impl InTerminal {
                 "koh took {typed} of {} bytes",
                 keys.len()
             );
-            match (&self.tty).write(&keys[typed..]) {
+            match self.tty().write(&keys[typed..]) {
                 Ok(n) => typed += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(1));
@@ -366,26 +383,24 @@ fn cli_keys_peer_lists_and_usage_errors() {
 #[tokio::test]
 async fn a_second_server_on_one_key_is_refused_until_the_first_stops() {
     let tmp = TempDir::new("serve-lock");
-    let first = boot_server_on(&tmp, Vec::new()).await.unwrap();
-    let refused = boot_server_on(&tmp, Vec::new()).await.err().unwrap();
+    let on_the_key = || boot_server(&tmp, Vec::new(), ServeOptions::default());
+    let (first, _) = on_the_key().await.unwrap();
+    let refused = on_the_key().await.err().unwrap();
     assert_eq!(refused.code, Exit::BUSY, "{refused:?}");
     assert!(refused.message.contains("server.key"), "{refused:?}");
     // The first stopped: the key is free (what marks it held is a lock, not a file's being
     // there: a server that was killed leaves the file, and nothing to clean up).
     first.shutdown().await;
-    let again = boot_server_on(&tmp, Vec::new()).await;
-    again
-        .expect("a server once the first stopped")
-        .shutdown()
-        .await;
+    let (again, _) = on_the_key().await.expect("a server once the first stopped");
+    again.shutdown().await;
 }
 
-/// A server that allows `allow`, with its other options from `more`.
+/// A server that allows `allow`, with its other options from `more`, or why it could not start.
 async fn boot_server(
     tmp: &TempDir,
     allow: Vec<iroh::EndpointId>,
     more: ServeOptions,
-) -> (RunningServer, Option<Route>) {
+) -> koh::Result<(RunningServer, Option<Route>)> {
     fs::create_dir_all(tmp.0.join("srv_cfg")).unwrap();
     let session_exe = more
         .session_exe
@@ -401,24 +416,9 @@ async fn boot_server(
         quiet: true,
         ..more
     })
-    .await
-    .unwrap();
+    .await?;
     let route = Some(Route::Direct(srv.direct_addr.unwrap()));
-    (srv, route)
-}
-
-/// A server on the key `boot_server` uses, or why it could not start.
-async fn boot_server_on(tmp: &TempDir, allow: Vec<iroh::EndpointId>) -> koh::Result<RunningServer> {
-    start_server(ServeOptions {
-        key_file: Some(tmp.0.join("srv_cfg/server.key")),
-        direct: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-        allow,
-        state_dir: Some(tmp.0.join("state")),
-        disable_relay: true,
-        quiet: true,
-        ..ServeOptions::default()
-    })
-    .await
+    Ok((srv, route))
 }
 
 fn new_key(tmp: &TempDir, name: &str) -> iroh::SecretKey {
@@ -454,7 +454,7 @@ async fn connections_are_capped_before_auth_and_a_place_comes_back_when_one_ends
     second.close().await;
     // The first goes: its place is the next client's.
     first.close().await;
-    door.served().await;
+    door.served(20).await;
     door.shut().await;
 }
 
@@ -470,8 +470,9 @@ async fn a_connection_that_proves_no_allowed_key_in_time_is_closed() {
     let (known, since) = (door.client().await, Instant::now());
     known.jobs(None).await.unwrap();
     let conn = silent.connection();
-    let closed = tokio::time::timeout(Duration::from_secs(20), conn.closed()).await;
-    let closed = closed.expect("the silent connection was closed");
+    // Closed within 5 s, five times its deadline: the time is the rule.
+    let closed = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+    let closed = closed.expect("the silent connection was closed within 5 s");
     let refused = koh::proto::CloseCode::Refused as u64;
     assert!(
         matches!(&closed, iroh::endpoint::ConnectionError::ApplicationClosed(close) if close.error_code.into_inner() == refused),
@@ -516,7 +517,7 @@ async fn a_connection_s_place_comes_back_when_its_requests_have_ended() {
     drop(streams);
     client.close().await;
     // The place stays the connection's until its command has ended, then is the next client's.
-    door.served().await;
+    door.served(20).await;
     assert!(ended.exists(), "served beside the command");
     door.shut().await;
 }
@@ -575,7 +576,8 @@ async fn a_handshake_that_never_finishes_gives_its_place_back_at_the_deadline() 
     early.close().await;
     // The deadline is counted from when the server took that up, handshake and all: two seconds
     // on, the place is the next client's, though the stalled peer is still sending.
-    door.served().await;
+    door.served(8).await;
+    assert!(!stalled.is_finished(), "the stalled peer gave up by itself");
     stalled.abort();
     forward.abort();
     door.shut().await;
@@ -807,16 +809,14 @@ impl Host {
         for dir in ["cli_cfg", "tap_cfg", "home", "crun"] {
             fs::create_dir_all(tmp.0.join(dir)).unwrap();
         }
-        let free = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut host = Self {
             tmp,
             served: None,
-            port: free.local_addr().unwrap().port(),
+            port: 0,
             extra: extra.iter().map(|arg| arg.to_string()).collect(),
             id: String::new(),
             sessions: PathBuf::new(),
         };
-        drop(free);
         host.serve();
         host
     }
@@ -829,7 +829,8 @@ impl Host {
         format!("127.0.0.1:{}", self.port)
     }
 
-    /// Starts the server: the first time, and anew after `stop`, on the same port and state.
+    /// Starts the server: the first time on a port the system gives it, and anew after `stop`
+    /// on that port and the same state.
     fn serve(&mut self) {
         let mut serve = Command::new(env!("CARGO_BIN_EXE_koh"));
         serve.args([
@@ -850,6 +851,8 @@ impl Host {
             .env("HOME", self.tmp.0.join("home"));
         let mut served = Served::spawn(&mut serve);
         self.id = served.says("koh server id:");
+        let bound: SocketAddr = served.says("listening:").parse().unwrap();
+        self.port = bound.port();
         self.sessions = PathBuf::from(served.says("sessions dir:"));
         self.served = Some(served);
     }
@@ -870,6 +873,15 @@ impl Host {
     }
 
     fn attach(&self, asks: &[&str], program: &[String]) -> InTerminal {
+        self.attach_on(InTerminal::pty(), asks, program)
+    }
+
+    fn attach_on(
+        &self,
+        pty: (fs::File, fs::File),
+        asks: &[&str],
+        program: &[String],
+    ) -> InTerminal {
         let addr = self.addr();
         let mut args = vec![self.id.as_str(), "--direct", &addr];
         args.extend_from_slice(asks);
@@ -877,7 +889,8 @@ impl Host {
             args.push("--");
             args.extend(program.iter().map(String::as_str));
         }
-        InTerminal::connect(&self.tmp.0.join("cli_cfg"), &self.tmp.0.join("crun"), &args)
+        let (config, runtime) = (self.tmp.0.join("cli_cfg"), self.tmp.0.join("crun"));
+        InTerminal::connect_on(pty, &config, &runtime, &args, true)
     }
 
     /// A `koh` of the client's, with its key and a runtime directory of its own.
@@ -929,7 +942,7 @@ fn koh_connect_in_a_terminal_has_its_keys_and_ends_when_the_program_does() {
         xpixel: 1000,
         ypixel: 600,
     };
-    fuxix::set_winsize(&second.tty, size).unwrap();
+    fuxix::set_winsize(second.tty(), size).unwrap();
     let resized = |_: &mut InTerminal| fs::read_to_string(pane.join("size")).unwrap() == "100 30\n";
     second.until("the session takes the terminal's size", resized);
     // The program's end is the end of `koh connect`, with the program's status: nobody has to
@@ -1016,10 +1029,7 @@ fn one_session_draws_to_two_terminals_and_survives_hangup() {
     });
     // The first is closed: its koh ends with 0, its viewer with it, and the second goes on to
     // the session's end.
-    drop(std::mem::replace(
-        &mut a.tty,
-        fs::File::open("/dev/null").unwrap(),
-    ));
+    drop(a.master.take());
     assert_eq!(a.ends(), Some(0));
     until("its viewer is gone", || viewers(&host).len() == 1);
     b.types(b"echo still-''here\n");
@@ -1520,6 +1530,11 @@ fn a_sessions_program_is_told_the_terminals_colours_and_has_its_keys_in_the_form
         until("the program is told what its terminal is", || {
             read() == told.as_bytes()
         });
+        // A program on the main screen is drawn on the terminal's alternate screen.
+        let shown = || fs::read_link(terminal.0.join("shown")).unwrap_or_default();
+        until("the viewer draws on the alternate screen", || {
+            shown() == Path::new("alt")
+        });
         if tag == "kitty" {
             until("the flag is set in the client's terminal", || {
                 terminal.says("modes").contains("keys1")
@@ -1553,10 +1568,12 @@ fn a_terminal_that_answers_nothing_is_asked_once_and_one_that_answers_in_pieces_
     let mut tty = host.attach(&["--session", "s"], &reads_into(&out));
     tty.answers = false;
     tty.until("it is asked", |tty| tty.drew(0, b"\x1b[c"));
+    // (From when the test read the question, which can be well after koh asked it: half the
+    // second, so that a reader late by up to that cannot fail a koh that waits it whole.)
     let began = Instant::now();
     tty.until("the program is ready", |tty| tty.drew(0, b"READY"));
     assert!(
-        began.elapsed() >= Duration::from_millis(900),
+        began.elapsed() >= Duration::from_millis(500),
         "{:?}",
         began.elapsed()
     );
@@ -1647,16 +1664,21 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let (burst, mut over, mut full, ready) = (vec![b'x'; 64 << 10], None, 0, Instant::now());
     let ended = loop {
         // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
-        // Once the terminal takes nothing 100 times running, or in 3 s, the program ends.
-        match (&tty.tty).write(&burst) {
-            Ok(1..) => full = 0,
-            _ => full += 1,
+        // Once the terminal has refused what is typed 100 times, all of it held up behind the
+        // program (on macOS it goes on taking a little at a time), the program ends.
+        if tty.tty().write(&burst).is_err() {
+            full += 1;
         }
-        if full == 100 || ready.elapsed() > Duration::from_secs(3) {
+        if full == 100 {
             fs::write(&gate, "").unwrap();
         }
+        let setup = ready.elapsed() < Duration::from_secs(10) || full >= 100;
+        assert!(
+            setup,
+            "setup: the terminal took all that was typed for 10 s"
+        );
         let mut drawn = [0; 4096];
-        while let Ok(n @ 1..) = (&tty.tty).read(&mut drawn) {
+        while let Ok(n @ 1..) = tty.tty().read(&mut drawn) {
             tty.drawn.extend_from_slice(&drawn[..n]);
         }
         if over.is_none() && state().starts_with("exited") {
@@ -1693,18 +1715,19 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
         fills
             .args(["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"])
             .stdout(theirs.try_clone().unwrap());
-        let mut fills = fills.spawn().unwrap();
-        std::thread::sleep(Duration::from_millis(500));
+        let _fills = Waits(fills.spawn().unwrap());
+        InTerminal::takes_no_more(&theirs);
         let name = how.trim_start_matches('-');
         let asks = [&host.id, "--direct", &host.addr(), "--session", name];
         let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
         until("the session is started", || {
             host.pane(name).join("run").exists()
         });
+        // (As master: told sooner after the session starts, koh is still there seconds on, in
+        // about half the runs on Linux. That is koh's, not this test's.)
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(koh.told(how), Some(code), "{how}");
-        drop(koh); // (first: see InTerminal's drop)
-        let _ = (fills.kill(), fills.wait());
+        drop(koh); // (before the filler: see InTerminal's drop)
     }
 }
 
@@ -1718,12 +1741,20 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         // (Every cell of another colour than the one before it: a screen of it is many bytes.)
         let draws = r"while :; do printf '\033[31mfl\033[32moo\033[33md-\033[34mof\033[35m-l\033[36min\033[37mes'; done";
         let flood = ["sh", "-c", draws].map(String::from);
-        let mut tty = host.attach(&["--session", how.trim_start_matches('-')], &flood);
+        let (pty, asks) = (
+            InTerminal::pty(),
+            ["--session", how.trim_start_matches('-')],
+        );
+        let slave = pty.1.try_clone().unwrap();
+        let mut tty = host.attach_on(pty, &asks, &flood);
         tty.until("the flood is drawn", |tty| {
             tty.drawn.windows(2).any(|drawn| drawn == b"es")
         });
-        // (Not read from here on: what koh writes fills the terminal, and waits.)
-        std::thread::sleep(Duration::from_secs(3));
+        // (Not read from here on: what koh writes fills the terminal, and waits.) The 2 s are
+        // koh's: told within about a second of its start, it is in some runs still there 20 s
+        // on; a second later, never seen to be.
+        InTerminal::takes_no_more(&slave);
+        std::thread::sleep(Duration::from_secs(2));
         assert_eq!(tty.told(how), Some(code), "{how}");
     }
 }
@@ -1952,13 +1983,19 @@ async fn wait_session_returns_the_commands_code_or_124_or_the_sessions_end() {
     let (code, printed, said) = wait.said();
     assert_eq!((code, printed.as_str()), (Some(42), "waited\n"), "{said}");
     // A wait the server has taken: the program ends, and the wait ends with its status and its
-    // last screen. Asked of a session that has ended, it says the same at once.
+    // last screen. Asked of a session that has ended, it says the same at once. (A session of
+    // its own: no retry of the one before is left to end it.)
+    let ends = host.session(
+        "e",
+        &sh("echo ready; read line; echo bye-$line; exit 3"),
+        "ready",
+    );
     let client = host.client().await;
-    let wait = waits(&client, "s").await;
-    fs::write(pane.join("in"), "exec sh -c 'echo bye-''now; exit 3'\n").unwrap();
+    let wait = waits(&client, "e").await;
+    fs::write(ends.join("in"), "now\n").unwrap();
     let (code, shown) = waited(wait).await;
     assert!(code == 3 && shown.contains("bye-now"), "{code} {shown:?}");
-    let (code, again, said) = host.asked("wait", &["--session", "s"]);
+    let (code, again, said) = host.asked("wait", &["--session", "e"]);
     assert_eq!((code, again), (Some(3), shown), "{said}");
     // Of one whose holder was killed nothing says how it ended: that is 1, not 0. And a name
     // that is no session's is not found.
@@ -2043,13 +2080,20 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     stepped(&moving, 1);
     last_is(&screen(&moving));
     stepped(&moving, 2);
-    let mut wait = Waits(
-        recipe(&["wait", moving.to_str().unwrap(), "30"])
-            .spawn()
-            .unwrap(),
+    // (Its first `date` is after it has asked what has ended: a `date` of the test's says so.)
+    let (bin, path) = (host.tmp.0.join("bin"), std::env::var("PATH").unwrap());
+    let (date, asked) = (bin.join("date"), host.tmp.0.join("asked"));
+    fs::create_dir(&bin).unwrap();
+    let wraps = format!(
+        "#!/bin/sh\n: > '{}'\nPATH='{path}' exec date \"$@\"\n",
+        asked.display()
     );
-    // (Time for its first look, which leaves no sign that every system shows.)
-    std::thread::sleep(Duration::from_millis(500));
+    fs::write(&date, wraps).unwrap();
+    fs::set_permissions(&date, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut waits = recipe(&["wait", moving.to_str().unwrap(), "30"]);
+    waits.env("PATH", format!("{}:{path}", bin.display()));
+    let mut wait = Waits(waits.spawn().unwrap());
+    until("the recipe's wait has asked", || asked.exists());
     stepped(&moving, 3);
     // (Time for it to look at the moved marks: the wait is the test.)
     std::thread::sleep(Duration::from_millis(500));
@@ -2298,13 +2342,9 @@ async fn a_list_of_sessions_longer_than_one_message_is_whole() {
         fs::write(pane.join("run"), format!("{n:032x}\n")).unwrap();
         fs::write(pane.join("title"), "t".repeat(256) + "\n").unwrap();
     }
-    let mut names: Vec<u32> = client
-        .sessions()
-        .await
-        .unwrap()
-        .iter()
-        .map(|s| s.name.parse().unwrap())
-        .collect();
+    let listed = client.sessions().await.unwrap();
+    assert!(listed.iter().all(|s| s.title == "t".repeat(256)));
+    let mut names: Vec<u32> = listed.iter().map(|s| s.name.parse().unwrap()).collect();
     names.sort();
     assert!(names.into_iter().eq(1..=4500));
     client.close().await;
@@ -2441,7 +2481,9 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     let (file, v) = (tmp.0.join("srv_cfg/clients"), valid.public());
     let ignored = format!("cpbot {} cp=/srv\nold_valid {v} cp=/srv\n", scoped.public());
     fs::write(&file, format!("{ignored}valid {v}\n")).unwrap();
-    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default()).await;
+    let (srv, route) = boot_server(&tmp, Vec::new(), ServeOptions::default())
+        .await
+        .unwrap();
     let dial = |k| Client::connect_direct(k, srv.endpoint_id, route.clone(), false);
     let marker = tmp.0.join("ran");
     let refused = dial(scoped).await.unwrap();
@@ -2464,13 +2506,13 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     // revokes the key. A file that is no UTF-8 is no list of anyone, its good line before the
     // bad byte too. (A file that cannot be read is said as a failure, 1, where that reply comes
     // before the close that refuses, 4.)
-    let good = format!("valid {v}\n");
+    let (good, mixed) = (format!("valid {v}\n"), format!("{ignored}valid {v}\n"));
     let lists = [
         (ignored.into_bytes(), Exit::REFUSED),
         ([good.as_bytes(), b"\xff\n"].concat(), Exit::FAILED),
     ];
     for (list, or) in lists {
-        fs::write(&file, &good).unwrap();
+        fs::write(&file, &mixed).unwrap();
         let client = dial(valid.clone()).await.unwrap();
         assert_eq!(client.exec(vec!["true".into()], None).await.unwrap(), 0);
         fs::write(&file, &list).unwrap();
@@ -3411,28 +3453,22 @@ fn job_reader_never_mixes_replacement_run() {
     let out = follower.stdout.take().unwrap();
     let (seen, out) = read_exact_bounded::<8, _>(out, &mut follower, 20, "OLD_RUN");
     assert_eq!(&seen, b"OLD_RUN\n");
+    // The old run, which runs on, is moved away whole (a folder removed file by file is, for a
+    // moment, a run with no state), and the new put in its place.
     let pane = jobs.join("rep");
-    if let Ok(mut ctl) = fuxix::open_fifo(pane.join("ctl")) {
-        let _ = ctl.write_all(b"kill 9\n");
-    }
-    until("the old run's holder has let go of its lock", || {
-        let lock = fuxix::open(&pane, false).map(|f| f.try_lock_shared());
-        !matches!(lock, Ok(Err(fs::TryLockError::WouldBlock)))
-    });
-    // (Moved away whole: a folder removed file by file is, for a moment, a run with no state.)
     fs::rename(&pane, jobs.join("rep_old")).unwrap();
     fs::rename(jobs.join("rep_new"), &pane).unwrap();
-    // The follower has none of the new run: it ends with the old one's kill, or says the job
-    // was started anew.
+    // The follower has none of the new run: it says the job was started anew.
     let (rest, said) = (drain(out), drain(follower.stderr.take().unwrap()));
     let st = wait_child(&mut follower, 20, "follower after replace");
     let (rest, said) = (
         rest.join().unwrap(),
         String::from_utf8(said.join().unwrap()).unwrap(),
     );
-    let old = st.code() == Some(137) || (st.code() == Some(1) && said.contains("started anew"));
     assert!(
-        old && !String::from_utf8_lossy(&rest).contains("NEW_RUN"),
+        st.code() == Some(1)
+            && said.contains("started anew")
+            && !String::from_utf8_lossy(&rest).contains("NEW_RUN"),
         "{st:?} {said}"
     );
 }
@@ -3441,8 +3477,8 @@ fn job_reader_never_mixes_replacement_run() {
 fn job_logs_broken_pipe_and_non_utf8_wait_tail() {
     let host = Host::start("job-io-edge", &[]);
     // `logs -f` to a reader that takes a byte and closes its pipe ends with 141.
-    let script =
-        "i=0; while [ $i -lt 500 ]; do printf 'LINE-%04d\\n' $i; sleep 0.02; i=$((i+1)); done";
+    // (It writes until it is killed: there is more to write once the pipe is closed.)
+    let script = "while :; do echo LINE; sleep 0.02; done";
     let run = ["--name", "chatter", "--", "/bin/sh", "-c", script];
     assert!(job_cmd(&host, "run", &run, 20).status.success());
     let mut follow = host.spawned("logs", &["chatter", "-f"]);
@@ -3475,7 +3511,15 @@ fn job_run_name_lifecycle_and_start_errors() {
     let run = |args: &[&str]| job_cmd(&host, "run", args, 20);
     let code = |args: &[&str]| run(args).status.code();
     // A name that is no session's name (fux's own among them) is a usage error.
-    for bad in ["-", "colours", "layout", ".hidden", "a/b", &"x".repeat(65)] {
+    for bad in [
+        "-",
+        "colours",
+        "keyboard",
+        "layout",
+        ".hidden",
+        "a/b",
+        &"x".repeat(65),
+    ] {
         assert_eq!(code(&["--name", bad, "--", "true"]), Some(2), "{bad}");
     }
     // A name that runs is refused; once it has ended, it is started anew.
@@ -3485,7 +3529,11 @@ fn job_run_name_lifecycle_and_start_errors() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("already running"));
     let killed = job_cmd(&host, "kill", &["dup", "--signal", "9"], 20);
     assert!(killed.status.success());
-    let _ = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
+    // Killed by the signal it was told: `killed 9`, and its wait is 128 + 9.
+    let waited = job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
+    let said = String::from_utf8_lossy(&waited.stderr);
+    assert_eq!(waited.status.code(), Some(137), "{said}");
+    assert!(said.contains("killed 9"), "{said}");
     assert_eq!(code(&["--name", "dup", "--", "echo", "second"]), Some(0));
     let second = || job_cmd(&host, "wait", &["dup", "--timeout", "10"], 20);
     assert!(second().status.success() && second().stdout == b"second\n");

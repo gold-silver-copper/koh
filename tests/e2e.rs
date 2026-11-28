@@ -2040,6 +2040,11 @@ async fn wait_session_returns_the_commands_code_or_124_or_the_sessions_end() {
     assert!(code == 3 && shown.contains("bye-now"), "{code} {shown:?}");
     let (code, again, said) = host.asked("wait", &["--session", "e"]);
     assert_eq!((code, again), (Some(3), shown), "{said}");
+    // One that ends with its last command: the wait is that command's, not the session's.
+    let l = host.session("l", &marks_by_steps(&["m 'D;7'; exit 0"]), "$");
+    let wait = waits(&client, "l").await;
+    fs::write(l.join("in"), "\n").unwrap();
+    assert_eq!(waited(wait).await.0, 7);
     // Of one whose holder was killed nothing says how it ended: that is 1, not 0. And a name
     // that is no session's is not found.
     let dead = host.session("dead", &sh("echo ready; sleep 30"), "ready");
@@ -2057,7 +2062,34 @@ async fn wait_session_returns_the_commands_code_or_124_or_the_sessions_end() {
 
 #[test]
 fn the_recipes_of_help_agents_read_what_the_commands_read() {
+    // The script is plain sh: it is run as it is, and with dash and mawk, and with busybox's
+    // ash, awk and sleep, first on its PATH as `sh`, `awk` and `sleep`, where they are here.
+    recipes("");
+    recipes("sh=dash awk=mawk");
+    recipes("sh=busybox awk=busybox sleep=busybox");
+}
+
+fn recipes(tools: &str) {
     let host = Host::start("recipes", &[]);
+    // (Its first `date` of a wait is after it has asked what has ended: a `date` of the test's
+    // says so, first on the script's PATH.)
+    let (bin, path) = (host.tmp.0.join("bin"), std::env::var("PATH").unwrap());
+    let (date, asked) = (bin.join("date"), host.tmp.0.join("asked"));
+    fs::create_dir(&bin).unwrap();
+    for (name, tool) in tools.split(' ').filter_map(|named| named.split_once('=')) {
+        let mut paths = std::env::split_paths(&path).map(|dir| dir.join(tool));
+        let Some(at) = paths.find(|at| at.is_file()) else {
+            return eprintln!("the recipes with {tools:?}: skipped, there is no {tool}");
+        };
+        std::os::unix::fs::symlink(at, bin.join(name)).unwrap();
+    }
+    eprintln!("the recipes with {tools:?}: run");
+    let wraps = format!(
+        "#!/bin/sh\n: > '{}'\nPATH='{path}' exec date \"$@\"\n",
+        asked.display()
+    );
+    fs::write(&date, wraps).unwrap();
+    fs::set_permissions(&date, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let pane = host.session("s", &marking_shell(&host), "$");
     // The script is the end of what `koh help-agents` prints, from its first line on; the help
     // itself has none of it.
@@ -2069,8 +2101,15 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     let recipe = |args: &[&str]| {
         let mut sh = Command::new("sh");
         sh.arg(&script).args(args);
+        sh.env("PATH", format!("{}:{path}", bin.display()));
         sh.stdout(Stdio::piped()).stderr(Stdio::piped());
         sh
+    };
+    let asks = |pane: &Path| {
+        let _ = fs::remove_file(&asked);
+        let wait = recipe(&["wait", pane.to_str().unwrap(), "30"]).spawn();
+        until("the recipe's wait has asked", || asked.exists());
+        Waits(wait.unwrap())
     };
     let run = |args: &[&str]| {
         let said = recipe(args).output().unwrap();
@@ -2123,20 +2162,7 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     stepped(&moving, 1);
     last_is(&screen(&moving));
     stepped(&moving, 2);
-    // (Its first `date` is after it has asked what has ended: a `date` of the test's says so.)
-    let (bin, path) = (host.tmp.0.join("bin"), std::env::var("PATH").unwrap());
-    let (date, asked) = (bin.join("date"), host.tmp.0.join("asked"));
-    fs::create_dir(&bin).unwrap();
-    let wraps = format!(
-        "#!/bin/sh\n: > '{}'\nPATH='{path}' exec date \"$@\"\n",
-        asked.display()
-    );
-    fs::write(&date, wraps).unwrap();
-    fs::set_permissions(&date, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let mut waits = recipe(&["wait", moving.to_str().unwrap(), "30"]);
-    waits.env("PATH", format!("{}:{path}", bin.display()));
-    let mut wait = Waits(waits.spawn().unwrap());
-    until("the recipe's wait has asked", || asked.exists());
+    let mut wait = asks(&moving);
     stepped(&moving, 3);
     // (Time for it to look at the moved marks: the wait is the test.)
     std::thread::sleep(Duration::from_millis(500));
@@ -2159,6 +2185,11 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
         code == Some(0) && list.starts_with("bare\tended\t\t0x0\tidle\t-\t\n"),
         "{list:?} {said}"
     );
+    // A session that ends with its last command: the wait is that command's, not the session's.
+    let ends = host.session("e", &marks_by_steps(&["m 'D;7'; exit 0"]), "$");
+    let mut wait = asks(&ends);
+    fs::write(ends.join("in"), "\n").unwrap();
+    assert_eq!(wait.said().0, Some(7), "{tools:?}");
 }
 
 /// A program for a session that marks as a shell does (OSC 133), by itself: a prompt, and then,

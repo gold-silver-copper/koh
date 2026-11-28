@@ -35,8 +35,14 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: clippy (production)
         run: cargo clippy --lib --bins --locked -- -D warnings
+      - name: mawk and busybox, for the script in `koh help-agents` (dash is there)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y mawk busybox
       - name: test
         run: cargo test --locked -- --test-threads 4
+      - name: the script in `koh help-agents`, saying which shells and awks ran it
+        if: runner.os == 'Linux'
+        run: cargo test --locked --test e2e the_recipes_of_help_agents -- --nocapture
 
   publish:
     runs-on: ubuntu-latest

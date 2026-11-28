@@ -1647,8 +1647,7 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let (burst, mut over, mut full, ready) = (vec![b'x'; 64 << 10], None, 0, Instant::now());
     let ended = loop {
         // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
-        // Once the terminal has taken nothing a hundred times running (or, one that goes on
-        // taking a little, in three seconds), the program ends.
+        // Once the terminal takes nothing 100 times running, or in 3 s, the program ends.
         match (&tty.tty).write(&burst) {
             Ok(1..) => full = 0,
             _ => full += 1,
@@ -1699,7 +1698,6 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
         let name = how.trim_start_matches('-');
         let asks = [&host.id, "--direct", &host.addr(), "--session", name];
         let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
-        // (koh has dialled and has its terminal by now: the session is there.)
         until("the session is started", || {
             host.pane(name).join("run").exists()
         });
@@ -2050,8 +2048,7 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
             .spawn()
             .unwrap(),
     );
-    // (Time for its first look, which leaves no sign every system shows: on macOS no file of
-    // its mktemp's came in TMPDIR.)
+    // (Time for its first look, which leaves no sign that every system shows.)
     std::thread::sleep(Duration::from_millis(500));
     stepped(&moving, 3);
     // (Time for it to look at the moved marks: the wait is the test.)

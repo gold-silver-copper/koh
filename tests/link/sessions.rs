@@ -170,6 +170,11 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
     // What the session had taken by then is the paste's start, in its order; a client that
     // comes then and pastes more, into a program that reads, has it typed whole after it.
     fs::write(rig.file("out.go"), "").unwrap();
+    let gone = || {
+        let mut left = fs::read_dir(&rig.sessions).unwrap().flatten();
+        left.all(|f| !f.file_name().to_string_lossy().starts_with(".view."))
+    };
+    rig::until("the viewer that was left is gone", secs(20), gone);
     let more: Vec<u8> = (1 << 20..(1 << 20) + 4096).flat_map(rig::line).collect();
     let client = rig.connect("s", "a").await;
     client.types(&more);

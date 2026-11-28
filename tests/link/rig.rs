@@ -27,7 +27,7 @@ use crate::net::{FaultNet, Profile};
 pub struct Rig {
     pub net: FaultNet,
     pub server_id: EndpointId,
-    sessions: PathBuf,
+    pub sessions: PathBuf,
     client_terms: PathBuf,
     tmp: PathBuf,
     _server: RunningServer,

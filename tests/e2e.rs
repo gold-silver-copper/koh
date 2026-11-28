@@ -1772,6 +1772,10 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         // (Not read from here on: what koh writes fills the terminal, and waits.)
         InTerminal::takes_no_more(&slave);
         if left {
+            // (Full once its kernel has moved what it holds to where it is read: Linux does so
+            // a while after, and takes a few KiB more meanwhile.)
+            std::thread::sleep(Duration::from_millis(300));
+            InTerminal::takes_no_more(&slave);
             tty.types(b"\x1d.");
             std::thread::sleep(Duration::from_secs(2));
             assert!(tty.koh.try_wait().unwrap().is_none(), "{how}: gone");

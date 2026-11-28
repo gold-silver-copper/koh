@@ -1651,7 +1651,7 @@ fn what_was_typed_before_the_key_that_leaves_is_typed() {
     until("the viewer is gone", || viewers(&host).is_empty());
 }
 
-// (Linux only: a macOS pty goes on taking a little at a time, so it never holds what is unread.)
+// (Linux only: on macOS CI the terminal went on taking and this never came to hold what is unread.)
 #[cfg(target_os = "linux")]
 #[test]
 fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
@@ -1669,10 +1669,12 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let (burst, mut over, mut full, ready) = (vec![b'x'; 64 << 10], None, 0, Instant::now());
     let ended = loop {
         // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
-        // Once the terminal has refused what is typed 100 times, all of it held up behind the
+        // Once the terminal has refused what is typed 100 times running, all of it held up behind the
         // program, the program ends.
-        if tty.tty().write(&burst).is_err() {
-            full += 1;
+        match tty.tty().write(&burst) {
+            Err(_) => full += 1,
+            Ok(_) if full < 100 => full = 0,
+            Ok(_) => {}
         }
         if full == 100 {
             fs::write(&gate, "").unwrap();
@@ -1736,8 +1738,8 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
     }
 }
 
-// (Linux only for now: on macOS, with the terminal seen full, koh was still there 2 s after
-// -TERM in every CI run; an open question of koh's there, not of this test's.)
+// (Linux only for now: on macOS, in the one CI run that saw the terminal full first, koh was
+// still there 2 s after -TERM: a possible defect of koh's there, not looked into.)
 #[cfg(target_os = "linux")]
 #[test]
 fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
@@ -1885,6 +1887,13 @@ fn sessions_lists_what_the_folders_say() {
         "sh -c 'until [ -e {} ]; do sleep 0.1; done; exit 5'\n",
         gate.display()
     );
+    // (The server tells a client its session's end before it lets go of the client's place.)
+    until("the two that ended are detached", || {
+        list()
+            .iter()
+            .skip(1)
+            .all(|line| line.contains("|detached|"))
+    });
     let listed = list();
     let starts = [
         "live|attached|running|idle|",

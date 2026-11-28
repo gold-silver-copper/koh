@@ -28,7 +28,8 @@ The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0 to 0.19.3 wor
 ### Changed
 
 - The tests run the script in `koh help-agents` also with dash and mawk, and with busybox's
-  ash, awk and sleep, where they are found; CI's Linux job has them. Nothing in it had to change.
+  ash, awk and sleep, where they are found; CI's Linux job has them, and fails if one of the
+  three was skipped. Nothing in the script had to change for them.
 
 ## [0.19.2] — 2026-11-28
 

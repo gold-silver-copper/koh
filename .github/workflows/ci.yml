@@ -42,7 +42,10 @@ jobs:
         run: cargo test --locked -- --test-threads 4
       - name: the script in `koh help-agents`, saying which shells and awks ran it
         if: runner.os == 'Linux'
-        run: cargo test --locked --test e2e the_recipes_of_help_agents -- --nocapture
+        run: |
+          cargo test --locked --test e2e the_recipes_of_help_agents -- --nocapture 2> recipes.log || { cat recipes.log; exit 1; }
+          cat recipes.log
+          ! grep skipped recipes.log
 
   publish:
     runs-on: ubuntu-latest

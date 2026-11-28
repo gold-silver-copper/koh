@@ -2131,7 +2131,10 @@ fn recipes(tools: &str) {
     assert_eq!((code, last.as_str()), (Some(0), "from-the-recipe\n"));
     assert_eq!(last, host.asked("output", &["--session", "s", "--last"]).1);
     let (code, shown, said) = run(&["wait", pane_dir, "1"]);
-    assert_eq!((code, shown), (Some(124), screen(&pane)), "{said}");
+    assert_eq!(
+        (code, shown, said),
+        (Some(124), screen(&pane), String::new())
+    );
     assert_eq!(run(&["screen", pane_dir]).1, screen(&pane));
     // The session ends: the recipe's wait ends with the program's status.
     fs::write(pane.join("in"), "exit 3\n").unwrap();
@@ -2170,7 +2173,10 @@ fn recipes(tools: &str) {
     stepped(&moving, 4);
     until("the recipe's wait ends", || wait.ended());
     let (code, printed, said) = wait.said();
-    assert_eq!((code, printed.as_str()), (Some(9), "two\n"), "{said}");
+    assert_eq!(
+        (code, printed.as_str(), said.as_str()),
+        (Some(9), "two\n", "")
+    );
     // A command's output with no line break at its end is its last line all the same, and one
     // empty line on an otherwise blank screen is that line.
     stepped(&moving, 5);

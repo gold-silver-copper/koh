@@ -1685,9 +1685,9 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
     // that goes on printing: koh's writing to it waits, and so would putting it back. Told to
     // end, koh ends all the same, each of the three ways, and soon. So it does on a terminal
     // another program filled before koh started: koh cannot ask it what it is like, and waits
-    // for nothing to do so.
+    // for nothing to do so. (That first, before the floods of the others go on.)
     let cases = [("-TERM", 0), ("-HUP", 0), ("-INT", 130)].map(|(how, code)| (how, code, false));
-    for (how, code, full) in cases.into_iter().chain([("-TERM", 0, true)]) {
+    for (how, code, full) in [("-TERM", 0, true)].into_iter().chain(cases) {
         // (Every cell of another colour than the one before it: a screen of it is many bytes.)
         let draws = r"while :; do printf '\033[31mfl\033[32moo\033[33md-\033[34mof\033[35m-l\033[36min\033[37mes'; done";
         let flood = ["sh", "-c", draws].map(String::from);

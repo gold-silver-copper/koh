@@ -257,7 +257,6 @@ impl InTerminal {
 
     /// Waits until a terminal takes no more of what its program writes (its `slave` end is not
     /// writable), 20 s at most.
-    #[cfg(target_os = "linux")]
     fn takes_no_more(slave: &fs::File) {
         use std::os::fd::AsFd as _;
         let full = || fuxix::wait([(Some(slave.as_fd()), fuxix::POLLOUT)], 0);
@@ -317,7 +316,6 @@ impl InTerminal {
     }
 
     /// Tells koh to end `how`, and gives the code it ended with: soon, in two seconds.
-    #[cfg(target_os = "linux")]
     fn told(&mut self, how: &str) -> Option<i32> {
         let told = Instant::now();
         signal(&self.koh.id().to_string(), how);
@@ -876,7 +874,7 @@ impl Host {
     }
 
     fn attach(&self, asks: &[&str], program: &[String]) -> InTerminal {
-        self.attach_on(InTerminal::pty(), asks, program)
+        self.attach_on(InTerminal::pty(), asks, program, true)
     }
 
     fn attach_on(
@@ -884,6 +882,7 @@ impl Host {
         pty: (fs::File, fs::File),
         asks: &[&str],
         program: &[String],
+        its: bool,
     ) -> InTerminal {
         let addr = self.addr();
         let mut args = vec![self.id.as_str(), "--direct", &addr];
@@ -893,7 +892,7 @@ impl Host {
             args.extend(program.iter().map(String::as_str));
         }
         let (config, runtime) = (self.tmp.0.join("cli_cfg"), self.tmp.0.join("crun"));
-        InTerminal::connect_on(pty, &config, &runtime, &args, true)
+        InTerminal::connect_on(pty, &config, &runtime, &args, its)
     }
 
     /// A `koh` of the client's, with its key and a runtime directory of its own.
@@ -1708,14 +1707,14 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     assert!(!tty.drew(0, b"no link"));
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to() {
     let host = Host::start("stalled-first", &[]);
     let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
     // A terminal that takes nothing from before koh starts (another program has filled it,
     // and nobody reads): koh cannot ask it what it is like, and waits for nothing to do so.
-    // Told to end, it ends, each of the three ways.
+    // Told to end, it ends, each of the three ways. (The terminal is not koh's controlling one,
+    // as under a shell: macOS ends that one's process only once the terminal takes what waits.)
     for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
         let (tty, theirs) = InTerminal::pty();
         let mut fills = Command::new("sh");
@@ -1726,7 +1725,7 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
         InTerminal::takes_no_more(&theirs);
         let name = how.trim_start_matches('-');
         let asks = [&host.id, "--direct", &host.addr(), "--session", name];
-        let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
+        let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, false);
         until("the session is started", || {
             host.pane(name).join("run").exists()
         });
@@ -1735,9 +1734,6 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
     }
 }
 
-// (Linux only for now: on macOS, in the one CI run that saw the terminal full first, koh was
-// still there 2 s after -TERM: a possible defect of koh's there, not looked into.)
-#[cfg(target_os = "linux")]
 #[test]
 fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
     let host = Host::start("stalled", &[]);
@@ -1753,7 +1749,7 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
             ["--session", how.trim_start_matches('-')],
         );
         let slave = pty.1.try_clone().unwrap();
-        let mut tty = host.attach_on(pty, &asks, &flood);
+        let mut tty = host.attach_on(pty, &asks, &flood, false); // (not its: see above)
         tty.until("the flood is drawn", |tty| {
             tty.drawn.windows(2).any(|drawn| drawn == b"es")
         });

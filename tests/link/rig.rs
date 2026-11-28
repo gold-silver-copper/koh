@@ -22,7 +22,7 @@ use koh::keys::{Role, load_or_create_key};
 use koh::server::{RunningServer, ServeOptions, start_server};
 use tokio::sync::watch;
 
-use crate::net::{FaultNet, Profile};
+use crate::net::FaultNet;
 
 pub struct Rig {
     pub net: FaultNet,
@@ -61,14 +61,14 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    /// A server on a link of `profile`.
-    pub async fn start(tag: &str, profile: Profile) -> Rig {
+    /// A server on the fault link.
+    pub async fn start(tag: &str) -> Rig {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let name = format!("koh-link-{tag}-{}-{}", std::process::id(), nanos.as_nanos());
         let tmp = std::env::temp_dir().join(name);
         fs::create_dir_all(&tmp).unwrap();
         let tmp = fs::canonicalize(tmp).unwrap();
-        let net = FaultNet::new(profile);
+        let net = FaultNet::new();
         let key_file = tmp.join("srv_cfg/server.key");
         let secret = load_or_create_key(Role::Server, Some(&key_file)).unwrap();
         let server_id = secret.public();

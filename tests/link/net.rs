@@ -2,12 +2,10 @@
 //!
 //! An endpoint bound with [`FaultNet::endpoint`] has no IP and no relay transport: its only path
 //! is this link in the test's own process, so every packet between two of them passes through
-//! it and nothing can route around it. The link delays packets, limits each direction's rate
-//! behind a buffer, drops everything for an interval, and counts what it carried and dropped
-//! towards each endpoint.
+//! it and nothing can route around it. The link drops everything for an interval, and counts
+//! what it carried and dropped towards each endpoint.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
@@ -19,7 +17,7 @@ use iroh::endpoint::transports::{
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr};
 use iroh_base::CustomAddr;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 /// This transport's number among iroh's custom addresses ("koh").
@@ -27,19 +25,6 @@ const TRANSPORT_ID: u64 = 0x006b_6f68;
 
 /// The packets that wait for an endpoint to read them. A full inbox drops the next packet.
 const INBOX: usize = 8192;
-
-/// What the link does to each packet, each way.
-#[derive(Clone, Debug, Default)]
-pub struct Profile {
-    /// How long a packet takes one way.
-    pub delay: Duration,
-    /// Each direction's bits a second, if limited: a packet waits its turn behind those before
-    /// it, and is dropped if it would wait longer than `queue`.
-    pub rate: Option<u64>,
-    /// The longest a packet waits for a limited link before it is dropped: the bottleneck's
-    /// buffer.
-    pub queue: Duration,
-}
 
 /// What became of the packets sent towards one endpoint.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,36 +36,27 @@ pub struct Counts {
 }
 
 #[derive(Debug)]
-pub struct Packet {
+struct Packet {
     from: CustomAddr,
-    pub data: Arc<[u8]>,
+    data: Arc<[u8]>,
 }
 
 /// One endpoint's side of the link: what is on its way to it.
 struct Towards {
     inbox: mpsc::Sender<Packet>,
     counts: Counts,
-    /// When the limited link towards it is next free.
-    busy_until: Instant,
 }
 
 struct State {
-    profile: Profile,
     /// Everything sent before this is dropped.
     outage: Option<Instant>,
     towards: HashMap<EndpointId, Towards>,
-    /// Packets on their way, the next to arrive first; one sent earlier before one sent later.
-    flying: BinaryHeap<Reverse<(Instant, u64, EndpointId)>>,
-    cargo: HashMap<u64, Packet>,
-    sent: u64,
-    pumping: bool,
 }
 
 /// The network. Clone it to hand it to several endpoints.
 #[derive(Clone)]
 pub struct FaultNet {
     state: Arc<Mutex<State>>,
-    wake: Arc<Notify>,
 }
 
 impl std::fmt::Debug for FaultNet {
@@ -90,18 +66,12 @@ impl std::fmt::Debug for FaultNet {
 }
 
 impl FaultNet {
-    pub fn new(profile: Profile) -> Self {
+    pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(State {
-                profile,
                 outage: None,
                 towards: HashMap::new(),
-                flying: BinaryHeap::new(),
-                cargo: HashMap::new(),
-                sent: 0,
-                pumping: false,
             })),
-            wake: Arc::new(Notify::new()),
         }
     }
 
@@ -135,20 +105,8 @@ impl FaultNet {
     pub async fn endpoint(&self, secret: SecretKey, accept: bool) -> Endpoint {
         let id = secret.public();
         let (inbox, packets) = mpsc::channel(INBOX);
-        {
-            let mut state = self.lock();
-            let (counts, busy_until) = (Counts::default(), Instant::now());
-            let towards = Towards {
-                inbox,
-                counts,
-                busy_until,
-            };
-            state.towards.insert(id, towards);
-            if !state.pumping {
-                state.pumping = true;
-                tokio::spawn(self.clone().pump());
-            }
-        }
+        let counts = Counts::default();
+        self.lock().towards.insert(id, Towards { inbox, counts });
         let transport = Arc::new(LinkTransport {
             net: self.clone(),
             id,
@@ -170,47 +128,10 @@ impl FaultNet {
         builder.bind().await.expect("an endpoint on the fault link")
     }
 
-    /// Hands each packet on its way to its endpoint when its time has come.
-    async fn pump(self) {
-        loop {
-            let next = {
-                let mut state = self.lock();
-                let now = Instant::now();
-                loop {
-                    match state.flying.peek().copied() {
-                        Some(Reverse((due, nth, to))) if due <= now => {
-                            state.flying.pop();
-                            let packet = state.cargo.remove(&nth);
-                            if let (Some(packet), Some(to)) = (packet, state.towards.get_mut(&to)) {
-                                to.deliver(packet);
-                            }
-                        }
-                        Some(Reverse((due, _, _))) => break Some(due),
-                        None => break None,
-                    }
-                }
-            };
-            match next {
-                Some(due) => {
-                    tokio::select! {
-                        () = tokio::time::sleep_until(due) => {}
-                        () = self.wake.notified() => {}
-                    }
-                }
-                None => self.wake.notified().await,
-            }
-        }
-    }
-
-    /// One packet from `from` towards `to`, through the profile.
+    /// One packet from `from` towards `to`: dropped during an outage, else handed on at once.
     fn route(&self, from: EndpointId, to: EndpointId, datagram: &[u8]) -> io::Result<()> {
         let mut state = self.lock();
-        let state = &mut *state;
-        let now = Instant::now();
-        let profile = state.profile.clone();
-        let outage = state.outage.is_some_and(|until| now < until);
-        let nth = state.sent;
-        state.sent += 1;
+        let outage = state.outage.is_some_and(|until| Instant::now() < until);
         let Some(towards) = state.towards.get_mut(&to) else {
             return Err(io::Error::other("no such endpoint on the fault link"));
         };
@@ -218,40 +139,14 @@ impl FaultNet {
             towards.counts.black_holed += 1;
             return Ok(());
         }
-        // A limited link: the packet goes once the link is free and takes its size's time to
-        // send; with the buffer full it is dropped, as a bottleneck's queue drops its tail.
-        let mut due = now + profile.delay;
-        if let Some(rate) = profile.rate.filter(|rate| *rate > 0) {
-            let free = towards.busy_until.max(now);
-            if free.duration_since(now) > profile.queue {
-                return Ok(());
-            }
-            let bits = datagram.len() as u64 * 8;
-            towards.busy_until = free + Duration::from_nanos(bits * 1_000_000_000 / rate);
-            due = towards.busy_until + profile.delay;
-        }
         let packet = Packet {
             from: custom_addr(from),
             data: datagram.into(),
         };
-        // (At once where nothing holds it: a clean link adds no timer's wait.)
-        if due <= now {
-            towards.deliver(packet);
-        } else {
-            state.cargo.insert(nth, packet);
-            state.flying.push(Reverse((due, nth, to)));
-            self.wake.notify_one();
+        if towards.inbox.try_send(packet).is_ok() {
+            towards.counts.bytes += datagram.len() as u64;
         }
         Ok(())
-    }
-}
-
-impl Towards {
-    fn deliver(&mut self, packet: Packet) {
-        let bytes = packet.data.len() as u64;
-        if self.inbox.try_send(packet).is_ok() {
-            self.counts.bytes += bytes;
-        }
     }
 }
 

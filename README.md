@@ -156,7 +156,9 @@ koh adds nothing to stop these. What happens instead is said.
   (1). It lives on, and is a session of its new name.
 - Don't `kill -9` a `koh connect`: nothing is left to put your terminal back, which stays
   raw, on the alternate screen, with whatever the session's program had turned on. Type
-  `reset` and Enter (you will not see it typed). Every other end puts it back.
+  `reset` and Enter (you will not see it typed). Every other end puts it back, but one that
+  koh is told to (a signal) while the terminal takes nothing: then its mode is put back, and
+  what leaves the alternate screen may not be written.
 - Don't look for the session's past in your terminal's own scrollback: the viewer draws on
   the alternate screen, which has none. `koh output SERVER --session NAME --last` prints what
   the last command printed, the session's `history` file on the server has all of it, and a

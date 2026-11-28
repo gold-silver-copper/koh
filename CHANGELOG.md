@@ -22,13 +22,14 @@ The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0, 0.19.1 and 0
 ### Fixed
 
 - `koh connect` told to end with a terminal that takes nothing could stay there, on Linux and
-  macOS (since 0.18.0), whenever its write to that terminal was blocked as it ended: it waited
-  for that write. Under a shell it is gone within a second, as 0.18.0 said.
+  macOS (since 0.18.0), when a write to that terminal was in progress as it ended: it waited
+  for that write. (One still waiting its turn was given up after a quarter of a second, and
+  koh left.) Under a shell it is gone within a second, as 0.18.0 said.
 - `koh connect` ending by itself (the session's end, `Ctrl-] .`, an error) waits for its
   terminal to take what puts it back, as long as that takes, or until it is told to end, when
   it gives the terminal a quarter of a second more and ends as it was told to (0 or 130, no
   error said to a terminal that takes nothing). 0.19.1 gave the terminal a quarter of a second,
-  and then, as a rule, waited anyway.
+  and then waited for a write in progress anyway.
 
 ## [0.19.1] — 2026-11-27
 

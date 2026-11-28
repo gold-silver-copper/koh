@@ -322,7 +322,7 @@ impl InTerminal {
         signal(&self.koh.id().to_string(), how);
         loop {
             let ended = self.koh.try_wait().unwrap();
-            assert!(told.elapsed().as_secs() < 2, "{how}: still there");
+            assert!(told.elapsed() < Duration::from_secs(2), "{how}: still there");
             if let Some(ended) = ended {
                 return ended.code();
             }

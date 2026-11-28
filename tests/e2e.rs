@@ -5,6 +5,7 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -328,15 +329,19 @@ fn cli_keys_peer_lists_and_usage_errors() {
     }
     let caps = [
         ("--max-connections", "18446744073709551615"),
+        ("--max-sessions", "65536"),
         ("--max-sessions", "many"),
     ];
     for (flag, value) in caps {
-        let (code, _, said) = koh(&tmp.0, &["serve", "--no-relay", flag, value]);
+        // (And a flag that is none after it: a cap taken is no server that runs on.)
+        let (code, _, said) = koh(&tmp.0, &["serve", "--no-relay", flag, value, "--none"]);
         assert!(
             code == Some(2) && said.contains(flag) && said.contains("1 to 65535"),
             "{said}"
         );
     }
+    // (Nothing was started for them: not even the key.)
+    assert!(!tmp.0.join("server.key").exists());
     use std::os::unix::ffi::OsStrExt as _;
     let not_utf8 = Command::new(env!("CARGO_BIN_EXE_koh"))
         .arg(std::ffi::OsStr::from_bytes(b"\xff"))
@@ -515,29 +520,6 @@ fn a_fifo_where_the_list_of_clients_is_holds_no_server() {
     });
     let read = told.recv_timeout(Duration::from_secs(20));
     assert!(matches!(read, Ok(Ok(0))), "{read:?}");
-}
-
-#[tokio::test]
-async fn a_cap_out_of_range_is_a_usage_error_not_a_panic() {
-    let tmp = TempDir::new("cap-range");
-    let caps = [(0, 64, "--max-connections"), (64, 65_536, "--max-sessions")];
-    for (max_connections, max_sessions, flag) in caps {
-        let more = ServeOptions {
-            key_file: Some(tmp.0.join("srv_cfg/server.key")),
-            max_connections,
-            max_sessions,
-            quiet: true,
-            disable_relay: true,
-            ..ServeOptions::default()
-        };
-        let err = start_server(more).await.err().expect("a refusal");
-        assert!(
-            err.code == Exit::USAGE && err.message.contains(flag),
-            "{err:?}"
-        );
-    }
-    // (Nothing was started for them: not even the key.)
-    assert!(!tmp.0.join("srv_cfg").exists());
 }
 
 #[tokio::test]
@@ -874,6 +856,16 @@ impl Host {
     }
 
     fn attach(&self, asks: &[&str], program: &[String]) -> InTerminal {
+        self.attach_on(InTerminal::pty(), asks, program)
+    }
+
+    /// `koh connect` on a terminal of the test's making.
+    fn attach_on(
+        &self,
+        pty: (fs::File, fs::File),
+        asks: &[&str],
+        program: &[String],
+    ) -> InTerminal {
         let addr = self.addr();
         let mut args = vec![self.id.as_str(), "--direct", &addr];
         args.extend_from_slice(asks);
@@ -881,7 +873,8 @@ impl Host {
             args.push("--");
             args.extend(program.iter().map(String::as_str));
         }
-        InTerminal::connect(&self.tmp.0.join("cli_cfg"), &self.tmp.0.join("crun"), &args)
+        let (config, runtime) = (self.tmp.0.join("cli_cfg"), self.tmp.0.join("crun"));
+        InTerminal::connect_on(pty, &config, &runtime, &args, true)
     }
 
     /// A `koh` of the client's, with its key and a runtime directory of its own.
@@ -1688,15 +1681,28 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
     let host = Host::start("stalled", &[]);
     // A terminal that takes nothing more (one behind a path that is stuck), under a program
     // that goes on printing: koh's writing to it waits, and so would putting it back. Told to
-    // end, koh ends all the same, each of the three ways, and soon.
-    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
+    // end, koh ends all the same, each of the three ways, and soon. So it does on a terminal
+    // another program filled before koh started: koh cannot ask it what it is like, and waits
+    // for nothing to do so.
+    let cases = [("-TERM", 0), ("-HUP", 0), ("-INT", 130)].map(|(how, code)| (how, code, false));
+    for (how, code, full) in cases.into_iter().chain([("-TERM", 0, true)]) {
         // (Every cell of another colour than the one before it: a screen of it is many bytes.)
         let draws = r"while :; do printf '\033[31mfl\033[32moo\033[33md-\033[34mof\033[35m-l\033[36min\033[37mes'; done";
         let flood = ["sh", "-c", draws].map(String::from);
-        let mut tty = host.attach(&["--session", how.trim_start_matches('-')], &flood);
-        tty.until("the flood is drawn", |tty| {
-            tty.drawn.windows(2).any(|drawn| drawn == b"es")
-        });
+        let ((pty, theirs), name) = (InTerminal::pty(), format!("{}{full}", &how[1..]));
+        let fill = ["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"];
+        let mut fills = Command::new("sh");
+        fills.args(fill).stdout(theirs.try_clone().unwrap());
+        let fills = full.then(|| fills.spawn().unwrap());
+        let takes = || fuxix::wait([(Some(theirs.as_fd()), fuxix::POLLOUT)], 0).unwrap();
+        until("the terminal is full", || fills.is_none() || takes() == [0]);
+        let mut tty = host.attach_on((pty, theirs), &["--session", &name], &flood);
+        match full {
+            true => until("the session is started", || {
+                host.pane(&name).join("run").exists()
+            }),
+            false => tty.until("the flood is drawn", |tty| tty.drew(0, b"es")),
+        }
         // (Not read from here on: what koh writes fills the terminal, and waits.)
         std::thread::sleep(Duration::from_secs(3));
         let told = Instant::now();
@@ -1712,6 +1718,10 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(ended, Some(code), "{how}");
+        // (The terminal goes first: on macOS a program that leaves a terminal it has written to
+        // is not gone until what it wrote is read, or the terminal's other end is closed.)
+        drop(tty);
+        let _ = fills.map(|mut fills| (fills.kill(), fills.wait()));
     }
 }
 

@@ -199,6 +199,8 @@ struct InTerminal {
 impl Drop for InTerminal {
     fn drop(&mut self) {
         let _ = self.koh.kill();
+        // (The terminal goes first: on macOS a koh killed is not gone while what it wrote waits.)
+        drop(fs::File::open("/dev/null").map(|null| std::mem::replace(&mut self.tty, null)));
         let _ = self.koh.wait();
     }
 }
@@ -1718,9 +1720,7 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(ended, Some(code), "{how}");
-        // (The terminal goes first: on macOS a program that leaves a terminal it has written to
-        // is not gone until what it wrote is read, or the terminal's other end is closed.)
-        drop(tty);
+        drop(tty); // (first: see InTerminal's drop)
         let _ = fills.map(|mut fills| (fills.kill(), fills.wait()));
     }
 }

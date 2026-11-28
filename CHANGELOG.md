@@ -11,9 +11,24 @@ binary, its tests and the fuzz targets share code, and any release may change it
 > period: **v0.4.0–v0.4.3** were tagged during a rapid follow-up series but superseded by **0.4.4**
 > before publishing, and **v0.6.0** (encrypted-at-rest keys, vt100 containment, per-node-id authz) was
 > developed and folded into **0.7.0** rather than released on its own. Published versions:
-> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0, 0.18.1, 0.19.0, 0.19.1 and 0.19.2 (0.12.1 is tag-only).
+> 0.1.0–0.3.2, 0.4.4, 0.5.0, 0.7.0–0.12.0, 0.13.0, 0.14.0, 0.15.0, 0.16.0, 0.17.0, 0.17.1, 0.17.2, 0.18.0, 0.18.1, 0.19.0, 0.19.1, 0.19.2 and 0.19.3 (0.12.1 is tag-only).
 
 ## [Unreleased]
+
+## [0.19.3] — 2026-11-28
+
+The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0 to 0.19.3 work together.
+
+### Fixed
+
+- `koh wait --session`, and the script's `wait` in `koh help-agents`, on a session that ended
+  with its last command could give the session's status and screen, not the command's code and
+  output. Each now asks whether the session lives before it reads its marks, not after.
+
+### Changed
+
+- The tests run the script in `koh help-agents` also with dash and mawk, and with busybox's
+  ash, awk and sleep, where they are found; CI's Linux job has them. Nothing in it had to change.
 
 ## [0.19.2] — 2026-11-28
 
@@ -925,7 +940,8 @@ key location changed).
 - Initial release: the SSP protocol core, the terminal model, the PTY host, the local-echo predictor,
   and the iroh QUIC transport.
 
-[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.19.2...HEAD
+[Unreleased]: https://github.com/gold-silver-copper/koh/compare/v0.19.3...HEAD
+[0.19.3]: https://github.com/gold-silver-copper/koh/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/gold-silver-copper/koh/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/gold-silver-copper/koh/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/gold-silver-copper/koh/compare/v0.18.1...v0.19.0

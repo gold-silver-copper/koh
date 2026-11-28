@@ -61,14 +61,10 @@ fn main() -> ExitCode {
             return ExitCode::from(err.code.0);
         }
     };
-    let streams_stdin = matches!(args.first().map(String::as_str), Some("exec" | "rsh"));
     let done = rt.block_on(run(args));
-    if streams_stdin {
-        // On normal completion, output has been flushed and the connection closed before `run`
-        // returns; on a signal, one blocking output write may still be in flight and koh exits
-        // without waiting for it (or for a blocked read of stdin).
-        rt.shutdown_background();
-    }
+    // What `run` waited for is done; what it left (a blocking write to a terminal or pipe that
+    // takes nothing, a blocked read of stdin) would hold koh's exit for good if waited for.
+    rt.shutdown_background();
     match done {
         Ok(code) => ExitCode::from(code.0),
         Err(err) => {

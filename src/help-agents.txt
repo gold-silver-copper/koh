@@ -84,11 +84,12 @@ await() { # until a command has ended since this was asked (its exit code is thi
   began=$(date +%s)
   while :; do
     # The first `end` of a higher number is the command: its code, what it printed, and how many marks came and went unread, of one read.
+    gone=; alive "$1" || gone=1   # (asked before the look: a holder gone has written its last marks)
     now=; [ -z "$asked" ] || now=$(look "$1" "$asked") || now=
     [ -z "$now" ] || {
       [ "${now#* }" = 0 ] || echo "the oldest end still kept, not known to be the first: ${now#* } marks came and went unread" >&2
       cat "$c"; exit "${now% *}"; }
-    alive "$1" || { cat "$1/shown/screen"; s=$(cat "$1/state")
+    [ -z "$gone" ] || { cat "$1/shown/screen"; s=$(cat "$1/state")
       case $s in "exited "*) exit "${s#exited }" ;; "killed "*) exit $((128 + ${s#killed })) ;; *) exit 1 ;; esac; }
     [ -z "${2:-}" ] || [ $(($(date +%s) - began)) -lt "$2" ] || { cat "$1/shown/screen"; exit 124; }
     sleep 0.1

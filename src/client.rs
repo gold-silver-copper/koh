@@ -461,15 +461,26 @@ impl Client {
             told(SignalKind::hangup())?,
             told(SignalKind::terminate())?,
         );
+        let mut told = async || {
+            tokio::select! {
+                _ = interrupt.recv() => 130,
+                _ = hangup.recv() => 0,
+                _ = terminate.recv() => 0,
+            }
+        };
         let mut console = Console::open(input, output)?;
         // Told to end (its terminal closed, as a rule), koh leaves as if its user had.
-        let ended = tokio::select! {
-            ended = self.session(opts, &mut console) => ended,
-            _ = interrupt.recv() => Ok(130),
-            _ = hangup.recv() => Ok(0),
-            _ = terminate.recv() => Ok(0),
+        let (mut ended, now) = tokio::select! {
+            ended = self.session(opts, &mut console) => (ended, false),
+            code = told() => (Ok(code), true),
         };
-        console.close().await;
+        console
+            .close(async {
+                if !now {
+                    ended = Ok(told().await);
+                }
+            })
+            .await;
         // (A server that is not there to hear of the end is not waited for.)
         let _ = tokio::time::timeout(Duration::from_millis(500), self.close()).await;
         ended
@@ -790,9 +801,9 @@ impl Console {
     }
 
     /// Lets the terminal go: put back, what it said of the link wiped, all of that written,
-    /// and then its mode. A terminal that takes nothing is given a quarter of a second for
-    /// all of it: koh ends when it is told to, whatever its terminal does.
-    async fn close(mut self) {
+    /// and then its mode. That is waited for as long as the terminal takes, until koh is
+    /// `told` to end: from then on it is given a quarter of a second, whatever it does.
+    async fn close(mut self, told: impl Future<Output = ()>) {
         let written = async {
             self.reset().await;
             if self.said {
@@ -803,7 +814,11 @@ impl Console {
                 let _ = tokio::task::spawn_blocking(move || writer.join()).await;
             }
         };
-        let _ = tokio::time::timeout(Duration::from_millis(250), written).await;
+        let bound = async {
+            told.await;
+            tokio::time::sleep(Duration::from_millis(250)).await
+        };
+        tokio::select! { () = written => {}, () = bound => {} }
         drop(self.raw);
     }
 

@@ -27,14 +27,20 @@ use crate::net::{FaultNet, Profile};
 pub struct Rig {
     pub net: FaultNet,
     pub server_id: EndpointId,
-    sessions: PathBuf,
+    pub sessions: PathBuf,
     client_terms: PathBuf,
     tmp: PathBuf,
     _server: RunningServer,
 }
 
+/// Kills the holders of the panes in `dir` that live: a holder keeps its folder locked, and a
+/// folder that is not locked names a holder that is gone (its number may be another's now).
 fn kill_holders(dir: &Path) {
     for pane in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let folder = fuxix::open(pane.path(), false).map(|folder| folder.try_lock_shared());
+        if !matches!(folder, Ok(Err(fs::TryLockError::WouldBlock))) {
+            continue;
+        }
         let status = fs::read_to_string(pane.path().join("status")).unwrap_or_default();
         if let Some(holder) = status
             .lines()
@@ -55,14 +61,14 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    /// A server on a link of `profile`, seeded.
-    pub async fn start(tag: &str, profile: Profile, seed: u64) -> Rig {
+    /// A server on a link of `profile`.
+    pub async fn start(tag: &str, profile: Profile) -> Rig {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let name = format!("koh-link-{tag}-{}-{}", std::process::id(), nanos.as_nanos());
         let tmp = std::env::temp_dir().join(name);
         fs::create_dir_all(&tmp).unwrap();
         let tmp = fs::canonicalize(tmp).unwrap();
-        let net = FaultNet::new(profile, seed);
+        let net = FaultNet::new(profile);
         let key_file = tmp.join("srv_cfg/server.key");
         let secret = load_or_create_key(Role::Server, Some(&key_file)).unwrap();
         let server_id = secret.public();
@@ -87,19 +93,6 @@ impl Rig {
             client_terms,
             tmp,
             _server: server,
-        }
-    }
-
-    /// Cuts every attach where it is: the viewers are killed, and what each had drawn up to
-    /// that byte is all its client is sent. (A link that is lost ends a stream at a byte too,
-    /// and is noticed eight seconds later.)
-    pub fn cut(&self) {
-        let session = self.sessions.parent().unwrap();
-        for viewer in fs::read_dir(session).into_iter().flatten().flatten() {
-            let name = viewer.file_name().to_string_lossy().into_owned();
-            if let Some(pid) = name.strip_prefix(".view.") {
-                let _ = Command::new("kill").args(["-KILL", pid]).status();
-            }
         }
     }
 
@@ -143,12 +136,6 @@ impl Rig {
         pane.to_path_buf()
     }
 
-    /// Connects a client (`who` = "a" or "b") to session `name` on a fresh 80x24 PTY without
-    /// waiting for the first output bytes.
-    pub async fn connect_now(&self, name: &str, who: &str) -> Connected {
-        self.connect_on(self.dialled(who).await, Some(name), false)
-    }
-
     /// A client of the key `who` that has dialled the server, and its endpoint's name.
     pub async fn dialled(&self, who: &str) -> (Client, EndpointId) {
         self.dialled_to(who, self.server_id).await
@@ -168,12 +155,8 @@ impl Rig {
     /// The names of the sessions there are.
     pub fn sessions(&self) -> Vec<String> {
         let folders = fs::read_dir(&self.sessions).unwrap().flatten();
-        let mut names: Vec<String> = folders
-            .map(|folder| folder.file_name().to_string_lossy().into_owned())
-            .filter(|name| !name.starts_with('.'))
-            .collect();
-        names.sort();
-        names
+        let names = folders.map(|folder| folder.file_name().to_string_lossy().into_owned());
+        names.filter(|name| !name.starts_with('.')).collect()
     }
 
     /// `koh connect` of a client that has dialled, to the session `name` or (`new`) a new one,
@@ -265,8 +248,11 @@ impl Rig {
 
     /// Connects and waits until the client's terminal has received its first screen bytes.
     pub async fn connect(&self, name: &str, who: &str) -> Connected {
-        let conn = self.connect_now(name, who).await;
-        conn.has_output(Duration::from_secs(20));
+        let conn = self.connect_on(self.dialled(who).await, Some(name), false);
+        until("the client received output", secs(20), || {
+            !conn.raw().is_empty() || conn.task.is_finished()
+        });
+        assert!(!conn.task.is_finished(), "koh connect ended unexpectedly");
         conn
     }
 }
@@ -276,7 +262,7 @@ impl Rig {
 pub struct Connected {
     /// Local fux pane rendering everything `koh connect` wrote to its terminal.
     pub term: PathBuf,
-    master: File,
+    pub master: File,
     raw_out: Arc<Mutex<Vec<u8>>>,
     /// The client's endpoint: what the link counts towards it is what the server sent.
     pub id: EndpointId,
@@ -292,21 +278,9 @@ impl Drop for Connected {
 }
 
 impl Connected {
-    pub fn has_output(&self, long: Duration) {
-        until("the client received output", long, || {
-            !self.raw_out.lock().unwrap().is_empty() || self.task.is_finished()
-        });
-        assert!(!self.task.is_finished(), "koh connect ended unexpectedly");
-    }
-
     /// Types bytes into the client's terminal (blocking until all bytes are written to PTY).
     pub fn types(&self, bytes: &[u8]) {
         write_all_pty(&self.master, bytes);
-    }
-
-    /// Clones the master fd so a background thread can type while the test runs.
-    pub fn master_clone(&self) -> File {
-        self.master.try_clone().unwrap()
     }
 
     /// Resizes the client's PTY and its local terminal emulator.
@@ -374,6 +348,10 @@ pub fn reads_into(out: &Path) -> [&str; 4] {
     ["sh", "-c", script, out.to_str().unwrap()]
 }
 
+pub fn secs(n: u64) -> Duration {
+    Duration::from_secs(n)
+}
+
 /// Waits, `long` at most, until `done` says so.
 pub fn until(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
     let deadline = Instant::now() + long;
@@ -381,12 +359,6 @@ pub fn until(what: &str, long: Duration, mut done: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "not in {long:?}: {what}");
         std::thread::sleep(Duration::from_millis(5));
     }
-}
-
-/// What a pane's `state` says became of its program.
-pub fn state(dir: &Path) -> String {
-    let state = fs::read_to_string(dir.join("state")).unwrap_or_default();
-    state.trim().to_string()
 }
 
 /// The screen a pane's folder shows.
@@ -403,83 +375,13 @@ pub fn screen_agrees(pane: &Path, client: &Connected) {
         let rows = screen.lines().map(|row| row.trim_end().to_string());
         rows.collect()
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let (want, got) = (screen(pane), client.screen());
-        if !want.is_empty() && rows(want.clone()) == rows(got.clone()) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "client screen != pane screen:\n--- pane ---\n{want}\n--- client ---\n{got}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    until("the client's screen is the pane's", secs(20), || {
+        let want = screen(pane);
+        !want.is_empty() && rows(want) == rows(client.screen())
+    });
 }
 
 /// The numbered line `n` of sixteen bytes, as a test types them.
 pub fn line(n: u64) -> Vec<u8> {
     format!("{n:015}\n").into_bytes()
-}
-
-/// The last `n` bytes of a file.
-pub fn tail(path: &Path, n: u64) -> Vec<u8> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-    let Ok(mut file) = fs::File::open(path) else {
-        return Vec::new();
-    };
-    let len = file.metadata().map_or(0, |file| file.len());
-    let _ = file.seek(SeekFrom::Start(len.saturating_sub(n)));
-    let mut end = Vec::new();
-    let _ = file.read_to_end(&mut end);
-    end
-}
-
-/// What was read of numbered lines of 16 bytes that were typed (line N at byte 16 N):
-/// how many stretches of them are left out, or where a byte came twice or out of its order.
-pub fn stretches(read: &[u8], typed: &[u8]) -> Result<usize, String> {
-    let (mut at, mut i, mut left_out) = (0, 0, 0);
-    while i < read.len() {
-        let rest = &read[i..];
-        let newline = rest.iter().position(|byte| *byte == b'\n');
-        let before = newline.map_or(rest.len(), |end| end + 1);
-        let line = rest.get(before..before + 15);
-        let place = match line.map(|line| String::from_utf8_lossy(line).parse::<usize>()) {
-            Some(Ok(line)) => (line * 16)
-                .checked_sub(before)
-                .ok_or(format!("byte {i}: before the first line"))?,
-            _ => typed
-                .len()
-                .checked_sub(rest.len())
-                .ok_or(format!("byte {i}: more than was typed"))?,
-        };
-        if place < at {
-            return Err(format!(
-                "byte {i} of what was read was typed at {place}: before {at}, which was read already"
-            ));
-        }
-        left_out += usize::from(place > at);
-        let same = rest.iter().zip(&typed[place..]);
-        let same = same.take_while(|(read, typed)| read == typed).count();
-        if same == 0 {
-            return Err(format!(
-                "byte {i} of what was read is not what was typed at {place}"
-            ));
-        }
-        (i, at) = (i + same, place + same);
-    }
-    Ok(left_out)
-}
-
-/// A test's own draws from its seed (splitmix64): when a link goes, and for how long.
-pub struct Draws(pub u64);
-
-impl Draws {
-    pub fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (z ^ (z >> 31)) % n
-    }
 }

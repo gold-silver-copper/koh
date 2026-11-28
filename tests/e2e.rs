@@ -2456,16 +2456,24 @@ async fn server_refuses_scoped_and_unknown_field_clients_lines() {
     assert_eq!(names_in(&tmp.0.join("state/fux/koh-sessions")), [""; 0]);
     // The file is read at every request, on a connection that lives: the line taken away
     // revokes the key. A file that is no UTF-8 is no list of anyone, its good line before the
-    // bad byte too.
+    // bad byte too. (A file that cannot be read is said as a failure, 1, where that reply comes
+    // before the close that refuses, 4.)
     let good = format!("valid {v}\n");
-    let lists = [ignored.into_bytes(), [good.as_bytes(), b"\xff\n"].concat()];
-    for list in lists {
+    let lists = [
+        (ignored.into_bytes(), Exit::REFUSED),
+        ([good.as_bytes(), b"\xff\n"].concat(), Exit::FAILED),
+    ];
+    for (list, or) in lists {
         fs::write(&file, &good).unwrap();
         let client = dial(valid.clone()).await.unwrap();
         assert_eq!(client.exec(vec!["true".into()], None).await.unwrap(), 0);
         fs::write(&file, &list).unwrap();
         let refused = client.jobs(None).await.unwrap_err().code;
-        assert_eq!(refused, Exit::REFUSED, "{}", String::from_utf8_lossy(&list));
+        let said = String::from_utf8_lossy(&list);
+        assert!(
+            [Exit::REFUSED, or].contains(&refused),
+            "{refused:?}: {said}"
+        );
         client.close().await;
     }
     srv.shutdown().await;

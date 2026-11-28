@@ -66,13 +66,13 @@ async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_
             .ends_with(&all[all.len() - 16..])
     });
     // Read is a start of what was typed and an end of it, which has all typed since koh said
-    // there was no link.
+    // there was no link. (Whole lines: the next line's leading zeros are no line kept.)
     let read = fs::read(&out).unwrap();
     let kept = read
-        .iter()
-        .zip(&all)
+        .chunks(16)
+        .zip(all.chunks(16))
         .take_while(|(read, typed)| read == typed);
-    let end = read.len() - kept.count();
+    let end = read.len() - 16 * kept.count();
     let whole = all.ends_with(&read[read.len() - end..]) && end >= all.len() - held;
     assert!(
         whole,

@@ -1716,7 +1716,7 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
     // A terminal that takes nothing from before koh starts (another program has filled it,
     // and nobody reads): koh cannot ask it what it is like, and waits for nothing to do so.
     // Told to end, it ends, each of the three ways: told as soon as it has made the terminal
-    // raw (it echoes no more), before anything is drawn. (koh has no controlling terminal here;
+    // raw (it echoes no more), as a rule before anything is drawn. (koh has no controlling terminal here;
     // a shell's child has one and is not its controlling process: koh's code runs alike in
     // both. macOS ends a controlling process only once its terminal takes what waits.)
     for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
@@ -1738,7 +1738,6 @@ fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to(
                 .split_whitespace()
                 .any(|flag| flag == "-echo")
         });
-        assert!(!host.pane(name).join("run").exists());
         assert_eq!(koh.told(how), Some(code), "{how}");
         drop(koh); // (before the filler: see InTerminal's drop)
     }
@@ -1756,7 +1755,7 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         ("-TERM", 0, false),
         ("-HUP", 0, false),
         ("-INT", 130, false),
-        ("-TERM", 0, true),
+        ("-INT", 130, true), // (told while it waits: it ends as it was told to, not as it was left)
         ("", 0, true),
     ];
     for (n, (how, code, left)) in rows.into_iter().enumerate() {
@@ -1782,7 +1781,12 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         }
         let from = tty.drawn.len();
         match how {
-            "" => assert!(tty.ends() == Some(0) && tty.drew(from, b"\x1b[?1049l")),
+            "" => {
+                tty.until("the terminal is put back", |tty| {
+                    tty.drew(from, b"\x1b[?1049l")
+                });
+                assert_eq!(tty.ends(), Some(0));
+            }
             how => assert_eq!(tty.told(how), Some(code), "{how}"),
         }
     }

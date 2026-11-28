@@ -25,8 +25,10 @@ The protocol is 0.19.0's (`koh/21`): clients and servers of 0.19.0, 0.19.1 and 0
   macOS (since 0.18.0), whenever its write to that terminal was blocked as it ended: it waited
   for that write. Under a shell it is gone within a second, as 0.18.0 said.
 - `koh connect` ending by itself (the session's end, `Ctrl-] .`, an error) waits for its
-  terminal to take what puts it back, as long as that takes, or until it is told to end:
-  0.19.1 gave the terminal a quarter of a second, and then, as a rule, waited anyway.
+  terminal to take what puts it back, as long as that takes, or until it is told to end, when
+  it gives the terminal a quarter of a second more and ends as it was told to (0 or 130, no
+  error said to a terminal that takes nothing). 0.19.1 gave the terminal a quarter of a second,
+  and then, as a rule, waited anyway.
 
 ## [0.19.1] — 2026-11-27
 

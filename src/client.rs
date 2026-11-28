@@ -470,14 +470,14 @@ impl Client {
         };
         let mut console = Console::open(input, output)?;
         // Told to end (its terminal closed, as a rule), koh leaves as if its user had.
-        let (ended, now) = tokio::select! {
+        let (mut ended, now) = tokio::select! {
             ended = self.session(opts, &mut console) => (ended, false),
             code = told() => (Ok(code), true),
         };
         console
             .close(async {
                 if !now {
-                    told().await;
+                    ended = Ok(told().await);
                 }
             })
             .await;

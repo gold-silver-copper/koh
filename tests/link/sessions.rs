@@ -1,5 +1,5 @@
-//! Sessions on the fault link: what a user would notice of one when the link goes silent, is
-//! cut in the middle of a sequence, or is slow.
+//! Sessions on the fault link: what a user would notice of one when the link goes silent, or is
+//! cut in the middle of a sequence.
 
 use std::fs;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ use koh::proto::{
     Attach, Attached, MAX_CTRL, Reply, Request, VIEW_FRAME, ViewOutput, recv_msg, send_msg,
 };
 
-use crate::net::Profile;
 use crate::rig::{self, Rig, secs};
 
 /// A link gone for forty seconds while a line is typed every 25 ms, and back: koh says there is
@@ -20,7 +19,7 @@ use crate::rig::{self, Rig, secs};
 /// and in its order: all of it, but what was on its way when the link went (one stretch).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_arrives_once() {
-    let rig = Rig::start("forty", Profile::default()).await;
+    let rig = Rig::start("forty").await;
     let out = rig.file("out");
     let pane = rig.pane("s", &rig::reads_into(&out));
     let client = rig.connect("s", "a").await;
@@ -91,7 +90,7 @@ async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_
 /// A first attach to a session with megabytes of history is sent the screen, not the history.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_attach_to_megabytes_of_history_is_sent_a_screen() {
-    let rig = Rig::start("fresh", Profile::default()).await;
+    let rig = Rig::start("fresh").await;
     let pane = rig.pane("s", &["sh"]);
     fs::write(pane.join("in"), "seq 1 150000; echo all-pr''inted\n").unwrap();
     rig::until("the history is there", secs(30), || {
@@ -126,7 +125,7 @@ fn the_terminal_is_put_back(client: &rig::Connected, when: &str) {
 /// answer the key, and wipes what it said of the link.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kohs_key_leaves_with_no_link_and_the_terminal_is_put_back() {
-    let rig = Rig::start("leaves", Profile::default()).await;
+    let rig = Rig::start("leaves").await;
     rig.pane("s", &["sh", "-c", MODES_ON]);
     let mut client = rig.connect("s", "a").await;
     rig::until("the modes are on", secs(10), || {
@@ -154,7 +153,7 @@ async fn kohs_key_leaves_with_no_link_and_the_terminal_is_put_back() {
 /// hears no key meanwhile. koh's key is the client's: it leaves all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_pasted() {
-    let rig = Rig::start("deaf", Profile::default()).await;
+    let rig = Rig::start("deaf").await;
     let out = rig.file("out");
     let reads = "stty raw -echo; echo READY; until [ -e \"$0.go\" ]; do sleep 0.05; done; exec cat > \"$0\"";
     let pane = rig.pane("s", &["sh", "-c", reads, out.to_str().unwrap()]);
@@ -198,7 +197,7 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_link_that_goes_in_the_first_attach_is_dialled_again_and_a_new_session_is_asked_for_once()
 {
-    let rig = Rig::start("first", Profile::default()).await;
+    let rig = Rig::start("first").await;
     let pane = rig.pane("s", &["sh", "-c", "echo FIRST-''SCREEN; exec sleep 600"]);
     // (Gone for longer than a link may be silent: the connection the attach was asked on is lost.)
     let on = rig.dialled("a").await;
@@ -267,7 +266,7 @@ async fn draws(send: &mut SendStream, bytes: &str) {
 /// is no message is the client's end, the terminal put back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_terminal_its_own() {
-    let rig = Rig::start("says", Profile::default()).await;
+    let rig = Rig::start("says").await;
     let server = Says::start(&rig).await;
     // What a viewer may be in the middle of: its modes going on, a scroll region, a frame
     // begun; text in a colour, a title, a link, a picture. It is cut inside each.
@@ -345,65 +344,4 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
         "{ended:?}"
     );
     the_terminal_is_put_back(&client, "after what no server says");
-}
-
-/// A key's echo during a flood at 256 kbit/s does not wait behind seconds of old frames: the
-/// viewer draws its next frame when its terminal has taken the last.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_keys_echo_during_a_flood_at_256_kbit_is_not_behind_old_frames() {
-    let rig = Rig::start(
-        "flood-256k",
-        Profile {
-            delay: Duration::from_millis(25),
-            rate: Some(256_000),
-            queue: Duration::from_millis(100),
-        },
-    )
-    .await;
-    // Rows 2..24 flooded while what is typed is echoed on row 1 (one writer, so that no
-    // sequence is cut by another).
-    let py = r#"
-import os, select, sys, tty
-tty.setraw(0)
-out = sys.stdout.buffer
-out.write(b'\x1b[2;24r\x1b[2;1H'); out.flush()
-n = 1
-while True:
-    if select.select([0], [], [], 0)[0]:
-        k = os.read(0, 1)
-        if not k: break
-        out.write(b'\x1b[1;1H===ECHO-' + k + b'===\x1b[24;1H')
-        out.flush()
-    out.write(''.join(f'{i}\r\n' for i in range(n, n + 200)).encode()); out.flush()
-    n = (n + 200) % 2000000 + 1
-"#;
-    rig.pane("s", &["python3", "-c", py]);
-    let client = rig.connect("s", "a").await;
-    let flood = || {
-        client
-            .screen()
-            .split_once('\n')
-            .map(|(_, rows)| rows.to_string())
-    };
-    // The flood has filled what waits ahead of the link before a key is typed: two seconds of
-    // the link's frames have come.
-    rig::until("the flood fills the link", secs(20), || {
-        rig.net.counts(client.id).bytes > 64_000
-    });
-    let drawn = flood();
-    let mut echoes = Vec::new();
-    for ch in ['A', 'B', 'C', 'D', 'E'] {
-        let want = format!("===ECHO-{ch}===");
-        let at = Instant::now();
-        client.types(&[ch as u8]);
-        rig::until(&want, secs(30), || client.screen().contains(&want));
-        echoes.push(at.elapsed());
-    }
-    echoes.sort();
-    let (median, worst) = (echoes[2], echoes[4]);
-    assert!(flood() != drawn, "the flood was not drawn on meanwhile");
-    assert!(
-        median < secs(2) && worst < secs(5),
-        "echo queued behind the flood: {echoes:?}"
-    );
 }

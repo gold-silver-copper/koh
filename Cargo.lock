@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "koh"
-version = "0.19.1"
+version = "0.19.2"
 dependencies = [
  "fux",
  "fux-vt",

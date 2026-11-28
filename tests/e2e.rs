@@ -1698,7 +1698,8 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
         let fills = full.then(|| fills.spawn().unwrap());
         let takes = || fuxix::wait([(Some(theirs.as_fd()), fuxix::POLLOUT)], 0).unwrap();
         until("the terminal is full", || fills.is_none() || takes() == [0]);
-        let mut tty = host.attach_on((pty, theirs), &["--session", &name], &flood);
+        let program: &[String] = if full { &[] } else { &flood };
+        let mut tty = host.attach_on((pty, theirs), &["--session", &name], program);
         match full {
             true => until("the session is started", || {
                 host.pane(&name).join("run").exists()
@@ -1706,7 +1707,7 @@ fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
             false => tty.until("the flood is drawn", |tty| tty.drew(0, b"es")),
         }
         // (Not read from here on: what koh writes fills the terminal, and waits.)
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_millis(if full { 500 } else { 3000 }));
         let told = Instant::now();
         signal(&tty.koh.id().to_string(), how);
         let ended = loop {
@@ -1982,11 +1983,10 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
     let script = host.tmp.0.join("sessions.sh");
     fs::write(&script, &help[help.find("#!/bin/sh").unwrap()..]).unwrap();
     assert!(!koh(&host.tmp.0, &["--help"]).1.contains("#!/bin/sh"));
-    let (scratch, dir) = (host.tmp.0.join("scratch"), host.sessions.to_str().unwrap());
-    fs::create_dir_all(&scratch).unwrap();
+    let dir = host.sessions.to_str().unwrap();
     let recipe = |args: &[&str]| {
         let mut sh = Command::new("sh");
-        sh.arg(&script).args(args).env("TMPDIR", &scratch);
+        sh.arg(&script).args(args);
         sh.stdout(Stdio::piped()).stderr(Stdio::piped());
         sh
     };
@@ -2046,14 +2046,9 @@ fn the_recipes_of_help_agents_read_what_the_commands_read() {
             .spawn()
             .unwrap(),
     );
-    // (Its first look has taken what it waits from once it has written what it read.)
-    let looked = || {
-        fs::read_dir(&scratch)
-            .unwrap()
-            .flatten()
-            .any(|f| f.metadata().is_ok_and(|m| m.len() > 0))
-    };
-    until("the recipe's wait has looked", looked);
+    // (Time for its first look, which leaves no sign every system shows: on macOS no file of
+    // its mktemp's came in TMPDIR.)
+    std::thread::sleep(Duration::from_millis(500));
     stepped(&moving, 3);
     // (Time for it to look at the moved marks: the wait is the test.)
     std::thread::sleep(Duration::from_millis(500));
@@ -3423,7 +3418,8 @@ fn job_reader_never_mixes_replacement_run() {
         let lock = fuxix::open(&pane, false).map(|f| f.try_lock_shared());
         !matches!(lock, Ok(Err(fs::TryLockError::WouldBlock)))
     });
-    fs::remove_dir_all(&pane).unwrap();
+    // (Moved away whole: a folder removed file by file is, for a moment, a run with no state.)
+    fs::rename(&pane, jobs.join("rep_old")).unwrap();
     fs::rename(jobs.join("rep_new"), &pane).unwrap();
     // The follower has none of the new run: it ends with the old one's kill, or says the job
     // was started anew.

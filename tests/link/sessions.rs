@@ -14,7 +14,7 @@ use koh::proto::{
 use crate::net::Profile;
 use crate::rig::{self, Rig, secs};
 
-/// A link gone for forty seconds while a line is typed every 10 ms, and back: koh says there is
+/// A link gone for forty seconds while a line is typed every 25 ms, and back: koh says there is
 /// no link once it has been silent for eight seconds, holds what is typed from then on and a
 /// resize, dials again, and is back within seconds of the path. What was typed arrives once
 /// and in its order: all of it, but what was on its way when the link went (one stretch).
@@ -38,7 +38,8 @@ async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_
             rig::write_all_pty(&master, &line);
             all.extend(line);
             count.store(all.len(), SeqCst);
-            std::thread::sleep(Duration::from_millis(10));
+            // (640 B/s: what is held stays well under its 64 KiB however long the redial takes.)
+            std::thread::sleep(Duration::from_millis(25));
         }
         all
     });
@@ -58,6 +59,7 @@ async fn a_link_gone_for_forty_seconds_is_back_within_seconds_and_what_is_typed_
     rig::until("the session is shown again", secs(20), || {
         !client.screen().contains("no link")
     });
+    rig::screen_agrees(&pane, &client);
     typing.store(false, SeqCst);
     let all = typist.join().unwrap();
     rig::until("the end of what was typed arrives", secs(20), || {
@@ -171,7 +173,10 @@ async fn kohs_key_leaves_a_session_whose_program_reads_nothing_of_what_was_paste
     // comes then and pastes more, into a program that reads, has it typed whole after it.
     fs::write(rig.file("out.go"), "").unwrap();
     let gone = || {
-        let mut left = fs::read_dir(&rig.sessions).unwrap().flatten();
+        // (A viewer's folder is beside the sessions', in koh's fux session.)
+        let mut left = fs::read_dir(rig.sessions.parent().unwrap())
+            .unwrap()
+            .flatten();
         left.all(|f| !f.file_name().to_string_lossy().starts_with(".view."))
     };
     rig::until("the viewer that was left is gone", secs(20), gone);
@@ -343,8 +348,7 @@ async fn a_server_that_cuts_a_sequence_or_says_what_none_says_leaves_the_termina
 }
 
 /// A key's echo during a flood at 256 kbit/s does not wait behind seconds of old frames: the
-/// viewer draws its next frame when its terminal has taken the last, and the stream reads no
-/// further ahead than its window.
+/// viewer draws its next frame when its terminal has taken the last.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_keys_echo_during_a_flood_at_256_kbit_is_not_behind_old_frames() {
     let rig = Rig::start(

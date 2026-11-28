@@ -164,9 +164,11 @@ fn screen(dir: &Path) -> Vec<u8> {
 /// that ended, what `state` says and its last screen. A folder that is gone or another run's
 /// once all that was read has ended, and nothing of it is given.
 fn looked(dir: &Path, run: Run, asked: u64) -> Option<(i32, String, Vec<u8>)> {
-    // (What is not known to be of one round is not believed: the next look is.)
+    // (What is not known to be of one round is not believed: the next look is.) The holder
+    // is asked BEFORE the read: one seen gone writes no more, and what it last wrote is read.
+    let alive = lives(dir);
     let (ended, whole) = pane::together(dir, lives, || pane::ended_since(asked, dir));
-    let answer = match (ended.filter(|_| whole), lives(dir)) {
+    let answer = match (ended.filter(|_| whole), alive) {
         (Some((code, printed, unread)), _) => {
             let said = match unread {
                 0 => "command ended (OSC 133)".to_string(),
@@ -185,6 +187,8 @@ fn looked(dir: &Path, run: Run, asked: u64) -> Option<(i32, String, Vec<u8>)> {
             let state = state_of(pane::line(dir, "state"), false);
             Some((pane::code(&state).unwrap_or(1), state, screen(dir)))
         }
+        // (Gone since it was asked: its last marks are read before a limit or a pause is.)
+        (None, true) if !lives(dir) => return looked(dir, run, asked),
         (None, true) => None,
     };
     match run_of(dir) == Some(run) {

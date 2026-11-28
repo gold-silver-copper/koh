@@ -5,7 +5,6 @@
 use std::fs;
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::fd::AsFd as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -297,6 +296,19 @@ impl InTerminal {
     fn drew(&self, from: usize, what: &[u8]) -> bool {
         let drawn = self.drawn.get(from..).unwrap_or_default();
         drawn.windows(what.len()).any(|drawn| drawn == what)
+    }
+
+    /// Tells koh to end `how`, and gives the code it ended with: soon, in two seconds.
+    fn told(&mut self, how: &str) -> Option<i32> {
+        let told = Instant::now();
+        signal(&self.koh.id().to_string(), how);
+        loop {
+            if let Some(ended) = self.koh.try_wait().unwrap() {
+                return ended.code();
+            }
+            assert!(told.elapsed().as_secs() < 2, "{how}: still there");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The exit code koh ended with.
@@ -858,16 +870,6 @@ impl Host {
     }
 
     fn attach(&self, asks: &[&str], program: &[String]) -> InTerminal {
-        self.attach_on(InTerminal::pty(), asks, program)
-    }
-
-    /// `koh connect` on a terminal of the test's making.
-    fn attach_on(
-        &self,
-        pty: (fs::File, fs::File),
-        asks: &[&str],
-        program: &[String],
-    ) -> InTerminal {
         let addr = self.addr();
         let mut args = vec![self.id.as_str(), "--direct", &addr];
         args.extend_from_slice(asks);
@@ -875,8 +877,7 @@ impl Host {
             args.push("--");
             args.extend(program.iter().map(String::as_str));
         }
-        let (config, runtime) = (self.tmp.0.join("cli_cfg"), self.tmp.0.join("crun"));
-        InTerminal::connect_on(pty, &config, &runtime, &args, true)
+        InTerminal::connect(&self.tmp.0.join("cli_cfg"), &self.tmp.0.join("crun"), &args)
     }
 
     /// A `koh` of the client's, with its key and a runtime directory of its own.
@@ -1643,15 +1644,16 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     let mut tty = host.attach(&["--session", "s"], &program);
     tty.until("the program is ready", |tty| tty.drew(0, b"READY"));
     let state = || fs::read_to_string(host.pane("s").join("state")).unwrap_or_default();
-    let (burst, mut over, mut full) = (vec![b'x'; 64 << 10], None, 0);
+    let (burst, mut over, mut full, ready) = (vec![b'x'; 64 << 10], None, 0, Instant::now());
     let ended = loop {
         // (As much as the terminal takes, and nothing once koh is gone; what koh draws is read.)
-        // Once the terminal has taken nothing a hundred times running, the program ends.
+        // Once the terminal has taken nothing a hundred times running (or, one that goes on
+        // taking a little, in three seconds), the program ends.
         match (&tty.tty).write(&burst) {
             Ok(1..) => full = 0,
             _ => full += 1,
         }
-        if full == 100 {
+        if full == 100 || ready.elapsed() > Duration::from_secs(3) {
             fs::write(&gate, "").unwrap();
         }
         let mut drawn = [0; 4096];
@@ -1664,7 +1666,7 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
         if let Some(ended) = tty.koh.try_wait().unwrap() {
             break ended.code();
         }
-        assert!(full < 10_000, "koh is still there");
+        assert!(ready.elapsed().as_secs() < 20, "koh is still there");
         std::thread::sleep(Duration::from_millis(2));
     };
     assert_eq!(ended, Some(42));
@@ -1678,51 +1680,53 @@ fn a_session_that_ends_with_typing_unread_ends_for_its_client_at_once() {
     assert!(!tty.drew(0, b"no link"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn koh_connect_started_on_a_terminal_that_takes_nothing_ends_when_it_is_told_to() {
+    let host = Host::start("stalled-first", &[]);
+    let (config, runtime) = (host.tmp.0.join("cli_cfg"), host.tmp.0.join("crun"));
+    // A terminal that takes nothing from before koh starts (another program has filled it,
+    // and nobody reads): koh cannot ask it what it is like, and waits for nothing to do so.
+    // Told to end, it ends, each of the three ways.
+    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
+        let (tty, theirs) = InTerminal::pty();
+        let mut fills = Command::new("sh");
+        fills
+            .args(["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"])
+            .stdout(theirs.try_clone().unwrap());
+        let mut fills = fills.spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let name = how.trim_start_matches('-');
+        let asks = [&host.id, "--direct", &host.addr(), "--session", name];
+        let mut koh = InTerminal::connect_on((tty, theirs), &config, &runtime, &asks, true);
+        // (koh has dialled and has its terminal by now: the session is there.)
+        until("the session is started", || {
+            host.pane(name).join("run").exists()
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(koh.told(how), Some(code), "{how}");
+        drop(koh); // (first: see InTerminal's drop)
+        let _ = (fills.kill(), fills.wait());
+    }
+}
+
 #[test]
 fn koh_connect_ends_when_it_is_told_to_though_its_terminal_takes_nothing() {
     let host = Host::start("stalled", &[]);
     // A terminal that takes nothing more (one behind a path that is stuck), under a program
     // that goes on printing: koh's writing to it waits, and so would putting it back. Told to
-    // end, koh ends all the same, each of the three ways, and soon. So it does on a terminal
-    // another program filled before koh started: koh cannot ask it what it is like, and waits
-    // for nothing to do so. (That first, before the floods of the others go on.)
-    let cases = [("-TERM", 0), ("-HUP", 0), ("-INT", 130)].map(|(how, code)| (how, code, false));
-    for (how, code, full) in [("-TERM", 0, true)].into_iter().chain(cases) {
+    // end, koh ends all the same, each of the three ways, and soon.
+    for (how, code) in [("-TERM", 0), ("-HUP", 0), ("-INT", 130)] {
         // (Every cell of another colour than the one before it: a screen of it is many bytes.)
         let draws = r"while :; do printf '\033[31mfl\033[32moo\033[33md-\033[34mof\033[35m-l\033[36min\033[37mes'; done";
         let flood = ["sh", "-c", draws].map(String::from);
-        let ((pty, theirs), name) = (InTerminal::pty(), format!("{}{full}", &how[1..]));
-        let fill = ["-c", "stty raw <&1; exec head -c 4194304 /dev/zero"];
-        let mut fills = Command::new("sh");
-        fills.args(fill).stdout(theirs.try_clone().unwrap());
-        let fills = full.then(|| fills.spawn().unwrap());
-        let takes = || fuxix::wait([(Some(theirs.as_fd()), fuxix::POLLOUT)], 0).unwrap();
-        until("the terminal is full", || fills.is_none() || takes() == [0]);
-        let program: &[String] = if full { &[] } else { &flood };
-        let mut tty = host.attach_on((pty, theirs), &["--session", &name], program);
-        match full {
-            true => until("the session is started", || {
-                host.pane(&name).join("run").exists()
-            }),
-            false => tty.until("the flood is drawn", |tty| tty.drew(0, b"es")),
-        }
+        let mut tty = host.attach(&["--session", how.trim_start_matches('-')], &flood);
+        tty.until("the flood is drawn", |tty| {
+            tty.drawn.windows(2).any(|drawn| drawn == b"es")
+        });
         // (Not read from here on: what koh writes fills the terminal, and waits.)
-        std::thread::sleep(Duration::from_millis(if full { 500 } else { 3000 }));
-        let told = Instant::now();
-        signal(&tty.koh.id().to_string(), how);
-        let ended = loop {
-            match tty.koh.try_wait().unwrap() {
-                Some(ended) => break ended.code(),
-                None => assert!(
-                    told.elapsed() < Duration::from_secs(2),
-                    "{how}: still there"
-                ),
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        assert_eq!(ended, Some(code), "{how}");
-        drop(tty); // (first: see InTerminal's drop)
-        let _ = fills.map(|mut fills| (fills.kill(), fills.wait()));
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(tty.told(how), Some(code), "{how}");
     }
 }
 
